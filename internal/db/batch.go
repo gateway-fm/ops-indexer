@@ -52,15 +52,20 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	}
 
 	if len(data.Transactions) > 0 {
+		// Precompute the set of tx hashes that have token transfers in this
+		// batch so the category bitfield can be set atomically on the insert.
+		txsWithTransfers := buildTokenTransferTxSet(data.Transfers)
 		batch := &pgx.Batch{}
 		for _, t := range data.Transactions {
+			_, hasTransfer := txsWithTransfers[t.Hash]
+			categories := computeTxCategories(t, hasTransfer)
 			batch.Queue(`
 				INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price,
-					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 				ON CONFLICT (hash) DO NOTHING`,
 				t.Hash, t.BlockNumber, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
-				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason)
+				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason, categories)
 		}
 		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {

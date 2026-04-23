@@ -101,13 +101,18 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 // Transaction operations
 
 func (d *DB) InsertTransaction(ctx context.Context, tx *types.Transaction) error {
+	// The one-off insert path doesn't know whether there are token transfers
+	// for this tx — bit 3 stays unset and is populated when the token_transfers
+	// rows are inserted alongside. The batch path (InsertBlockDataBatch) sets
+	// it atomically in the same transaction.
+	categories := computeTxCategories(tx, false)
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price,
-			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (hash) DO NOTHING`,
 		tx.Hash, tx.BlockNumber, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
-		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason)
+		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason, categories)
 	return err
 }
 
@@ -254,15 +259,14 @@ func (d *DB) GetTransactionsWithCategories(ctx context.Context, limit int, befor
 	var rows pgx.Rows
 	var err error
 
+	// Categories are read from the materialized `categories` bitfield populated
+	// at insert time (migration 003). Prior implementation ran 4 correlated
+	// subqueries per row.
 	query := `
 		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
-			-- Computed categories
-			t.value > 0 as is_coin_transfer,
-			(t.to_address IS NOT NULL AND LENGTH(t.input_data) > 0 AND EXISTS(SELECT 1 FROM contracts c WHERE LOWER(c.address) = LOWER(t.to_address))) as is_contract_call,
-			(t.to_address IS NULL AND EXISTS(SELECT 1 FROM contracts c WHERE c.creation_tx = t.hash)) as is_contract_creation,
-			(SELECT COUNT(*) FROM token_transfers tt WHERE tt.tx_hash = t.hash) as token_transfer_count
+			t.categories
 		FROM transactions t
 		JOIN blocks b ON t.block_number = b.number`
 
@@ -293,11 +297,7 @@ func (d *DB) GetTransactionsPaginatedWithCategories(ctx context.Context, page, p
 		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
-			-- Computed categories
-			t.value > 0 as is_coin_transfer,
-			(t.to_address IS NOT NULL AND LENGTH(t.input_data) > 0 AND EXISTS(SELECT 1 FROM contracts c WHERE LOWER(c.address) = LOWER(t.to_address))) as is_contract_call,
-			(t.to_address IS NULL AND EXISTS(SELECT 1 FROM contracts c WHERE c.creation_tx = t.hash)) as is_contract_creation,
-			(SELECT COUNT(*) FROM token_transfers tt WHERE tt.tx_hash = t.hash) as token_transfer_count
+			t.categories
 		FROM transactions t
 		JOIN blocks b ON t.block_number = b.number
 		WHERE NOT (t.tx_type = ANY($1::int[]))
@@ -315,18 +315,13 @@ func (d *DB) GetTransactionsPaginatedWithCategories(ctx context.Context, page, p
 func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*types.Transaction, error) {
 	var tx types.Transaction
 	var valueStr string
-	var isCoinTransfer, isContractCall, isContractCreation bool
-	var tokenTransferCount int
+	var bits int16
 
 	err := d.pool.QueryRow(ctx, `
 		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, c.address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
-			-- Computed categories
-			t.value > 0 as is_coin_transfer,
-			(t.to_address IS NOT NULL AND LENGTH(t.input_data) > 0 AND EXISTS(SELECT 1 FROM contracts c2 WHERE LOWER(c2.address) = LOWER(t.to_address))) as is_contract_call,
-			(t.to_address IS NULL AND c.address IS NOT NULL) as is_contract_creation,
-			(SELECT COUNT(*) FROM token_transfers tt WHERE tt.tx_hash = t.hash) as token_transfer_count
+			t.categories
 		FROM transactions t
 		JOIN blocks b ON t.block_number = b.number
 		LEFT JOIN contracts c ON c.creation_tx = t.hash
@@ -334,7 +329,7 @@ func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*ty
 		&tx.Hash, &tx.BlockNumber, &tx.BlockTimestamp, &tx.TxIndex, &tx.From, &tx.To, &tx.ContractAddress, &valueStr,
 		&tx.GasUsed, &tx.GasPrice, &tx.GasLimit, &tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.Nonce,
 		&tx.TxType, &tx.InputData, &tx.Status, &tx.Error, &tx.RevertReason, &tx.CreatedAt,
-		&isCoinTransfer, &isContractCall, &isContractCreation, &tokenTransferCount)
+		&bits)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -342,8 +337,10 @@ func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*ty
 		return nil, err
 	}
 	tx.Value = types.JSONString(valueStr)
-	tx.TxCategories = buildCategories(tx.TxType, isCoinTransfer, isContractCall, isContractCreation, tokenTransferCount)
-	tx.TokenTransferCount = tokenTransferCount
+	tx.TxCategories = buildCategoriesFromBits(tx.TxType, bits)
+	if bits&CategoryTokenTransfer != 0 {
+		tx.TokenTransferCount = 1 // materialized column stores presence, not count
+	}
 
 	return &tx, nil
 }
@@ -353,39 +350,42 @@ func scanTransactionsWithCategories(rows pgx.Rows) ([]types.Transaction, error) 
 	for rows.Next() {
 		var tx types.Transaction
 		var valueStr string
-		var isCoinTransfer, isContractCall, isContractCreation bool
-		var tokenTransferCount int
+		var bits int16
 
 		if err := rows.Scan(&tx.Hash, &tx.BlockNumber, &tx.BlockTimestamp, &tx.TxIndex, &tx.From, &tx.To, &valueStr,
 			&tx.GasUsed, &tx.GasPrice, &tx.GasLimit, &tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.Nonce,
 			&tx.TxType, &tx.InputData, &tx.Status, &tx.Error, &tx.RevertReason, &tx.CreatedAt,
-			&isCoinTransfer, &isContractCall, &isContractCreation, &tokenTransferCount); err != nil {
+			&bits); err != nil {
 			return nil, err
 		}
 		tx.Value = types.JSONString(valueStr)
-		tx.TxCategories = buildCategories(tx.TxType, isCoinTransfer, isContractCall, isContractCreation, tokenTransferCount)
-		tx.TokenTransferCount = tokenTransferCount
-
+		tx.TxCategories = buildCategoriesFromBits(tx.TxType, bits)
+		if bits&CategoryTokenTransfer != 0 {
+			tx.TokenTransferCount = 1
+		}
 		txs = append(txs, tx)
 	}
 	return txs, rows.Err()
 }
 
-func buildCategories(txType int, isCoinTransfer, isContractCall, isContractCreation bool, tokenTransferCount int) []string {
+// buildCategoriesFromBits converts the materialized bitfield (migration 003)
+// to the free-form category labels used in the existing types.Transaction.
+// Preserves the legacy "system_transaction" special-case for OP deposit txs.
+func buildCategoriesFromBits(txType int, bits int16) []string {
 	if txType == types.TxTypeDeposit {
 		return []string{types.TxCategorySystemTransaction}
 	}
 	var categories []string
-	if isContractCreation {
+	if bits&CategoryContractCreation != 0 {
 		categories = append(categories, types.TxCategoryContractCreation)
 	}
-	if isContractCall {
+	if bits&CategoryContractCall != 0 {
 		categories = append(categories, types.TxCategoryContractCall)
 	}
-	if isCoinTransfer {
+	if bits&CategoryCoinTransfer != 0 {
 		categories = append(categories, types.TxCategoryCoinTransfer)
 	}
-	if tokenTransferCount > 0 {
+	if bits&CategoryTokenTransfer != 0 {
 		categories = append(categories, types.TxCategoryTokenTransfer)
 	}
 	return categories

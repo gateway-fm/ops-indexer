@@ -4,9 +4,6 @@ import (
 	"context"
 	"log/slog"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 )
 
@@ -91,9 +88,20 @@ func (s *Server) BatchGetBlockTransactionCounts(
 	ctx context.Context,
 	req *indexerv1.BatchGetBlockTransactionCountsRequest,
 ) (*indexerv1.BatchGetBlockTransactionCountsResponse, error) {
-	_ = ctx
-	_ = req
-	// TODO: add db.BatchGetBlockTransactionCounts(ctx, numbers[]) using
-	// `SELECT block_number, COUNT(*) FROM transactions WHERE block_number = ANY($1) GROUP BY block_number`.
-	return nil, status.Error(codes.Unimplemented, "BatchGetBlockTransactionCounts pending db support")
+	nums := req.GetBlockNumbers()
+	if len(nums) == 0 {
+		return &indexerv1.BatchGetBlockTransactionCountsResponse{Counts: map[uint64]uint32{}}, nil
+	}
+	counts, err := s.db.BatchGetBlockTransactionCounts(ctx, nums)
+	if err != nil {
+		slog.Error("BatchGetBlockTransactionCounts", "error", err)
+		return nil, internalErr(err, "BatchGetBlockTransactionCounts")
+	}
+	// Missing blocks: return 0 so clients get a full map.
+	for _, n := range nums {
+		if _, ok := counts[n]; !ok {
+			counts[n] = 0
+		}
+	}
+	return &indexerv1.BatchGetBlockTransactionCountsResponse{Counts: counts}, nil
 }

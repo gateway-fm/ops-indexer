@@ -5,9 +5,6 @@ import (
 	"log/slog"
 	"strings"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 )
@@ -175,9 +172,32 @@ func (s *Server) BatchGetTokenBalances(
 	ctx context.Context,
 	req *indexerv1.BatchGetTokenBalancesRequest,
 ) (*indexerv1.BatchGetTokenBalancesResponse, error) {
-	_ = ctx
-	_ = req
-	// TODO: add db.BatchGetTokenBalances(addresses[], tokenAddr) that returns
-	// the full set in one query and groups client-side.
-	return nil, status.Error(codes.Unimplemented, "BatchGetTokenBalances pending db support")
+	addrs := req.GetAddresses()
+	if len(addrs) == 0 {
+		return &indexerv1.BatchGetTokenBalancesResponse{
+			Balances: map[string]*indexerv1.BatchGetTokenBalancesResponse_TokenBalanceList{},
+		}, nil
+	}
+	grouped, err := s.db.BatchGetTokenBalances(ctx, addrs, req.GetTokenAddress())
+	if err != nil {
+		slog.Error("BatchGetTokenBalances", "error", err)
+		return nil, internalErr(err, "BatchGetTokenBalances")
+	}
+	out := make(map[string]*indexerv1.BatchGetTokenBalancesResponse_TokenBalanceList, len(grouped))
+	for addr, balances := range grouped {
+		items := make([]*indexerv1.TokenBalance, 0, len(balances))
+		for i := range balances {
+			items = append(items, mapBalance(&balances[i]))
+		}
+		out[addr] = &indexerv1.BatchGetTokenBalancesResponse_TokenBalanceList{Items: items}
+	}
+	// Return an empty list for addresses that have no balances so clients get
+	// a full map matching their input.
+	for _, a := range addrs {
+		lk := strings.ToLower(a)
+		if _, ok := out[lk]; !ok {
+			out[lk] = &indexerv1.BatchGetTokenBalancesResponse_TokenBalanceList{}
+		}
+	}
+	return &indexerv1.BatchGetTokenBalancesResponse{Balances: out}, nil
 }

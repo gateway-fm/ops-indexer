@@ -5,9 +5,6 @@ import (
 	"log/slog"
 	"strings"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 )
@@ -132,9 +129,22 @@ func (s *Server) BatchGetAddressTransactionCounts(
 	ctx context.Context,
 	req *indexerv1.BatchGetAddressTransactionCountsRequest,
 ) (*indexerv1.BatchGetAddressTransactionCountsResponse, error) {
-	_ = ctx
-	_ = req
-	// TODO: add a db.BatchGetAddressTransactionCounts(addresses[]) that returns
-	// `SELECT address, tx_count FROM address_stats WHERE address = ANY($1)`.
-	return nil, status.Error(codes.Unimplemented, "BatchGetAddressTransactionCounts pending db support")
+	addrs := req.GetAddresses()
+	if len(addrs) == 0 {
+		return &indexerv1.BatchGetAddressTransactionCountsResponse{Counts: map[string]uint64{}}, nil
+	}
+	counts, err := s.db.BatchGetAddressTransactionCounts(ctx, addrs)
+	if err != nil {
+		slog.Error("BatchGetAddressTransactionCounts", "error", err)
+		return nil, internalErr(err, "BatchGetAddressTransactionCounts")
+	}
+	// Return 0 for addresses that don't exist in address_stats so callers
+	// get a full map matching their input.
+	for _, a := range addrs {
+		lk := strings.ToLower(a)
+		if _, ok := counts[lk]; !ok {
+			counts[lk] = 0
+		}
+	}
+	return &indexerv1.BatchGetAddressTransactionCountsResponse{Counts: counts}, nil
 }
