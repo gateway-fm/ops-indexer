@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+
+# Go
+vendor/
+*.test
+*.out
+coverage.*
+
+# Generated code
+gen/
+*.pb.go
+*_grpc.pb.go
+
+# Local dev
+.env
+.env.local
+*.local.*
+docker-compose.override.yml
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log

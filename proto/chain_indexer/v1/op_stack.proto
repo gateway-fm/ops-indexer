@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+// OPDeposit is one L1→L2 deposit emitted by the Optimism Portal contract.
+// Only populated when the indexer is configured with OP_STACK_ENABLED=true.
+//
+// When the indexer is not in OP-Stack mode, RPCs here return gRPC code
+// Unavailable with a message explaining the chain is not OP-Stack.
+message OPDeposit {
+  string l1_transaction_hash = 1;
+  string l2_transaction_hash = 2;
+  uint64 l1_block_number = 3;
+  uint64 l2_block_number = 4;
+
+  google.protobuf.Timestamp l1_block_timestamp = 5;
+  google.protobuf.Timestamp l2_block_timestamp = 6;
+
+  string from = 7;  // L1 sender
+  string to = 8;    // L2 recipient
+  BigInt value = 9;
+  string data = 10;  // call data forwarded to L2
+
+  uint64 gas_limit = 11;
+  bool is_creation = 12;
+}
+
+message GetOPDepositRequest {
+  // Lookup by either L1 or L2 tx hash.
+  oneof selector {
+    string l1_transaction_hash = 1;
+    string l2_transaction_hash = 2;
+  }
+}
+
+message ListOPDepositsRequest {
+  PageRequest page = 1;
+
+  // Optional filters. Order is by l1_block_number DESC by default.
+  string by_from = 2;
+  string by_to = 3;
+  BlockRange l1_block_range = 4;
+}
+
+message ListOPDepositsResponse {
+  repeated OPDeposit deposits = 1;
+  PageResponse page = 2;
+}

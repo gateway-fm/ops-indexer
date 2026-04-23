@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+// Address stats derived by the indexer. This is the canonical "address
+// details" payload consumers merge with their own per-context data
+// (e.g. ENS, verification status, labels).
+message Address {
+  string address = 1;
+  bool is_contract = 2;
+
+  uint64 tx_count_in = 3;   // txs where address is `to`
+  uint64 tx_count_out = 4;  // txs where address is `from`
+  uint64 token_count = 5;   // distinct tokens held or interacted with
+
+  google.protobuf.Timestamp first_seen_at = 6;
+  google.protobuf.Timestamp last_seen_at = 7;
+  uint64 first_seen_block = 8;
+  uint64 last_seen_block = 9;
+
+  // Native balance in wei. Set only if the indexer tracks balances
+  // (config-dependent). Empty string means "unknown / not tracked".
+  BigInt native_balance = 10;
+}
+
+message GetAddressRequest {
+  string address = 1;
+}
+
+message ListAddressesRequest {
+  OffsetPageRequest page = 1;
+
+  enum SortBy {
+    SORT_BY_UNSPECIFIED = 0;
+    SORT_BY_TX_COUNT = 1;       // default: most active first
+    SORT_BY_NATIVE_BALANCE = 2; // richest first
+  }
+  SortBy sort_by = 2;
+}
+
+message ListAddressesResponse {
+  repeated Address addresses = 1;
+  OffsetPageResponse page = 2;
+}

@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+// Block is a single chain block as indexed. Fields match the EVM canonical
+// block header plus a few indexer-computed counts.
+message Block {
+  uint64 number = 1;
+  string hash = 2;
+  string parent_hash = 3;
+  google.protobuf.Timestamp timestamp = 4;
+
+  string miner = 5;
+  uint64 gas_used = 6;
+  uint64 gas_limit = 7;
+  BigInt base_fee_per_gas = 8;  // EIP-1559; empty on pre-1559 blocks
+  BigInt difficulty = 9;
+  BigInt total_difficulty = 10;
+
+  string state_root = 11;
+  string transactions_root = 12;
+  string receipts_root = 13;
+  string sha3_uncles = 14;
+  string extra_data = 15;
+  string mix_hash = 16;
+  string nonce = 17;
+  uint64 size = 18;
+
+  // Indexer-computed: number of transactions in this block.
+  // Consumers use this to avoid a separate count query.
+  uint32 transaction_count = 19;
+}
+
+// GetBlock fetches one block by number or hash.
+message GetBlockRequest {
+  oneof selector {
+    uint64 number = 1;
+    string hash = 2;
+  }
+}
+
+// ListBlocks returns a paginated feed of blocks in descending order by number.
+message ListBlocksRequest {
+  PageRequest page = 1;
+
+  // Optional: return blocks with number strictly less than this.
+  // Equivalent to a cursor on the first page, but explicit for jumping.
+  // Ignored if page.cursor is set.
+  uint64 before_number = 2;
+}
+
+message ListBlocksResponse {
+  repeated Block blocks = 1;
+  PageResponse page = 2;
+}
+
+// BatchGetBlockTransactionCounts returns tx counts keyed by block number.
+// Used by consumers rendering a block list to avoid N+1 queries.
+message BatchGetBlockTransactionCountsRequest {
+  repeated uint64 block_numbers = 1;
+}
+
+message BatchGetBlockTransactionCountsResponse {
+  // Map of block number to transaction count.
+  map<uint64, uint32> counts = 1;
+}

@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+// TransactionCategory flags what kind of activity a transaction represents.
+// Materialized at index time on the transactions table; consumers filter on
+// these without server-side recomputation.
+enum TransactionCategory {
+  TRANSACTION_CATEGORY_UNSPECIFIED = 0;
+  TRANSACTION_CATEGORY_COIN_TRANSFER = 1;       // native-value transfer
+  TRANSACTION_CATEGORY_CONTRACT_CREATION = 2;   // to=null, deploys code
+  TRANSACTION_CATEGORY_CONTRACT_CALL = 3;       // call to a contract
+  TRANSACTION_CATEGORY_TOKEN_TRANSFER = 4;      // emitted an ERC20/721/1155 Transfer log
+}
+
+// TransactionStatus is the receipt status.
+enum TransactionStatus {
+  TRANSACTION_STATUS_UNSPECIFIED = 0;
+  TRANSACTION_STATUS_SUCCESS = 1;
+  TRANSACTION_STATUS_FAILED = 2;
+}
+
+// Transaction is one indexed transaction.
+//
+// Field conventions:
+//   - `to` is empty for contract-creation transactions. Consumers check
+//     `contract_address` for the deployed address in that case.
+//   - Gas price fields are populated based on tx type; EIP-1559 txs have
+//     max_fee_per_gas / max_priority_fee_per_gas; legacy txs have gas_price.
+message Transaction {
+  string hash = 1;
+  uint64 block_number = 2;
+  string block_hash = 3;
+  uint32 transaction_index = 4;
+  google.protobuf.Timestamp block_timestamp = 5;
+
+  string from = 6;
+  string to = 7;  // empty if contract creation
+  BigInt value = 8;
+
+  uint64 gas = 9;
+  uint64 gas_used = 10;
+  BigInt gas_price = 11;
+  BigInt effective_gas_price = 12;
+  BigInt max_fee_per_gas = 13;
+  BigInt max_priority_fee_per_gas = 14;
+
+  uint64 nonce = 15;
+  string input = 16;           // hex-encoded calldata (0x-prefixed)
+  string method_id = 17;       // first 4 bytes of input, empty if input < 4 bytes
+  TransactionStatus status = 18;
+  uint32 tx_type = 19;         // 0=legacy, 1=EIP-2930, 2=EIP-1559, 126=EIP-4844...
+  uint64 cumulative_gas_used = 20;
+
+  // Populated only on contract-creation transactions.
+  string contract_address = 21;
+
+  // Indexer-computed categories. A tx can match multiple
+  // (e.g. contract_call + token_transfer).
+  repeated TransactionCategory categories = 22;
+}
+
+// ----- RPC messages -----
+
+message GetTransactionRequest {
+  string hash = 1;
+}
+
+// ListTransactions is the paginated tx feed. One RPC subsumes the current
+// privacy-proxy/block-explorer variants (with/without categories, offset/cursor).
+//
+// Filters are ANDed. All filters are optional.
+message ListTransactionsRequest {
+  PageRequest page = 1;
+
+  // Optional filters.
+  oneof filter {
+    AddressFilter by_address = 2;
+    BlockFilter by_block = 3;
+  }
+
+  // Optional: limit to txs matching any of these categories.
+  repeated TransactionCategory category_in = 4;
+
+  // Optional: [from_block, to_block) bound.
+  BlockRange block_range = 5;
+
+  // Optional: only txs newer than / older than a timestamp.
+  TimeRange time_range = 6;
+
+  // Optional: only txs with this status.
+  TransactionStatus status = 7;
+
+  message AddressFilter {
+    string address = 1;
+    AddressDirection direction = 2;  // default: BOTH
+  }
+
+  message BlockFilter {
+    oneof selector {
+      uint64 number = 1;
+      string hash = 2;
+    }
+  }
+}
+
+enum AddressDirection {
+  ADDRESS_DIRECTION_BOTH = 0;  // from OR to
+  ADDRESS_DIRECTION_FROM = 1;
+  ADDRESS_DIRECTION_TO = 2;
+}
+
+message ListTransactionsResponse {
+  repeated Transaction transactions = 1;
+  PageResponse page = 2;
+}
+
+// BatchGetAddressTransactionCounts returns tx counts for multiple addresses.
+// Used by consumers avoiding N+1 on account-list rendering.
+message BatchGetAddressTransactionCountsRequest {
+  repeated string addresses = 1;
+}
+
+message BatchGetAddressTransactionCountsResponse {
+  // Map of lowercase address to tx count.
+  map<string, uint64> counts = 1;
+}

@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+
+// Contract carries chain-facts-only data about a deployed contract.
+//
+// NOT INCLUDED here and never served by the indexer:
+//   - ABI
+//   - Source code
+//   - Verification status
+//   - Compiler version
+//
+// Those belong to consumers that manage verification (block-explorer api in
+// standalone mode). Privacy mode does not expose contract verification, so
+// privacy-proxy does not need them either.
+message Contract {
+  string address = 1;
+
+  string deployer = 2;
+  string deployment_tx_hash = 3;
+  uint64 deployment_block = 4;
+  google.protobuf.Timestamp deployed_at = 5;
+
+  // Deployed bytecode (hex, 0x-prefixed).
+  string bytecode = 6;
+
+  // Proxy detection — indexer-computed at deploy time.
+  bool is_proxy = 7;
+  ProxyType proxy_type = 8;
+  string proxy_implementation = 9;  // current implementation address; empty if not a proxy
+  string proxy_admin = 10;           // empty if unknown
+}
+
+enum ProxyType {
+  PROXY_TYPE_UNSPECIFIED = 0;
+  PROXY_TYPE_NONE = 1;
+  PROXY_TYPE_ERC1967 = 2;
+  PROXY_TYPE_TRANSPARENT = 3;
+  PROXY_TYPE_UUPS = 4;
+  PROXY_TYPE_BEACON = 5;
+}
+
+message GetContractRequest {
+  string address = 1;
+}

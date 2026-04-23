@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "chain_indexer/v1/common.proto";
+import "chain_indexer/v1/block.proto";
+import "chain_indexer/v1/transaction.proto";
+import "chain_indexer/v1/log.proto";
+import "chain_indexer/v1/token.proto";
+import "chain_indexer/v1/address.proto";
+import "chain_indexer/v1/contract.proto";
+import "chain_indexer/v1/internal_tx.proto";
+import "chain_indexer/v1/stats.proto";
+import "chain_indexer/v1/op_stack.proto";
+
+// IndexerService is the read-only API for indexed chain data.
+//
+// Trust model: the indexer is not a security layer. It returns whatever is
+// requested. Authorization, redaction, and privacy filtering are the
+// consumer's responsibility. In privacy-suite deployments the indexer listens
+// only on a trusted network and privacy-proxy is the sole consumer.
+//
+// Pagination: cursor-based by default (opaque cursor strings). A small set
+// of browse-style endpoints use offset pagination — see the individual
+// messages. Sort order is fixed per RPC.
+//
+// Errors: standard gRPC status codes. NotFound for missing entities;
+// InvalidArgument for malformed input; Unavailable for features that are
+// off for this indexer config (e.g. OP-Stack RPCs on a non-OP chain).
+service IndexerService {
+  // ----- Blocks -----
+  rpc GetBlock(GetBlockRequest) returns (Block);
+  rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+  rpc GetLatestBlockNumber(Empty) returns (LatestBlockNumber);
+  rpc BatchGetBlockTransactionCounts(BatchGetBlockTransactionCountsRequest) returns (BatchGetBlockTransactionCountsResponse);
+
+  // ----- Transactions -----
+  rpc GetTransaction(GetTransactionRequest) returns (Transaction);
+  rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
+  rpc BatchGetAddressTransactionCounts(BatchGetAddressTransactionCountsRequest) returns (BatchGetAddressTransactionCountsResponse);
+
+  // ----- Logs -----
+  rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
+
+  // ----- Tokens & transfers -----
+  rpc GetToken(GetTokenRequest) returns (Token);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc ListTokenTransfers(ListTokenTransfersRequest) returns (ListTokenTransfersResponse);
+  rpc ListTokenHolders(ListTokenHoldersRequest) returns (ListTokenHoldersResponse);
+  rpc ListTokenBalances(ListTokenBalancesRequest) returns (ListTokenBalancesResponse);
+  rpc BatchGetTokenBalances(BatchGetTokenBalancesRequest) returns (BatchGetTokenBalancesResponse);
+
+  // ----- Addresses -----
+  rpc GetAddress(GetAddressRequest) returns (Address);
+  rpc ListAddresses(ListAddressesRequest) returns (ListAddressesResponse);
+
+  // ----- Contracts -----
+  rpc GetContract(GetContractRequest) returns (Contract);
+
+  // ----- Internal transactions -----
+  rpc ListInternalTransactions(ListInternalTransactionsRequest) returns (ListInternalTransactionsResponse);
+
+  // ----- Stats -----
+  rpc GetChainStats(Empty) returns (ChainStats);
+  rpc GetTransactionHistory(GetTransactionHistoryRequest) returns (TransactionHistory);
+  rpc GetGasPrices(GetGasPricesRequest) returns (GasPrices);
+  rpc GetDailyStats(GetDailyStatsRequest) returns (GetDailyStatsResponse);
+
+  // ----- Search -----
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // ----- Sync -----
+  rpc GetSyncStatus(Empty) returns (SyncStatus);
+
+  // ----- OP-Stack (optional, config-gated) -----
+  rpc GetOPDeposit(GetOPDepositRequest) returns (OPDeposit);
+  rpc ListOPDeposits(ListOPDepositsRequest) returns (ListOPDepositsResponse);
+}
+
+// ----- Service-level messages -----
+
+message LatestBlockNumber {
+  uint64 number = 1;
+}
+
+// Search provides prefix-match autocomplete across blocks, transactions,
+// addresses, and tokens. Results are ranked by best fit; sort order is
+// a server concern.
+message SearchRequest {
+  string query = 1;
+  uint32 limit_per_kind = 2;  // default 5, server-capped
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;
+
+  message SearchResult {
+    SearchResultKind kind = 1;
+
+    oneof item {
+      Block block = 2;
+      Transaction transaction = 3;
+      Address address = 4;
+      Token token = 5;
+    }
+  }
+
+  enum SearchResultKind {
+    SEARCH_RESULT_KIND_UNSPECIFIED = 0;
+    SEARCH_RESULT_KIND_BLOCK = 1;
+    SEARCH_RESULT_KIND_TRANSACTION = 2;
+    SEARCH_RESULT_KIND_ADDRESS = 3;
+    SEARCH_RESULT_KIND_TOKEN = 4;
+  }
+}

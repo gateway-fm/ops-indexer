@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+message ChainStats {
+  uint64 latest_block_number = 1;
+  google.protobuf.Timestamp latest_block_timestamp = 2;
+
+  uint64 total_blocks = 3;
+  uint64 total_transactions = 4;
+  uint64 total_addresses = 5;
+  uint64 total_contracts = 6;
+
+  // Moving average over the last N blocks (N is indexer config).
+  float avg_block_time_seconds = 7;
+  float avg_tx_per_block = 8;
+}
+
+// TransactionHistoryBucket is one bin in a tx-count-over-time histogram.
+message TransactionHistoryBucket {
+  google.protobuf.Timestamp bucket_start = 1;
+  google.protobuf.Timestamp bucket_end = 2;
+  uint64 transaction_count = 3;
+}
+
+enum TimeBucket {
+  TIME_BUCKET_UNSPECIFIED = 0;
+  TIME_BUCKET_HOUR = 1;
+  TIME_BUCKET_DAY = 2;
+  TIME_BUCKET_WEEK = 3;
+}
+
+message GetTransactionHistoryRequest {
+  TimeRange range = 1;          // required
+  TimeBucket bucket = 2;        // default: HOUR
+}
+
+message TransactionHistory {
+  repeated TransactionHistoryBucket buckets = 1;
+}
+
+// Gas price percentiles across the last N blocks.
+message GasPrices {
+  // Suggested gas prices in wei (as BigInt strings).
+  BigInt slow = 1;    // 25th percentile
+  BigInt normal = 2;  // 50th percentile
+  BigInt fast = 3;    // 75th percentile
+
+  BigInt base_fee = 4;        // latest base fee (EIP-1559)
+  uint64 sample_block_count = 5;  // how many blocks were sampled
+}
+
+message GetGasPricesRequest {
+  // Number of recent blocks to sample. Server-capped.
+  uint32 sample_block_count = 1;  // default: 20
+}
+
+// DailyStats is a pre-aggregated row for one UTC day.
+message DailyStats {
+  string date = 1;  // "YYYY-MM-DD" in UTC
+
+  uint64 transactions = 2;
+  uint64 new_addresses = 3;
+  uint64 active_addresses = 4;
+  uint64 blocks = 5;
+  uint64 gas_used = 6;
+  BigInt total_fees = 7;
+}
+
+message GetDailyStatsRequest {
+  string from_date = 1;  // inclusive, "YYYY-MM-DD"
+  string to_date = 2;    // inclusive, "YYYY-MM-DD"
+}
+
+message GetDailyStatsResponse {
+  repeated DailyStats days = 1;
+}
+
+// Sync status reflects how caught up the indexer is with the chain.
+message SyncStatus {
+  uint64 latest_chain_block = 1;     // from the EVM node
+  uint64 latest_indexed_block = 2;   // highest contiguously indexed block
+  uint64 gap_count = 3;               // number of unindexed ranges
+  bool is_syncing = 4;
+  google.protobuf.Timestamp last_updated_at = 5;
+}

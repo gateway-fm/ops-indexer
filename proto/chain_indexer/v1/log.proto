@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+// Log is one EVM log record.
+//
+// `topics` is a list of 0-4 topics (topic0..topic3).
+// `data` is hex-encoded with 0x prefix.
+message Log {
+  uint64 block_number = 1;
+  string block_hash = 2;
+  google.protobuf.Timestamp block_timestamp = 3;
+  string transaction_hash = 4;
+  uint32 transaction_index = 5;
+  uint32 log_index = 6;
+
+  string address = 7;       // contract that emitted the log
+  repeated string topics = 8;  // 0..4 entries
+  string data = 9;
+
+  bool removed = 10;  // true if the log was reverted via a reorg
+}
+
+// ListLogs returns logs matching the provided filter.
+// At least one filter field must be set to prevent a full table scan
+// (enforced server-side; see docs/API.md for error behavior).
+message ListLogsRequest {
+  PageRequest page = 1;
+
+  // Optional filters. At least one of by_tx_hash, by_address, topic0 must be set.
+  string by_tx_hash = 2;
+  string by_address = 3;
+  string topic0 = 4;
+
+  BlockRange block_range = 5;
+}
+
+message ListLogsResponse {
+  repeated Log logs = 1;
+  PageResponse page = 2;
+}

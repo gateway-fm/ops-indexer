@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+// InternalTransaction is a trace-level call inside an outer transaction.
+// Indexed from debug_traceTransaction output.
+message InternalTransaction {
+  string transaction_hash = 1;
+  uint64 block_number = 2;
+  google.protobuf.Timestamp block_timestamp = 3;
+
+  // Path of the sub-call inside the trace tree.
+  // Example: "0/1/0" means first child of second child of root.
+  string trace_address = 4;
+
+  // One of: CALL, CALLCODE, DELEGATECALL, STATICCALL, CREATE, CREATE2, SELFDESTRUCT.
+  string call_type = 5;
+
+  string from = 6;
+  string to = 7;  // empty for CREATE / CREATE2 (see contract_address)
+  BigInt value = 8;
+  uint64 gas = 9;
+  uint64 gas_used = 10;
+  string input = 11;
+  string output = 12;
+
+  // Populated only for CREATE / CREATE2.
+  string contract_address = 13;
+
+  // Non-empty if the call reverted.
+  string error = 14;
+}
+
+message ListInternalTransactionsRequest {
+  PageRequest page = 1;
+
+  // Optional filters. At least one of by_tx_hash, by_address, by_block must be set.
+  string by_tx_hash = 2;
+  string by_address = 3;
+  BlockFilter by_block = 4;
+
+  message BlockFilter {
+    oneof selector {
+      uint64 number = 1;
+      string hash = 2;
+    }
+  }
+}
+
+message ListInternalTransactionsResponse {
+  repeated InternalTransaction internal_transactions = 1;
+  PageResponse page = 2;
+}

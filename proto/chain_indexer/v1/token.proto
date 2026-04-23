@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package chain_indexer.v1;
+
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1";
+
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v1/common.proto";
+
+enum TokenType {
+  TOKEN_TYPE_UNSPECIFIED = 0;
+  TOKEN_TYPE_ERC20 = 1;
+  TOKEN_TYPE_ERC721 = 2;
+  TOKEN_TYPE_ERC1155 = 3;
+}
+
+message Token {
+  string address = 1;
+  string name = 2;
+  string symbol = 3;
+  uint32 decimals = 4;  // ERC20 only; 0 for NFTs
+  BigInt total_supply = 5;
+  TokenType token_type = 6;
+
+  // Indexer-computed stats.
+  uint64 holder_count = 7;
+  uint64 transfer_count = 8;
+
+  // Optional enrichment.
+  string icon_url = 9;
+  string price_usd = 10;  // decimal string; empty if unknown
+}
+
+// TokenTransfer is one ERC20/721/1155 Transfer (or TransferSingle/Batch) event.
+message TokenTransfer {
+  string transaction_hash = 1;
+  uint32 log_index = 2;
+  uint64 block_number = 3;
+  google.protobuf.Timestamp block_timestamp = 4;
+
+  string token_address = 5;
+  TokenType token_type = 6;
+
+  string from = 7;
+  string to = 8;
+  BigInt value = 9;       // amount (ERC20) or quantity (ERC1155)
+  BigInt token_id = 10;   // NFT token id; empty for pure ERC20
+}
+
+// TokenBalance is one holder's balance for one token.
+message TokenBalance {
+  string address = 1;         // holder address
+  string token_address = 2;
+  BigInt balance = 3;
+  TokenType token_type = 4;
+
+  // For ERC721: the count of NFTs held (token_id not populated).
+  // For ERC1155: balance across all token_ids if aggregated.
+  // Consumers with need for per-token-id balances should use a separate RPC
+  // (future; not in Phase 1 surface).
+}
+
+// ----- RPC messages -----
+
+message GetTokenRequest {
+  string address = 1;
+}
+
+message ListTokensRequest {
+  OffsetPageRequest page = 1;
+  TokenType token_type = 2;  // UNSPECIFIED = all
+}
+
+message ListTokensResponse {
+  repeated Token tokens = 1;
+  OffsetPageResponse page = 2;
+}
+
+message ListTokenTransfersRequest {
+  PageRequest page = 1;
+
+  // Optional filters. At least one of by_tx_hash, by_address, by_token must be set.
+  string by_tx_hash = 2;
+  string by_address = 3;
+  string by_token = 4;
+
+  BlockRange block_range = 5;
+}
+
+message ListTokenTransfersResponse {
+  repeated TokenTransfer transfers = 1;
+  PageResponse page = 2;
+}
+
+message ListTokenHoldersRequest {
+  OffsetPageRequest page = 1;
+  string token_address = 2;
+}
+
+message ListTokenHoldersResponse {
+  repeated TokenBalance holders = 1;
+  OffsetPageResponse page = 2;
+}
+
+message ListTokenBalancesRequest {
+  PageRequest page = 1;
+  string address = 2;  // holder
+
+  // Optional: limit to a specific token.
+  string token_address = 3;
+}
+
+message ListTokenBalancesResponse {
+  repeated TokenBalance balances = 1;
+  PageResponse page = 2;
+}
+
+message BatchGetTokenBalancesRequest {
+  repeated string addresses = 1;
+
+  // Optional: limit to a specific token. If empty, returns balances across
+  // all tokens for each address (can be large — cap server-side).
+  string token_address = 2;
+}
+
+message BatchGetTokenBalancesResponse {
+  // Keyed by lowercase address. Each entry is the list of balances for that holder.
+  map<string, TokenBalanceList> balances = 1;
+
+  message TokenBalanceList {
+    repeated TokenBalance items = 1;
+  }
+}
