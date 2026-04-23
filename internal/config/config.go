@@ -9,11 +9,14 @@ import (
 )
 
 type Config struct {
-	RPCURL       string        `mapstructure:"rpc_url"`
-	DatabaseURL  string        `mapstructure:"database_url"`
-	APIPort      int           `mapstructure:"api_port"`
-	PollInterval time.Duration `mapstructure:"poll_interval"`
-	StartBlock   uint64        `mapstructure:"start_block"`
+	RPCURL          string        `mapstructure:"rpc_url"`
+	DatabaseURL     string        `mapstructure:"database_url"`
+	// GRPCListenAddr is the address the chain-indexer gRPC server binds to,
+	// e.g. ":50051". Required.
+	GRPCListenAddr  string        `mapstructure:"grpc_listen_addr"`
+	APIPort         int           `mapstructure:"api_port"`
+	PollInterval    time.Duration `mapstructure:"poll_interval"`
+	StartBlock      uint64        `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -66,7 +69,8 @@ type Config struct {
 
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("rpc_url", "http://127.0.0.1:8545")
-	v.SetDefault("database_url", "postgres://postgres:postgres@localhost:5432/explorer?sslmode=disable")
+	v.SetDefault("database_url", "postgres://postgres:postgres@localhost:5432/chain_indexer?sslmode=disable")
+	v.SetDefault("grpc_listen_addr", ":50051")
 	v.SetDefault("api_port", 8080)
 	v.SetDefault("poll_interval", "2s")
 	v.SetDefault("start_block", 0)
@@ -129,6 +133,7 @@ func Load() (*Config, error) {
 	cfg := &Config{}
 	cfg.RPCURL = v.GetString("rpc_url")
 	cfg.DatabaseURL = v.GetString("database_url")
+	cfg.GRPCListenAddr = v.GetString("grpc_listen_addr")
 	cfg.APIPort = v.GetInt("api_port")
 	cfg.PollInterval = v.GetDuration("poll_interval")
 	cfg.StartBlock = v.GetUint64("start_block")

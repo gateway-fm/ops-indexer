@@ -110,9 +110,10 @@ message ListTransactionsRequest {
 }
 
 enum AddressDirection {
-  ADDRESS_DIRECTION_BOTH = 0;  // from OR to
-  ADDRESS_DIRECTION_FROM = 1;
-  ADDRESS_DIRECTION_TO = 2;
+  ADDRESS_DIRECTION_UNSPECIFIED = 0;  // behaves as BOTH (from OR to)
+  ADDRESS_DIRECTION_BOTH = 1;
+  ADDRESS_DIRECTION_FROM = 2;
+  ADDRESS_DIRECTION_TO = 3;
 }
 
 message ListTransactionsResponse {

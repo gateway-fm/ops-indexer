@@ -1,3 +1,13 @@
+// Command indexer runs the chain-indexer service.
+//
+// The binary does two things concurrently:
+//  1. An indexing worker polls the configured EVM node and writes chain data
+//     to postgres (backfill + realtime).
+//  2. A gRPC server exposes the indexed data to consumers via
+//     chain_indexer.v1.IndexerService.
+//
+// Both share the same database handle. On SIGINT / SIGTERM the service
+// gracefully drains in-flight work and shuts down.
 package main
 
 import (
@@ -7,10 +17,12 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/gateway-fm/chain-indexer/internal/config"
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/grpcserver"
 	"github.com/gateway-fm/chain-indexer/internal/indexer"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
@@ -37,7 +49,8 @@ func main() {
 	}
 	defer database.Close()
 
-	// Parse hidden transaction types from config
+	// Hidden tx types affect indexer receipt fetching and post-indexing filters.
+	skipReceipts := make(map[int]bool)
 	if cfg.HiddenTxTypes != "" {
 		for _, s := range strings.Split(cfg.HiddenTxTypes, ",") {
 			s = strings.TrimSpace(s)
@@ -49,6 +62,7 @@ func main() {
 				log.Warn("invalid hidden_tx_types value, skipping", "value", s, "error", err)
 				continue
 			}
+			skipReceipts[n] = true
 			database.HiddenTxTypes = append(database.HiddenTxTypes, n)
 		}
 		if len(database.HiddenTxTypes) > 0 {
@@ -60,34 +74,9 @@ func main() {
 		log.Fatal("failed to run migrations", "error", err)
 	}
 
-	// Parse and apply hidden tx types to DB for query filtering
-	if cfg.HiddenTxTypes != "" {
-		var hidden []int
-		for _, s := range strings.Split(cfg.HiddenTxTypes, ",") {
-			s = strings.TrimSpace(s)
-			if n, err := strconv.Atoi(s); err == nil {
-				hidden = append(hidden, n)
-			}
-		}
-		if len(hidden) > 0 {
-			database.HiddenTxTypes = hidden
-		}
-	}
-
 	rpcClient, err := rpc.New(cfg.RPCURL)
 	if err != nil {
 		log.Fatal("failed to create rpc client", "error", err)
-	}
-
-	// Parse hidden tx types into a set for skipping receipt fetches
-	skipReceipts := make(map[int]bool)
-	if cfg.HiddenTxTypes != "" {
-		for _, s := range strings.Split(cfg.HiddenTxTypes, ",") {
-			s = strings.TrimSpace(s)
-			if n, err := strconv.Atoi(s); err == nil {
-				skipReceipts[n] = true
-			}
-		}
 	}
 
 	idxCfg := &indexer.Config{
@@ -108,6 +97,14 @@ func main() {
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
+	grpcSrv, err := grpcserver.New(grpcserver.Config{
+		ListenAddr:     cfg.GRPCListenAddr,
+		OPStackEnabled: cfg.EnableOPDeposits,
+	}, database)
+	if err != nil {
+		log.Fatal("failed to create grpc server", "error", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -115,12 +112,30 @@ func main() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		log.Info("shutting down indexer")
+		log.Info("shutting down chain-indexer")
 		cancel()
 	}()
 
-	log.Info("starting indexer worker")
-	if err := idx.Start(ctx); err != nil {
-		log.Error("indexer error", "error", err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		log.Info("starting indexer worker")
+		if err := idx.Start(ctx); err != nil {
+			log.Error("indexer worker error", "error", err)
+			cancel()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := grpcSrv.Serve(ctx); err != nil {
+			log.Error("grpc server error", "error", err)
+			cancel()
+		}
+	}()
+
+	wg.Wait()
+	log.Info("chain-indexer stopped")
 }

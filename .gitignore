@@ -9,10 +9,8 @@ vendor/
 *.out
 coverage.*
 
-# Generated code
-gen/
-*.pb.go
-*_grpc.pb.go
+# Generated Go stubs are checked in — consumers shouldn't need buf/protoc locally.
+# (gen/ is tracked; regenerate via `make proto-gen`.)
 
 # Local dev
 .env
