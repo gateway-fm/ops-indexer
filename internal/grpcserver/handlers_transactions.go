@@ -1,0 +1,140 @@
+package grpcserver
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
+	"github.com/gateway-fm/chain-indexer/internal/types"
+)
+
+func (s *Server) GetTransaction(ctx context.Context, req *indexerv1.GetTransactionRequest) (*indexerv1.Transaction, error) {
+	if req.GetHash() == "" {
+		return nil, invalidArgument("hash is required")
+	}
+	// Use the category-aware variant so responses include the category bitfield.
+	tx, err := s.db.GetTransactionWithCategories(ctx, req.GetHash())
+	if err != nil {
+		slog.Error("GetTransaction", "error", err)
+		return nil, internalErr(err, "GetTransaction")
+	}
+	if tx == nil {
+		return nil, notFound("transaction", req.GetHash())
+	}
+	return mapTransaction(tx), nil
+}
+
+func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransactionsRequest) (*indexerv1.ListTransactionsResponse, error) {
+	limit := s.clampPageSize(req.GetPage().GetPageSize())
+
+	// Filter dispatch.
+	switch f := req.GetFilter().(type) {
+	case *indexerv1.ListTransactionsRequest_ByAddress:
+		if f.ByAddress.GetAddress() == "" {
+			return nil, invalidArgument("address is required")
+		}
+		addr := strings.ToLower(f.ByAddress.GetAddress())
+		var beforeBlock *uint64
+		if c := req.GetPage().GetCursor(); c != "" {
+			var cur txFeedCursor
+			if err := decodeCursor(c, &cur); err != nil {
+				return nil, err
+			}
+			beforeBlock = &cur.BlockNumber
+		}
+		rows, err := s.db.GetTransactionsByAddress(ctx, addr, int(limit)+1, beforeBlock)
+		if err != nil {
+			slog.Error("ListTransactions by address", "error", err)
+			return nil, internalErr(err, "ListTransactions")
+		}
+		return buildTxListResponse(rows, limit), nil
+
+	case *indexerv1.ListTransactionsRequest_ByBlock:
+		switch b := f.ByBlock.GetSelector().(type) {
+		case *indexerv1.ListTransactionsRequest_BlockFilter_Number:
+			rows, err := s.db.GetTransactionsByBlock(ctx, b.Number)
+			if err != nil {
+				slog.Error("ListTransactions by block", "error", err)
+				return nil, internalErr(err, "ListTransactions")
+			}
+			return &indexerv1.ListTransactionsResponse{
+				Transactions: mapTransactions(rows),
+				Page:         &indexerv1.PageResponse{},
+			}, nil
+		case *indexerv1.ListTransactionsRequest_BlockFilter_Hash:
+			// Lookup block by hash, then fetch its transactions by number.
+			blk, err := s.db.GetBlockByHash(ctx, b.Hash)
+			if err != nil {
+				slog.Error("ListTransactions by block hash", "error", err)
+				return nil, internalErr(err, "ListTransactions")
+			}
+			if blk == nil {
+				return nil, notFound("block", b.Hash)
+			}
+			rows, err := s.db.GetTransactionsByBlock(ctx, blk.Number)
+			if err != nil {
+				return nil, internalErr(err, "ListTransactions")
+			}
+			return &indexerv1.ListTransactionsResponse{
+				Transactions: mapTransactions(rows),
+				Page:         &indexerv1.PageResponse{},
+			}, nil
+		}
+		return nil, invalidArgument("block filter: selector is required")
+
+	case nil:
+		// No filter — main transaction feed.
+		var beforeBlock *uint64
+		if c := req.GetPage().GetCursor(); c != "" {
+			var cur txFeedCursor
+			if err := decodeCursor(c, &cur); err != nil {
+				return nil, err
+			}
+			beforeBlock = &cur.BlockNumber
+		}
+		rows, err := s.db.GetTransactionsWithCategories(ctx, int(limit)+1, beforeBlock)
+		if err != nil {
+			slog.Error("ListTransactions feed", "error", err)
+			return nil, internalErr(err, "ListTransactions")
+		}
+		return buildTxListResponse(rows, limit), nil
+	}
+	return nil, invalidArgument("unsupported filter type")
+}
+
+// buildTxListResponse applies the limit+1 cursor encoding pattern.
+// If len(rows) > limit, encode a cursor pointing at the last returned row
+// and trim rows to the requested page size.
+func buildTxListResponse(rows []types.Transaction, limit int32) *indexerv1.ListTransactionsResponse {
+	nextCursor := ""
+	if int32(len(rows)) > limit {
+		last := rows[limit-1]
+		enc, err := encodeCursor(txFeedCursor{
+			BlockNumber:      last.BlockNumber,
+			TransactionIndex: uint32(last.TxIndex),
+		})
+		if err == nil {
+			nextCursor = enc
+		}
+		rows = rows[:limit]
+	}
+	return &indexerv1.ListTransactionsResponse{
+		Transactions: mapTransactions(rows),
+		Page:         &indexerv1.PageResponse{NextCursor: nextCursor},
+	}
+}
+
+func (s *Server) BatchGetAddressTransactionCounts(
+	ctx context.Context,
+	req *indexerv1.BatchGetAddressTransactionCountsRequest,
+) (*indexerv1.BatchGetAddressTransactionCountsResponse, error) {
+	_ = ctx
+	_ = req
+	// TODO: add a db.BatchGetAddressTransactionCounts(addresses[]) that returns
+	// `SELECT address, tx_count FROM address_stats WHERE address = ANY($1)`.
+	return nil, status.Error(codes.Unimplemented, "BatchGetAddressTransactionCounts pending db support")
+}
