@@ -1,0 +1,297 @@
+package db
+
+import (
+	"context"
+
+	"github.com/gateway-fm/chain-indexer/internal/types"
+
+	"github.com/jackc/pgx/v5"
+)
+
+type BlockData struct {
+	Block                *types.Block
+	Transactions         []*types.Transaction
+	Logs                 []*types.Log
+	Transfers            []*types.TokenTransfer
+	Contracts            []*types.Contract
+	Tokens               []*types.Token
+	InternalTransactions []*types.InternalTransaction
+	AddressStats         map[string]*AddressStatsDelta
+	SkipAddressStats     bool // Skip address_stats updates (for catchup mode to avoid deadlocks)
+}
+
+type AddressStatsDelta struct {
+	Address              string
+	TxCountDelta         int
+	InternalTxCountDelta int
+	TokenTransferDelta   int
+	IsContract           bool
+	BlockNumber          uint64
+}
+
+func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if data.Block != nil {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
+				size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			ON CONFLICT (number) DO NOTHING`,
+			data.Block.Number, data.Block.Hash, data.Block.ParentHash, data.Block.Timestamp,
+			data.Block.GasUsed, data.Block.GasLimit, data.Block.BaseFeePerGas, data.Block.TransactionCount,
+			data.Block.Size, data.Block.Difficulty, data.Block.TotalDifficulty, data.Block.Nonce,
+			data.Block.Miner, data.Block.ExtraData, data.Block.StateRoot, data.Block.TransactionsRoot, data.Block.ReceiptsRoot)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(data.Transactions) > 0 {
+		batch := &pgx.Batch{}
+		for _, t := range data.Transactions {
+			batch.Queue(`
+				INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price,
+					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				ON CONFLICT (hash) DO NOTHING`,
+				t.Hash, t.BlockNumber, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
+				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.Contracts) > 0 {
+		batch := &pgx.Batch{}
+		for _, c := range data.Contracts {
+			batch.Queue(`
+				INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
+					contract_name, compiler_version, optimization_used, source_code, abi)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				ON CONFLICT (address) DO NOTHING`,
+				c.Address, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
+				c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.Tokens) > 0 {
+		batch := &pgx.Batch{}
+		for _, t := range data.Tokens {
+			batch.Queue(`
+				INSERT INTO tokens (address, symbol, name, decimals, token_type, total_supply, block_number, creation_tx, l1_address)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				ON CONFLICT (address) DO UPDATE SET
+					symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
+					name = COALESCE(EXCLUDED.name, tokens.name),
+					decimals = COALESCE(EXCLUDED.decimals, tokens.decimals),
+					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)`,
+				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.Logs) > 0 {
+		batch := &pgx.Batch{}
+		for _, l := range data.Logs {
+			batch.Queue(`
+				INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.Transfers) > 0 {
+		batch := &pgx.Batch{}
+		for _, t := range data.Transfers {
+			batch.Queue(`
+				INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
+					block_number, timestamp, transfer_type, token_type, token_id, is_internal)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
+				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.InternalTransactions) > 0 {
+		batch := &pgx.Batch{}
+		for _, it := range data.InternalTransactions {
+			batch.Queue(`
+				INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
+					gas, gas_used, input, output, call_type, error, timestamp)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
+				it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
+				it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.AddressStats) > 0 && !data.SkipAddressStats {
+		batch := &pgx.Batch{}
+		for _, s := range data.AddressStats {
+			batch.Queue(`
+				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $5, $6, NOW())
+				ON CONFLICT (address) DO UPDATE SET
+					tx_count = address_stats.tx_count + $2,
+					internal_tx_count = address_stats.internal_tx_count + $3,
+					token_transfer_count = address_stats.token_transfer_count + $4,
+					last_seen = $5,
+					is_contract = COALESCE(EXCLUDED.is_contract, address_stats.is_contract),
+					updated_at = NOW()`,
+				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// RebuildAddressStats rebuilds address_stats after catchup completes.
+func (d *DB) RebuildAddressStats(ctx context.Context) error {
+	_, err := d.pool.Exec(ctx, `
+		TRUNCATE address_stats;
+
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
+		SELECT
+			addr,
+			COALESCE(tx_count, 0),
+			COALESCE(internal_tx_count, 0),
+			COALESCE(token_transfer_count, 0),
+			first_seen,
+			last_seen,
+			COALESCE(is_contract, false),
+			NOW()
+		FROM (
+			SELECT
+				a.address as addr,
+				tx.tx_count,
+				it.internal_tx_count,
+				tt.token_transfer_count,
+				LEAST(tx.first_seen, it.first_seen, tt.first_seen) as first_seen,
+				GREATEST(tx.last_seen, it.last_seen, tt.last_seen) as last_seen,
+				c.is_contract
+			FROM (
+				SELECT from_address as address FROM transactions
+				UNION
+				SELECT to_address as address FROM transactions WHERE to_address IS NOT NULL
+				UNION
+				SELECT from_address as address FROM internal_transactions
+				UNION
+				SELECT to_address as address FROM internal_transactions WHERE to_address IS NOT NULL
+				UNION
+				SELECT from_address as address FROM token_transfers
+				UNION
+				SELECT to_address as address FROM token_transfers
+			) a
+			LEFT JOIN (
+				SELECT address, COUNT(*) as tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
+				FROM (
+					SELECT from_address as address, block_number FROM transactions
+					UNION ALL
+					SELECT to_address as address, block_number FROM transactions WHERE to_address IS NOT NULL
+				) t
+				GROUP BY address
+			) tx ON a.address = tx.address
+			LEFT JOIN (
+				SELECT address, COUNT(*) as internal_tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
+				FROM (
+					SELECT from_address as address, block_number FROM internal_transactions
+					UNION ALL
+					SELECT to_address as address, block_number FROM internal_transactions WHERE to_address IS NOT NULL
+				) t
+				GROUP BY address
+			) it ON a.address = it.address
+			LEFT JOIN (
+				SELECT address, COUNT(*) as token_transfer_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
+				FROM (
+					SELECT from_address as address, block_number FROM token_transfers
+					UNION ALL
+					SELECT to_address as address, block_number FROM token_transfers
+				) t
+				GROUP BY address
+			) tt ON a.address = tt.address
+			LEFT JOIN (
+				SELECT address, true as is_contract FROM contracts
+			) c ON LOWER(a.address) = LOWER(c.address)
+		) stats
+		WHERE addr IS NOT NULL
+	`)
+	return err
+}
+
+func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {
+	if len(balances) == 0 {
+		return nil
+	}
+
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	batch := &pgx.Batch{}
+	for _, b := range balances {
+		batch.Queue(`
+			INSERT INTO balances (address, token_address, block_number, balance)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
+			b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	if err := br.Close(); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (d *DB) GetAllTokenAddresses(ctx context.Context) ([]string, error) {
+	rows, err := d.pool.Query(ctx, `SELECT address FROM tokens`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var addresses []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		addresses = append(addresses, addr)
+	}
+	return addresses, rows.Err()
+}

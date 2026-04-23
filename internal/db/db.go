@@ -1,0 +1,76 @@
+package db
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io/fs"
+
+	"github.com/gateway-fm/chain-indexer/internal/log"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/tern/v2/migrate"
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+type DB struct {
+	pool          *pgxpool.Pool
+	// HiddenTxTypes are transaction type numbers excluded from default listings
+	// (e.g. 126 for OP deposit system transactions). Set via HIDDEN_TX_TYPES env var.
+	HiddenTxTypes []int
+}
+
+func New(databaseURL string) (*DB, error) {
+	pool, err := pgxpool.New(context.Background(), databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(context.Background()); err != nil {
+		return nil, err
+	}
+	return &DB{pool: pool, HiddenTxTypes: []int{}}, nil
+}
+
+func (d *DB) Close() {
+	d.pool.Close()
+}
+
+func (d *DB) Migrate() error {
+	ctx := context.Background()
+
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection: %w", err)
+	}
+	defer conn.Release()
+
+	migrator, err := migrate.NewMigrator(ctx, conn.Conn(), "schema_version")
+	if err != nil {
+		return fmt.Errorf("failed to create migrator: %w", err)
+	}
+
+	migrationsFS, err := fs.Sub(migrations, "migrations")
+	if err != nil {
+		return fmt.Errorf("failed to get migrations sub-fs: %w", err)
+	}
+
+	err = migrator.LoadMigrations(migrationsFS)
+	if err != nil {
+		return fmt.Errorf("failed to load migrations: %w", err)
+	}
+
+	migrator.OnStart = func(seq int32, name string, direction string, sql string) {
+		log.Info(fmt.Sprintf("running migration %d: %s %s", seq, name, direction))
+	}
+
+	count := len(migrator.Migrations)
+	log.Info("migrations loaded", "count", count)
+
+	if err = migrator.Migrate(ctx); err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	return nil
+}
