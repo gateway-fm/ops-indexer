@@ -63,4 +63,9 @@ jobs:
 
       - name: buf breaking
         if: github.event_name == 'pull_request'
-        run: buf breaking --against "https://github.com/${{ github.repository }}.git#branch=main"
+        # The repo is private; embed GITHUB_TOKEN in the clone URL so
+        # buf can fetch the main-branch baseline. Token is scoped to
+        # contents:read for this job (see permissions: at job level).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: buf breaking --against "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git#branch=main"
