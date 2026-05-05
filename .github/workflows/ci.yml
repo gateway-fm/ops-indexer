@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: bufbuild/buf-action@a0f1d1c8a5a66a2322f1ca93a22d2bab7305d9a5 # v1.2.1
+      - uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1.4.0
         with:
           setup_only: true
 
@@ -63,4 +63,9 @@ jobs:
 
       - name: buf breaking
         if: github.event_name == 'pull_request'
-        run: buf breaking --against "https://github.com/${{ github.repository }}.git#branch=main"
+        # The repo is private; embed GITHUB_TOKEN in the clone URL so
+        # buf can fetch the main-branch baseline. Token is scoped to
+        # contents:read for this job (see permissions: at job level).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: buf breaking --against "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git#branch=main"
