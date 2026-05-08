@@ -1,16 +1,26 @@
 name: Docker Publish
 
-# Publishes multi-arch chain-indexer images to GHCR.
+# Publishes multi-arch chain-indexer images to BOTH GHCR and Docker Hub.
 #
 # Triggers:
 #   - Push to main         -> tags :main and :sha-<7>
 #   - Push of v* tag       -> tags :<semver> (e.g. v1.2.3) and :latest
 #   - workflow_dispatch    -> tags :main and :sha-<7> (same as main push)
 #
-# Auth: GHCR via GITHUB_TOKEN (OIDC-friendly, no static secrets, no PAT).
+# Why both registries: privacy-proxy and block-explorer publish to Docker
+# Hub under the gatewayfm org; chain-indexer was the odd one out at GHCR.
+# Operators pulling the full Open Privacy Suite previously had to log into
+# two registries. We keep the GHCR push for backwards compatibility with
+# existing privacy-proxy compose manifests until they cut over.
+#
+# Auth:
+#   - GHCR     -> GITHUB_TOKEN (OIDC-friendly, no static secrets, no PAT).
+#   - Docker Hub -> DOCKERHUB_USERNAME + DOCKERHUB_TOKEN (Docker Hub access
+#     token, NOT a GitHub PAT — PATs are blocked org-wide).
+#
 # Permissions: contents:read + packages:write at job level (least privilege).
 # Multi-arch: linux/amd64 + linux/arm64 (QEMU + buildx).
-# Cache: GitHub Actions cache (type=gha, mode=max).
+# Cache: GitHub Actions cache (type=gha, mode=max). One build, two pushes.
 #
 # The companion docker-build.yml runs on PRs as a build-only dry run; this
 # workflow handles the publish path. Image labels are populated by
@@ -49,11 +59,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
-          images: ghcr.io/gateway-fm/chain-indexer
+          # Comma-separated list = same tag suffixes pushed to both registries.
+          images: |
+            ghcr.io/gateway-fm/chain-indexer
+            gatewayfm/chain-indexer
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
