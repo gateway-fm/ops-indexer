@@ -72,5 +72,18 @@ func (d *DB) Migrate() error {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 
+	// Reconciles counters against actual row counts in case earlier writes
+	// bypassed the live-increment path (e.g. pre-existing rows on first deploy).
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO chain_counters (name, count, updated_at) VALUES
+			('blocks_total',       (SELECT COUNT(*) FROM blocks),        NOW()),
+			('transactions_total', (SELECT COUNT(*) FROM transactions),  NOW()),
+			('addresses_total',    (SELECT COUNT(*) FROM address_stats), NOW()),
+			('tokens_total',       (SELECT COUNT(*) FROM tokens),        NOW())
+		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`); err != nil {
+		return fmt.Errorf("failed to re-seed chain_counters: %w", err)
+	}
+	log.Info("chain_counters re-seeded from row counts")
+
 	return nil
 }

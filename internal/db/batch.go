@@ -36,8 +36,10 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	}
 	defer tx.Rollback(ctx)
 
+	var deltaBlocks, deltaTxs, deltaTokens, deltaAddresses int64
+
 	if data.Block != nil {
-		_, err = tx.Exec(ctx, `
+		ct, err := tx.Exec(ctx, `
 			INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 				size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
@@ -49,25 +51,39 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		if err != nil {
 			return err
 		}
+		deltaBlocks += ct.RowsAffected()
 	}
 
 	if len(data.Transactions) > 0 {
 		// Precompute the set of tx hashes that have token transfers in this
 		// batch so the category bitfield can be set atomically on the insert.
 		txsWithTransfers := buildTokenTransferTxSet(data.Transfers)
+		var blockTimestamp *uint64
+		if data.Block != nil {
+			ts := data.Block.Timestamp
+			blockTimestamp = &ts
+		}
 		batch := &pgx.Batch{}
 		for _, t := range data.Transactions {
 			_, hasTransfer := txsWithTransfers[t.Hash]
 			categories := computeTxCategories(t, hasTransfer)
 			batch.Queue(`
-				INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price,
+				INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 				ON CONFLICT (hash) DO NOTHING`,
-				t.Hash, t.BlockNumber, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
+				t.Hash, t.BlockNumber, blockTimestamp, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
 				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason, categories)
 		}
 		br := tx.SendBatch(ctx, batch)
+		for range data.Transactions {
+			ct, err := br.Exec()
+			if err != nil {
+				_ = br.Close()
+				return err
+			}
+			deltaTxs += ct.RowsAffected()
+		}
 		if err := br.Close(); err != nil {
 			return err
 		}
@@ -79,7 +95,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			batch.Queue(`
 				INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
 					contract_name, compiler_version, optimization_used, source_code, abi)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 				ON CONFLICT (address) DO NOTHING`,
 				c.Address, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
 				c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
@@ -100,10 +116,21 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 					symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
 					name = COALESCE(EXCLUDED.name, tokens.name),
 					decimals = COALESCE(EXCLUDED.decimals, tokens.decimals),
-					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)`,
+					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)
+				RETURNING (xmax = 0)`,
 				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
 		}
 		br := tx.SendBatch(ctx, batch)
+		for range data.Tokens {
+			var wasNew bool
+			if err := br.QueryRow().Scan(&wasNew); err != nil {
+				_ = br.Close()
+				return err
+			}
+			if wasNew {
+				deltaTokens++
+			}
+		}
 		if err := br.Close(); err != nil {
 			return err
 		}
@@ -170,11 +197,38 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 					token_transfer_count = address_stats.token_transfer_count + $4,
 					last_seen = $5,
 					is_contract = COALESCE(EXCLUDED.is_contract, address_stats.is_contract),
-					updated_at = NOW()`,
+					updated_at = NOW()
+				RETURNING (xmax = 0)`,
 				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract)
 		}
 		br := tx.SendBatch(ctx, batch)
+		for range data.AddressStats {
+			var wasNew bool
+			if err := br.QueryRow().Scan(&wasNew); err != nil {
+				_ = br.Close()
+				return err
+			}
+			if wasNew {
+				deltaAddresses++
+			}
+		}
 		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if deltaBlocks|deltaTxs|deltaTokens|deltaAddresses != 0 {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO chain_counters (name, count, updated_at) VALUES
+				('blocks_total',       $1, NOW()),
+				('transactions_total', $2, NOW()),
+				('tokens_total',       $3, NOW()),
+				('addresses_total',    $4, NOW())
+			ON CONFLICT (name) DO UPDATE
+				SET count = chain_counters.count + EXCLUDED.count,
+					updated_at = NOW()`,
+			deltaBlocks, deltaTxs, deltaTokens, deltaAddresses)
+		if err != nil {
 			return err
 		}
 	}

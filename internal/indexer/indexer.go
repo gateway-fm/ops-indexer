@@ -920,8 +920,9 @@ func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta
 			delta.IsContract = true
 		}
 	} else {
+		// Store lowercased so the row PK matches `WHERE address = LOWER($1)` reads.
 		stats[key] = &db.AddressStatsDelta{
-			Address:      address,
+			Address:      key,
 			TxCountDelta: 1,
 			IsContract:   isContract,
 			BlockNumber:  blockNumber,
@@ -947,7 +948,7 @@ func (i *Indexer) updateAddressStatsDeltaInternal(stats map[string]*db.AddressSt
 		delta.InternalTxCountDelta++
 	} else {
 		stats[key] = &db.AddressStatsDelta{
-			Address:              address,
+			Address:              key,
 			InternalTxCountDelta: 1,
 			BlockNumber:          blockNumber,
 		}

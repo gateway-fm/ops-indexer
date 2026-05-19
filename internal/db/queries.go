@@ -23,14 +23,32 @@ func (d *DB) GetLatestBlockNumber(ctx context.Context) (uint64, error) {
 }
 
 func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
-	_, err := d.pool.Exec(ctx, `
+	// Tx wrap keeps the chain_counters bump atomic with the row insert.
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	ct, err := tx.Exec(ctx, `
 		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 			size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (number) DO NOTHING`,
 		b.Number, b.Hash, b.ParentHash, b.Timestamp, b.GasUsed, b.GasLimit, b.BaseFeePerGas, b.TransactionCount,
 		b.Size, b.Difficulty, b.TotalDifficulty, b.Nonce, b.Miner, b.ExtraData, b.StateRoot, b.TransactionsRoot, b.ReceiptsRoot)
-	return err
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chain_counters (name, count, updated_at) VALUES ('blocks_total', $1, NOW())
+			ON CONFLICT (name) DO UPDATE SET count = chain_counters.count + EXCLUDED.count, updated_at = NOW()`,
+			ct.RowsAffected()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (d *DB) GetBlock(ctx context.Context, number uint64) (*types.Block, error) {
@@ -107,11 +125,11 @@ func (d *DB) InsertTransaction(ctx context.Context, tx *types.Transaction) error
 	// it atomically in the same transaction.
 	categories := computeTxCategories(tx, false)
 	_, err := d.pool.Exec(ctx, `
-		INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price,
+		INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (hash) DO NOTHING`,
-		tx.Hash, tx.BlockNumber, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
+		tx.Hash, tx.BlockNumber, tx.BlockTimestamp, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
 		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason, categories)
 	return err
 }
@@ -145,19 +163,17 @@ func (d *DB) GetTransactions(ctx context.Context, limit int, beforeBlock *uint64
 
 	if beforeBlock != nil {
 		rows, err = d.pool.Query(ctx, `
-			SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+			SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			JOIN blocks b ON t.block_number = b.number
 			WHERE NOT (t.tx_type = ANY($1::int[])) AND t.block_number < $2 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`, d.HiddenTxTypes, *beforeBlock, limit)
 	} else {
 		rows, err = d.pool.Query(ctx, `
-			SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+			SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			JOIN blocks b ON t.block_number = b.number
 			WHERE NOT (t.tx_type = ANY($1::int[])) ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`, d.HiddenTxTypes, limit)
 	}
 	if err != nil {
@@ -177,11 +193,10 @@ func (d *DB) GetTransactionsPaginated(ctx context.Context, page, pageSize int) (
 
 	offset := (page - 1) * pageSize
 	rows, err := d.pool.Query(ctx, `
-		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 		FROM transactions t
-		JOIN blocks b ON t.block_number = b.number
 		WHERE NOT (t.tx_type = ANY($1::int[]))
 		ORDER BY t.block_number DESC, t.tx_index DESC
 		LIMIT $2 OFFSET $3`, d.HiddenTxTypes, pageSize, offset)
@@ -196,11 +211,10 @@ func (d *DB) GetTransactionsPaginated(ctx context.Context, page, pageSize int) (
 
 func (d *DB) GetTransactionsByBlock(ctx context.Context, blockNumber uint64) ([]types.Transaction, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 		FROM transactions t
-		JOIN blocks b ON t.block_number = b.number
 		WHERE t.block_number = $1 ORDER BY t.tx_index`, blockNumber)
 	if err != nil {
 		return nil, err
@@ -215,20 +229,18 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 
 	if beforeBlock != nil {
 		rows, err = d.pool.Query(ctx, `
-			SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+			SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			JOIN blocks b ON t.block_number = b.number
 			WHERE (t.from_address = $1 OR t.to_address = $1) AND t.block_number < $2
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`, address, *beforeBlock, limit)
 	} else {
 		rows, err = d.pool.Query(ctx, `
-			SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+			SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			JOIN blocks b ON t.block_number = b.number
 			WHERE t.from_address = $1 OR t.to_address = $1
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`, address, limit)
 	}
@@ -263,12 +275,11 @@ func (d *DB) GetTransactionsWithCategories(ctx context.Context, limit int, befor
 	// at insert time (migration 003). Prior implementation ran 4 correlated
 	// subqueries per row.
 	query := `
-		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
 			t.categories
-		FROM transactions t
-		JOIN blocks b ON t.block_number = b.number`
+		FROM transactions t`
 
 	if beforeBlock != nil {
 		query += ` WHERE NOT (t.tx_type = ANY($1::int[])) AND t.block_number < $2 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`
@@ -294,12 +305,11 @@ func (d *DB) GetTransactionsPaginatedWithCategories(ctx context.Context, page, p
 
 	offset := (page - 1) * pageSize
 	rows, err := d.pool.Query(ctx, `
-		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
 			t.categories
 		FROM transactions t
-		JOIN blocks b ON t.block_number = b.number
 		WHERE NOT (t.tx_type = ANY($1::int[]))
 		ORDER BY t.block_number DESC, t.tx_index DESC
 		LIMIT $2 OFFSET $3`, d.HiddenTxTypes, pageSize, offset)
@@ -318,12 +328,11 @@ func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*ty
 	var bits int16
 
 	err := d.pool.QueryRow(ctx, `
-		SELECT t.hash, t.block_number, b.timestamp, t.tx_index, t.from_address, t.to_address, c.address, t.value::text,
+		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, c.address, t.value::text,
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
 			t.categories
 		FROM transactions t
-		JOIN blocks b ON t.block_number = b.number
 		LEFT JOIN contracts c ON c.creation_tx = t.hash
 		WHERE t.hash = $1`, hash).Scan(
 		&tx.Hash, &tx.BlockNumber, &tx.BlockTimestamp, &tx.TxIndex, &tx.From, &tx.To, &tx.ContractAddress, &valueStr,
@@ -597,7 +606,7 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 		)
 		SELECT lb.address, lb.balance::text,
 			(lb.balance::numeric / NULLIF(ts.supply::numeric, 0) * 100)::numeric(10,4) as percentage,
-			COALESCE((SELECT true FROM contracts WHERE LOWER(address) = LOWER(lb.address)), false) as is_contract
+			COALESCE((SELECT true FROM contracts WHERE address = LOWER(lb.address)), false) as is_contract
 		FROM latest_balances lb, total_supply ts
 		WHERE lb.rn = 1
 		ORDER BY lb.balance DESC
@@ -768,7 +777,7 @@ func (d *DB) UpdateAddressStatsCounters(ctx context.Context, address string, int
 			internal_tx_count = internal_tx_count + $2,
 			token_transfer_count = token_transfer_count + $3,
 			updated_at = NOW()
-		WHERE LOWER(address) = LOWER($1)`,
+		WHERE address = LOWER($1)`,
 		address, internalTxCount, tokenTransferCount)
 	return err
 }
@@ -777,7 +786,7 @@ func (d *DB) GetAddressStats(ctx context.Context, address string) (*types.Addres
 	var s types.AddressStats
 	err := d.pool.QueryRow(ctx, `
 		SELECT address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at
-		FROM address_stats WHERE LOWER(address) = LOWER($1)`, address).Scan(
+		FROM address_stats WHERE address = LOWER($1)`, address).Scan(
 		&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return &types.AddressStats{Address: address}, nil
@@ -821,7 +830,7 @@ func (d *DB) InsertContract(ctx context.Context, c *types.Contract) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
 			contract_name, compiler_version, optimization_used, source_code, abi)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (address) DO NOTHING`,
 		c.Address, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
 		c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
@@ -834,7 +843,7 @@ func (d *DB) GetContract(ctx context.Context, address string) (*types.Contract, 
 		SELECT address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
 			contract_name, compiler_version, optimization_used, evm_version, source_code, abi, created_at,
 			license_type, constructor_args, optimization_runs
-		FROM contracts WHERE LOWER(address) = LOWER($1)`, address).Scan(
+		FROM contracts WHERE address = LOWER($1)`, address).Scan(
 		&c.Address, &c.Bytecode, &c.BytecodeHash, &c.Creator, &c.CreationTx, &c.BlockNumber, &c.IsVerified,
 		&c.ContractName, &c.CompilerVersion, &c.OptimizationUsed, &c.EVMVersion, &c.SourceCode, &c.ABI, &c.CreatedAt,
 		&c.LicenseType, &c.ConstructorArgs, &c.OptimizationRuns)
@@ -846,7 +855,7 @@ func (d *DB) GetContract(ctx context.Context, address string) (*types.Contract, 
 
 func (d *DB) IsContract(ctx context.Context, address string) (bool, error) {
 	var exists bool
-	err := d.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM contracts WHERE LOWER(address) = LOWER($1))`, address).Scan(&exists)
+	err := d.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM contracts WHERE address = LOWER($1))`, address).Scan(&exists)
 	return exists, err
 }
 
@@ -863,7 +872,7 @@ func (d *DB) VerifyContract(ctx context.Context, address string, name string, co
 			license_type = NULLIF($8, ''),
 			constructor_args = NULLIF($9, ''),
 			optimization_runs = NULLIF($10, 0)
-		WHERE LOWER(address) = LOWER($1)`,
+		WHERE address = LOWER($1)`,
 		address, name, compilerVersion, optimizationUsed, sourceCode, abi, evmVersion, licenseType, constructorArgs, optimizationRuns)
 	return err
 }
@@ -879,7 +888,7 @@ func (d *DB) UpdateContractABI(ctx context.Context, address string, abi json.Raw
 func (d *DB) SetContractABI(ctx context.Context, address string, abi json.RawMessage) error {
 	result, err := d.pool.Exec(ctx, `
 		UPDATE contracts SET abi = $2
-		WHERE LOWER(address) = LOWER($1)`,
+		WHERE address = LOWER($1)`,
 		address, abi)
 	if err != nil {
 		return err
@@ -888,7 +897,7 @@ func (d *DB) SetContractABI(ctx context.Context, address string, abi json.RawMes
 	if result.RowsAffected() == 0 {
 		_, err = d.pool.Exec(ctx, `
 			INSERT INTO contracts (address, bytecode, creator, creation_tx, block_number, is_verified, abi)
-			VALUES ($1, '', '', '', 0, false, $2)
+			VALUES (LOWER($1), '', '', '', 0, false, $2)
 			ON CONFLICT (address) DO UPDATE SET abi = $2`,
 			address, abi)
 	}
@@ -1142,10 +1151,10 @@ func (d *DB) GetChainStats(ctx context.Context) (*types.ChainStats, error) {
 	var avgBlockTime *float64
 	err := d.pool.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM blocks),
-			(SELECT COUNT(*) FROM transactions),
-			(SELECT COUNT(*) FROM address_stats),
-			(SELECT COUNT(*) FROM tokens),
+			COALESCE((SELECT count FROM chain_counters WHERE name = 'blocks_total'), 0),
+			COALESCE((SELECT count FROM chain_counters WHERE name = 'transactions_total'), 0),
+			COALESCE((SELECT count FROM chain_counters WHERE name = 'addresses_total'), 0),
+			COALESCE((SELECT count FROM chain_counters WHERE name = 'tokens_total'), 0),
 			(SELECT
 				CASE WHEN COUNT(*) > 1
 				THEN (MAX(timestamp) - MIN(timestamp))::float / NULLIF(COUNT(*) - 1, 0)
@@ -1159,13 +1168,14 @@ func (d *DB) GetChainStats(ctx context.Context) (*types.ChainStats, error) {
 }
 
 func (d *DB) GetTransactionHistory(ctx context.Context, intervalSeconds int, limit int) ([]types.TxHistoryPoint, error) {
+	// Time-window predicate keeps the scan within idx_blocks_timestamp.
 	rows, err := d.pool.Query(ctx, `
 		SELECT
 			(b.timestamp / $1) * $1 as interval_start,
 			COUNT(t.hash) as tx_count
 		FROM blocks b
 		LEFT JOIN transactions t ON t.block_number = b.number
-		WHERE b.timestamp > 0
+		WHERE b.timestamp >= EXTRACT(EPOCH FROM NOW())::bigint - ($1::bigint * $2::bigint)
 		GROUP BY interval_start
 		ORDER BY interval_start DESC
 		LIMIT $2`, intervalSeconds, limit)
