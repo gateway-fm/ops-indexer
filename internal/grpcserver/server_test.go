@@ -141,11 +141,12 @@ func seedChain(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("seed block %d: %v", i, err)
 		}
 		_, err = pool.Exec(ctx, `
-			INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, nonce, tx_type, input_data, status)
-			VALUES ($1, $2, 0, '0xaaa0000000000000000000000000000000000001', '0xbbb0000000000000000000000000000000000002', 1000000000000000000, 21000, 1000000000, 0, 0, '0x', 1)
+			INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price, nonce, tx_type, input_data, status)
+			VALUES ($1, $2, $3, 0, '0xaaa0000000000000000000000000000000000001', '0xbbb0000000000000000000000000000000000002', 1000000000000000000, 21000, 1000000000, 0, 0, '0x', 1)
 		`,
 			fmt.Sprintf("0x%064x", 0x1000+i),
 			i,
+			1_700_000_000+int64(i),
 		)
 		if err != nil {
 			t.Fatalf("seed tx %d: %v", i, err)
