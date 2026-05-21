@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -227,22 +228,45 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 	var rows pgx.Rows
 	var err error
 
+	// Addresses in this table are stored in mixed-case (checksum) form
+	// because they come straight from RPC. Callers pass a normalised
+	// lowercase address, so the WHERE clause has to be case-insensitive
+	// for any rows to match.
+	//
+	// We also surface transactions where the address participates only via
+	// a Transfer event (e.g. an ERC-20 recipient who never sent a tx of
+	// their own and so isn't the tx-level from/to). Otherwise the page
+	// reads "0 transactions" for any pure-recipient address, which surprises
+	// users who clicked through from the token transfers list.
+	addr := strings.ToLower(address)
 	if beforeBlock != nil {
 		rows, err = d.pool.Query(ctx, `
 			SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			WHERE (t.from_address = $1 OR t.to_address = $1) AND t.block_number < $2
-			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`, address, *beforeBlock, limit)
+			WHERE (
+				LOWER(t.from_address) = $1
+				OR LOWER(t.to_address) = $1
+				OR t.hash IN (
+					SELECT tx_hash FROM token_transfers
+					WHERE LOWER(from_address) = $1 OR LOWER(to_address) = $1
+				)
+			) AND t.block_number < $2
+			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`, addr, *beforeBlock, limit)
 	} else {
 		rows, err = d.pool.Query(ctx, `
 			SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			WHERE t.from_address = $1 OR t.to_address = $1
-			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`, address, limit)
+			WHERE LOWER(t.from_address) = $1
+			   OR LOWER(t.to_address) = $1
+			   OR t.hash IN (
+				SELECT tx_hash FROM token_transfers
+				WHERE LOWER(from_address) = $1 OR LOWER(to_address) = $1
+			   )
+			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`, addr, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -429,30 +453,44 @@ func (d *DB) GetToken(ctx context.Context, address string) (*types.Token, error)
 	return &t, err
 }
 
-func (d *DB) GetTokens(ctx context.Context, limit int, offset int, tokenType string) ([]types.Token, int64, error) {
-	var total int64
-	query := "SELECT COUNT(*) FROM tokens"
+// GetTokens returns a page of tokens, optionally filtered by token type and a
+// case-insensitive substring match over name / symbol / address. The same
+// WHERE clause is reused for the COUNT and the page query so totals match.
+func (d *DB) GetTokens(ctx context.Context, limit int, offset int, tokenType, search string) ([]types.Token, int64, error) {
+	var (
+		conds []string
+		args  []any
+	)
 	if tokenType != "" {
-		query += " WHERE token_type = $1"
-		d.pool.QueryRow(ctx, query, tokenType).Scan(&total)
-	} else {
-		d.pool.QueryRow(ctx, query).Scan(&total)
+		args = append(args, tokenType)
+		conds = append(conds, fmt.Sprintf("token_type = $%d", len(args)))
+	}
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, "%"+strings.ToLower(search)+"%")
+		conds = append(conds, fmt.Sprintf(
+			"(LOWER(name) LIKE $%d OR LOWER(symbol) LIKE $%d OR LOWER(address) LIKE $%d)",
+			len(args), len(args), len(args),
+		))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
-	var rows pgx.Rows
-	var err error
-	if tokenType != "" {
-		rows, err = d.pool.Query(ctx, `
-			SELECT address, symbol, name, decimals, token_type, total_supply, holder_count, transfer_count,
-				usd_price, icon_url, l1_address, block_number, creation_tx, off_chain_updated_at, created_at
-			FROM tokens WHERE token_type = $1
-			ORDER BY holder_count DESC, address LIMIT $2 OFFSET $3`, tokenType, limit, offset)
-	} else {
-		rows, err = d.pool.Query(ctx, `
-			SELECT address, symbol, name, decimals, token_type, total_supply, holder_count, transfer_count,
-				usd_price, icon_url, l1_address, block_number, creation_tx, off_chain_updated_at, created_at
-			FROM tokens ORDER BY holder_count DESC, address LIMIT $1 OFFSET $2`, limit, offset)
+	var total int64
+	if err := d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM tokens"+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
 	}
+
+	args = append(args, limit, offset)
+	query := `
+		SELECT address, symbol, name, decimals, token_type, total_supply, holder_count, transfer_count,
+			usd_price, icon_url, l1_address, block_number, creation_tx, off_chain_updated_at, created_at
+		FROM tokens` + where + fmt.Sprintf(
+		" ORDER BY holder_count DESC, address LIMIT $%d OFFSET $%d", len(args)-1, len(args),
+	)
+
+	rows, err := d.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -475,6 +513,78 @@ func (d *DB) UpdateTokenStats(ctx context.Context, address string, holderCount i
 		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE LOWER(address) = LOWER($1)`,
 		address, holderCount, transferCount)
 	return err
+}
+
+// RefreshTokenStats recomputes holder_count, transfer_count, and (for ERC20
+// only) total_supply for a single token from the underlying token_transfers
+// and balances tables, then writes the result onto the tokens row. Cheap and
+// idempotent. The token row must already exist; if not, the call is a no-op.
+//
+// holder_count counts addresses whose latest balance for this token is > 0.
+// transfer_count is COUNT(*) over token_transfers.
+// total_supply (ERC20 only) is the running sum of mint values minus burn values.
+func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
+	addr := strings.ToLower(tokenAddress)
+
+	var tokenType string
+	if err := d.pool.QueryRow(ctx,
+		`SELECT token_type FROM tokens WHERE LOWER(address) = $1`, addr,
+	).Scan(&tokenType); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil
+		}
+		return fmt.Errorf("RefreshTokenStats: read token_type: %w", err)
+	}
+
+	var transferCount int64
+	if err := d.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM token_transfers WHERE LOWER(token_address) = $1`, addr,
+	).Scan(&transferCount); err != nil {
+		return fmt.Errorf("RefreshTokenStats: count transfers: %w", err)
+	}
+
+	var holderCount int64
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT DISTINCT ON (address) balance
+			FROM balances
+			WHERE LOWER(token_address) = $1
+			ORDER BY address, block_number DESC
+		) latest
+		WHERE balance > 0`, addr,
+	).Scan(&holderCount); err != nil {
+		return fmt.Errorf("RefreshTokenStats: count holders: %w", err)
+	}
+
+	if tokenType == "ERC20" {
+		_, err := d.pool.Exec(ctx, `
+			UPDATE tokens
+			SET holder_count = $2,
+			    transfer_count = $3,
+			    total_supply = (
+			        SELECT COALESCE(
+			            SUM(CASE WHEN from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+			          - SUM(CASE WHEN to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
+			            0
+			        )
+			        FROM token_transfers
+			        WHERE LOWER(token_address) = $1 AND token_type = 'ERC20'
+			    )
+			WHERE LOWER(address) = $1`,
+			addr, holderCount, transferCount)
+		if err != nil {
+			return fmt.Errorf("RefreshTokenStats: update ERC20 stats: %w", err)
+		}
+		return nil
+	}
+
+	_, err := d.pool.Exec(ctx, `
+		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE LOWER(address) = $1`,
+		addr, holderCount, transferCount)
+	if err != nil {
+		return fmt.Errorf("RefreshTokenStats: update stats: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) UpdateTokenPrice(ctx context.Context, address string, price float64, iconURL *string) error {
@@ -502,18 +612,21 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 	var rows pgx.Rows
 	var err error
 
+	// Same case-sensitivity issue as GetTransactionsByAddress: stored
+	// addresses are mixed-case checksum, callers pass lowercase.
+	addr := strings.ToLower(address)
 	if beforeBlock != nil {
 		rows, err = d.pool.Query(ctx, `
 			SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 				timestamp, transfer_type, token_type, token_id, is_internal
-			FROM token_transfers WHERE (from_address = $1 OR to_address = $1) AND block_number < $2
-			ORDER BY block_number DESC, log_index DESC LIMIT $3`, address, *beforeBlock, limit)
+			FROM token_transfers WHERE (LOWER(from_address) = $1 OR LOWER(to_address) = $1) AND block_number < $2
+			ORDER BY block_number DESC, log_index DESC LIMIT $3`, addr, *beforeBlock, limit)
 	} else {
 		rows, err = d.pool.Query(ctx, `
 			SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 				timestamp, transfer_type, token_type, token_id, is_internal
-			FROM token_transfers WHERE from_address = $1 OR to_address = $1
-			ORDER BY block_number DESC, log_index DESC LIMIT $2`, address, limit)
+			FROM token_transfers WHERE LOWER(from_address) = $1 OR LOWER(to_address) = $1
+			ORDER BY block_number DESC, log_index DESC LIMIT $2`, addr, limit)
 	}
 	if err != nil {
 		return nil, err

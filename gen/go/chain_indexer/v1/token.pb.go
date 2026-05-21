@@ -423,9 +423,12 @@ func (x *GetTokenRequest) GetAddress() string {
 }
 
 type ListTokensRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Page          *OffsetPageRequest     `protobuf:"bytes,1,opt,name=page,proto3" json:"page,omitempty"`
-	TokenType     TokenType              `protobuf:"varint,2,opt,name=token_type,json=tokenType,proto3,enum=chain_indexer.v1.TokenType" json:"token_type,omitempty"` // UNSPECIFIED = all
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Page      *OffsetPageRequest     `protobuf:"bytes,1,opt,name=page,proto3" json:"page,omitempty"`
+	TokenType TokenType              `protobuf:"varint,2,opt,name=token_type,json=tokenType,proto3,enum=chain_indexer.v1.TokenType" json:"token_type,omitempty"` // UNSPECIFIED = all
+	// Optional. Case-insensitive substring match against the token's name,
+	// symbol, or address (raw 0x-prefixed form). Empty = no filter.
+	Search        string `protobuf:"bytes,3,opt,name=search,proto3" json:"search,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -472,6 +475,13 @@ func (x *ListTokensRequest) GetTokenType() TokenType {
 		return x.TokenType
 	}
 	return TokenType_TOKEN_TYPE_UNSPECIFIED
+}
+
+func (x *ListTokensRequest) GetSearch() string {
+	if x != nil {
+		return x.Search
+	}
+	return ""
 }
 
 type ListTokensResponse struct {
@@ -1053,11 +1063,12 @@ const file_chain_indexer_v1_token_proto_rawDesc = "" +
 	"\n" +
 	"token_type\x18\x04 \x01(\x0e2\x1b.chain_indexer.v1.TokenTypeR\ttokenType\"+\n" +
 	"\x0fGetTokenRequest\x12\x18\n" +
-	"\aaddress\x18\x01 \x01(\tR\aaddress\"\x88\x01\n" +
+	"\aaddress\x18\x01 \x01(\tR\aaddress\"\xa0\x01\n" +
 	"\x11ListTokensRequest\x127\n" +
 	"\x04page\x18\x01 \x01(\v2#.chain_indexer.v1.OffsetPageRequestR\x04page\x12:\n" +
 	"\n" +
-	"token_type\x18\x02 \x01(\x0e2\x1b.chain_indexer.v1.TokenTypeR\ttokenType\"\x7f\n" +
+	"token_type\x18\x02 \x01(\x0e2\x1b.chain_indexer.v1.TokenTypeR\ttokenType\x12\x16\n" +
+	"\x06search\x18\x03 \x01(\tR\x06search\"\x7f\n" +
 	"\x12ListTokensResponse\x12/\n" +
 	"\x06tokens\x18\x01 \x03(\v2\x17.chain_indexer.v1.TokenR\x06tokens\x128\n" +
 	"\x04page\x18\x02 \x01(\v2$.chain_indexer.v1.OffsetPageResponseR\x04page\"\xe5\x01\n" +

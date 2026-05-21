@@ -184,6 +184,11 @@ func (m *MockDatabase) InsertBalancesBatch(ctx context.Context, balances []*type
 	return args.Error(0)
 }
 
+func (m *MockDatabase) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
+	args := m.Called(ctx, tokenAddress)
+	return args.Error(0)
+}
+
 func (m *MockDatabase) ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error) {
 	args := m.Called(ctx, date)
 	if args.Get(0) == nil {

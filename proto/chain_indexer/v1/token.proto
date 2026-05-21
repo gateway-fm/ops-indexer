@@ -69,6 +69,10 @@ message GetTokenRequest {
 message ListTokensRequest {
   OffsetPageRequest page = 1;
   TokenType token_type = 2;  // UNSPECIFIED = all
+
+  // Optional. Case-insensitive substring match against the token's name,
+  // symbol, or address (raw 0x-prefixed form). Empty = no filter.
+  string search = 3;
 }
 
 message ListTokensResponse {
