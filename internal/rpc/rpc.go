@@ -168,6 +168,46 @@ func (c *Client) FetchBlockReceipts(ctx context.Context, blockNumber uint64) ([]
 	return receipts, nil
 }
 
+// fetchLogsAsReceipts is a fallback for nodes that refuse receipts on certain
+// blocks — observed on op-reth in OP-Stack mode when the block-builder doesn't
+// include the L1-info system transaction at index 0, which makes the node 500
+// every eth_getBlockReceipts / eth_getTransactionReceipt with
+// "unexpected l1 block info tx calldata length". eth_getLogs works because
+// it reads logs from the block-receipt index without parsing tx[0].
+//
+// The synthetic receipts here are LOG-ONLY: Status defaults to 1 (assumed
+// success — there's no way to recover it without the real receipt), GasUsed
+// stays 0, ContractAddress is left zero. The caller (processBlockParallelRaw)
+// already tolerates these gaps when receipt fields aren't authoritative.
+//
+// Returned map is keyed by tx hash; txs with no logs simply won't appear.
+func (c *Client) fetchLogsAsReceipts(ctx context.Context, blockNumber uint64) (map[common.Hash]*rpclient.Receipt, error) {
+	blockBig := new(big.Int).SetUint64(blockNumber)
+	logs, err := c.raw.FilterLogs(ctx, rpclient.FilterQuery{
+		FromBlock: blockBig,
+		ToBlock:   blockBig,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	receipts := make(map[common.Hash]*rpclient.Receipt)
+	for i := range logs {
+		l := &logs[i]
+		r, ok := receipts[l.TxHash]
+		if !ok {
+			r = &rpclient.Receipt{
+				TxHash:      l.TxHash,
+				BlockNumber: blockBig,
+				Status:      1,
+			}
+			receipts[l.TxHash] = r
+		}
+		r.Logs = append(r.Logs, l)
+	}
+	return receipts, nil
+}
+
 func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash, workers int, rateLimit int, blockNumber ...uint64) (map[common.Hash]*rpclient.Receipt, error) {
 	if len(txHashes) == 0 {
 		return make(map[common.Hash]*rpclient.Receipt), nil
@@ -187,15 +227,23 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 		}
 		if err != nil {
 			// If the error indicates the method doesn't exist, fall through to per-TX.
-			// For any other error (data errors, node issues), return empty receipts
-			// rather than hammering the node with N individual calls that will also fail.
+			// For any other error (data errors, node issues), try eth_getLogs as a
+			// last resort so we can at least index events/token transfers — op-reth
+			// in OP-Stack mode refuses receipts on blocks whose tx[0] isn't the L1
+			// info system tx, but eth_getLogs still works on those same blocks.
 			errMsg := err.Error()
 			if strings.Contains(errMsg, "method not found") || strings.Contains(errMsg, "not supported") || strings.Contains(errMsg, "does not exist") {
 				log.Warn("eth_getBlockReceipts not supported, falling back to per-TX fetch",
 					"block", blockNumber[0], "error", err)
 			} else {
-				log.Warn("eth_getBlockReceipts failed, skipping receipts for block",
-					"block", blockNumber[0], "error", err, "txs", len(txHashes))
+				logReceipts, lerr := c.fetchLogsAsReceipts(ctx, blockNumber[0])
+				if lerr == nil {
+					log.Warn("eth_getBlockReceipts failed; recovered logs via eth_getLogs (status/gasUsed not available)",
+						"block", blockNumber[0], "receipts_err", err, "txs_with_logs", len(logReceipts), "total_txs", len(txHashes))
+					return logReceipts, nil
+				}
+				log.Warn("eth_getBlockReceipts failed and eth_getLogs fallback also failed; skipping receipts for block",
+					"block", blockNumber[0], "receipts_err", err, "logs_err", lerr, "txs", len(txHashes))
 				return make(map[common.Hash]*rpclient.Receipt), nil
 			}
 		}
