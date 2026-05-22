@@ -42,7 +42,7 @@ func (s *Server) ListTokens(ctx context.Context, req *indexerv1.ListTokensReques
 		tokenType = "ERC1155"
 	}
 
-	rows, total, err := s.db.GetTokens(ctx, pageSize, offset, tokenType)
+	rows, total, err := s.db.GetTokens(ctx, pageSize, offset, tokenType, req.GetSearch())
 	if err != nil {
 		slog.Error("ListTokens", "error", err)
 		return nil, internalErr(err, "ListTokens")

@@ -28,6 +28,16 @@ type BalanceWorkerPool struct {
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	// onFlush is invoked (if set) after each successful batch write with the
+	// distinct token addresses present in that batch. Used by the indexer to
+	// refresh derived stats (holder count) when balances actually land.
+	onFlush func(tokenAddresses []string)
+}
+
+// SetOnFlush installs a post-flush callback. Must be called before Start.
+func (p *BalanceWorkerPool) SetOnFlush(fn func(tokenAddresses []string)) {
+	p.onFlush = fn
 }
 
 func NewBalanceWorkerPool(database Database, rpcClient RPCClient, numWorkers, rateLimit int) *BalanceWorkerPool {
@@ -88,18 +98,30 @@ func (p *BalanceWorkerPool) worker(id int) {
 
 	batch := make([]*types.Balance, 0, 100)
 
+	// Periodic flush so low-throughput chains don't strand fetched balances in
+	// memory waiting for the size threshold. Size-based flush at 100 still
+	// applies for high-throughput periods.
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) > 0 {
+			p.flushBatch(batch)
+			p.notifyFlush(batch)
+			batch = batch[:0]
+		}
+	}
+
 	for {
 		select {
 		case <-p.ctx.Done():
-			if len(batch) > 0 {
-				p.flushBatch(batch)
-			}
+			flush()
 			return
+		case <-ticker.C:
+			flush()
 		case work, ok := <-p.workChan:
 			if !ok {
-				if len(batch) > 0 {
-					p.flushBatch(batch)
-				}
+				flush()
 				return
 			}
 
@@ -115,11 +137,30 @@ func (p *BalanceWorkerPool) worker(id int) {
 			batch = append(batch, balance)
 
 			if len(batch) >= 100 {
-				p.flushBatch(batch)
-				batch = make([]*types.Balance, 0, 100)
+				flush()
 			}
 		}
 	}
+}
+
+// notifyFlush invokes the optional post-flush callback with the set of token
+// addresses whose balances were just written, so downstream consumers (e.g.
+// stat refreshers) can update derived counters without polling.
+func (p *BalanceWorkerPool) notifyFlush(batch []*types.Balance) {
+	if p.onFlush == nil {
+		return
+	}
+	seen := make(map[string]struct{}, len(batch))
+	tokens := make([]string, 0, len(batch))
+	for _, b := range batch {
+		key := strings.ToLower(b.TokenAddress)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		tokens = append(tokens, key)
+	}
+	p.onFlush(tokens)
 }
 
 func (p *BalanceWorkerPool) fetchBalance(work BalanceWork) (*types.Balance, error) {

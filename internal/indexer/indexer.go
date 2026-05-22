@@ -137,6 +137,18 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
 		idx.balanceWorkers = NewBalanceWorkerPool(database, rpcClient, cfg.BalanceWorkers, cfg.RPCRateLimit)
+		// When balances actually land in the DB, refresh holder_count for the
+		// affected tokens so the cached count on the tokens row matches the
+		// new balance set without waiting for the next transfer.
+		idx.balanceWorkers.SetOnFlush(func(tokenAddresses []string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			for _, addr := range tokenAddresses {
+				if err := database.RefreshTokenStats(ctx, addr); err != nil {
+					log.Warn("refresh token stats after balance flush failed", "token", addr, "error", err)
+				}
+			}
+		})
 	}
 
 	return idx
@@ -823,14 +835,15 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 					}
 				}
 
-				if delta, ok := blockData.AddressStats[strings.ToLower(from)]; ok {
-					delta.TokenTransferDelta++
-				}
-				if to != nil {
-					if delta, ok := blockData.AddressStats[strings.ToLower(*to)]; ok {
-						delta.TokenTransferDelta++
-					}
-				}
+				// Token-transfer participation tracks the Transfer EVENT's
+				// from/to (parsed from log topics), NOT the transaction's
+				// from/to. The tx sender is the caller of the contract; the
+				// actual holders being credited / debited live in the event.
+				// Pre-bug, we incremented the txn's from/to here, which both
+				// over-counted the contract address and missed every transfer
+				// recipient who never sent a tx themselves.
+				i.bumpTokenTransferDelta(blockData.AddressStats, fromAddr, blockNumber)
+				i.bumpTokenTransferDelta(blockData.AddressStats, toAddr, blockNumber)
 			}
 		}
 	}
@@ -878,6 +891,21 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 
 	if err := i.db.InsertBlockDataBatch(ctx, blockData); err != nil {
 		return err
+	}
+
+	// Refresh derived stats (transfer_count, total_supply, holder_count) for
+	// each token touched in this block. Cheap aggregate queries; runs
+	// synchronously so the new counts are visible on the next read.
+	if len(blockData.Transfers) > 0 {
+		touched := make(map[string]struct{}, len(blockData.Transfers))
+		for _, t := range blockData.Transfers {
+			touched[strings.ToLower(t.TokenAddress)] = struct{}{}
+		}
+		for tokenAddr := range touched {
+			if err := i.db.RefreshTokenStats(ctx, tokenAddr); err != nil {
+				log.Warn("refresh token stats failed", "token", tokenAddr, "error", err)
+			}
+		}
 	}
 
 	if i.balanceWorkers != nil && len(balanceWork) > 0 {
@@ -940,6 +968,36 @@ func (i *Indexer) updateDailyStatsForDate(ctx context.Context, blockTimestamp ui
 	if err := i.db.UpsertDailyStats(ctx, stats); err != nil {
 		log.Warn("failed to upsert daily stats", "date", date.Format("2006-01-02"), "error", err)
 	}
+}
+
+// bumpTokenTransferDelta records this address as a participant in a Transfer
+// event. Creates the address_stats entry if absent so transfer-only
+// recipients (who never sent a tx of their own) are still indexed. Skips
+// the zero address (mint source / burn sink isn't a holder).
+//
+// When creating a new entry, we also seed TxCountDelta=1: this transfer's
+// underlying tx genuinely touches the address (it shows up in their
+// Transactions list via the same log-join we do in GetTransactionsByAddress).
+// If the entry already exists, the address was already credited as tx-from
+// or tx-to and we mustn't double-count. This is approximate when the same
+// address appears in transfers across multiple txs in one block (the rebuild
+// SQL is authoritative for those edge cases), but it eliminates the common
+// pure-recipient drift of badge=0 vs list=N.
+func (i *Indexer) bumpTokenTransferDelta(stats map[string]*db.AddressStatsDelta, addr common.Address, blockNumber uint64) {
+	if addr == zeroAddress {
+		return
+	}
+	key := strings.ToLower(addr.Hex())
+	delta, ok := stats[key]
+	if !ok {
+		delta = &db.AddressStatsDelta{
+			Address:      key,
+			TxCountDelta: 1,
+			BlockNumber:  blockNumber,
+		}
+		stats[key] = delta
+	}
+	delta.TokenTransferDelta++
 }
 
 func (i *Indexer) updateAddressStatsDeltaInternal(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64) {

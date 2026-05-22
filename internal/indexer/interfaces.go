@@ -47,6 +47,7 @@ type Database interface {
 
 	GetAllTokenAddresses(ctx context.Context) ([]string, error)
 	InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error
+	RefreshTokenStats(ctx context.Context, tokenAddress string) error
 
 	ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error)
 	UpsertDailyStats(ctx context.Context, stats *types.DailyStats) error

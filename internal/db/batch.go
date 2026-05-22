@@ -238,6 +238,16 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 
 // RebuildAddressStats rebuilds address_stats after catchup completes.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
+	// All address keys are lowercased so duplicate-case rows from past
+	// writes (some checksum-cased, some lowercase) collapse to one row per
+	// address. Ongoing delta writes already lowercase the key, so this
+	// stays consistent going forward.
+	//
+	// tx_count is the count of distinct tx hashes involving the address
+	// either as the EVM from/to OR as a Transfer-event participant in that
+	// tx's logs. This matches the inclusive list returned by
+	// GetTransactionsByAddress — a recipient who never sent a tx of their
+	// own still gets credit for the mint/transfer txs that gave them tokens.
 	_, err := d.pool.Exec(ctx, `
 		TRUNCATE address_stats;
 
@@ -261,48 +271,52 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				GREATEST(tx.last_seen, it.last_seen, tt.last_seen) as last_seen,
 				c.is_contract
 			FROM (
-				SELECT from_address as address FROM transactions
+				SELECT LOWER(from_address) as address FROM transactions
 				UNION
-				SELECT to_address as address FROM transactions WHERE to_address IS NOT NULL
+				SELECT LOWER(to_address) as address FROM transactions WHERE to_address IS NOT NULL
 				UNION
-				SELECT from_address as address FROM internal_transactions
+				SELECT LOWER(from_address) as address FROM internal_transactions
 				UNION
-				SELECT to_address as address FROM internal_transactions WHERE to_address IS NOT NULL
+				SELECT LOWER(to_address) as address FROM internal_transactions WHERE to_address IS NOT NULL
 				UNION
-				SELECT from_address as address FROM token_transfers
+				SELECT LOWER(from_address) as address FROM token_transfers
 				UNION
-				SELECT to_address as address FROM token_transfers
+				SELECT LOWER(to_address) as address FROM token_transfers
 			) a
 			LEFT JOIN (
-				SELECT address, COUNT(*) as tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
+				SELECT address, COUNT(DISTINCT tx_hash) as tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
 				FROM (
-					SELECT from_address as address, block_number FROM transactions
+					SELECT LOWER(from_address) as address, hash as tx_hash, block_number FROM transactions
 					UNION ALL
-					SELECT to_address as address, block_number FROM transactions WHERE to_address IS NOT NULL
+					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS NOT NULL
+					UNION ALL
+					SELECT LOWER(tt.from_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
+					UNION ALL
+					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
 				) t
 				GROUP BY address
 			) tx ON a.address = tx.address
 			LEFT JOIN (
 				SELECT address, COUNT(*) as internal_tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
 				FROM (
-					SELECT from_address as address, block_number FROM internal_transactions
+					SELECT LOWER(from_address) as address, block_number FROM internal_transactions
 					UNION ALL
-					SELECT to_address as address, block_number FROM internal_transactions WHERE to_address IS NOT NULL
+					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS NOT NULL
 				) t
 				GROUP BY address
 			) it ON a.address = it.address
 			LEFT JOIN (
 				SELECT address, COUNT(*) as token_transfer_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
 				FROM (
-					SELECT from_address as address, block_number FROM token_transfers
+					SELECT LOWER(from_address) as address, block_number FROM token_transfers
 					UNION ALL
-					SELECT to_address as address, block_number FROM token_transfers
+					SELECT LOWER(to_address) as address, block_number FROM token_transfers
 				) t
 				GROUP BY address
 			) tt ON a.address = tt.address
 			LEFT JOIN (
-				SELECT address, true as is_contract FROM contracts
-			) c ON LOWER(a.address) = LOWER(c.address)
+				SELECT LOWER(address) as address, true as is_contract FROM contracts
+			) c ON a.address = c.address
 		) stats
 		WHERE addr IS NOT NULL
 	`)
