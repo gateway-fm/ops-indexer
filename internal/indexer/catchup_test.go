@@ -25,7 +25,7 @@ func newMockSubscription() *mockSubscription {
 	return &mockSubscription{errCh: make(chan error, 1)}
 }
 
-func (s *mockSubscription) Unsubscribe() {}
+func (s *mockSubscription) Unsubscribe()      {}
 func (s *mockSubscription) Err() <-chan error { return s.errCh }
 
 func newTestCatchupIndexer(mockDB *MockDatabase, mockRPC *MockRPCClient) *CatchupIndexer {
@@ -341,6 +341,58 @@ func TestCatchupIndexer_BlockProducer_GoesIdleWhenNoRanges(t *testing.T) {
 	}
 
 	catchup.Stop()
+}
+
+func TestCatchupIndexer_RebuildAddressStats_FiresOncePerProcess(t *testing.T) {
+	mockDB := new(MockDatabase)
+	mockRPC := new(MockRPCClient)
+
+	cfg := &CatchupConfig{Workers: 1, BatchSize: 100, QueueSize: 100}
+	idxCfg := &Config{RPCWorkers: 1, RPCRateLimit: 100}
+	catchup := NewCatchupIndexer(mockDB, mockRPC, cfg, idxCfg, NewTokenCache(), NewContractCache(), nil, false)
+	catchup.pollInterval = 5 * time.Millisecond
+
+	collectorDB := new(MockDatabase)
+	collectorRPC := new(MockRPCClient)
+	collector := NewMissingRangeCollector(collectorDB, collectorRPC, nil)
+	catchup.collector = collector
+
+	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
+		Return([]db.BlockRange{{FromNumber: 1, ToNumber: 1}}, nil).Once()
+	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
+		Return([]db.BlockRange{}, nil).Times(30)
+	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
+		Return([]db.BlockRange{{FromNumber: 2, ToNumber: 2}}, nil).Once()
+	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
+		Return([]db.BlockRange{}, nil)
+
+	for _, blockNum := range []uint64{1, 2} {
+		mockDB.On("HasBlock", mock.Anything, blockNum).Return(false, nil).Once()
+		mockRPC.On("RawBlockByNumber", mock.Anything, blockNum).Return(makeRawBlock(blockNum), nil)
+		collectorDB.On("DeleteMissingRangeByBlock", mock.Anything, blockNum).Return(nil)
+	}
+	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockDB.On("InsertBlockDataBatch", mock.Anything, mock.Anything).Return(nil).Maybe()
+	collectorDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
+	mockDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
+
+	mockDB.On("RebuildAddressStats", mock.Anything).Return(nil)
+
+	err := catchup.Start(context.Background(), 1, 2)
+	assert.NoError(t, err)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&catchup.processedBlocks) >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	catchup.Stop()
+
+	mockDB.AssertNumberOfCalls(t, "RebuildAddressStats", 1)
 }
 
 // --- Realtime Indexer Tests ---

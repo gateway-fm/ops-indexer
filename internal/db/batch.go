@@ -248,7 +248,17 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	// tx's logs. This matches the inclusive list returned by
 	// GetTransactionsByAddress — a recipient who never sent a tx of their
 	// own still gets credit for the mint/transfer txs that gave them tokens.
-	_, err := d.pool.Exec(ctx, `
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '1GB'`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
 		TRUNCATE address_stats;
 
 		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
@@ -319,8 +329,11 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 			) c ON a.address = c.address
 		) stats
 		WHERE addr IS NOT NULL
-	`)
-	return err
+	`); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {
