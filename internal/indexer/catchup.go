@@ -332,6 +332,11 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 	}
 
 	catchupConfig := *c.idxCfg
+	// Catchup never writes address_stats incrementally — the realtime indexer is
+	// the primary path that keeps it current. Trade-off: a block processed by
+	// catchup after the initial-sync rebuild (e.g. one realtime missed via an RPC
+	// blip and requeued) stays stale in address_stats until the next process
+	// restart. Acceptable, since post-sync catchup only handles rare gaps.
 	catchupConfig.SkipAddressStats = true
 
 	idx := &Indexer{

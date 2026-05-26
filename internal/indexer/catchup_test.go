@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type mockSubscription struct {
@@ -25,7 +26,7 @@ func newMockSubscription() *mockSubscription {
 	return &mockSubscription{errCh: make(chan error, 1)}
 }
 
-func (s *mockSubscription) Unsubscribe()      {}
+func (s *mockSubscription) Unsubscribe() {}
 func (s *mockSubscription) Err() <-chan error { return s.errCh }
 
 func newTestCatchupIndexer(mockDB *MockDatabase, mockRPC *MockRPCClient) *CatchupIndexer {
@@ -343,6 +344,31 @@ func TestCatchupIndexer_BlockProducer_GoesIdleWhenNoRanges(t *testing.T) {
 	catchup.Stop()
 }
 
+// scriptedCollectorDB feeds the catchup producer a controlled range sequence:
+// block 1, then empties, then (once releaseBlock2 is set) one new head block,
+// then empties forever — counting the idle polls that follow block 2. This
+// avoids coupling the test to magic poll counts or wall-clock timing.
+type scriptedCollectorDB struct {
+	*MockDatabase
+	block1Sent     atomic.Bool
+	releaseBlock2  atomic.Bool
+	block2Sent     atomic.Bool
+	idlePollsAfter atomic.Int64
+}
+
+func (s *scriptedCollectorDB) GetMissingRangesBatch(ctx context.Context, batchSize int) ([]db.BlockRange, error) {
+	if !s.block1Sent.Swap(true) {
+		return []db.BlockRange{{FromNumber: 1, ToNumber: 1}}, nil
+	}
+	if s.releaseBlock2.Load() && !s.block2Sent.Swap(true) {
+		return []db.BlockRange{{FromNumber: 2, ToNumber: 2}}, nil
+	}
+	if s.block2Sent.Load() {
+		s.idlePollsAfter.Add(1)
+	}
+	return nil, nil
+}
+
 func TestCatchupIndexer_RebuildAddressStats_FiresOncePerProcess(t *testing.T) {
 	mockDB := new(MockDatabase)
 	mockRPC := new(MockRPCClient)
@@ -350,47 +376,49 @@ func TestCatchupIndexer_RebuildAddressStats_FiresOncePerProcess(t *testing.T) {
 	cfg := &CatchupConfig{Workers: 1, BatchSize: 100, QueueSize: 100}
 	idxCfg := &Config{RPCWorkers: 1, RPCRateLimit: 100}
 	catchup := NewCatchupIndexer(mockDB, mockRPC, cfg, idxCfg, NewTokenCache(), NewContractCache(), nil, false)
-	catchup.pollInterval = 5 * time.Millisecond
+	catchup.pollInterval = 2 * time.Millisecond
 
-	collectorDB := new(MockDatabase)
-	collectorRPC := new(MockRPCClient)
-	collector := NewMissingRangeCollector(collectorDB, collectorRPC, nil)
+	scripted := &scriptedCollectorDB{MockDatabase: new(MockDatabase)}
+	collector := NewMissingRangeCollector(scripted, new(MockRPCClient), nil)
 	catchup.collector = collector
 
-	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
-		Return([]db.BlockRange{{FromNumber: 1, ToNumber: 1}}, nil).Once()
-	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
-		Return([]db.BlockRange{}, nil).Times(30)
-	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
-		Return([]db.BlockRange{{FromNumber: 2, ToNumber: 2}}, nil).Once()
-	collectorDB.On("GetMissingRangesBatch", mock.Anything, 100).
-		Return([]db.BlockRange{}, nil)
+	rebuilt := make(chan struct{}, 8)
+	catchup.SetOnComplete(func() { rebuilt <- struct{}{} })
 
 	for _, blockNum := range []uint64{1, 2} {
-		mockDB.On("HasBlock", mock.Anything, blockNum).Return(false, nil).Once()
+		mockDB.On("HasBlock", mock.Anything, blockNum).Return(false, nil)
 		mockRPC.On("RawBlockByNumber", mock.Anything, blockNum).Return(makeRawBlock(blockNum), nil)
-		collectorDB.On("DeleteMissingRangeByBlock", mock.Anything, blockNum).Return(nil)
+		scripted.On("DeleteMissingRangeByBlock", mock.Anything, blockNum).Return(nil)
 	}
 	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
 	mockDB.On("InsertBlockDataBatch", mock.Anything, mock.Anything).Return(nil).Maybe()
-	collectorDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
+	mockDB.On("RebuildAddressStats", mock.Anything).Return(nil)
+	scripted.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
 	mockDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
 
-	mockDB.On("RebuildAddressStats", mock.Anything).Return(nil)
+	require.NoError(t, catchup.Start(context.Background(), 1, 2))
+	defer catchup.Stop()
 
-	err := catchup.Start(context.Background(), 1, 2)
-	assert.NoError(t, err)
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if atomic.LoadInt64(&catchup.processedBlocks) >= 2 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Initial-sync rebuild must fire once; sync on the completion signal, not a
+	// wall-clock sleep.
+	select {
+	case <-rebuilt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial address_stats rebuild did not fire")
 	}
-	time.Sleep(300 * time.Millisecond)
 
-	catchup.Stop()
+	// A steady-state chain-head block now arrives after initial sync.
+	scripted.releaseBlock2.Store(true)
+
+	// Wait until the producer has idled several cycles past block 2 — enough that
+	// a latch-resetting (buggy) implementation would have re-fired the rebuild.
+	require.Eventually(t, func() bool { return scripted.idlePollsAfter.Load() >= 5 },
+		5*time.Second, 2*time.Millisecond)
+
+	// HasBlock=false, so processedBlocks only advances via real processing —
+	// guards against a vacuous pass where blocks were never indexed.
+	require.Eventually(t, func() bool { return atomic.LoadInt64(&catchup.processedBlocks) >= 2 },
+		5*time.Second, 2*time.Millisecond)
 
 	mockDB.AssertNumberOfCalls(t, "RebuildAddressStats", 1)
 }

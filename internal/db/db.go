@@ -20,6 +20,9 @@ type DB struct {
 	// HiddenTxTypes are transaction type numbers excluded from default listings
 	// (e.g. 126 for OP deposit system transactions). Set via HIDDEN_TX_TYPES env var.
 	HiddenTxTypes []int
+	// RebuildWorkMem is the work_mem for the address_stats rebuild transaction.
+	// Empty falls back to a safe default. Set via REBUILD_WORK_MEM env var.
+	RebuildWorkMem string
 }
 
 func New(databaseURL string) (*DB, error) {

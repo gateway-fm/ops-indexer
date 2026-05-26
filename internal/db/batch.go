@@ -2,11 +2,26 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// workMemPattern matches a Postgres memory size (digits + optional unit) so the
+// value can be safely interpolated into SET LOCAL, which cannot be parameterized.
+var workMemPattern = regexp.MustCompile(`(?i)^[0-9]+(kb|mb|gb|tb)?$`)
+
+func sanitizeWorkMem(v string) string {
+	v = strings.TrimSpace(v)
+	if workMemPattern.MatchString(v) {
+		return v
+	}
+	return "1GB"
+}
 
 type BlockData struct {
 	Block                *types.Block
@@ -254,7 +269,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '1GB'`); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL work_mem = '%s'", sanitizeWorkMem(d.RebuildWorkMem))); err != nil {
 		return err
 	}
 
