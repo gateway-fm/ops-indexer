@@ -59,6 +59,10 @@ type Config struct {
 	// exclude from the default transaction listings (e.g. "126" for OP deposit TXs).
 	HiddenTxTypes         string        `mapstructure:"hidden_tx_types"`
 
+	// RebuildWorkMem sets work_mem (via SET LOCAL) for the one-shot address_stats
+	// rebuild. Env: REBUILD_WORK_MEM. Lower it on memory-tight Postgres.
+	RebuildWorkMem        string        `mapstructure:"rebuild_work_mem"`
+
 	EnableOPDeposits      bool          `mapstructure:"enable_op_deposits"`
 	L1RPCURL              string        `mapstructure:"l1_rpc_url"`
 	OptimismPortalAddress string        `mapstructure:"optimism_portal_address"`
@@ -107,6 +111,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 
 	v.SetDefault("hidden_tx_types", "126") // OP deposit system transactions hidden by default
+	v.SetDefault("rebuild_work_mem", "1GB")
 
 	v.SetDefault("enable_op_deposits", false)
 	v.SetDefault("l1_rpc_url", "")
@@ -171,6 +176,8 @@ func Load() (*Config, error) {
 	cfg.SSORedirectURI = v.GetString("sso_redirect_uri")
 
 	cfg.LogLevel = v.GetString("log_level")
+
+	cfg.RebuildWorkMem = v.GetString("rebuild_work_mem")
 
 	cfg.EnableOPDeposits = v.GetBool("enable_op_deposits")
 	cfg.L1RPCURL = v.GetString("l1_rpc_url")

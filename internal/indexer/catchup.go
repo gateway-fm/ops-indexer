@@ -52,6 +52,8 @@ type CatchupIndexer struct {
 
 	// Completion callback
 	onComplete func()
+
+	pollInterval time.Duration
 }
 
 func NewCatchupIndexer(
@@ -78,6 +80,7 @@ func NewCatchupIndexer(
 		ctx:              ctx,
 		cancel:           cancel,
 		lastLogTime:      time.Now(),
+		pollInterval:     5 * time.Second,
 	}
 }
 
@@ -130,7 +133,10 @@ func (c *CatchupIndexer) blockProducerFromRanges() {
 
 	idleCount := 0
 	completionCalled := false
-	pollInterval := 5 * time.Second // Poll every 5 seconds when idle
+	pollInterval := c.pollInterval
+	if pollInterval <= 0 {
+		pollInterval = 5 * time.Second
+	}
 
 	for {
 		select {
@@ -201,13 +207,6 @@ func (c *CatchupIndexer) blockProducerFromRanges() {
 				"ranges", len(ranges))
 		}
 		idleCount = 0
-
-		// If completion was called but new work appeared, we need to skip address stats
-		// for this batch (they'll be updated incrementally or rebuilt later)
-		if completionCalled {
-			// Reset completion flag - we'll call it again when we go idle
-			completionCalled = false
-		}
 
 		for _, r := range ranges {
 			for blockNum := r.FromNumber; blockNum <= r.ToNumber; blockNum++ {
@@ -333,6 +332,11 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 	}
 
 	catchupConfig := *c.idxCfg
+	// Catchup never writes address_stats incrementally — the realtime indexer is
+	// the primary path that keeps it current. Trade-off: a block processed by
+	// catchup after the initial-sync rebuild (e.g. one realtime missed via an RPC
+	// blip and requeued) stays stale in address_stats until the next process
+	// restart. Acceptable, since post-sync catchup only handles rare gaps.
 	catchupConfig.SkipAddressStats = true
 
 	idx := &Indexer{

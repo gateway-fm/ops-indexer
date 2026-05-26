@@ -48,6 +48,7 @@ func main() {
 		log.Fatal("failed to connect to database", "error", err)
 	}
 	defer database.Close()
+	database.RebuildWorkMem = cfg.RebuildWorkMem
 
 	// Hidden tx types affect indexer receipt fetching and post-indexing filters.
 	skipReceipts := make(map[int]bool)

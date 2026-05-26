@@ -2,11 +2,26 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// workMemPattern matches a Postgres memory size (digits + optional unit) so the
+// value can be safely interpolated into SET LOCAL, which cannot be parameterized.
+var workMemPattern = regexp.MustCompile(`(?i)^[0-9]+(kb|mb|gb|tb)?$`)
+
+func sanitizeWorkMem(v string) string {
+	v = strings.TrimSpace(v)
+	if workMemPattern.MatchString(v) {
+		return v
+	}
+	return "1GB"
+}
 
 type BlockData struct {
 	Block                *types.Block
@@ -248,7 +263,17 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	// tx's logs. This matches the inclusive list returned by
 	// GetTransactionsByAddress — a recipient who never sent a tx of their
 	// own still gets credit for the mint/transfer txs that gave them tokens.
-	_, err := d.pool.Exec(ctx, `
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL work_mem = '%s'", sanitizeWorkMem(d.RebuildWorkMem))); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
 		TRUNCATE address_stats;
 
 		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
@@ -319,8 +344,11 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 			) c ON a.address = c.address
 		) stats
 		WHERE addr IS NOT NULL
-	`)
-	return err
+	`); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {
