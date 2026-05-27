@@ -7,8 +7,55 @@
 --   * chain_counters: O(1) totals replacing 4× COUNT(*) in GetChainStats,
 --     maintained transactionally by InsertBlockDataBatch
 
-UPDATE contracts     SET address = LOWER(address) WHERE address != LOWER(address);
-UPDATE address_stats SET address = LOWER(address) WHERE address != LOWER(address);
+-- Normalise addresses to lowercase so reads hit the PK index. A blind
+-- UPDATE ... LOWER(address) collides on the primary key whenever legacy
+-- mixed-case rows (written by the pre-0.2.0 indexer) share a lowercase form
+-- with an existing row, so we merge instead of rename.
+--
+-- address_stats is an aggregate table: fold each mixed-case row into its
+-- lowercase canonical row, summing counts and widening the seen-range.
+WITH merged AS (
+    SELECT
+        LOWER(address)            AS address,
+        SUM(tx_count)             AS tx_count,
+        SUM(internal_tx_count)    AS internal_tx_count,
+        SUM(token_transfer_count) AS token_transfer_count,
+        MIN(first_seen)           AS first_seen,
+        MAX(last_seen)            AS last_seen,
+        bool_or(is_contract)      AS is_contract
+    FROM address_stats
+    WHERE address != LOWER(address)
+    GROUP BY LOWER(address)
+)
+INSERT INTO address_stats AS s
+    (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
+SELECT address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, NOW()
+FROM merged
+ON CONFLICT (address) DO UPDATE SET
+    tx_count             = s.tx_count + EXCLUDED.tx_count,
+    internal_tx_count    = s.internal_tx_count + EXCLUDED.internal_tx_count,
+    token_transfer_count = s.token_transfer_count + EXCLUDED.token_transfer_count,
+    first_seen           = LEAST(s.first_seen, EXCLUDED.first_seen),
+    last_seen            = GREATEST(s.last_seen, EXCLUDED.last_seen),
+    is_contract          = s.is_contract OR EXCLUDED.is_contract,
+    updated_at           = NOW();
+DELETE FROM address_stats WHERE address != LOWER(address);
+
+-- contracts is not aggregate: keep one canonical row per lowercase address
+-- (prefer an already-lowercase row, then the earliest creation) and drop the
+-- rest, then lowercase the survivor.
+DELETE FROM contracts
+WHERE ctid IN (
+    SELECT ctid FROM (
+        SELECT ctid, ROW_NUMBER() OVER (
+            PARTITION BY LOWER(address)
+            ORDER BY (address = LOWER(address)) DESC, block_number ASC, ctid
+        ) AS rn
+        FROM contracts
+    ) ranked
+    WHERE rn > 1
+);
+UPDATE contracts SET address = LOWER(address) WHERE address != LOWER(address);
 
 CREATE INDEX IF NOT EXISTS idx_contracts_creation_tx ON contracts(creation_tx);
 
