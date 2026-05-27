@@ -275,6 +275,11 @@ func (m *MockRPCClient) FetchTokenMetadataBatch(ctx context.Context, addresses [
 	return args.Get(0).(map[common.Address]*rpc.TokenMetadataResult), args.Error(1)
 }
 
+func (m *MockRPCClient) FetchTokenURIsBatch(ctx context.Context, reqs []rpc.NFTURIRequest, workers int, rateLimit int) map[int]string {
+	args := m.Called(ctx, reqs, workers, rateLimit)
+	return args.Get(0).(map[int]string)
+}
+
 func (m *MockRPCClient) ChainID(ctx context.Context) (*big.Int, error) {
 	args := m.Called(ctx)
 	return args.Get(0).(*big.Int), args.Error(1)

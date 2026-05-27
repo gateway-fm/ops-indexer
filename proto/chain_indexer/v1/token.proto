@@ -135,3 +135,22 @@ message BatchGetTokenBalancesResponse {
     repeated TokenBalance items = 1;
   }
 }
+
+// One NFT instance in a collection's inventory: a token id, its current owner,
+// and the raw tokenURI captured at mint.
+message TokenInventoryItem {
+  BigInt token_id = 1;
+  string owner = 2;
+  string token_uri = 3;  // raw tokenURI(); empty if unknown
+}
+
+message ListTokenInventoryRequest {
+  OffsetPageRequest page = 1;
+  string token_address = 2;
+  string token_id = 3;  // optional: filter to a single token id (decimal string)
+}
+
+message ListTokenInventoryResponse {
+  repeated TokenInventoryItem items = 1;
+  OffsetPageResponse page = 2;
+}

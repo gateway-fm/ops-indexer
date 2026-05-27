@@ -630,6 +630,11 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	newTokenTxHashes := make(map[common.Address]string)
 	balanceWork := make([]BalanceWork, 0)
 
+	// NFT instances touched this block, and (for mints) the tokenURI fetches to
+	// run after the log loop. nftURIRowIdx[k] indexes into blockData.NFTTokens.
+	var nftURIReqs []rpc.NFTURIRequest
+	var nftURIRowIdx []int
+
 	for idx, rawTx := range rawTxs {
 		receipt := receipts[rawTx.Hash]
 
@@ -813,6 +818,25 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 					IsInternal:   false,
 				})
 
+				// Track the per-instance owner for the inventory view. Owner
+				// advances to the latest transfer's `to` (zero = burned); the
+				// tokenURI is fetched once, at mint.
+				if tokenType == types.TokenTypeERC721 && tokenID != nil {
+					blockData.NFTTokens = append(blockData.NFTTokens, &types.NFTToken{
+						TokenAddress: logEntry.Address.Hex(),
+						TokenID:      *tokenID,
+						Owner:        toAddr.Hex(),
+						BlockNumber:  blockNumber,
+					})
+					if transferType == types.TransferTypeMint {
+						nftURIReqs = append(nftURIReqs, rpc.NFTURIRequest{
+							Address: logEntry.Address,
+							TokenID: logEntry.Topics[3].Big(),
+						})
+						nftURIRowIdx = append(nftURIRowIdx, len(blockData.NFTTokens)-1)
+					}
+				}
+
 				if fromAddr != zeroAddress {
 					balanceWork = append(balanceWork, BalanceWork{
 						Address:      fromAddr,
@@ -866,6 +890,17 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	}
 
 	if len(newTokenAddresses) > 0 {
+		// A token is only ever discovered from a Transfer event we just parsed,
+		// and that path already classifies ERC721 by its 4-topic signature (the
+		// tokenId is carried as an indexed topic). Carry that signal over to the
+		// token entity instead of defaulting every new contract to ERC20.
+		erc721Tokens := make(map[string]bool)
+		for _, tr := range blockData.Transfers {
+			if tr.TokenType == types.TokenTypeERC721 {
+				erc721Tokens[tr.TokenAddress] = true
+			}
+		}
+
 		tokenMetadata, err := i.rpc.FetchTokenMetadataBatch(ctx, newTokenAddresses, i.config.TokenMetadataWorkers, i.config.RPCRateLimit)
 		if err != nil {
 			log.Warn("failed to fetch token metadata batch", "error", err)
@@ -875,16 +910,30 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 					continue
 				}
 				txHash := newTokenTxHashes[addr]
+
+				tokenType, decimals := classifyNewToken(erc721Tokens[addr.Hex()], meta.Decimals)
+
 				blockData.Tokens = append(blockData.Tokens, &types.Token{
 					Address:     addr.Hex(),
 					Symbol:      meta.Symbol,
 					Name:        meta.Name,
-					Decimals:    meta.Decimals,
-					TokenType:   types.TokenTypeERC20,
+					Decimals:    decimals,
+					TokenType:   tokenType,
 					BlockNumber: blockNumber,
 					CreationTx:  &txHash,
 				})
 				i.tokenCache.Add(addr.Hex())
+			}
+		}
+	}
+
+	// Resolve tokenURI for freshly minted NFTs and attach to their rows.
+	if len(nftURIReqs) > 0 {
+		uris := i.rpc.FetchTokenURIsBatch(ctx, nftURIReqs, i.config.TokenMetadataWorkers, i.config.RPCRateLimit)
+		for k, rowIdx := range nftURIRowIdx {
+			if uri, ok := uris[k]; ok {
+				u := uri
+				blockData.NFTTokens[rowIdx].TokenURI = &u
 			}
 		}
 	}
@@ -983,6 +1032,18 @@ func (i *Indexer) updateDailyStatsForDate(ctx context.Context, blockTimestamp ui
 // address appears in transfers across multiple txs in one block (the rebuild
 // SQL is authoritative for those edge cases), but it eliminates the common
 // pure-recipient drift of badge=0 vs list=N.
+// classifyNewToken decides the stored token_type and decimals for a freshly
+// discovered contract. ERC721 is inferred from the transfer topology already
+// parsed for this block (a 4-topic Transfer carries the tokenId as an indexed
+// topic). NFTs do not implement decimals(), so the metadata layer's fallback
+// of 18 is meaningless for them and is replaced with 0.
+func classifyNewToken(isERC721 bool, metaDecimals int) (tokenType string, decimals int) {
+	if isERC721 {
+		return types.TokenTypeERC721, 0
+	}
+	return types.TokenTypeERC20, metaDecimals
+}
+
 func (i *Indexer) bumpTokenTransferDelta(stats map[string]*db.AddressStatsDelta, addr common.Address, blockNumber uint64) {
 	if addr == zeroAddress {
 		return
