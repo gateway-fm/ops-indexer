@@ -128,7 +128,7 @@ func (d *DB) InsertTransaction(ctx context.Context, tx *types.Transaction) error
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (hash) DO NOTHING`,
 		tx.Hash, tx.BlockNumber, tx.BlockTimestamp, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
 		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason, categories)
@@ -429,7 +429,7 @@ func buildCategoriesFromBits(txType int, bits int16) []string {
 func (d *DB) InsertToken(ctx context.Context, t *types.Token) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO tokens (address, symbol, name, decimals, token_type, total_supply, block_number, creation_tx, l1_address)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (address) DO UPDATE SET
 			symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
 			name = COALESCE(EXCLUDED.name, tokens.name),
@@ -601,7 +601,7 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) er
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 			block_number, timestamp, transfer_type, token_type, token_id, is_internal)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 		t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 		t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
@@ -747,7 +747,7 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 func (d *DB) InsertBalance(ctx context.Context, b *types.Balance) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO balances (address, token_address, block_number, balance)
-		VALUES ($1, $2, $3, $4)
+		VALUES (LOWER($1), LOWER($2), $3, $4)
 		ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
 		b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
 	return err
@@ -830,7 +830,7 @@ func (d *DB) GetTokenBalances(ctx context.Context, address string) ([]types.Bala
 func (d *DB) IncrementCounter(ctx context.Context, address string, counterType string, delta int64) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO counters (address, counter_type, count, updated_at)
-		VALUES ($1, $2, $3, NOW())
+		VALUES (LOWER($1), $2, $3, NOW())
 		ON CONFLICT (address, counter_type) DO UPDATE SET
 			count = counters.count + $3,
 			updated_at = NOW()`,
@@ -874,7 +874,7 @@ func (d *DB) GetCounters(ctx context.Context, address string) ([]types.Counter, 
 func (d *DB) UpsertAddressStats(ctx context.Context, address string, blockNumber uint64, isContract bool) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO address_stats (address, tx_count, first_seen, last_seen, is_contract, updated_at)
-		VALUES ($1, 1, $2, $2, $3, NOW())
+		VALUES (LOWER($1), 1, $2, $2, $3, NOW())
 		ON CONFLICT (address) DO UPDATE SET
 			tx_count = address_stats.tx_count + 1,
 			last_seen = $2,
@@ -1048,7 +1048,7 @@ func (d *DB) GetVerifiedContracts(ctx context.Context, limit int, offset int) ([
 func (d *DB) InsertLog(ctx context.Context, l *types.Log) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 		l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
 	return err
@@ -1155,7 +1155,7 @@ func (d *DB) InsertInternalTransaction(ctx context.Context, it *types.InternalTr
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 			gas, gas_used, input, output, call_type, error, timestamp)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
 		it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 		it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
