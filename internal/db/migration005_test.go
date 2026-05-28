@@ -12,33 +12,39 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// Upgrade-case integration test for the v0.1.x → v0.2.x → this-PR migration
-// path. The intent is the question every operator asks before bumping a
-// running devnet:
+// Property-level regression tests for migration 005_lowercase_addresses.sql.
+// These pin four invariants that the migration + the writer-side LOWER() +
+// the read queries must keep upholding together — independent of whether
+// any real-world deployment is still mid-upgrade. They protect against:
 //
-//   1. Will the migration finish, or get stuck on a duplicate-key or
-//      foreign-key conflict?
-//   2. Will reads still find my old rows after the migration?
-//   3. Will new writes land alongside the canonicalised old data?
-//   4. Will running the migration a second time corrupt anything?
+//   1. Migration-file edits that introduce a duplicate-key or FK conflict
+//      on previously-handled corner cases (caught by re-running the
+//      migration SQL on a fixture that contains those corners).
+//   2. Read-query refactors that lose case handling — every API surface
+//      the explorer relies on must still find rows after the migration
+//      normalises addresses.
+//   3. Writer-side regressions — new INSERTs must continue to land in the
+//      canonical lowercase form alongside migrated rows.
+//   4. Idempotency loss — re-running the migration SQL (operator re-deploy,
+//      catchup retry, etc.) must not corrupt or duplicate rows.
 //
-// We don't go through Migrate() here because it tracks state in schema_version
-// and won't replay 005. Instead we set up the DB with all migrations applied
-// (the "fresh-install" state every test starts from), then bypass the
-// writer-side LOWER() by inserting mixed-case rows via raw SQL — that
-// simulates pre-migration data left behind in a real upgrade. We then run
-// 005's UPDATE statements directly to verify the upgrade behaviour
-// end-to-end.
+// We don't go through Migrate() because schema_version tracking blocks
+// replay. Instead the fixture inserts mixed-case rows via raw SQL — bypassing
+// the writer-side LOWER() — and then runs the migration's UPDATE statements
+// directly. The mixed-case fixture is synthetic: this is not a one-shot
+// "did the prod upgrade work?" check, it's a permanent regression test for
+// the migration file's content and the surrounding code's compatibility
+// with it.
 
-func setupUpgradeTestDB(t *testing.T) (*DB, func()) {
+func setupMigration005TestDB(t *testing.T) (*DB, func()) {
 	t.Helper()
 	ctx := context.Background()
 
 	pgC, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("postgres:15-alpine"),
-		postgres.WithDatabase("upgradedb"),
-		postgres.WithUsername("upuser"),
-		postgres.WithPassword("uppass"),
+		postgres.WithDatabase("m005db"),
+		postgres.WithUsername("m005user"),
+		postgres.WithPassword("m005pass"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
@@ -96,11 +102,13 @@ UPDATE balances SET address = LOWER(address) WHERE address != LOWER(address);
 UPDATE balances SET token_address = LOWER(token_address) WHERE token_address != LOWER(token_address);
 `
 
-// TestUpgrade_MigratesPreExistingMixedCaseData covers the four operator
-// concerns: migration finishes, reads find the data afterwards, new writes
-// land alongside, and re-running is a no-op.
-func TestUpgrade_MigratesPreExistingMixedCaseData(t *testing.T) {
-	d, cleanup := setupUpgradeTestDB(t)
+// TestMigration005_NormalisesMixedCaseAddresses pins the four invariants
+// the migration + writer + read queries must keep upholding together:
+// the migration completes on a mixed-case fixture, reads find the migrated
+// data through the API, new writes coexist in the canonical form, and
+// re-running the migration is a no-op.
+func TestMigration005_NormalisesMixedCaseAddresses(t *testing.T) {
+	d, cleanup := setupMigration005TestDB(t)
 	defer cleanup()
 	ctx := context.Background()
 
@@ -185,14 +193,16 @@ func TestUpgrade_MigratesPreExistingMixedCaseData(t *testing.T) {
 	require.Len(t, txs, 2, "idempotency: re-running the migration must not lose or duplicate rows")
 }
 
-// TestUpgrade_BalancesPKConflict pins the specific corner the migration's
-// DELETE-then-UPDATE pattern was designed for: a balances row exists in BOTH
-// lowercase and checksum case for the same (token_address, block_number).
-// Without the DELETE the UPDATE would trip balances_pkey. Operators have hit
-// this exact shape on upgrade in the wild — we don't want to ship a migration
-// that crashes on it.
-func TestUpgrade_BalancesPKConflict(t *testing.T) {
-	d, cleanup := setupUpgradeTestDB(t)
+// TestMigration005_BalancesPKConflictResolution pins the specific corner
+// the migration's DELETE-then-UPDATE pattern was designed for: a balances
+// row exists in BOTH lowercase and checksum case for the same
+// (token_address, block_number). Without the DELETE the UPDATE would trip
+// balances_pkey. The test catches removal/refactor of the DELETE clause
+// in 005 even if the surrounding upgrade scenario no longer applies in
+// production — the migration file lives in the codebase permanently and
+// must keep handling its documented edge cases.
+func TestMigration005_BalancesPKConflictResolution(t *testing.T) {
+	d, cleanup := setupMigration005TestDB(t)
 	defer cleanup()
 	ctx := context.Background()
 
