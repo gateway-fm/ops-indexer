@@ -26,6 +26,35 @@
 -- Note for write-side: the corresponding code change wraps every address
 -- parameter in INSERT statements with LOWER(...) so newly indexed rows
 -- arrive canonical. See internal/db/batch.go and internal/db/queries.go.
+--
+-- ======================================================================
+-- CONTRACT (read this before adding a new address-bearing INSERT)
+-- ======================================================================
+--
+-- Address-bearing columns store lowercase exclusively. The contract is
+-- enforced at the writer boundary — every INSERT / UPDATE that takes an
+-- address parameter wraps it in LOWER($N). After that boundary, queries
+-- can use plain equality and rely on the btree indexes.
+--
+-- NOT enforced via CHECK (address = LOWER(address)) by design:
+--
+--   * Every INSERT/UPDATE that produces a constant-lowercased value via
+--     LOWER($N) would still be re-checked at runtime, adding per-row
+--     latency on the indexer hot path (batch inserts at chain tip across
+--     transactions / logs / token_transfers). The check would always
+--     pass — pure overhead.
+--   * High-throughput indexers in the wider ecosystem (Etherscan,
+--     Blockscout, The Graph) don't use case CHECK constraints for this
+--     reason; they rely on writer-side normalisation + tests.
+--
+-- If you're adding a new address-bearing INSERT or UPDATE:
+--   1. Wrap the address parameter in LOWER($N) at the call site.
+--   2. Add a unit test under internal/db/writer_lowercase_test.go that
+--      asserts the row is stored in lowercase.
+--
+-- If a future deployment needs DB-level defense in depth (e.g. raw SQL
+-- migrations or ETL bypassing the writer), add CHECK constraints THEN
+-- as a remediation. Not preemptively.
 
 UPDATE transactions
 SET from_address = LOWER(from_address)
