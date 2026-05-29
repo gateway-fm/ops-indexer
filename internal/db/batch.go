@@ -85,7 +85,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			batch.Queue(`
 				INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+				VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 				ON CONFLICT (hash) DO NOTHING`,
 				t.Hash, t.BlockNumber, blockTimestamp, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
 				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason, categories)
@@ -126,7 +126,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		for _, t := range data.Tokens {
 			batch.Queue(`
 				INSERT INTO tokens (address, symbol, name, decimals, token_type, total_supply, block_number, creation_tx, l1_address)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9)
 				ON CONFLICT (address) DO UPDATE SET
 					symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
 					name = COALESCE(EXCLUDED.name, tokens.name),
@@ -156,7 +156,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		for _, l := range data.Logs {
 			batch.Queue(`
 				INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
 				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 				l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
 		}
@@ -172,7 +172,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			batch.Queue(`
 				INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 					block_number, timestamp, transfer_type, token_type, token_id, is_internal)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
 				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 				t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
@@ -189,7 +189,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			batch.Queue(`
 				INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 					gas, gas_used, input, output, call_type, error, timestamp)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
 				it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 				it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
@@ -205,7 +205,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		for _, s := range data.AddressStats {
 			batch.Queue(`
 				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $5, $6, NOW())
+				VALUES (LOWER($1), $2, $3, $4, $5, $5, $6, NOW())
 				ON CONFLICT (address) DO UPDATE SET
 					tx_count = address_stats.tx_count + $2,
 					internal_tx_count = address_stats.internal_tx_count + $3,
@@ -366,7 +366,7 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	for _, b := range balances {
 		batch.Queue(`
 			INSERT INTO balances (address, token_address, block_number, balance)
-			VALUES ($1, $2, $3, $4)
+			VALUES (LOWER($1), LOWER($2), $3, $4)
 			ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
 			b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
 	}

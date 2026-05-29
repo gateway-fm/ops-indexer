@@ -128,7 +128,7 @@ func (d *DB) InsertTransaction(ctx context.Context, tx *types.Transaction) error
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (hash) DO NOTHING`,
 		tx.Hash, tx.BlockNumber, tx.BlockTimestamp, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
 		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason, categories)
@@ -246,11 +246,11 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
 			WHERE (
-				LOWER(t.from_address) = $1
-				OR LOWER(t.to_address) = $1
+				t.from_address = $1
+				OR t.to_address = $1
 				OR t.hash IN (
 					SELECT tx_hash FROM token_transfers
-					WHERE LOWER(from_address) = $1 OR LOWER(to_address) = $1
+					WHERE from_address = $1 OR to_address = $1
 				)
 			) AND t.block_number < $2
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`, addr, *beforeBlock, limit)
@@ -260,11 +260,11 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 				t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 			FROM transactions t
-			WHERE LOWER(t.from_address) = $1
-			   OR LOWER(t.to_address) = $1
+			WHERE t.from_address = $1
+			   OR t.to_address = $1
 			   OR t.hash IN (
 				SELECT tx_hash FROM token_transfers
-				WHERE LOWER(from_address) = $1 OR LOWER(to_address) = $1
+				WHERE from_address = $1 OR to_address = $1
 			   )
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`, addr, limit)
 	}
@@ -429,7 +429,7 @@ func buildCategoriesFromBits(txType int, bits int16) []string {
 func (d *DB) InsertToken(ctx context.Context, t *types.Token) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO tokens (address, symbol, name, decimals, token_type, total_supply, block_number, creation_tx, l1_address)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (address) DO UPDATE SET
 			symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
 			name = COALESCE(EXCLUDED.name, tokens.name),
@@ -444,7 +444,7 @@ func (d *DB) GetToken(ctx context.Context, address string) (*types.Token, error)
 	err := d.pool.QueryRow(ctx, `
 		SELECT address, symbol, name, decimals, token_type, total_supply, holder_count, transfer_count,
 			usd_price, icon_url, l1_address, block_number, creation_tx, off_chain_updated_at, created_at
-		FROM tokens WHERE LOWER(address) = LOWER($1)`, address).Scan(
+		FROM tokens WHERE address = LOWER($1)`, address).Scan(
 		&t.Address, &t.Symbol, &t.Name, &t.Decimals, &t.TokenType, &t.TotalSupply, &t.HolderCount, &t.TransferCount,
 		&t.USDPrice, &t.IconURL, &t.L1Address, &t.BlockNumber, &t.CreationTx, &t.OffChainUpdatedAt, &t.CreatedAt)
 	if err == pgx.ErrNoRows {
@@ -510,7 +510,7 @@ func (d *DB) GetTokens(ctx context.Context, limit int, offset int, tokenType, se
 
 func (d *DB) UpdateTokenStats(ctx context.Context, address string, holderCount int, transferCount int) error {
 	_, err := d.pool.Exec(ctx, `
-		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE LOWER(address) = LOWER($1)`,
+		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = LOWER($1)`,
 		address, holderCount, transferCount)
 	return err
 }
@@ -528,7 +528,7 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 
 	var tokenType string
 	if err := d.pool.QueryRow(ctx,
-		`SELECT token_type FROM tokens WHERE LOWER(address) = $1`, addr,
+		`SELECT token_type FROM tokens WHERE address = $1`, addr,
 	).Scan(&tokenType); err != nil {
 		if err == pgx.ErrNoRows {
 			return nil
@@ -538,7 +538,7 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 
 	var transferCount int64
 	if err := d.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM token_transfers WHERE LOWER(token_address) = $1`, addr,
+		`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, addr,
 	).Scan(&transferCount); err != nil {
 		return fmt.Errorf("RefreshTokenStats: count transfers: %w", err)
 	}
@@ -548,7 +548,7 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		SELECT COUNT(*) FROM (
 			SELECT DISTINCT ON (address) balance
 			FROM balances
-			WHERE LOWER(token_address) = $1
+			WHERE token_address = $1
 			ORDER BY address, block_number DESC
 		) latest
 		WHERE balance > 0`, addr,
@@ -568,9 +568,9 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 			            0
 			        )
 			        FROM token_transfers
-			        WHERE LOWER(token_address) = $1 AND token_type = 'ERC20'
+			        WHERE token_address = $1 AND token_type = 'ERC20'
 			    )
-			WHERE LOWER(address) = $1`,
+			WHERE address = $1`,
 			addr, holderCount, transferCount)
 		if err != nil {
 			return fmt.Errorf("RefreshTokenStats: update ERC20 stats: %w", err)
@@ -579,7 +579,7 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 	}
 
 	_, err := d.pool.Exec(ctx, `
-		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE LOWER(address) = $1`,
+		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = $1`,
 		addr, holderCount, transferCount)
 	if err != nil {
 		return fmt.Errorf("RefreshTokenStats: update stats: %w", err)
@@ -590,7 +590,7 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 func (d *DB) UpdateTokenPrice(ctx context.Context, address string, price float64, iconURL *string) error {
 	_, err := d.pool.Exec(ctx, `
 		UPDATE tokens SET usd_price = $2, icon_url = $3, off_chain_updated_at = NOW()
-		WHERE LOWER(address) = LOWER($1)`,
+		WHERE address = LOWER($1)`,
 		address, price, iconURL)
 	return err
 }
@@ -601,7 +601,7 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) er
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 			block_number, timestamp, transfer_type, token_type, token_id, is_internal)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 		t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 		t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
@@ -612,20 +612,22 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 	var rows pgx.Rows
 	var err error
 
-	// Same case-sensitivity issue as GetTransactionsByAddress: stored
-	// addresses are mixed-case checksum, callers pass lowercase.
+	// Addresses are canonical lowercase post migration 005; the caller's
+	// strings.ToLower is enough to match the stored column without a
+	// LOWER() on the column side (which would otherwise defeat
+	// idx_transfer_from / idx_transfer_to).
 	addr := strings.ToLower(address)
 	if beforeBlock != nil {
 		rows, err = d.pool.Query(ctx, `
 			SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 				timestamp, transfer_type, token_type, token_id, is_internal
-			FROM token_transfers WHERE (LOWER(from_address) = $1 OR LOWER(to_address) = $1) AND block_number < $2
+			FROM token_transfers WHERE (from_address = $1 OR to_address = $1) AND block_number < $2
 			ORDER BY block_number DESC, log_index DESC LIMIT $3`, addr, *beforeBlock, limit)
 	} else {
 		rows, err = d.pool.Query(ctx, `
 			SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 				timestamp, transfer_type, token_type, token_id, is_internal
-			FROM token_transfers WHERE LOWER(from_address) = $1 OR LOWER(to_address) = $1
+			FROM token_transfers WHERE from_address = $1 OR to_address = $1
 			ORDER BY block_number DESC, log_index DESC LIMIT $2`, addr, limit)
 	}
 	if err != nil {
@@ -650,12 +652,12 @@ func (d *DB) GetTransfersByTransaction(ctx context.Context, txHash string) ([]ty
 
 func (d *DB) GetTransfersByToken(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenTransfer, int64, error) {
 	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM token_transfers WHERE LOWER(token_address) = LOWER($1)", tokenAddress).Scan(&total)
+	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM token_transfers WHERE token_address = LOWER($1)", tokenAddress).Scan(&total)
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 			timestamp, transfer_type, token_type, token_id, is_internal
-		FROM token_transfers WHERE LOWER(token_address) = LOWER($1)
+		FROM token_transfers WHERE token_address = LOWER($1)
 		ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, tokenAddress, limit, offset)
 	if err != nil {
 		return nil, 0, err
@@ -705,14 +707,14 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 	var total int64
 	d.pool.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT address) FROM balances
-		WHERE LOWER(token_address) = LOWER($1) AND balance > 0`, tokenAddress).Scan(&total)
+		WHERE token_address = LOWER($1) AND balance > 0`, tokenAddress).Scan(&total)
 
 	rows, err := d.pool.Query(ctx, `
 		WITH latest_balances AS (
 			SELECT address, balance,
 				ROW_NUMBER() OVER (PARTITION BY address ORDER BY block_number DESC) as rn
 			FROM balances
-			WHERE LOWER(token_address) = LOWER($1) AND balance > 0
+			WHERE token_address = LOWER($1) AND balance > 0
 		),
 		total_supply AS (
 			SELECT COALESCE(SUM(balance), 1) as supply FROM latest_balances WHERE rn = 1
@@ -747,7 +749,7 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 func (d *DB) InsertBalance(ctx context.Context, b *types.Balance) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO balances (address, token_address, block_number, balance)
-		VALUES ($1, $2, $3, $4)
+		VALUES (LOWER($1), LOWER($2), $3, $4)
 		ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
 		b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
 	return err
@@ -759,7 +761,7 @@ func (d *DB) GetLatestBalance(ctx context.Context, address string, tokenAddress 
 	err := d.pool.QueryRow(ctx, `
 		SELECT address, token_address, block_number, balance::text
 		FROM balances
-		WHERE LOWER(address) = LOWER($1) AND LOWER(token_address) = LOWER($2)
+		WHERE address = LOWER($1) AND token_address = LOWER($2)
 		ORDER BY block_number DESC LIMIT 1`, address, tokenAddress).Scan(
 		&b.Address, &b.TokenAddress, &b.BlockNumber, &balanceStr)
 	if err == pgx.ErrNoRows {
@@ -776,7 +778,7 @@ func (d *DB) GetBalanceHistory(ctx context.Context, address string, tokenAddress
 	rows, err := d.pool.Query(ctx, `
 		SELECT address, token_address, block_number, balance::text
 		FROM balances
-		WHERE LOWER(address) = LOWER($1) AND LOWER(token_address) = LOWER($2)
+		WHERE address = LOWER($1) AND token_address = LOWER($2)
 		ORDER BY block_number DESC LIMIT $3`, address, tokenAddress, limit)
 	if err != nil {
 		return nil, err
@@ -802,7 +804,7 @@ func (d *DB) GetTokenBalances(ctx context.Context, address string) ([]types.Bala
 			SELECT address, token_address, balance, block_number,
 				ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY block_number DESC) as rn
 			FROM balances
-			WHERE LOWER(address) = LOWER($1)
+			WHERE address = LOWER($1)
 		)
 		SELECT address, token_address, block_number, balance::text
 		FROM latest_balances WHERE rn = 1 AND balance > 0
@@ -830,7 +832,7 @@ func (d *DB) GetTokenBalances(ctx context.Context, address string) ([]types.Bala
 func (d *DB) IncrementCounter(ctx context.Context, address string, counterType string, delta int64) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO counters (address, counter_type, count, updated_at)
-		VALUES ($1, $2, $3, NOW())
+		VALUES (LOWER($1), $2, $3, NOW())
 		ON CONFLICT (address, counter_type) DO UPDATE SET
 			count = counters.count + $3,
 			updated_at = NOW()`,
@@ -841,7 +843,7 @@ func (d *DB) IncrementCounter(ctx context.Context, address string, counterType s
 func (d *DB) GetCounter(ctx context.Context, address string, counterType string) (int64, error) {
 	var count int64
 	err := d.pool.QueryRow(ctx, `
-		SELECT count FROM counters WHERE LOWER(address) = LOWER($1) AND counter_type = $2`,
+		SELECT count FROM counters WHERE address = LOWER($1) AND counter_type = $2`,
 		address, counterType).Scan(&count)
 	if err == pgx.ErrNoRows {
 		return 0, nil
@@ -852,7 +854,7 @@ func (d *DB) GetCounter(ctx context.Context, address string, counterType string)
 func (d *DB) GetCounters(ctx context.Context, address string) ([]types.Counter, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT address, counter_type, count, updated_at
-		FROM counters WHERE LOWER(address) = LOWER($1)`, address)
+		FROM counters WHERE address = LOWER($1)`, address)
 	if err != nil {
 		return nil, err
 	}
@@ -874,7 +876,7 @@ func (d *DB) GetCounters(ctx context.Context, address string) ([]types.Counter, 
 func (d *DB) UpsertAddressStats(ctx context.Context, address string, blockNumber uint64, isContract bool) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO address_stats (address, tx_count, first_seen, last_seen, is_contract, updated_at)
-		VALUES ($1, 1, $2, $2, $3, NOW())
+		VALUES (LOWER($1), 1, $2, $2, $3, NOW())
 		ON CONFLICT (address) DO UPDATE SET
 			tx_count = address_stats.tx_count + 1,
 			last_seen = $2,
@@ -993,7 +995,7 @@ func (d *DB) VerifyContract(ctx context.Context, address string, name string, co
 func (d *DB) UpdateContractABI(ctx context.Context, address string, abi json.RawMessage) error {
 	_, err := d.pool.Exec(ctx, `
 		UPDATE contracts SET abi = $2
-		WHERE LOWER(address) = LOWER($1)`,
+		WHERE address = LOWER($1)`,
 		address, abi)
 	return err
 }
@@ -1048,7 +1050,7 @@ func (d *DB) GetVerifiedContracts(ctx context.Context, limit int, offset int) ([
 func (d *DB) InsertLog(ctx context.Context, l *types.Log) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 		l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
 	return err
@@ -1068,11 +1070,11 @@ func (d *DB) GetLogsByTransaction(ctx context.Context, txHash string) ([]types.L
 
 func (d *DB) GetLogsByAddress(ctx context.Context, address string, limit int, offset int) ([]types.Log, int64, error) {
 	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM logs WHERE LOWER(address) = LOWER($1)", address).Scan(&total)
+	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM logs WHERE address = LOWER($1)", address).Scan(&total)
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed
-		FROM logs WHERE LOWER(address) = LOWER($1)
+		FROM logs WHERE address = LOWER($1)
 		ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, address, limit, offset)
 	if err != nil {
 		return nil, 0, err
@@ -1106,7 +1108,7 @@ func (d *DB) GetLogs(ctx context.Context, address *string, topic0 *string, fromB
 	argIdx := 1
 
 	if address != nil {
-		query += fmt.Sprintf(" AND LOWER(address) = LOWER($%d)", argIdx)
+		query += fmt.Sprintf(" AND address = LOWER($%d)", argIdx)
 		args = append(args, *address)
 		argIdx++
 	}
@@ -1155,7 +1157,7 @@ func (d *DB) InsertInternalTransaction(ctx context.Context, it *types.InternalTr
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 			gas, gas_used, input, output, call_type, error, timestamp)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
 		it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 		it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
@@ -1192,13 +1194,13 @@ func (d *DB) GetInternalTransactionsByAddress(ctx context.Context, address strin
 	var total int64
 	d.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM internal_transactions
-		WHERE LOWER(from_address) = LOWER($1) OR LOWER(to_address) = LOWER($1)`, address).Scan(&total)
+		WHERE from_address = LOWER($1) OR to_address = LOWER($1)`, address).Scan(&total)
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, block_number, trace_address, from_address, to_address, value::text,
 			gas, gas_used, input, output, call_type, error, timestamp
 		FROM internal_transactions
-		WHERE LOWER(from_address) = LOWER($1) OR LOWER(to_address) = LOWER($1)
+		WHERE from_address = LOWER($1) OR to_address = LOWER($1)
 		ORDER BY block_number DESC, id DESC LIMIT $2 OFFSET $3`, address, limit, offset)
 	if err != nil {
 		return nil, 0, err
