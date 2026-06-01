@@ -515,14 +515,15 @@ func (d *DB) UpdateTokenStats(ctx context.Context, address string, holderCount i
 	return err
 }
 
-// RefreshTokenStats recomputes holder_count, transfer_count, and (for ERC20
-// only) total_supply for a single token from the underlying token_transfers
-// and balances tables, then writes the result onto the tokens row. Cheap and
-// idempotent. The token row must already exist; if not, the call is a no-op.
+// RefreshTokenStats recomputes holder_count, transfer_count, and total_supply
+// for a single token from the underlying token_transfers / balances / nft_tokens
+// tables, then writes the result onto the tokens row. Cheap and idempotent. The
+// token row must already exist; if not, the call is a no-op.
 //
 // holder_count counts addresses whose latest balance for this token is > 0.
 // transfer_count is COUNT(*) over token_transfers.
-// total_supply (ERC20 only) is the running sum of mint values minus burn values.
+// total_supply is mints−burns for ERC20, and the live (non-burned) token-id
+// count for ERC721; left untouched for other standards.
 func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 	addr := strings.ToLower(tokenAddress)
 
@@ -574,6 +575,26 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 			addr, holderCount, transferCount)
 		if err != nil {
 			return fmt.Errorf("RefreshTokenStats: update ERC20 stats: %w", err)
+		}
+		return nil
+	}
+
+	if tokenType == "ERC721" {
+		// Supply for an NFT collection is the number of live (non-burned) token
+		// ids, tracked per-instance in nft_tokens.
+		_, err := d.pool.Exec(ctx, `
+			UPDATE tokens
+			SET holder_count = $2,
+			    transfer_count = $3,
+			    total_supply = (
+			        SELECT COUNT(*) FROM nft_tokens
+			        WHERE LOWER(token_address) = $1
+			          AND owner <> '0x0000000000000000000000000000000000000000'
+			    )
+			WHERE LOWER(address) = $1`,
+			addr, holderCount, transferCount)
+		if err != nil {
+			return fmt.Errorf("RefreshTokenStats: update ERC721 stats: %w", err)
 		}
 		return nil
 	}
@@ -742,6 +763,43 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 		holders = append(holders, h)
 	}
 	return holders, total, rows.Err()
+}
+
+// GetTokenInventory lists live (non-burned) NFT instances of a collection,
+// ordered by token id. Owner and tokenURI come straight from nft_tokens, which
+// the indexer maintains per (token_address, token_id). A non-empty tokenID
+// filters to a single instance (used by the per-NFT detail lookup).
+func (d *DB) GetTokenInventory(ctx context.Context, tokenAddress string, tokenID string, limit int, offset int) ([]types.TokenInventoryItem, int64, error) {
+	var total int64
+	d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM nft_tokens
+		WHERE LOWER(token_address) = LOWER($1)
+		  AND owner <> '0x0000000000000000000000000000000000000000'
+		  AND ($2 = '' OR token_id = $2::numeric)`,
+		tokenAddress, tokenID).Scan(&total)
+
+	rows, err := d.pool.Query(ctx, `
+		SELECT token_id::text, owner, token_uri
+		FROM nft_tokens
+		WHERE LOWER(token_address) = LOWER($1)
+		  AND owner <> '0x0000000000000000000000000000000000000000'
+		  AND ($2 = '' OR token_id = $2::numeric)
+		ORDER BY token_id
+		LIMIT $3 OFFSET $4`, tokenAddress, tokenID, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var items []types.TokenInventoryItem
+	for rows.Next() {
+		var it types.TokenInventoryItem
+		if err := rows.Scan(&it.TokenID, &it.Owner, &it.TokenURI); err != nil {
+			return nil, 0, err
+		}
+		items = append(items, it)
+	}
+	return items, total, rows.Err()
 }
 
 // Balance operations

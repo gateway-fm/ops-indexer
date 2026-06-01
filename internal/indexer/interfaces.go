@@ -69,6 +69,7 @@ type RPCClient interface {
 	GetCode(ctx context.Context, address common.Address) ([]byte, error)
 	FetchTracesBatch(ctx context.Context, txHashes []common.Hash, startBlock, endBlock uint64, workers, rateLimit int) ([]*types.InternalTransaction, error)
 	FetchTokenMetadataBatch(ctx context.Context, addresses []common.Address, workers int, rateLimit int) (map[common.Address]*rpc.TokenMetadataResult, error)
+	FetchTokenURIsBatch(ctx context.Context, reqs []rpc.NFTURIRequest, workers int, rateLimit int) map[int]string
 	ChainID(ctx context.Context) (*big.Int, error)
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*rpclient.Receipt, error)
 }

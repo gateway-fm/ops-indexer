@@ -981,6 +981,180 @@ func (x *BatchGetTokenBalancesResponse) GetBalances() map[string]*BatchGetTokenB
 	return nil
 }
 
+// One NFT instance in a collection's inventory: a token id, its current owner,
+// and the raw tokenURI captured at mint.
+type TokenInventoryItem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TokenId       *BigInt                `protobuf:"bytes,1,opt,name=token_id,json=tokenId,proto3" json:"token_id,omitempty"`
+	Owner         string                 `protobuf:"bytes,2,opt,name=owner,proto3" json:"owner,omitempty"`
+	TokenUri      string                 `protobuf:"bytes,3,opt,name=token_uri,json=tokenUri,proto3" json:"token_uri,omitempty"` // raw tokenURI(); empty if unknown
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenInventoryItem) Reset() {
+	*x = TokenInventoryItem{}
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenInventoryItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenInventoryItem) ProtoMessage() {}
+
+func (x *TokenInventoryItem) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenInventoryItem.ProtoReflect.Descriptor instead.
+func (*TokenInventoryItem) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v1_token_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *TokenInventoryItem) GetTokenId() *BigInt {
+	if x != nil {
+		return x.TokenId
+	}
+	return nil
+}
+
+func (x *TokenInventoryItem) GetOwner() string {
+	if x != nil {
+		return x.Owner
+	}
+	return ""
+}
+
+func (x *TokenInventoryItem) GetTokenUri() string {
+	if x != nil {
+		return x.TokenUri
+	}
+	return ""
+}
+
+type ListTokenInventoryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Page          *OffsetPageRequest     `protobuf:"bytes,1,opt,name=page,proto3" json:"page,omitempty"`
+	TokenAddress  string                 `protobuf:"bytes,2,opt,name=token_address,json=tokenAddress,proto3" json:"token_address,omitempty"`
+	TokenId       string                 `protobuf:"bytes,3,opt,name=token_id,json=tokenId,proto3" json:"token_id,omitempty"` // optional: filter to a single token id (decimal string)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListTokenInventoryRequest) Reset() {
+	*x = ListTokenInventoryRequest{}
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListTokenInventoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListTokenInventoryRequest) ProtoMessage() {}
+
+func (x *ListTokenInventoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListTokenInventoryRequest.ProtoReflect.Descriptor instead.
+func (*ListTokenInventoryRequest) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v1_token_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ListTokenInventoryRequest) GetPage() *OffsetPageRequest {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
+func (x *ListTokenInventoryRequest) GetTokenAddress() string {
+	if x != nil {
+		return x.TokenAddress
+	}
+	return ""
+}
+
+func (x *ListTokenInventoryRequest) GetTokenId() string {
+	if x != nil {
+		return x.TokenId
+	}
+	return ""
+}
+
+type ListTokenInventoryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*TokenInventoryItem  `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	Page          *OffsetPageResponse    `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListTokenInventoryResponse) Reset() {
+	*x = ListTokenInventoryResponse{}
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListTokenInventoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListTokenInventoryResponse) ProtoMessage() {}
+
+func (x *ListTokenInventoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListTokenInventoryResponse.ProtoReflect.Descriptor instead.
+func (*ListTokenInventoryResponse) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v1_token_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ListTokenInventoryResponse) GetItems() []*TokenInventoryItem {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+func (x *ListTokenInventoryResponse) GetPage() *OffsetPageResponse {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
 type BatchGetTokenBalancesResponse_TokenBalanceList struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Items         []*TokenBalance        `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
@@ -990,7 +1164,7 @@ type BatchGetTokenBalancesResponse_TokenBalanceList struct {
 
 func (x *BatchGetTokenBalancesResponse_TokenBalanceList) Reset() {
 	*x = BatchGetTokenBalancesResponse_TokenBalanceList{}
-	mi := &file_chain_indexer_v1_token_proto_msgTypes[15]
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1002,7 +1176,7 @@ func (x *BatchGetTokenBalancesResponse_TokenBalanceList) String() string {
 func (*BatchGetTokenBalancesResponse_TokenBalanceList) ProtoMessage() {}
 
 func (x *BatchGetTokenBalancesResponse_TokenBalanceList) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v1_token_proto_msgTypes[15]
+	mi := &file_chain_indexer_v1_token_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1106,7 +1280,18 @@ const file_chain_indexer_v1_token_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12V\n" +
 	"\x05value\x18\x02 \x01(\v2@.chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceListR\x05value:\x028\x01\x1aH\n" +
 	"\x10TokenBalanceList\x124\n" +
-	"\x05items\x18\x01 \x03(\v2\x1e.chain_indexer.v1.TokenBalanceR\x05items*l\n" +
+	"\x05items\x18\x01 \x03(\v2\x1e.chain_indexer.v1.TokenBalanceR\x05items\"|\n" +
+	"\x12TokenInventoryItem\x123\n" +
+	"\btoken_id\x18\x01 \x01(\v2\x18.chain_indexer.v1.BigIntR\atokenId\x12\x14\n" +
+	"\x05owner\x18\x02 \x01(\tR\x05owner\x12\x1b\n" +
+	"\ttoken_uri\x18\x03 \x01(\tR\btokenUri\"\x94\x01\n" +
+	"\x19ListTokenInventoryRequest\x127\n" +
+	"\x04page\x18\x01 \x01(\v2#.chain_indexer.v1.OffsetPageRequestR\x04page\x12#\n" +
+	"\rtoken_address\x18\x02 \x01(\tR\ftokenAddress\x12\x19\n" +
+	"\btoken_id\x18\x03 \x01(\tR\atokenId\"\x92\x01\n" +
+	"\x1aListTokenInventoryResponse\x12:\n" +
+	"\x05items\x18\x01 \x03(\v2$.chain_indexer.v1.TokenInventoryItemR\x05items\x128\n" +
+	"\x04page\x18\x02 \x01(\v2$.chain_indexer.v1.OffsetPageResponseR\x04page*l\n" +
 	"\tTokenType\x12\x1a\n" +
 	"\x16TOKEN_TYPE_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10TOKEN_TYPE_ERC20\x10\x01\x12\x15\n" +
@@ -1126,7 +1311,7 @@ func file_chain_indexer_v1_token_proto_rawDescGZIP() []byte {
 }
 
 var file_chain_indexer_v1_token_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_chain_indexer_v1_token_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_chain_indexer_v1_token_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_chain_indexer_v1_token_proto_goTypes = []any{
 	(TokenType)(0),                                         // 0: chain_indexer.v1.TokenType
 	(*Token)(nil),                                          // 1: chain_indexer.v1.Token
@@ -1143,47 +1328,54 @@ var file_chain_indexer_v1_token_proto_goTypes = []any{
 	(*ListTokenBalancesResponse)(nil),                      // 12: chain_indexer.v1.ListTokenBalancesResponse
 	(*BatchGetTokenBalancesRequest)(nil),                   // 13: chain_indexer.v1.BatchGetTokenBalancesRequest
 	(*BatchGetTokenBalancesResponse)(nil),                  // 14: chain_indexer.v1.BatchGetTokenBalancesResponse
-	nil,                                                    // 15: chain_indexer.v1.BatchGetTokenBalancesResponse.BalancesEntry
-	(*BatchGetTokenBalancesResponse_TokenBalanceList)(nil), // 16: chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceList
-	(*BigInt)(nil),                                         // 17: chain_indexer.v1.BigInt
-	(*timestamppb.Timestamp)(nil),                          // 18: google.protobuf.Timestamp
-	(*OffsetPageRequest)(nil),                              // 19: chain_indexer.v1.OffsetPageRequest
-	(*OffsetPageResponse)(nil),                             // 20: chain_indexer.v1.OffsetPageResponse
-	(*PageRequest)(nil),                                    // 21: chain_indexer.v1.PageRequest
-	(*BlockRange)(nil),                                     // 22: chain_indexer.v1.BlockRange
-	(*PageResponse)(nil),                                   // 23: chain_indexer.v1.PageResponse
+	(*TokenInventoryItem)(nil),                             // 15: chain_indexer.v1.TokenInventoryItem
+	(*ListTokenInventoryRequest)(nil),                      // 16: chain_indexer.v1.ListTokenInventoryRequest
+	(*ListTokenInventoryResponse)(nil),                     // 17: chain_indexer.v1.ListTokenInventoryResponse
+	nil,                                                    // 18: chain_indexer.v1.BatchGetTokenBalancesResponse.BalancesEntry
+	(*BatchGetTokenBalancesResponse_TokenBalanceList)(nil), // 19: chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceList
+	(*BigInt)(nil),                                         // 20: chain_indexer.v1.BigInt
+	(*timestamppb.Timestamp)(nil),                          // 21: google.protobuf.Timestamp
+	(*OffsetPageRequest)(nil),                              // 22: chain_indexer.v1.OffsetPageRequest
+	(*OffsetPageResponse)(nil),                             // 23: chain_indexer.v1.OffsetPageResponse
+	(*PageRequest)(nil),                                    // 24: chain_indexer.v1.PageRequest
+	(*BlockRange)(nil),                                     // 25: chain_indexer.v1.BlockRange
+	(*PageResponse)(nil),                                   // 26: chain_indexer.v1.PageResponse
 }
 var file_chain_indexer_v1_token_proto_depIdxs = []int32{
-	17, // 0: chain_indexer.v1.Token.total_supply:type_name -> chain_indexer.v1.BigInt
+	20, // 0: chain_indexer.v1.Token.total_supply:type_name -> chain_indexer.v1.BigInt
 	0,  // 1: chain_indexer.v1.Token.token_type:type_name -> chain_indexer.v1.TokenType
-	18, // 2: chain_indexer.v1.TokenTransfer.block_timestamp:type_name -> google.protobuf.Timestamp
+	21, // 2: chain_indexer.v1.TokenTransfer.block_timestamp:type_name -> google.protobuf.Timestamp
 	0,  // 3: chain_indexer.v1.TokenTransfer.token_type:type_name -> chain_indexer.v1.TokenType
-	17, // 4: chain_indexer.v1.TokenTransfer.value:type_name -> chain_indexer.v1.BigInt
-	17, // 5: chain_indexer.v1.TokenTransfer.token_id:type_name -> chain_indexer.v1.BigInt
-	17, // 6: chain_indexer.v1.TokenBalance.balance:type_name -> chain_indexer.v1.BigInt
+	20, // 4: chain_indexer.v1.TokenTransfer.value:type_name -> chain_indexer.v1.BigInt
+	20, // 5: chain_indexer.v1.TokenTransfer.token_id:type_name -> chain_indexer.v1.BigInt
+	20, // 6: chain_indexer.v1.TokenBalance.balance:type_name -> chain_indexer.v1.BigInt
 	0,  // 7: chain_indexer.v1.TokenBalance.token_type:type_name -> chain_indexer.v1.TokenType
-	19, // 8: chain_indexer.v1.ListTokensRequest.page:type_name -> chain_indexer.v1.OffsetPageRequest
+	22, // 8: chain_indexer.v1.ListTokensRequest.page:type_name -> chain_indexer.v1.OffsetPageRequest
 	0,  // 9: chain_indexer.v1.ListTokensRequest.token_type:type_name -> chain_indexer.v1.TokenType
 	1,  // 10: chain_indexer.v1.ListTokensResponse.tokens:type_name -> chain_indexer.v1.Token
-	20, // 11: chain_indexer.v1.ListTokensResponse.page:type_name -> chain_indexer.v1.OffsetPageResponse
-	21, // 12: chain_indexer.v1.ListTokenTransfersRequest.page:type_name -> chain_indexer.v1.PageRequest
-	22, // 13: chain_indexer.v1.ListTokenTransfersRequest.block_range:type_name -> chain_indexer.v1.BlockRange
+	23, // 11: chain_indexer.v1.ListTokensResponse.page:type_name -> chain_indexer.v1.OffsetPageResponse
+	24, // 12: chain_indexer.v1.ListTokenTransfersRequest.page:type_name -> chain_indexer.v1.PageRequest
+	25, // 13: chain_indexer.v1.ListTokenTransfersRequest.block_range:type_name -> chain_indexer.v1.BlockRange
 	2,  // 14: chain_indexer.v1.ListTokenTransfersResponse.transfers:type_name -> chain_indexer.v1.TokenTransfer
-	23, // 15: chain_indexer.v1.ListTokenTransfersResponse.page:type_name -> chain_indexer.v1.PageResponse
-	19, // 16: chain_indexer.v1.ListTokenHoldersRequest.page:type_name -> chain_indexer.v1.OffsetPageRequest
+	26, // 15: chain_indexer.v1.ListTokenTransfersResponse.page:type_name -> chain_indexer.v1.PageResponse
+	22, // 16: chain_indexer.v1.ListTokenHoldersRequest.page:type_name -> chain_indexer.v1.OffsetPageRequest
 	3,  // 17: chain_indexer.v1.ListTokenHoldersResponse.holders:type_name -> chain_indexer.v1.TokenBalance
-	20, // 18: chain_indexer.v1.ListTokenHoldersResponse.page:type_name -> chain_indexer.v1.OffsetPageResponse
-	21, // 19: chain_indexer.v1.ListTokenBalancesRequest.page:type_name -> chain_indexer.v1.PageRequest
+	23, // 18: chain_indexer.v1.ListTokenHoldersResponse.page:type_name -> chain_indexer.v1.OffsetPageResponse
+	24, // 19: chain_indexer.v1.ListTokenBalancesRequest.page:type_name -> chain_indexer.v1.PageRequest
 	3,  // 20: chain_indexer.v1.ListTokenBalancesResponse.balances:type_name -> chain_indexer.v1.TokenBalance
-	23, // 21: chain_indexer.v1.ListTokenBalancesResponse.page:type_name -> chain_indexer.v1.PageResponse
-	15, // 22: chain_indexer.v1.BatchGetTokenBalancesResponse.balances:type_name -> chain_indexer.v1.BatchGetTokenBalancesResponse.BalancesEntry
-	16, // 23: chain_indexer.v1.BatchGetTokenBalancesResponse.BalancesEntry.value:type_name -> chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceList
-	3,  // 24: chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceList.items:type_name -> chain_indexer.v1.TokenBalance
-	25, // [25:25] is the sub-list for method output_type
-	25, // [25:25] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	26, // 21: chain_indexer.v1.ListTokenBalancesResponse.page:type_name -> chain_indexer.v1.PageResponse
+	18, // 22: chain_indexer.v1.BatchGetTokenBalancesResponse.balances:type_name -> chain_indexer.v1.BatchGetTokenBalancesResponse.BalancesEntry
+	20, // 23: chain_indexer.v1.TokenInventoryItem.token_id:type_name -> chain_indexer.v1.BigInt
+	22, // 24: chain_indexer.v1.ListTokenInventoryRequest.page:type_name -> chain_indexer.v1.OffsetPageRequest
+	15, // 25: chain_indexer.v1.ListTokenInventoryResponse.items:type_name -> chain_indexer.v1.TokenInventoryItem
+	23, // 26: chain_indexer.v1.ListTokenInventoryResponse.page:type_name -> chain_indexer.v1.OffsetPageResponse
+	19, // 27: chain_indexer.v1.BatchGetTokenBalancesResponse.BalancesEntry.value:type_name -> chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceList
+	3,  // 28: chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceList.items:type_name -> chain_indexer.v1.TokenBalance
+	29, // [29:29] is the sub-list for method output_type
+	29, // [29:29] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_chain_indexer_v1_token_proto_init() }
@@ -1198,7 +1390,7 @@ func file_chain_indexer_v1_token_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_chain_indexer_v1_token_proto_rawDesc), len(file_chain_indexer_v1_token_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   16,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -376,6 +376,56 @@ func (c *Client) FetchTokenMetadataBatch(ctx context.Context, addresses []common
 	return results, nil
 }
 
+// NFTURIRequest identifies a single token whose tokenURI should be fetched.
+type NFTURIRequest struct {
+	Address common.Address
+	TokenID *big.Int
+}
+
+// FetchTokenURIsBatch calls tokenURI(uint256) for each request concurrently and
+// returns a map keyed by the request's index in reqs. A missing entry means the
+// call reverted or returned no string (tolerated — many ERC721s omit metadata).
+func (c *Client) FetchTokenURIsBatch(ctx context.Context, reqs []NFTURIRequest, workers int, rateLimit int) map[int]string {
+	results := make(map[int]string, len(reqs))
+	if len(reqs) == 0 {
+		return results
+	}
+
+	limiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit/10+1)
+	var mu sync.Mutex
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+
+	for i, req := range reqs {
+		i, req := i, req // capture loop variables
+		g.Go(func() error {
+			if err := limiter.Wait(ctx); err != nil {
+				return nil
+			}
+			// tokenURI(uint256): selector 0xc87b56dd + 32-byte big-endian id.
+			data := make([]byte, 4+32)
+			copy(data, common.FromHex("0xc87b56dd"))
+			if req.TokenID != nil {
+				req.TokenID.FillBytes(data[4:])
+			}
+			out, err := c.CallContract(ctx, req.Address, data)
+			if err != nil {
+				return nil // tolerate reverts
+			}
+			if uri := parseStringResult(out); uri != "" {
+				mu.Lock()
+				results[i] = uri
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
+
+	g.Wait()
+	return results
+}
+
 func parseStringResult(data []byte) string {
 	if len(data) < 64 {
 		result := string(data)

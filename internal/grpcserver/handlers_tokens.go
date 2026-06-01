@@ -138,6 +138,48 @@ func (s *Server) ListTokenHolders(ctx context.Context, req *indexerv1.ListTokenH
 	}, nil
 }
 
+func (s *Server) ListTokenInventory(ctx context.Context, req *indexerv1.ListTokenInventoryRequest) (*indexerv1.ListTokenInventoryResponse, error) {
+	if req.GetTokenAddress() == "" {
+		return nil, invalidArgument("token_address is required")
+	}
+	page := int(req.GetPage().GetPage())
+	if page < 1 {
+		page = 1
+	}
+	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
+	offset := (page - 1) * pageSize
+
+	rows, total, err := s.db.GetTokenInventory(ctx, strings.ToLower(req.GetTokenAddress()), req.GetTokenId(), pageSize, offset)
+	if err != nil {
+		slog.Error("ListTokenInventory", "error", err)
+		return nil, internalErr(err, "ListTokenInventory")
+	}
+	return &indexerv1.ListTokenInventoryResponse{
+		Items: mapInventoryItems(rows),
+		Page: &indexerv1.OffsetPageResponse{
+			Page:       int32(page),
+			PageSize:   int32(pageSize),
+			TotalItems: total,
+		},
+	}, nil
+}
+
+func mapInventoryItems(rows []types.TokenInventoryItem) []*indexerv1.TokenInventoryItem {
+	out := make([]*indexerv1.TokenInventoryItem, 0, len(rows))
+	for _, r := range rows {
+		uri := ""
+		if r.TokenURI != nil {
+			uri = *r.TokenURI
+		}
+		out = append(out, &indexerv1.TokenInventoryItem{
+			TokenId:  bigIntFromString(r.TokenID),
+			Owner:    r.Owner,
+			TokenUri: uri,
+		})
+	}
+	return out
+}
+
 func (s *Server) ListTokenBalances(ctx context.Context, req *indexerv1.ListTokenBalancesRequest) (*indexerv1.ListTokenBalancesResponse, error) {
 	if req.GetAddress() == "" {
 		return nil, invalidArgument("address is required")

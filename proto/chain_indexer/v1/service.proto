@@ -49,6 +49,7 @@ service IndexerService {
   rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
   rpc ListTokenTransfers(ListTokenTransfersRequest) returns (ListTokenTransfersResponse);
   rpc ListTokenHolders(ListTokenHoldersRequest) returns (ListTokenHoldersResponse);
+  rpc ListTokenInventory(ListTokenInventoryRequest) returns (ListTokenInventoryResponse);
   rpc ListTokenBalances(ListTokenBalancesRequest) returns (ListTokenBalancesResponse);
   rpc BatchGetTokenBalances(BatchGetTokenBalancesRequest) returns (BatchGetTokenBalancesResponse);
 

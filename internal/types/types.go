@@ -108,6 +108,23 @@ type Token struct {
 	CreatedAt          time.Time  `json:"createdAt"`
 }
 
+// NFTToken is one per-instance row written during indexing: the current owner
+// and (for mints) the tokenURI of a single ERC721 token id.
+type NFTToken struct {
+	TokenAddress string
+	TokenID      string // decimal string
+	Owner        string
+	TokenURI     *string // captured at mint; nil for non-mint transfers
+	BlockNumber  uint64
+}
+
+// TokenInventoryItem is one entry in a collection's inventory listing.
+type TokenInventoryItem struct {
+	TokenID  string  `json:"tokenId"`
+	Owner    string  `json:"owner"`
+	TokenURI *string `json:"tokenUri,omitempty"`
+}
+
 type TokenTransfer struct {
 	ID           int64      `json:"id"`
 	TxHash       string     `json:"txHash"`

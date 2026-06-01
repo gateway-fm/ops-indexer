@@ -31,6 +31,7 @@ const (
 	IndexerService_ListTokens_FullMethodName                       = "/chain_indexer.v1.IndexerService/ListTokens"
 	IndexerService_ListTokenTransfers_FullMethodName               = "/chain_indexer.v1.IndexerService/ListTokenTransfers"
 	IndexerService_ListTokenHolders_FullMethodName                 = "/chain_indexer.v1.IndexerService/ListTokenHolders"
+	IndexerService_ListTokenInventory_FullMethodName               = "/chain_indexer.v1.IndexerService/ListTokenInventory"
 	IndexerService_ListTokenBalances_FullMethodName                = "/chain_indexer.v1.IndexerService/ListTokenBalances"
 	IndexerService_BatchGetTokenBalances_FullMethodName            = "/chain_indexer.v1.IndexerService/BatchGetTokenBalances"
 	IndexerService_GetAddress_FullMethodName                       = "/chain_indexer.v1.IndexerService/GetAddress"
@@ -82,6 +83,7 @@ type IndexerServiceClient interface {
 	ListTokens(ctx context.Context, in *ListTokensRequest, opts ...grpc.CallOption) (*ListTokensResponse, error)
 	ListTokenTransfers(ctx context.Context, in *ListTokenTransfersRequest, opts ...grpc.CallOption) (*ListTokenTransfersResponse, error)
 	ListTokenHolders(ctx context.Context, in *ListTokenHoldersRequest, opts ...grpc.CallOption) (*ListTokenHoldersResponse, error)
+	ListTokenInventory(ctx context.Context, in *ListTokenInventoryRequest, opts ...grpc.CallOption) (*ListTokenInventoryResponse, error)
 	ListTokenBalances(ctx context.Context, in *ListTokenBalancesRequest, opts ...grpc.CallOption) (*ListTokenBalancesResponse, error)
 	BatchGetTokenBalances(ctx context.Context, in *BatchGetTokenBalancesRequest, opts ...grpc.CallOption) (*BatchGetTokenBalancesResponse, error)
 	// ----- Addresses -----
@@ -227,6 +229,16 @@ func (c *indexerServiceClient) ListTokenHolders(ctx context.Context, in *ListTok
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListTokenHoldersResponse)
 	err := c.cc.Invoke(ctx, IndexerService_ListTokenHolders_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexerServiceClient) ListTokenInventory(ctx context.Context, in *ListTokenInventoryRequest, opts ...grpc.CallOption) (*ListTokenInventoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTokenInventoryResponse)
+	err := c.cc.Invoke(ctx, IndexerService_ListTokenInventory_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -408,6 +420,7 @@ type IndexerServiceServer interface {
 	ListTokens(context.Context, *ListTokensRequest) (*ListTokensResponse, error)
 	ListTokenTransfers(context.Context, *ListTokenTransfersRequest) (*ListTokenTransfersResponse, error)
 	ListTokenHolders(context.Context, *ListTokenHoldersRequest) (*ListTokenHoldersResponse, error)
+	ListTokenInventory(context.Context, *ListTokenInventoryRequest) (*ListTokenInventoryResponse, error)
 	ListTokenBalances(context.Context, *ListTokenBalancesRequest) (*ListTokenBalancesResponse, error)
 	BatchGetTokenBalances(context.Context, *BatchGetTokenBalancesRequest) (*BatchGetTokenBalancesResponse, error)
 	// ----- Addresses -----
@@ -474,6 +487,9 @@ func (UnimplementedIndexerServiceServer) ListTokenTransfers(context.Context, *Li
 }
 func (UnimplementedIndexerServiceServer) ListTokenHolders(context.Context, *ListTokenHoldersRequest) (*ListTokenHoldersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListTokenHolders not implemented")
+}
+func (UnimplementedIndexerServiceServer) ListTokenInventory(context.Context, *ListTokenInventoryRequest) (*ListTokenInventoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListTokenInventory not implemented")
 }
 func (UnimplementedIndexerServiceServer) ListTokenBalances(context.Context, *ListTokenBalancesRequest) (*ListTokenBalancesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListTokenBalances not implemented")
@@ -750,6 +766,24 @@ func _IndexerService_ListTokenHolders_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(IndexerServiceServer).ListTokenHolders(ctx, req.(*ListTokenHoldersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexerService_ListTokenInventory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTokenInventoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexerServiceServer).ListTokenInventory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexerService_ListTokenInventory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexerServiceServer).ListTokenInventory(ctx, req.(*ListTokenInventoryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1060,6 +1094,10 @@ var IndexerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListTokenHolders",
 			Handler:    _IndexerService_ListTokenHolders_Handler,
+		},
+		{
+			MethodName: "ListTokenInventory",
+			Handler:    _IndexerService_ListTokenInventory_Handler,
 		},
 		{
 			MethodName: "ListTokenBalances",

@@ -30,6 +30,7 @@ type BlockData struct {
 	Transfers            []*types.TokenTransfer
 	Contracts            []*types.Contract
 	Tokens               []*types.Token
+	NFTTokens            []*types.NFTToken
 	InternalTransactions []*types.InternalTransaction
 	AddressStats         map[string]*AddressStatsDelta
 	SkipAddressStats     bool // Skip address_stats updates (for catchup mode to avoid deadlocks)
@@ -131,6 +132,10 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 					symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
 					name = COALESCE(EXCLUDED.name, tokens.name),
 					decimals = COALESCE(EXCLUDED.decimals, tokens.decimals),
+					-- Promote a previously misclassified row (e.g. an ERC721 first
+					-- seen before this fix, stored as the ERC20 default) when a
+					-- more specific type is observed, but never downgrade.
+					token_type = CASE WHEN EXCLUDED.token_type <> 'ERC20' THEN EXCLUDED.token_type ELSE tokens.token_type END,
 					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)
 				RETURNING (xmax = 0)`,
 				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
@@ -146,6 +151,27 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 				deltaTokens++
 			}
 		}
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	if len(data.NFTTokens) > 0 {
+		batch := &pgx.Batch{}
+		for _, n := range data.NFTTokens {
+			batch.Queue(`
+				INSERT INTO nft_tokens (token_address, token_id, owner, token_uri, block_number)
+				VALUES ($1, $2, $3, $4, $5)
+				ON CONFLICT (token_address, token_id) DO UPDATE SET
+					owner = EXCLUDED.owner,
+					-- tokenURI is captured once at mint; a later transfer carries
+					-- no URI, so keep the existing value rather than nulling it.
+					token_uri = COALESCE(nft_tokens.token_uri, EXCLUDED.token_uri),
+					block_number = EXCLUDED.block_number,
+					updated_at = NOW()`,
+				n.TokenAddress, n.TokenID, n.Owner, n.TokenURI, n.BlockNumber)
+		}
+		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {
 			return err
 		}
