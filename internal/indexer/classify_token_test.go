@@ -10,6 +10,7 @@ func TestClassifyNewToken(t *testing.T) {
 	tests := []struct {
 		name         string
 		isERC721     bool
+		isERC1155    bool
 		metaDecimals int
 		wantType     string
 		wantDecimals int
@@ -19,6 +20,21 @@ func TestClassifyNewToken(t *testing.T) {
 			isERC721:     true,
 			metaDecimals: 18, // metadata fallback for a contract with no decimals()
 			wantType:     types.TokenTypeERC721,
+			wantDecimals: 0,
+		},
+		{
+			name:         "erc1155 forces type 1155 and zero decimals",
+			isERC1155:    true,
+			metaDecimals: 18,
+			wantType:     types.TokenTypeERC1155,
+			wantDecimals: 0,
+		},
+		{
+			name:         "erc1155 wins over erc721 when both signals present",
+			isERC721:     true,
+			isERC1155:    true,
+			metaDecimals: 18,
+			wantType:     types.TokenTypeERC1155,
 			wantDecimals: 0,
 		},
 		{
@@ -39,7 +55,7 @@ func TestClassifyNewToken(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotType, gotDecimals := classifyNewToken(tt.isERC721, tt.metaDecimals)
+			gotType, gotDecimals := classifyNewToken(tt.isERC721, tt.isERC1155, tt.metaDecimals)
 			if gotType != tt.wantType {
 				t.Errorf("token type = %q, want %q", gotType, tt.wantType)
 			}
