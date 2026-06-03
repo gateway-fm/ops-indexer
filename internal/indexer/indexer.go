@@ -48,6 +48,18 @@ type Config struct {
 
 var transferTopic = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
+// ERC-1155 transfer event signatures. Unlike ERC20/721 these carry the token
+// id(s) and value(s) in the log data, not the indexed topics; topics 1-3 are
+// operator/from/to.
+//   TransferSingle(address,address,address,uint256,uint256)
+//   TransferBatch(address,address,address,uint256[],uint256[])
+var transferSingleTopic = common.HexToHash("0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62")
+var transferBatchTopic = common.HexToHash("0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb")
+
+// erc1155URISelector is the 4-byte selector for uri(uint256), the ERC-1155
+// metadata accessor (the ERC-721 equivalent is tokenURI(uint256)).
+const erc1155URISelector = "0x0e89341c"
+
 var zeroAddress = common.HexToAddress("0x0000000000000000000000000000000000000000")
 
 type Indexer struct {
@@ -634,6 +646,10 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	// run after the log loop. nftURIRowIdx[k] indexes into blockData.NFTTokens.
 	var nftURIReqs []rpc.NFTURIRequest
 	var nftURIRowIdx []int
+	// Same, for ERC-1155: uri(id) is fetched at mint and attached to the
+	// recipient's holding row. erc1155URIRowIdx[k] indexes ERC1155Holdings.
+	var erc1155URIReqs []rpc.NFTURIRequest
+	var erc1155URIRowIdx []int
 
 	for idx, rawTx := range rawTxs {
 		receipt := receipts[rawTx.Hash]
@@ -869,6 +885,94 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 				i.bumpTokenTransferDelta(blockData.AddressStats, fromAddr, blockNumber)
 				i.bumpTokenTransferDelta(blockData.AddressStats, toAddr, blockNumber)
 			}
+
+			// ERC-1155: TransferSingle / TransferBatch. Topics are
+			// [sig, operator, from, to]; the id(s) and value(s) live in the
+			// log data, not the topics.
+			if len(logEntry.Topics) >= 4 &&
+				(logEntry.Topics[0] == transferSingleTopic || logEntry.Topics[0] == transferBatchTopic) {
+				fromAddr := common.BytesToAddress(logEntry.Topics[2].Bytes())
+				toAddr := common.BytesToAddress(logEntry.Topics[3].Bytes())
+
+				var ids, values []*big.Int
+				if logEntry.Topics[0] == transferSingleTopic {
+					if len(logEntry.Data) >= 64 {
+						ids = []*big.Int{new(big.Int).SetBytes(logEntry.Data[0:32])}
+						values = []*big.Int{new(big.Int).SetBytes(logEntry.Data[32:64])}
+					}
+				} else {
+					ids, values = decodeERC1155Batch(logEntry.Data)
+				}
+
+				transferType := types.TransferTypeTransfer
+				if fromAddr == zeroAddress {
+					transferType = types.TransferTypeMint
+				} else if toAddr == zeroAddress {
+					transferType = types.TransferTypeBurn
+				}
+
+				for n := 0; n < len(ids) && n < len(values); n++ {
+					idStr := ids[n].String()
+					valStr := values[n].String()
+
+					blockData.Transfers = append(blockData.Transfers, &types.TokenTransfer{
+						TxHash:       rawTx.Hash.Hex(),
+						LogIndex:     int(logEntry.Index),
+						TokenAddress: logEntry.Address.Hex(),
+						From:         fromAddr.Hex(),
+						To:           toAddr.Hex(),
+						Value:        types.JSONString(valStr),
+						BlockNumber:  blockNumber,
+						Timestamp:    &blockTimestamp,
+						TransferType: transferType,
+						TokenType:    types.TokenTypeERC1155,
+						TokenID:      &idStr,
+						IsInternal:   false,
+					})
+
+					// Accumulate per-(id, owner) balances as signed deltas:
+					// debit the sender, credit the recipient. A mint (from=0)
+					// or burn (to=0) only touches one side. ERC1155 balances
+					// are per token id, which the aggregate `balances` table
+					// cannot express, so they live in erc1155_holdings instead.
+					if fromAddr != zeroAddress {
+						blockData.ERC1155Holdings = append(blockData.ERC1155Holdings, &types.ERC1155Holding{
+							TokenAddress: logEntry.Address.Hex(),
+							TokenID:      idStr,
+							Owner:        fromAddr.Hex(),
+							Delta:        new(big.Int).Neg(values[n]).String(),
+							BlockNumber:  blockNumber,
+						})
+					}
+					if toAddr != zeroAddress {
+						blockData.ERC1155Holdings = append(blockData.ERC1155Holdings, &types.ERC1155Holding{
+							TokenAddress: logEntry.Address.Hex(),
+							TokenID:      idStr,
+							Owner:        toAddr.Hex(),
+							Delta:        valStr,
+							BlockNumber:  blockNumber,
+						})
+						if transferType == types.TransferTypeMint {
+							erc1155URIReqs = append(erc1155URIReqs, rpc.NFTURIRequest{
+								Address:  logEntry.Address,
+								TokenID:  ids[n],
+								Selector: erc1155URISelector,
+							})
+							erc1155URIRowIdx = append(erc1155URIRowIdx, len(blockData.ERC1155Holdings)-1)
+						}
+					}
+
+					i.bumpTokenTransferDelta(blockData.AddressStats, fromAddr, blockNumber)
+					i.bumpTokenTransferDelta(blockData.AddressStats, toAddr, blockNumber)
+				}
+
+				if len(ids) > 0 && !i.tokenCache.Has(logEntry.Address.Hex()) {
+					if _, exists := newTokenTxHashes[logEntry.Address]; !exists {
+						newTokenAddresses = append(newTokenAddresses, logEntry.Address)
+						newTokenTxHashes[logEntry.Address] = rawTx.Hash.Hex()
+					}
+				}
+			}
 		}
 	}
 
@@ -895,9 +999,13 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		// tokenId is carried as an indexed topic). Carry that signal over to the
 		// token entity instead of defaulting every new contract to ERC20.
 		erc721Tokens := make(map[string]bool)
+		erc1155Tokens := make(map[string]bool)
 		for _, tr := range blockData.Transfers {
-			if tr.TokenType == types.TokenTypeERC721 {
+			switch tr.TokenType {
+			case types.TokenTypeERC721:
 				erc721Tokens[tr.TokenAddress] = true
+			case types.TokenTypeERC1155:
+				erc1155Tokens[tr.TokenAddress] = true
 			}
 		}
 
@@ -911,7 +1019,7 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 				}
 				txHash := newTokenTxHashes[addr]
 
-				tokenType, decimals := classifyNewToken(erc721Tokens[addr.Hex()], meta.Decimals)
+				tokenType, decimals := classifyNewToken(erc721Tokens[addr.Hex()], erc1155Tokens[addr.Hex()], meta.Decimals)
 
 				blockData.Tokens = append(blockData.Tokens, &types.Token{
 					Address:     addr.Hex(),
@@ -934,6 +1042,18 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			if uri, ok := uris[k]; ok {
 				u := uri
 				blockData.NFTTokens[rowIdx].TokenURI = &u
+			}
+		}
+	}
+
+	// Same for freshly minted ERC-1155 ids: resolve uri(id) and attach it to
+	// the mint recipient's holding row.
+	if len(erc1155URIReqs) > 0 {
+		uris := i.rpc.FetchTokenURIsBatch(ctx, erc1155URIReqs, i.config.TokenMetadataWorkers, i.config.RPCRateLimit)
+		for k, rowIdx := range erc1155URIRowIdx {
+			if uri, ok := uris[k]; ok {
+				u := uri
+				blockData.ERC1155Holdings[rowIdx].TokenURI = &u
 			}
 		}
 	}
@@ -1033,15 +1153,60 @@ func (i *Indexer) updateDailyStatsForDate(ctx context.Context, blockTimestamp ui
 // SQL is authoritative for those edge cases), but it eliminates the common
 // pure-recipient drift of badge=0 vs list=N.
 // classifyNewToken decides the stored token_type and decimals for a freshly
-// discovered contract. ERC721 is inferred from the transfer topology already
-// parsed for this block (a 4-topic Transfer carries the tokenId as an indexed
-// topic). NFTs do not implement decimals(), so the metadata layer's fallback
-// of 18 is meaningless for them and is replaced with 0.
-func classifyNewToken(isERC721 bool, metaDecimals int) (tokenType string, decimals int) {
-	if isERC721 {
+// discovered contract. The standard is inferred from the transfer topology
+// already parsed for this block: a 4-topic Transfer carries the tokenId as an
+// indexed topic (ERC721), and TransferSingle/TransferBatch mark ERC1155. NFTs
+// and multi-tokens do not implement decimals(), so the metadata layer's
+// fallback of 18 is meaningless for them and is replaced with 0.
+func classifyNewToken(isERC721, isERC1155 bool, metaDecimals int) (tokenType string, decimals int) {
+	switch {
+	case isERC1155:
+		return types.TokenTypeERC1155, 0
+	case isERC721:
 		return types.TokenTypeERC721, 0
+	default:
+		return types.TokenTypeERC20, metaDecimals
 	}
-	return types.TokenTypeERC20, metaDecimals
+}
+
+// decodeERC1155Batch decodes the data payload of a TransferBatch event, whose
+// ABI is (uint256[] ids, uint256[] values). The layout is: two 32-byte head
+// words holding the byte offsets of each array, then each array as a 32-byte
+// length followed by that many 32-byte words. Malformed/truncated data yields
+// nil slices (the event is skipped) rather than a panic. Only the shorter of
+// the two arrays is honoured if their lengths disagree.
+func decodeERC1155Batch(data []byte) (ids, values []*big.Int) {
+	readWord := func(off uint64) (*big.Int, bool) {
+		if off+32 > uint64(len(data)) {
+			return nil, false
+		}
+		return new(big.Int).SetBytes(data[off : off+32]), true
+	}
+	readArray := func(headWord uint64) []*big.Int {
+		off, ok := readWord(headWord * 32)
+		if !ok {
+			return nil
+		}
+		base := off.Uint64()
+		lenWord, ok := readWord(base)
+		if !ok {
+			return nil
+		}
+		n := lenWord.Uint64()
+		out := make([]*big.Int, 0, n)
+		for k := uint64(0); k < n; k++ {
+			w, ok := readWord(base + 32 + k*32)
+			if !ok {
+				return nil
+			}
+			out = append(out, w)
+		}
+		return out
+	}
+	if len(data) < 64 {
+		return nil, nil
+	}
+	return readArray(0), readArray(1)
 }
 
 func (i *Indexer) bumpTokenTransferDelta(stats map[string]*db.AddressStatsDelta, addr common.Address, blockNumber uint64) {

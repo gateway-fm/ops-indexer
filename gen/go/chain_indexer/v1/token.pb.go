@@ -981,13 +981,17 @@ func (x *BatchGetTokenBalancesResponse) GetBalances() map[string]*BatchGetTokenB
 	return nil
 }
 
-// One NFT instance in a collection's inventory: a token id, its current owner,
-// and the raw tokenURI captured at mint.
+// One entry in a collection's inventory. For ERC-721 this is a single token id
+// with its current owner. For ERC-1155 the same id is held by many owners, so
+// owner is empty and quantity (total live supply of the id) and holders
+// (distinct owners with a positive balance) are populated instead.
 type TokenInventoryItem struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TokenId       *BigInt                `protobuf:"bytes,1,opt,name=token_id,json=tokenId,proto3" json:"token_id,omitempty"`
 	Owner         string                 `protobuf:"bytes,2,opt,name=owner,proto3" json:"owner,omitempty"`
-	TokenUri      string                 `protobuf:"bytes,3,opt,name=token_uri,json=tokenUri,proto3" json:"token_uri,omitempty"` // raw tokenURI(); empty if unknown
+	TokenUri      string                 `protobuf:"bytes,3,opt,name=token_uri,json=tokenUri,proto3" json:"token_uri,omitempty"` // raw tokenURI()/uri(); empty if unknown
+	Quantity      string                 `protobuf:"bytes,4,opt,name=quantity,proto3" json:"quantity,omitempty"`                 // ERC-1155: total live supply of this id; empty for ERC-721
+	Holders       int64                  `protobuf:"varint,5,opt,name=holders,proto3" json:"holders,omitempty"`                  // ERC-1155: distinct owners holding this id; 0 for ERC-721
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1041,6 +1045,20 @@ func (x *TokenInventoryItem) GetTokenUri() string {
 		return x.TokenUri
 	}
 	return ""
+}
+
+func (x *TokenInventoryItem) GetQuantity() string {
+	if x != nil {
+		return x.Quantity
+	}
+	return ""
+}
+
+func (x *TokenInventoryItem) GetHolders() int64 {
+	if x != nil {
+		return x.Holders
+	}
+	return 0
 }
 
 type ListTokenInventoryRequest struct {
@@ -1280,11 +1298,13 @@ const file_chain_indexer_v1_token_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12V\n" +
 	"\x05value\x18\x02 \x01(\v2@.chain_indexer.v1.BatchGetTokenBalancesResponse.TokenBalanceListR\x05value:\x028\x01\x1aH\n" +
 	"\x10TokenBalanceList\x124\n" +
-	"\x05items\x18\x01 \x03(\v2\x1e.chain_indexer.v1.TokenBalanceR\x05items\"|\n" +
+	"\x05items\x18\x01 \x03(\v2\x1e.chain_indexer.v1.TokenBalanceR\x05items\"\xb2\x01\n" +
 	"\x12TokenInventoryItem\x123\n" +
 	"\btoken_id\x18\x01 \x01(\v2\x18.chain_indexer.v1.BigIntR\atokenId\x12\x14\n" +
 	"\x05owner\x18\x02 \x01(\tR\x05owner\x12\x1b\n" +
-	"\ttoken_uri\x18\x03 \x01(\tR\btokenUri\"\x94\x01\n" +
+	"\ttoken_uri\x18\x03 \x01(\tR\btokenUri\x12\x1a\n" +
+	"\bquantity\x18\x04 \x01(\tR\bquantity\x12\x18\n" +
+	"\aholders\x18\x05 \x01(\x03R\aholders\"\x94\x01\n" +
 	"\x19ListTokenInventoryRequest\x127\n" +
 	"\x04page\x18\x01 \x01(\v2#.chain_indexer.v1.OffsetPageRequestR\x04page\x12#\n" +
 	"\rtoken_address\x18\x02 \x01(\tR\ftokenAddress\x12\x19\n" +

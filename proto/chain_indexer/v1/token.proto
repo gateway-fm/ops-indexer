@@ -136,12 +136,16 @@ message BatchGetTokenBalancesResponse {
   }
 }
 
-// One NFT instance in a collection's inventory: a token id, its current owner,
-// and the raw tokenURI captured at mint.
+// One entry in a collection's inventory. For ERC-721 this is a single token id
+// with its current owner. For ERC-1155 the same id is held by many owners, so
+// owner is empty and quantity (total live supply of the id) and holders
+// (distinct owners with a positive balance) are populated instead.
 message TokenInventoryItem {
   BigInt token_id = 1;
   string owner = 2;
-  string token_uri = 3;  // raw tokenURI(); empty if unknown
+  string token_uri = 3;  // raw tokenURI()/uri(); empty if unknown
+  string quantity = 4;   // ERC-1155: total live supply of this id; empty for ERC-721
+  int64 holders = 5;     // ERC-1155: distinct owners holding this id; 0 for ERC-721
 }
 
 message ListTokenInventoryRequest {

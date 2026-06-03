@@ -118,11 +118,31 @@ type NFTToken struct {
 	BlockNumber  uint64
 }
 
-// TokenInventoryItem is one entry in a collection's inventory listing.
+// ERC1155Holding is one (collection, token_id, owner) balance row, written as a
+// signed delta during indexing and accumulated in the erc1155_holdings table.
+// Unlike ERC721 (one owner per id), an ERC1155 token id can be held by many
+// owners, each with a quantity — so the per-instance owner model of NFTToken
+// does not fit. Delta is positive for the transfer's `to` and negative for its
+// `from`; TokenURI is captured once at mint (uri(id)).
+type ERC1155Holding struct {
+	TokenAddress string
+	TokenID      string  // decimal string
+	Owner        string
+	Delta        string  // signed decimal string applied to the running balance
+	TokenURI     *string // captured at mint; nil otherwise
+	BlockNumber  uint64
+}
+
+// TokenInventoryItem is one entry in a collection's inventory listing. For
+// ERC721 it is a single token id with its current Owner. For ERC1155 the same
+// id is held by many owners, so Owner is empty and Quantity (total live supply
+// of the id) and Holders (distinct owners with a positive balance) are set.
 type TokenInventoryItem struct {
 	TokenID  string  `json:"tokenId"`
 	Owner    string  `json:"owner"`
 	TokenURI *string `json:"tokenUri,omitempty"`
+	Quantity *string `json:"quantity,omitempty"`
+	Holders  *int64  `json:"holders,omitempty"`
 }
 
 type TokenTransfer struct {
@@ -302,9 +322,10 @@ const (
 )
 
 const (
-	TokenTypeERC20  = "ERC20"
-	TokenTypeERC721 = "ERC721"
-	TokenTypeNative = "NATIVE"
+	TokenTypeERC20   = "ERC20"
+	TokenTypeERC721  = "ERC721"
+	TokenTypeERC1155 = "ERC1155"
+	TokenTypeNative  = "NATIVE"
 )
 
 const (
