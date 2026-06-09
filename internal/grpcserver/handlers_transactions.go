@@ -103,6 +103,30 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 	return nil, invalidArgument("unsupported filter type")
 }
 
+// ListTransactionsPaginated serves the global tx feed with offset pagination
+// and a true chain-wide total, for browse-style UIs that show "page X of Y".
+func (s *Server) ListTransactionsPaginated(ctx context.Context, req *indexerv1.ListTransactionsPaginatedRequest) (*indexerv1.ListTransactionsPaginatedResponse, error) {
+	page := int(req.GetPage().GetPage())
+	if page < 1 {
+		page = 1
+	}
+	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
+
+	rows, total, err := s.db.GetTransactionsPaginatedWithCategories(ctx, page, pageSize)
+	if err != nil {
+		slog.Error("ListTransactionsPaginated", "error", err)
+		return nil, internalErr(err, "ListTransactionsPaginated")
+	}
+	return &indexerv1.ListTransactionsPaginatedResponse{
+		Transactions: mapTransactions(rows),
+		Page: &indexerv1.OffsetPageResponse{
+			Page:       int32(page),
+			PageSize:   int32(pageSize),
+			TotalItems: total,
+		},
+	}, nil
+}
+
 // buildTxListResponse applies the limit+1 cursor encoding pattern.
 // If len(rows) > limit, encode a cursor pointing at the last returned row
 // and trim rows to the requested page size.

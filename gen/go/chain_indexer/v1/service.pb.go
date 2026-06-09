@@ -365,7 +365,7 @@ const file_chain_indexer_v1_service_proto_rawDesc = "" +
 	"\x18SEARCH_RESULT_KIND_BLOCK\x10\x01\x12\"\n" +
 	"\x1eSEARCH_RESULT_KIND_TRANSACTION\x10\x02\x12\x1e\n" +
 	"\x1aSEARCH_RESULT_KIND_ADDRESS\x10\x03\x12\x1c\n" +
-	"\x18SEARCH_RESULT_KIND_TOKEN\x10\x042\xe1\x15\n" +
+	"\x18SEARCH_RESULT_KIND_TOKEN\x10\x042\xe8\x16\n" +
 	"\x0eIndexerService\x12F\n" +
 	"\bGetBlock\x12!.chain_indexer.v1.GetBlockRequest\x1a\x17.chain_indexer.v1.Block\x12W\n" +
 	"\n" +
@@ -373,7 +373,8 @@ const file_chain_indexer_v1_service_proto_rawDesc = "" +
 	"\x14GetLatestBlockNumber\x12\x17.chain_indexer.v1.Empty\x1a#.chain_indexer.v1.LatestBlockNumber\x12\x93\x01\n" +
 	"\x1eBatchGetBlockTransactionCounts\x127.chain_indexer.v1.BatchGetBlockTransactionCountsRequest\x1a8.chain_indexer.v1.BatchGetBlockTransactionCountsResponse\x12X\n" +
 	"\x0eGetTransaction\x12'.chain_indexer.v1.GetTransactionRequest\x1a\x1d.chain_indexer.v1.Transaction\x12i\n" +
-	"\x10ListTransactions\x12).chain_indexer.v1.ListTransactionsRequest\x1a*.chain_indexer.v1.ListTransactionsResponse\x12\x99\x01\n" +
+	"\x10ListTransactions\x12).chain_indexer.v1.ListTransactionsRequest\x1a*.chain_indexer.v1.ListTransactionsResponse\x12\x84\x01\n" +
+	"\x19ListTransactionsPaginated\x122.chain_indexer.v1.ListTransactionsPaginatedRequest\x1a3.chain_indexer.v1.ListTransactionsPaginatedResponse\x12\x99\x01\n" +
 	" BatchGetAddressTransactionCounts\x129.chain_indexer.v1.BatchGetAddressTransactionCountsRequest\x1a:.chain_indexer.v1.BatchGetAddressTransactionCountsResponse\x12Q\n" +
 	"\bListLogs\x12!.chain_indexer.v1.ListLogsRequest\x1a\".chain_indexer.v1.ListLogsResponse\x12F\n" +
 	"\bGetToken\x12!.chain_indexer.v1.GetTokenRequest\x1a\x17.chain_indexer.v1.Token\x12W\n" +
@@ -429,47 +430,49 @@ var file_chain_indexer_v1_service_proto_goTypes = []any{
 	(*BatchGetBlockTransactionCountsRequest)(nil),    // 12: chain_indexer.v1.BatchGetBlockTransactionCountsRequest
 	(*GetTransactionRequest)(nil),                    // 13: chain_indexer.v1.GetTransactionRequest
 	(*ListTransactionsRequest)(nil),                  // 14: chain_indexer.v1.ListTransactionsRequest
-	(*BatchGetAddressTransactionCountsRequest)(nil),  // 15: chain_indexer.v1.BatchGetAddressTransactionCountsRequest
-	(*ListLogsRequest)(nil),                          // 16: chain_indexer.v1.ListLogsRequest
-	(*GetTokenRequest)(nil),                          // 17: chain_indexer.v1.GetTokenRequest
-	(*ListTokensRequest)(nil),                        // 18: chain_indexer.v1.ListTokensRequest
-	(*ListTokenTransfersRequest)(nil),                // 19: chain_indexer.v1.ListTokenTransfersRequest
-	(*ListAllTokenTransfersRequest)(nil),             // 20: chain_indexer.v1.ListAllTokenTransfersRequest
-	(*ListTokenHoldersRequest)(nil),                  // 21: chain_indexer.v1.ListTokenHoldersRequest
-	(*ListTokenInventoryRequest)(nil),                // 22: chain_indexer.v1.ListTokenInventoryRequest
-	(*ListTokenBalancesRequest)(nil),                 // 23: chain_indexer.v1.ListTokenBalancesRequest
-	(*BatchGetTokenBalancesRequest)(nil),             // 24: chain_indexer.v1.BatchGetTokenBalancesRequest
-	(*GetAddressRequest)(nil),                        // 25: chain_indexer.v1.GetAddressRequest
-	(*ListAddressesRequest)(nil),                     // 26: chain_indexer.v1.ListAddressesRequest
-	(*GetContractRequest)(nil),                       // 27: chain_indexer.v1.GetContractRequest
-	(*ListInternalTransactionsRequest)(nil),          // 28: chain_indexer.v1.ListInternalTransactionsRequest
-	(*GetTransactionHistoryRequest)(nil),             // 29: chain_indexer.v1.GetTransactionHistoryRequest
-	(*GetGasPricesRequest)(nil),                      // 30: chain_indexer.v1.GetGasPricesRequest
-	(*GetDailyStatsRequest)(nil),                     // 31: chain_indexer.v1.GetDailyStatsRequest
-	(*GetOPDepositRequest)(nil),                      // 32: chain_indexer.v1.GetOPDepositRequest
-	(*ListOPDepositsRequest)(nil),                    // 33: chain_indexer.v1.ListOPDepositsRequest
-	(*ListBlocksResponse)(nil),                       // 34: chain_indexer.v1.ListBlocksResponse
-	(*BatchGetBlockTransactionCountsResponse)(nil),   // 35: chain_indexer.v1.BatchGetBlockTransactionCountsResponse
-	(*ListTransactionsResponse)(nil),                 // 36: chain_indexer.v1.ListTransactionsResponse
-	(*BatchGetAddressTransactionCountsResponse)(nil), // 37: chain_indexer.v1.BatchGetAddressTransactionCountsResponse
-	(*ListLogsResponse)(nil),                         // 38: chain_indexer.v1.ListLogsResponse
-	(*ListTokensResponse)(nil),                       // 39: chain_indexer.v1.ListTokensResponse
-	(*ListTokenTransfersResponse)(nil),               // 40: chain_indexer.v1.ListTokenTransfersResponse
-	(*ListAllTokenTransfersResponse)(nil),            // 41: chain_indexer.v1.ListAllTokenTransfersResponse
-	(*ListTokenHoldersResponse)(nil),                 // 42: chain_indexer.v1.ListTokenHoldersResponse
-	(*ListTokenInventoryResponse)(nil),               // 43: chain_indexer.v1.ListTokenInventoryResponse
-	(*ListTokenBalancesResponse)(nil),                // 44: chain_indexer.v1.ListTokenBalancesResponse
-	(*BatchGetTokenBalancesResponse)(nil),            // 45: chain_indexer.v1.BatchGetTokenBalancesResponse
-	(*ListAddressesResponse)(nil),                    // 46: chain_indexer.v1.ListAddressesResponse
-	(*Contract)(nil),                                 // 47: chain_indexer.v1.Contract
-	(*ListInternalTransactionsResponse)(nil),         // 48: chain_indexer.v1.ListInternalTransactionsResponse
-	(*ChainStats)(nil),                               // 49: chain_indexer.v1.ChainStats
-	(*TransactionHistory)(nil),                       // 50: chain_indexer.v1.TransactionHistory
-	(*GasPrices)(nil),                                // 51: chain_indexer.v1.GasPrices
-	(*GetDailyStatsResponse)(nil),                    // 52: chain_indexer.v1.GetDailyStatsResponse
-	(*SyncStatus)(nil),                               // 53: chain_indexer.v1.SyncStatus
-	(*OPDeposit)(nil),                                // 54: chain_indexer.v1.OPDeposit
-	(*ListOPDepositsResponse)(nil),                   // 55: chain_indexer.v1.ListOPDepositsResponse
+	(*ListTransactionsPaginatedRequest)(nil),         // 15: chain_indexer.v1.ListTransactionsPaginatedRequest
+	(*BatchGetAddressTransactionCountsRequest)(nil),  // 16: chain_indexer.v1.BatchGetAddressTransactionCountsRequest
+	(*ListLogsRequest)(nil),                          // 17: chain_indexer.v1.ListLogsRequest
+	(*GetTokenRequest)(nil),                          // 18: chain_indexer.v1.GetTokenRequest
+	(*ListTokensRequest)(nil),                        // 19: chain_indexer.v1.ListTokensRequest
+	(*ListTokenTransfersRequest)(nil),                // 20: chain_indexer.v1.ListTokenTransfersRequest
+	(*ListAllTokenTransfersRequest)(nil),             // 21: chain_indexer.v1.ListAllTokenTransfersRequest
+	(*ListTokenHoldersRequest)(nil),                  // 22: chain_indexer.v1.ListTokenHoldersRequest
+	(*ListTokenInventoryRequest)(nil),                // 23: chain_indexer.v1.ListTokenInventoryRequest
+	(*ListTokenBalancesRequest)(nil),                 // 24: chain_indexer.v1.ListTokenBalancesRequest
+	(*BatchGetTokenBalancesRequest)(nil),             // 25: chain_indexer.v1.BatchGetTokenBalancesRequest
+	(*GetAddressRequest)(nil),                        // 26: chain_indexer.v1.GetAddressRequest
+	(*ListAddressesRequest)(nil),                     // 27: chain_indexer.v1.ListAddressesRequest
+	(*GetContractRequest)(nil),                       // 28: chain_indexer.v1.GetContractRequest
+	(*ListInternalTransactionsRequest)(nil),          // 29: chain_indexer.v1.ListInternalTransactionsRequest
+	(*GetTransactionHistoryRequest)(nil),             // 30: chain_indexer.v1.GetTransactionHistoryRequest
+	(*GetGasPricesRequest)(nil),                      // 31: chain_indexer.v1.GetGasPricesRequest
+	(*GetDailyStatsRequest)(nil),                     // 32: chain_indexer.v1.GetDailyStatsRequest
+	(*GetOPDepositRequest)(nil),                      // 33: chain_indexer.v1.GetOPDepositRequest
+	(*ListOPDepositsRequest)(nil),                    // 34: chain_indexer.v1.ListOPDepositsRequest
+	(*ListBlocksResponse)(nil),                       // 35: chain_indexer.v1.ListBlocksResponse
+	(*BatchGetBlockTransactionCountsResponse)(nil),   // 36: chain_indexer.v1.BatchGetBlockTransactionCountsResponse
+	(*ListTransactionsResponse)(nil),                 // 37: chain_indexer.v1.ListTransactionsResponse
+	(*ListTransactionsPaginatedResponse)(nil),        // 38: chain_indexer.v1.ListTransactionsPaginatedResponse
+	(*BatchGetAddressTransactionCountsResponse)(nil), // 39: chain_indexer.v1.BatchGetAddressTransactionCountsResponse
+	(*ListLogsResponse)(nil),                         // 40: chain_indexer.v1.ListLogsResponse
+	(*ListTokensResponse)(nil),                       // 41: chain_indexer.v1.ListTokensResponse
+	(*ListTokenTransfersResponse)(nil),               // 42: chain_indexer.v1.ListTokenTransfersResponse
+	(*ListAllTokenTransfersResponse)(nil),            // 43: chain_indexer.v1.ListAllTokenTransfersResponse
+	(*ListTokenHoldersResponse)(nil),                 // 44: chain_indexer.v1.ListTokenHoldersResponse
+	(*ListTokenInventoryResponse)(nil),               // 45: chain_indexer.v1.ListTokenInventoryResponse
+	(*ListTokenBalancesResponse)(nil),                // 46: chain_indexer.v1.ListTokenBalancesResponse
+	(*BatchGetTokenBalancesResponse)(nil),            // 47: chain_indexer.v1.BatchGetTokenBalancesResponse
+	(*ListAddressesResponse)(nil),                    // 48: chain_indexer.v1.ListAddressesResponse
+	(*Contract)(nil),                                 // 49: chain_indexer.v1.Contract
+	(*ListInternalTransactionsResponse)(nil),         // 50: chain_indexer.v1.ListInternalTransactionsResponse
+	(*ChainStats)(nil),                               // 51: chain_indexer.v1.ChainStats
+	(*TransactionHistory)(nil),                       // 52: chain_indexer.v1.TransactionHistory
+	(*GasPrices)(nil),                                // 53: chain_indexer.v1.GasPrices
+	(*GetDailyStatsResponse)(nil),                    // 54: chain_indexer.v1.GetDailyStatsResponse
+	(*SyncStatus)(nil),                               // 55: chain_indexer.v1.SyncStatus
+	(*OPDeposit)(nil),                                // 56: chain_indexer.v1.OPDeposit
+	(*ListOPDepositsResponse)(nil),                   // 57: chain_indexer.v1.ListOPDepositsResponse
 }
 var file_chain_indexer_v1_service_proto_depIdxs = []int32{
 	4,  // 0: chain_indexer.v1.SearchResponse.results:type_name -> chain_indexer.v1.SearchResponse.SearchResult
@@ -484,58 +487,60 @@ var file_chain_indexer_v1_service_proto_depIdxs = []int32{
 	12, // 9: chain_indexer.v1.IndexerService.BatchGetBlockTransactionCounts:input_type -> chain_indexer.v1.BatchGetBlockTransactionCountsRequest
 	13, // 10: chain_indexer.v1.IndexerService.GetTransaction:input_type -> chain_indexer.v1.GetTransactionRequest
 	14, // 11: chain_indexer.v1.IndexerService.ListTransactions:input_type -> chain_indexer.v1.ListTransactionsRequest
-	15, // 12: chain_indexer.v1.IndexerService.BatchGetAddressTransactionCounts:input_type -> chain_indexer.v1.BatchGetAddressTransactionCountsRequest
-	16, // 13: chain_indexer.v1.IndexerService.ListLogs:input_type -> chain_indexer.v1.ListLogsRequest
-	17, // 14: chain_indexer.v1.IndexerService.GetToken:input_type -> chain_indexer.v1.GetTokenRequest
-	18, // 15: chain_indexer.v1.IndexerService.ListTokens:input_type -> chain_indexer.v1.ListTokensRequest
-	19, // 16: chain_indexer.v1.IndexerService.ListTokenTransfers:input_type -> chain_indexer.v1.ListTokenTransfersRequest
-	20, // 17: chain_indexer.v1.IndexerService.ListAllTokenTransfers:input_type -> chain_indexer.v1.ListAllTokenTransfersRequest
-	21, // 18: chain_indexer.v1.IndexerService.ListTokenHolders:input_type -> chain_indexer.v1.ListTokenHoldersRequest
-	22, // 19: chain_indexer.v1.IndexerService.ListTokenInventory:input_type -> chain_indexer.v1.ListTokenInventoryRequest
-	23, // 20: chain_indexer.v1.IndexerService.ListTokenBalances:input_type -> chain_indexer.v1.ListTokenBalancesRequest
-	24, // 21: chain_indexer.v1.IndexerService.BatchGetTokenBalances:input_type -> chain_indexer.v1.BatchGetTokenBalancesRequest
-	25, // 22: chain_indexer.v1.IndexerService.GetAddress:input_type -> chain_indexer.v1.GetAddressRequest
-	26, // 23: chain_indexer.v1.IndexerService.ListAddresses:input_type -> chain_indexer.v1.ListAddressesRequest
-	27, // 24: chain_indexer.v1.IndexerService.GetContract:input_type -> chain_indexer.v1.GetContractRequest
-	28, // 25: chain_indexer.v1.IndexerService.ListInternalTransactions:input_type -> chain_indexer.v1.ListInternalTransactionsRequest
-	11, // 26: chain_indexer.v1.IndexerService.GetChainStats:input_type -> chain_indexer.v1.Empty
-	29, // 27: chain_indexer.v1.IndexerService.GetTransactionHistory:input_type -> chain_indexer.v1.GetTransactionHistoryRequest
-	30, // 28: chain_indexer.v1.IndexerService.GetGasPrices:input_type -> chain_indexer.v1.GetGasPricesRequest
-	31, // 29: chain_indexer.v1.IndexerService.GetDailyStats:input_type -> chain_indexer.v1.GetDailyStatsRequest
-	2,  // 30: chain_indexer.v1.IndexerService.Search:input_type -> chain_indexer.v1.SearchRequest
-	11, // 31: chain_indexer.v1.IndexerService.GetSyncStatus:input_type -> chain_indexer.v1.Empty
-	32, // 32: chain_indexer.v1.IndexerService.GetOPDeposit:input_type -> chain_indexer.v1.GetOPDepositRequest
-	33, // 33: chain_indexer.v1.IndexerService.ListOPDeposits:input_type -> chain_indexer.v1.ListOPDepositsRequest
-	5,  // 34: chain_indexer.v1.IndexerService.GetBlock:output_type -> chain_indexer.v1.Block
-	34, // 35: chain_indexer.v1.IndexerService.ListBlocks:output_type -> chain_indexer.v1.ListBlocksResponse
-	1,  // 36: chain_indexer.v1.IndexerService.GetLatestBlockNumber:output_type -> chain_indexer.v1.LatestBlockNumber
-	35, // 37: chain_indexer.v1.IndexerService.BatchGetBlockTransactionCounts:output_type -> chain_indexer.v1.BatchGetBlockTransactionCountsResponse
-	6,  // 38: chain_indexer.v1.IndexerService.GetTransaction:output_type -> chain_indexer.v1.Transaction
-	36, // 39: chain_indexer.v1.IndexerService.ListTransactions:output_type -> chain_indexer.v1.ListTransactionsResponse
-	37, // 40: chain_indexer.v1.IndexerService.BatchGetAddressTransactionCounts:output_type -> chain_indexer.v1.BatchGetAddressTransactionCountsResponse
-	38, // 41: chain_indexer.v1.IndexerService.ListLogs:output_type -> chain_indexer.v1.ListLogsResponse
-	8,  // 42: chain_indexer.v1.IndexerService.GetToken:output_type -> chain_indexer.v1.Token
-	39, // 43: chain_indexer.v1.IndexerService.ListTokens:output_type -> chain_indexer.v1.ListTokensResponse
-	40, // 44: chain_indexer.v1.IndexerService.ListTokenTransfers:output_type -> chain_indexer.v1.ListTokenTransfersResponse
-	41, // 45: chain_indexer.v1.IndexerService.ListAllTokenTransfers:output_type -> chain_indexer.v1.ListAllTokenTransfersResponse
-	42, // 46: chain_indexer.v1.IndexerService.ListTokenHolders:output_type -> chain_indexer.v1.ListTokenHoldersResponse
-	43, // 47: chain_indexer.v1.IndexerService.ListTokenInventory:output_type -> chain_indexer.v1.ListTokenInventoryResponse
-	44, // 48: chain_indexer.v1.IndexerService.ListTokenBalances:output_type -> chain_indexer.v1.ListTokenBalancesResponse
-	45, // 49: chain_indexer.v1.IndexerService.BatchGetTokenBalances:output_type -> chain_indexer.v1.BatchGetTokenBalancesResponse
-	7,  // 50: chain_indexer.v1.IndexerService.GetAddress:output_type -> chain_indexer.v1.Address
-	46, // 51: chain_indexer.v1.IndexerService.ListAddresses:output_type -> chain_indexer.v1.ListAddressesResponse
-	47, // 52: chain_indexer.v1.IndexerService.GetContract:output_type -> chain_indexer.v1.Contract
-	48, // 53: chain_indexer.v1.IndexerService.ListInternalTransactions:output_type -> chain_indexer.v1.ListInternalTransactionsResponse
-	49, // 54: chain_indexer.v1.IndexerService.GetChainStats:output_type -> chain_indexer.v1.ChainStats
-	50, // 55: chain_indexer.v1.IndexerService.GetTransactionHistory:output_type -> chain_indexer.v1.TransactionHistory
-	51, // 56: chain_indexer.v1.IndexerService.GetGasPrices:output_type -> chain_indexer.v1.GasPrices
-	52, // 57: chain_indexer.v1.IndexerService.GetDailyStats:output_type -> chain_indexer.v1.GetDailyStatsResponse
-	3,  // 58: chain_indexer.v1.IndexerService.Search:output_type -> chain_indexer.v1.SearchResponse
-	53, // 59: chain_indexer.v1.IndexerService.GetSyncStatus:output_type -> chain_indexer.v1.SyncStatus
-	54, // 60: chain_indexer.v1.IndexerService.GetOPDeposit:output_type -> chain_indexer.v1.OPDeposit
-	55, // 61: chain_indexer.v1.IndexerService.ListOPDeposits:output_type -> chain_indexer.v1.ListOPDepositsResponse
-	34, // [34:62] is the sub-list for method output_type
-	6,  // [6:34] is the sub-list for method input_type
+	15, // 12: chain_indexer.v1.IndexerService.ListTransactionsPaginated:input_type -> chain_indexer.v1.ListTransactionsPaginatedRequest
+	16, // 13: chain_indexer.v1.IndexerService.BatchGetAddressTransactionCounts:input_type -> chain_indexer.v1.BatchGetAddressTransactionCountsRequest
+	17, // 14: chain_indexer.v1.IndexerService.ListLogs:input_type -> chain_indexer.v1.ListLogsRequest
+	18, // 15: chain_indexer.v1.IndexerService.GetToken:input_type -> chain_indexer.v1.GetTokenRequest
+	19, // 16: chain_indexer.v1.IndexerService.ListTokens:input_type -> chain_indexer.v1.ListTokensRequest
+	20, // 17: chain_indexer.v1.IndexerService.ListTokenTransfers:input_type -> chain_indexer.v1.ListTokenTransfersRequest
+	21, // 18: chain_indexer.v1.IndexerService.ListAllTokenTransfers:input_type -> chain_indexer.v1.ListAllTokenTransfersRequest
+	22, // 19: chain_indexer.v1.IndexerService.ListTokenHolders:input_type -> chain_indexer.v1.ListTokenHoldersRequest
+	23, // 20: chain_indexer.v1.IndexerService.ListTokenInventory:input_type -> chain_indexer.v1.ListTokenInventoryRequest
+	24, // 21: chain_indexer.v1.IndexerService.ListTokenBalances:input_type -> chain_indexer.v1.ListTokenBalancesRequest
+	25, // 22: chain_indexer.v1.IndexerService.BatchGetTokenBalances:input_type -> chain_indexer.v1.BatchGetTokenBalancesRequest
+	26, // 23: chain_indexer.v1.IndexerService.GetAddress:input_type -> chain_indexer.v1.GetAddressRequest
+	27, // 24: chain_indexer.v1.IndexerService.ListAddresses:input_type -> chain_indexer.v1.ListAddressesRequest
+	28, // 25: chain_indexer.v1.IndexerService.GetContract:input_type -> chain_indexer.v1.GetContractRequest
+	29, // 26: chain_indexer.v1.IndexerService.ListInternalTransactions:input_type -> chain_indexer.v1.ListInternalTransactionsRequest
+	11, // 27: chain_indexer.v1.IndexerService.GetChainStats:input_type -> chain_indexer.v1.Empty
+	30, // 28: chain_indexer.v1.IndexerService.GetTransactionHistory:input_type -> chain_indexer.v1.GetTransactionHistoryRequest
+	31, // 29: chain_indexer.v1.IndexerService.GetGasPrices:input_type -> chain_indexer.v1.GetGasPricesRequest
+	32, // 30: chain_indexer.v1.IndexerService.GetDailyStats:input_type -> chain_indexer.v1.GetDailyStatsRequest
+	2,  // 31: chain_indexer.v1.IndexerService.Search:input_type -> chain_indexer.v1.SearchRequest
+	11, // 32: chain_indexer.v1.IndexerService.GetSyncStatus:input_type -> chain_indexer.v1.Empty
+	33, // 33: chain_indexer.v1.IndexerService.GetOPDeposit:input_type -> chain_indexer.v1.GetOPDepositRequest
+	34, // 34: chain_indexer.v1.IndexerService.ListOPDeposits:input_type -> chain_indexer.v1.ListOPDepositsRequest
+	5,  // 35: chain_indexer.v1.IndexerService.GetBlock:output_type -> chain_indexer.v1.Block
+	35, // 36: chain_indexer.v1.IndexerService.ListBlocks:output_type -> chain_indexer.v1.ListBlocksResponse
+	1,  // 37: chain_indexer.v1.IndexerService.GetLatestBlockNumber:output_type -> chain_indexer.v1.LatestBlockNumber
+	36, // 38: chain_indexer.v1.IndexerService.BatchGetBlockTransactionCounts:output_type -> chain_indexer.v1.BatchGetBlockTransactionCountsResponse
+	6,  // 39: chain_indexer.v1.IndexerService.GetTransaction:output_type -> chain_indexer.v1.Transaction
+	37, // 40: chain_indexer.v1.IndexerService.ListTransactions:output_type -> chain_indexer.v1.ListTransactionsResponse
+	38, // 41: chain_indexer.v1.IndexerService.ListTransactionsPaginated:output_type -> chain_indexer.v1.ListTransactionsPaginatedResponse
+	39, // 42: chain_indexer.v1.IndexerService.BatchGetAddressTransactionCounts:output_type -> chain_indexer.v1.BatchGetAddressTransactionCountsResponse
+	40, // 43: chain_indexer.v1.IndexerService.ListLogs:output_type -> chain_indexer.v1.ListLogsResponse
+	8,  // 44: chain_indexer.v1.IndexerService.GetToken:output_type -> chain_indexer.v1.Token
+	41, // 45: chain_indexer.v1.IndexerService.ListTokens:output_type -> chain_indexer.v1.ListTokensResponse
+	42, // 46: chain_indexer.v1.IndexerService.ListTokenTransfers:output_type -> chain_indexer.v1.ListTokenTransfersResponse
+	43, // 47: chain_indexer.v1.IndexerService.ListAllTokenTransfers:output_type -> chain_indexer.v1.ListAllTokenTransfersResponse
+	44, // 48: chain_indexer.v1.IndexerService.ListTokenHolders:output_type -> chain_indexer.v1.ListTokenHoldersResponse
+	45, // 49: chain_indexer.v1.IndexerService.ListTokenInventory:output_type -> chain_indexer.v1.ListTokenInventoryResponse
+	46, // 50: chain_indexer.v1.IndexerService.ListTokenBalances:output_type -> chain_indexer.v1.ListTokenBalancesResponse
+	47, // 51: chain_indexer.v1.IndexerService.BatchGetTokenBalances:output_type -> chain_indexer.v1.BatchGetTokenBalancesResponse
+	7,  // 52: chain_indexer.v1.IndexerService.GetAddress:output_type -> chain_indexer.v1.Address
+	48, // 53: chain_indexer.v1.IndexerService.ListAddresses:output_type -> chain_indexer.v1.ListAddressesResponse
+	49, // 54: chain_indexer.v1.IndexerService.GetContract:output_type -> chain_indexer.v1.Contract
+	50, // 55: chain_indexer.v1.IndexerService.ListInternalTransactions:output_type -> chain_indexer.v1.ListInternalTransactionsResponse
+	51, // 56: chain_indexer.v1.IndexerService.GetChainStats:output_type -> chain_indexer.v1.ChainStats
+	52, // 57: chain_indexer.v1.IndexerService.GetTransactionHistory:output_type -> chain_indexer.v1.TransactionHistory
+	53, // 58: chain_indexer.v1.IndexerService.GetGasPrices:output_type -> chain_indexer.v1.GasPrices
+	54, // 59: chain_indexer.v1.IndexerService.GetDailyStats:output_type -> chain_indexer.v1.GetDailyStatsResponse
+	3,  // 60: chain_indexer.v1.IndexerService.Search:output_type -> chain_indexer.v1.SearchResponse
+	55, // 61: chain_indexer.v1.IndexerService.GetSyncStatus:output_type -> chain_indexer.v1.SyncStatus
+	56, // 62: chain_indexer.v1.IndexerService.GetOPDeposit:output_type -> chain_indexer.v1.OPDeposit
+	57, // 63: chain_indexer.v1.IndexerService.ListOPDeposits:output_type -> chain_indexer.v1.ListOPDepositsResponse
+	35, // [35:64] is the sub-list for method output_type
+	6,  // [6:35] is the sub-list for method input_type
 	6,  // [6:6] is the sub-list for extension type_name
 	6,  // [6:6] is the sub-list for extension extendee
 	0,  // [0:6] is the sub-list for field type_name

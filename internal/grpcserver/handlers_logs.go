@@ -21,24 +21,24 @@ func (s *Server) ListLogs(ctx context.Context, req *indexerv1.ListLogsRequest) (
 	}
 
 	var rows []types.Log
+	var total int64
 	var err error
-	// Dispatch to the narrowest existing db query.
+	// Dispatch to the narrowest existing db query. total is the filter-wide
+	// count (ignoring pagination) so consumers can show a true "of N".
 	switch {
 	case hasTxHash:
+		// A tx's logs are fully returned (no limit), so len is the true total.
 		rows, err = s.db.GetLogsByTransaction(ctx, req.GetByTxHash())
+		total = int64(len(rows))
 	case hasAddress && !hasTopic:
 		// db.GetLogsByAddress uses offset pagination; we adapt by ignoring offset
 		// for the first cursor-less page and returning no next cursor. A
 		// follow-up DB change introduces proper cursor semantics for this path.
-		var rs []types.Log
-		rs, _, err = s.db.GetLogsByAddress(ctx, strings.ToLower(req.GetByAddress()), limit, 0)
-		rows = rs
+		rows, total, err = s.db.GetLogsByAddress(ctx, strings.ToLower(req.GetByAddress()), limit, 0)
 	case hasTopic && !hasAddress:
-		var rs []types.Log
-		rs, _, err = s.db.GetLogsByTopic(ctx, req.GetTopic0(), limit, 0)
-		rows = rs
+		rows, total, err = s.db.GetLogsByTopic(ctx, req.GetTopic0(), limit, 0)
 	default:
-		// Multi-filter branch: use the flexible GetLogs.
+		// Multi-filter branch: use the flexible GetLogs + matching CountLogs.
 		var addr, topic *string
 		if hasAddress {
 			a := strings.ToLower(req.GetByAddress())
@@ -60,6 +60,9 @@ func (s *Server) ListLogs(ctx context.Context, req *indexerv1.ListLogsRequest) (
 			}
 		}
 		rows, err = s.db.GetLogs(ctx, addr, topic, from, to, limit)
+		if err == nil {
+			total, err = s.db.CountLogs(ctx, addr, topic, from, to)
+		}
 	}
 	if err != nil {
 		slog.Error("ListLogs", "error", err)
@@ -67,7 +70,8 @@ func (s *Server) ListLogs(ctx context.Context, req *indexerv1.ListLogsRequest) (
 	}
 
 	return &indexerv1.ListLogsResponse{
-		Logs: mapLogs(rows),
-		Page: &indexerv1.PageResponse{}, // cursor pagination for logs pending DB support
+		Logs:       mapLogs(rows),
+		Page:       &indexerv1.PageResponse{}, // cursor pagination for logs pending DB support
+		TotalCount: total,
 	}, nil
 }

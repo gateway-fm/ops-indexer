@@ -43,4 +43,9 @@ message ListLogsRequest {
 message ListLogsResponse {
   repeated Log logs = 1;
   PageResponse page = 2;
+
+  // Total number of logs matching the request filter (ignoring pagination),
+  // so consumers can render a true "of N" count. 0 when no filter yields a
+  // countable set.
+  int64 total_count = 3;
 }

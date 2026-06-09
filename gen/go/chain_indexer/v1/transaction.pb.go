@@ -632,6 +632,108 @@ func (x *ListTransactionsResponse) GetPage() *PageResponse {
 	return nil
 }
 
+// ListTransactionsPaginated is the offset-paginated variant of the global
+// transaction feed. Unlike the cursor-based ListTransactions, it returns a
+// true chain-wide total in OffsetPageResponse.total_items so browse-style
+// consumers can render "page X of Y" / "N total". Sorted newest-first.
+// No filters: this is the unfiltered global feed (use ListTransactions for
+// by-address / by-block feeds).
+type ListTransactionsPaginatedRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Page          *OffsetPageRequest     `protobuf:"bytes,1,opt,name=page,proto3" json:"page,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListTransactionsPaginatedRequest) Reset() {
+	*x = ListTransactionsPaginatedRequest{}
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListTransactionsPaginatedRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListTransactionsPaginatedRequest) ProtoMessage() {}
+
+func (x *ListTransactionsPaginatedRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListTransactionsPaginatedRequest.ProtoReflect.Descriptor instead.
+func (*ListTransactionsPaginatedRequest) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v1_transaction_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ListTransactionsPaginatedRequest) GetPage() *OffsetPageRequest {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
+type ListTransactionsPaginatedResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Transactions  []*Transaction         `protobuf:"bytes,1,rep,name=transactions,proto3" json:"transactions,omitempty"`
+	Page          *OffsetPageResponse    `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListTransactionsPaginatedResponse) Reset() {
+	*x = ListTransactionsPaginatedResponse{}
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListTransactionsPaginatedResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListTransactionsPaginatedResponse) ProtoMessage() {}
+
+func (x *ListTransactionsPaginatedResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListTransactionsPaginatedResponse.ProtoReflect.Descriptor instead.
+func (*ListTransactionsPaginatedResponse) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v1_transaction_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ListTransactionsPaginatedResponse) GetTransactions() []*Transaction {
+	if x != nil {
+		return x.Transactions
+	}
+	return nil
+}
+
+func (x *ListTransactionsPaginatedResponse) GetPage() *OffsetPageResponse {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
 // BatchGetAddressTransactionCounts returns tx counts for multiple addresses.
 // Used by consumers avoiding N+1 on account-list rendering.
 type BatchGetAddressTransactionCountsRequest struct {
@@ -643,7 +745,7 @@ type BatchGetAddressTransactionCountsRequest struct {
 
 func (x *BatchGetAddressTransactionCountsRequest) Reset() {
 	*x = BatchGetAddressTransactionCountsRequest{}
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[4]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -655,7 +757,7 @@ func (x *BatchGetAddressTransactionCountsRequest) String() string {
 func (*BatchGetAddressTransactionCountsRequest) ProtoMessage() {}
 
 func (x *BatchGetAddressTransactionCountsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[4]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -668,7 +770,7 @@ func (x *BatchGetAddressTransactionCountsRequest) ProtoReflect() protoreflect.Me
 
 // Deprecated: Use BatchGetAddressTransactionCountsRequest.ProtoReflect.Descriptor instead.
 func (*BatchGetAddressTransactionCountsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v1_transaction_proto_rawDescGZIP(), []int{4}
+	return file_chain_indexer_v1_transaction_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *BatchGetAddressTransactionCountsRequest) GetAddresses() []string {
@@ -688,7 +790,7 @@ type BatchGetAddressTransactionCountsResponse struct {
 
 func (x *BatchGetAddressTransactionCountsResponse) Reset() {
 	*x = BatchGetAddressTransactionCountsResponse{}
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[5]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -700,7 +802,7 @@ func (x *BatchGetAddressTransactionCountsResponse) String() string {
 func (*BatchGetAddressTransactionCountsResponse) ProtoMessage() {}
 
 func (x *BatchGetAddressTransactionCountsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[5]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -713,7 +815,7 @@ func (x *BatchGetAddressTransactionCountsResponse) ProtoReflect() protoreflect.M
 
 // Deprecated: Use BatchGetAddressTransactionCountsResponse.ProtoReflect.Descriptor instead.
 func (*BatchGetAddressTransactionCountsResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v1_transaction_proto_rawDescGZIP(), []int{5}
+	return file_chain_indexer_v1_transaction_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *BatchGetAddressTransactionCountsResponse) GetCounts() map[string]uint64 {
@@ -733,7 +835,7 @@ type ListTransactionsRequest_AddressFilter struct {
 
 func (x *ListTransactionsRequest_AddressFilter) Reset() {
 	*x = ListTransactionsRequest_AddressFilter{}
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[6]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -745,7 +847,7 @@ func (x *ListTransactionsRequest_AddressFilter) String() string {
 func (*ListTransactionsRequest_AddressFilter) ProtoMessage() {}
 
 func (x *ListTransactionsRequest_AddressFilter) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[6]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -788,7 +890,7 @@ type ListTransactionsRequest_BlockFilter struct {
 
 func (x *ListTransactionsRequest_BlockFilter) Reset() {
 	*x = ListTransactionsRequest_BlockFilter{}
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[7]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -800,7 +902,7 @@ func (x *ListTransactionsRequest_BlockFilter) String() string {
 func (*ListTransactionsRequest_BlockFilter) ProtoMessage() {}
 
 func (x *ListTransactionsRequest_BlockFilter) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[7]
+	mi := &file_chain_indexer_v1_transaction_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -914,7 +1016,12 @@ const file_chain_indexer_v1_transaction_proto_rawDesc = "" +
 	"\x06filter\"\x91\x01\n" +
 	"\x18ListTransactionsResponse\x12A\n" +
 	"\ftransactions\x18\x01 \x03(\v2\x1d.chain_indexer.v1.TransactionR\ftransactions\x122\n" +
-	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04page\"G\n" +
+	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04page\"[\n" +
+	" ListTransactionsPaginatedRequest\x127\n" +
+	"\x04page\x18\x01 \x01(\v2#.chain_indexer.v1.OffsetPageRequestR\x04page\"\xa0\x01\n" +
+	"!ListTransactionsPaginatedResponse\x12A\n" +
+	"\ftransactions\x18\x01 \x03(\v2\x1d.chain_indexer.v1.TransactionR\ftransactions\x128\n" +
+	"\x04page\x18\x02 \x01(\v2$.chain_indexer.v1.OffsetPageResponseR\x04page\"G\n" +
 	"'BatchGetAddressTransactionCountsRequest\x12\x1c\n" +
 	"\taddresses\x18\x01 \x03(\tR\taddresses\"\xc5\x01\n" +
 	"(BatchGetAddressTransactionCountsResponse\x12^\n" +
@@ -951,7 +1058,7 @@ func file_chain_indexer_v1_transaction_proto_rawDescGZIP() []byte {
 }
 
 var file_chain_indexer_v1_transaction_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_chain_indexer_v1_transaction_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_chain_indexer_v1_transaction_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_chain_indexer_v1_transaction_proto_goTypes = []any{
 	(TransactionCategory)(0),                         // 0: chain_indexer.v1.TransactionCategory
 	(TransactionStatus)(0),                           // 1: chain_indexer.v1.TransactionStatus
@@ -960,43 +1067,50 @@ var file_chain_indexer_v1_transaction_proto_goTypes = []any{
 	(*GetTransactionRequest)(nil),                    // 4: chain_indexer.v1.GetTransactionRequest
 	(*ListTransactionsRequest)(nil),                  // 5: chain_indexer.v1.ListTransactionsRequest
 	(*ListTransactionsResponse)(nil),                 // 6: chain_indexer.v1.ListTransactionsResponse
-	(*BatchGetAddressTransactionCountsRequest)(nil),  // 7: chain_indexer.v1.BatchGetAddressTransactionCountsRequest
-	(*BatchGetAddressTransactionCountsResponse)(nil), // 8: chain_indexer.v1.BatchGetAddressTransactionCountsResponse
-	(*ListTransactionsRequest_AddressFilter)(nil),    // 9: chain_indexer.v1.ListTransactionsRequest.AddressFilter
-	(*ListTransactionsRequest_BlockFilter)(nil),      // 10: chain_indexer.v1.ListTransactionsRequest.BlockFilter
-	nil,                           // 11: chain_indexer.v1.BatchGetAddressTransactionCountsResponse.CountsEntry
-	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
-	(*BigInt)(nil),                // 13: chain_indexer.v1.BigInt
-	(*PageRequest)(nil),           // 14: chain_indexer.v1.PageRequest
-	(*BlockRange)(nil),            // 15: chain_indexer.v1.BlockRange
-	(*TimeRange)(nil),             // 16: chain_indexer.v1.TimeRange
-	(*PageResponse)(nil),          // 17: chain_indexer.v1.PageResponse
+	(*ListTransactionsPaginatedRequest)(nil),         // 7: chain_indexer.v1.ListTransactionsPaginatedRequest
+	(*ListTransactionsPaginatedResponse)(nil),        // 8: chain_indexer.v1.ListTransactionsPaginatedResponse
+	(*BatchGetAddressTransactionCountsRequest)(nil),  // 9: chain_indexer.v1.BatchGetAddressTransactionCountsRequest
+	(*BatchGetAddressTransactionCountsResponse)(nil), // 10: chain_indexer.v1.BatchGetAddressTransactionCountsResponse
+	(*ListTransactionsRequest_AddressFilter)(nil),    // 11: chain_indexer.v1.ListTransactionsRequest.AddressFilter
+	(*ListTransactionsRequest_BlockFilter)(nil),      // 12: chain_indexer.v1.ListTransactionsRequest.BlockFilter
+	nil,                           // 13: chain_indexer.v1.BatchGetAddressTransactionCountsResponse.CountsEntry
+	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
+	(*BigInt)(nil),                // 15: chain_indexer.v1.BigInt
+	(*PageRequest)(nil),           // 16: chain_indexer.v1.PageRequest
+	(*BlockRange)(nil),            // 17: chain_indexer.v1.BlockRange
+	(*TimeRange)(nil),             // 18: chain_indexer.v1.TimeRange
+	(*PageResponse)(nil),          // 19: chain_indexer.v1.PageResponse
+	(*OffsetPageRequest)(nil),     // 20: chain_indexer.v1.OffsetPageRequest
+	(*OffsetPageResponse)(nil),    // 21: chain_indexer.v1.OffsetPageResponse
 }
 var file_chain_indexer_v1_transaction_proto_depIdxs = []int32{
-	12, // 0: chain_indexer.v1.Transaction.block_timestamp:type_name -> google.protobuf.Timestamp
-	13, // 1: chain_indexer.v1.Transaction.value:type_name -> chain_indexer.v1.BigInt
-	13, // 2: chain_indexer.v1.Transaction.gas_price:type_name -> chain_indexer.v1.BigInt
-	13, // 3: chain_indexer.v1.Transaction.effective_gas_price:type_name -> chain_indexer.v1.BigInt
-	13, // 4: chain_indexer.v1.Transaction.max_fee_per_gas:type_name -> chain_indexer.v1.BigInt
-	13, // 5: chain_indexer.v1.Transaction.max_priority_fee_per_gas:type_name -> chain_indexer.v1.BigInt
+	14, // 0: chain_indexer.v1.Transaction.block_timestamp:type_name -> google.protobuf.Timestamp
+	15, // 1: chain_indexer.v1.Transaction.value:type_name -> chain_indexer.v1.BigInt
+	15, // 2: chain_indexer.v1.Transaction.gas_price:type_name -> chain_indexer.v1.BigInt
+	15, // 3: chain_indexer.v1.Transaction.effective_gas_price:type_name -> chain_indexer.v1.BigInt
+	15, // 4: chain_indexer.v1.Transaction.max_fee_per_gas:type_name -> chain_indexer.v1.BigInt
+	15, // 5: chain_indexer.v1.Transaction.max_priority_fee_per_gas:type_name -> chain_indexer.v1.BigInt
 	1,  // 6: chain_indexer.v1.Transaction.status:type_name -> chain_indexer.v1.TransactionStatus
 	0,  // 7: chain_indexer.v1.Transaction.categories:type_name -> chain_indexer.v1.TransactionCategory
-	14, // 8: chain_indexer.v1.ListTransactionsRequest.page:type_name -> chain_indexer.v1.PageRequest
-	9,  // 9: chain_indexer.v1.ListTransactionsRequest.by_address:type_name -> chain_indexer.v1.ListTransactionsRequest.AddressFilter
-	10, // 10: chain_indexer.v1.ListTransactionsRequest.by_block:type_name -> chain_indexer.v1.ListTransactionsRequest.BlockFilter
+	16, // 8: chain_indexer.v1.ListTransactionsRequest.page:type_name -> chain_indexer.v1.PageRequest
+	11, // 9: chain_indexer.v1.ListTransactionsRequest.by_address:type_name -> chain_indexer.v1.ListTransactionsRequest.AddressFilter
+	12, // 10: chain_indexer.v1.ListTransactionsRequest.by_block:type_name -> chain_indexer.v1.ListTransactionsRequest.BlockFilter
 	0,  // 11: chain_indexer.v1.ListTransactionsRequest.category_in:type_name -> chain_indexer.v1.TransactionCategory
-	15, // 12: chain_indexer.v1.ListTransactionsRequest.block_range:type_name -> chain_indexer.v1.BlockRange
-	16, // 13: chain_indexer.v1.ListTransactionsRequest.time_range:type_name -> chain_indexer.v1.TimeRange
+	17, // 12: chain_indexer.v1.ListTransactionsRequest.block_range:type_name -> chain_indexer.v1.BlockRange
+	18, // 13: chain_indexer.v1.ListTransactionsRequest.time_range:type_name -> chain_indexer.v1.TimeRange
 	1,  // 14: chain_indexer.v1.ListTransactionsRequest.status:type_name -> chain_indexer.v1.TransactionStatus
 	3,  // 15: chain_indexer.v1.ListTransactionsResponse.transactions:type_name -> chain_indexer.v1.Transaction
-	17, // 16: chain_indexer.v1.ListTransactionsResponse.page:type_name -> chain_indexer.v1.PageResponse
-	11, // 17: chain_indexer.v1.BatchGetAddressTransactionCountsResponse.counts:type_name -> chain_indexer.v1.BatchGetAddressTransactionCountsResponse.CountsEntry
-	2,  // 18: chain_indexer.v1.ListTransactionsRequest.AddressFilter.direction:type_name -> chain_indexer.v1.AddressDirection
-	19, // [19:19] is the sub-list for method output_type
-	19, // [19:19] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	19, // 16: chain_indexer.v1.ListTransactionsResponse.page:type_name -> chain_indexer.v1.PageResponse
+	20, // 17: chain_indexer.v1.ListTransactionsPaginatedRequest.page:type_name -> chain_indexer.v1.OffsetPageRequest
+	3,  // 18: chain_indexer.v1.ListTransactionsPaginatedResponse.transactions:type_name -> chain_indexer.v1.Transaction
+	21, // 19: chain_indexer.v1.ListTransactionsPaginatedResponse.page:type_name -> chain_indexer.v1.OffsetPageResponse
+	13, // 20: chain_indexer.v1.BatchGetAddressTransactionCountsResponse.counts:type_name -> chain_indexer.v1.BatchGetAddressTransactionCountsResponse.CountsEntry
+	2,  // 21: chain_indexer.v1.ListTransactionsRequest.AddressFilter.direction:type_name -> chain_indexer.v1.AddressDirection
+	22, // [22:22] is the sub-list for method output_type
+	22, // [22:22] is the sub-list for method input_type
+	22, // [22:22] is the sub-list for extension type_name
+	22, // [22:22] is the sub-list for extension extendee
+	0,  // [0:22] is the sub-list for field type_name
 }
 
 func init() { file_chain_indexer_v1_transaction_proto_init() }
@@ -1009,7 +1123,7 @@ func file_chain_indexer_v1_transaction_proto_init() {
 		(*ListTransactionsRequest_ByAddress)(nil),
 		(*ListTransactionsRequest_ByBlock)(nil),
 	}
-	file_chain_indexer_v1_transaction_proto_msgTypes[7].OneofWrappers = []any{
+	file_chain_indexer_v1_transaction_proto_msgTypes[9].OneofWrappers = []any{
 		(*ListTransactionsRequest_BlockFilter_Number)(nil),
 		(*ListTransactionsRequest_BlockFilter_Hash)(nil),
 	}
@@ -1019,7 +1133,7 @@ func file_chain_indexer_v1_transaction_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_chain_indexer_v1_transaction_proto_rawDesc), len(file_chain_indexer_v1_transaction_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

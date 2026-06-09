@@ -25,6 +25,7 @@ const (
 	IndexerService_BatchGetBlockTransactionCounts_FullMethodName   = "/chain_indexer.v1.IndexerService/BatchGetBlockTransactionCounts"
 	IndexerService_GetTransaction_FullMethodName                   = "/chain_indexer.v1.IndexerService/GetTransaction"
 	IndexerService_ListTransactions_FullMethodName                 = "/chain_indexer.v1.IndexerService/ListTransactions"
+	IndexerService_ListTransactionsPaginated_FullMethodName        = "/chain_indexer.v1.IndexerService/ListTransactionsPaginated"
 	IndexerService_BatchGetAddressTransactionCounts_FullMethodName = "/chain_indexer.v1.IndexerService/BatchGetAddressTransactionCounts"
 	IndexerService_ListLogs_FullMethodName                         = "/chain_indexer.v1.IndexerService/ListLogs"
 	IndexerService_GetToken_FullMethodName                         = "/chain_indexer.v1.IndexerService/GetToken"
@@ -76,6 +77,8 @@ type IndexerServiceClient interface {
 	// ----- Transactions -----
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*Transaction, error)
 	ListTransactions(ctx context.Context, in *ListTransactionsRequest, opts ...grpc.CallOption) (*ListTransactionsResponse, error)
+	// Offset-paginated global feed with a true total_items (for browse-style UIs).
+	ListTransactionsPaginated(ctx context.Context, in *ListTransactionsPaginatedRequest, opts ...grpc.CallOption) (*ListTransactionsPaginatedResponse, error)
 	BatchGetAddressTransactionCounts(ctx context.Context, in *BatchGetAddressTransactionCountsRequest, opts ...grpc.CallOption) (*BatchGetAddressTransactionCountsResponse, error)
 	// ----- Logs -----
 	ListLogs(ctx context.Context, in *ListLogsRequest, opts ...grpc.CallOption) (*ListLogsResponse, error)
@@ -171,6 +174,16 @@ func (c *indexerServiceClient) ListTransactions(ctx context.Context, in *ListTra
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListTransactionsResponse)
 	err := c.cc.Invoke(ctx, IndexerService_ListTransactions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *indexerServiceClient) ListTransactionsPaginated(ctx context.Context, in *ListTransactionsPaginatedRequest, opts ...grpc.CallOption) (*ListTransactionsPaginatedResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTransactionsPaginatedResponse)
+	err := c.cc.Invoke(ctx, IndexerService_ListTransactionsPaginated_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -424,6 +437,8 @@ type IndexerServiceServer interface {
 	// ----- Transactions -----
 	GetTransaction(context.Context, *GetTransactionRequest) (*Transaction, error)
 	ListTransactions(context.Context, *ListTransactionsRequest) (*ListTransactionsResponse, error)
+	// Offset-paginated global feed with a true total_items (for browse-style UIs).
+	ListTransactionsPaginated(context.Context, *ListTransactionsPaginatedRequest) (*ListTransactionsPaginatedResponse, error)
 	BatchGetAddressTransactionCounts(context.Context, *BatchGetAddressTransactionCountsRequest) (*BatchGetAddressTransactionCountsResponse, error)
 	// ----- Logs -----
 	ListLogs(context.Context, *ListLogsRequest) (*ListLogsResponse, error)
@@ -482,6 +497,9 @@ func (UnimplementedIndexerServiceServer) GetTransaction(context.Context, *GetTra
 }
 func (UnimplementedIndexerServiceServer) ListTransactions(context.Context, *ListTransactionsRequest) (*ListTransactionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListTransactions not implemented")
+}
+func (UnimplementedIndexerServiceServer) ListTransactionsPaginated(context.Context, *ListTransactionsPaginatedRequest) (*ListTransactionsPaginatedResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListTransactionsPaginated not implemented")
 }
 func (UnimplementedIndexerServiceServer) BatchGetAddressTransactionCounts(context.Context, *BatchGetAddressTransactionCountsRequest) (*BatchGetAddressTransactionCountsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BatchGetAddressTransactionCounts not implemented")
@@ -674,6 +692,24 @@ func _IndexerService_ListTransactions_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(IndexerServiceServer).ListTransactions(ctx, req.(*ListTransactionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _IndexerService_ListTransactionsPaginated_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTransactionsPaginatedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexerServiceServer).ListTransactionsPaginated(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexerService_ListTransactionsPaginated_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexerServiceServer).ListTransactionsPaginated(ctx, req.(*ListTransactionsPaginatedRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1104,6 +1140,10 @@ var IndexerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListTransactions",
 			Handler:    _IndexerService_ListTransactions_Handler,
+		},
+		{
+			MethodName: "ListTransactionsPaginated",
+			Handler:    _IndexerService_ListTransactionsPaginated_Handler,
 		},
 		{
 			MethodName: "BatchGetAddressTransactionCounts",

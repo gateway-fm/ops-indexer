@@ -68,10 +68,13 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 	}
 
 	var rows []types.TokenTransfer
+	var total int64
 	var err error
 	switch {
 	case hasTx:
+		// A tx's transfers are fully returned, so len is the true total.
 		rows, err = s.db.GetTransfersByTransaction(ctx, req.GetByTxHash())
+		total = int64(len(rows))
 	case hasAddr:
 		var beforeBlock *uint64
 		if c := req.GetPage().GetCursor(); c != "" {
@@ -81,11 +84,13 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 			}
 			beforeBlock = &cur.BlockNumber
 		}
-		rows, err = s.db.GetTransfersByAddress(ctx, strings.ToLower(req.GetByAddress()), limit+1, beforeBlock)
+		addr := strings.ToLower(req.GetByAddress())
+		rows, err = s.db.GetTransfersByAddress(ctx, addr, limit+1, beforeBlock)
+		if err == nil {
+			total, err = s.db.CountTransfersByAddress(ctx, addr)
+		}
 	case hasTok:
-		var rs []types.TokenTransfer
-		rs, _, err = s.db.GetTransfersByToken(ctx, strings.ToLower(req.GetByToken()), limit, 0)
-		rows = rs
+		rows, total, err = s.db.GetTransfersByToken(ctx, strings.ToLower(req.GetByToken()), limit, 0)
 	}
 	if err != nil {
 		slog.Error("ListTokenTransfers", "error", err)
@@ -102,8 +107,9 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 	}
 
 	return &indexerv1.ListTokenTransfersResponse{
-		Transfers: mapTokenTransfers(rows),
-		Page:      &indexerv1.PageResponse{NextCursor: nextCursor},
+		Transfers:  mapTokenTransfers(rows),
+		Page:       &indexerv1.PageResponse{NextCursor: nextCursor},
+		TotalCount: total,
 	}, nil
 }
 

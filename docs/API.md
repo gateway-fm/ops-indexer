@@ -52,7 +52,12 @@ message PageResponse {
 ### Offset pagination
 
 Use only for bounded browse endpoints where total is meaningful to show and users typically jump to a page:
-- `ListAddresses`, `ListTokens`, `ListTokenHolders`, `ListVerifiedContracts` (not in v1).
+- `ListAddresses`, `ListTokens`, `ListTokenHolders`, `ListTransactionsPaginated`, `ListVerifiedContracts` (not in v1).
+
+`ListTransactionsPaginated` is the offset-paginated variant of the global
+transaction feed: same rows as `ListTransactions` (no filter), but with a true
+chain-wide `total_items` so browse-style UIs can render "page X of Y". Use the
+cursor-based `ListTransactions` for by-address / by-block feeds.
 
 ```proto
 message OffsetPageRequest {
@@ -68,6 +73,15 @@ message OffsetPageResponse {
 
 - `total_items` is an exact count. On large tables the server may cap the scan and return `-1` for "too many to count" — consumers render "1000+" in that case.
 - `page_size` cap matches cursor pagination (100 by default).
+
+### Filter-wide counts on cursor list endpoints
+
+`ListLogs`, `ListTokenTransfers`, and `ListInternalTransactions` stay
+cursor-paginated, but each response also carries a `total_count` (int64) — the
+exact number of rows matching the request filter, ignoring pagination — so
+consumers can render a true "showing N of M". It is the count for the active
+filter (e.g. all logs for `by_address`, all transfers of a `by_token`, every
+log of a `by_tx_hash`), independent of `page_size`.
 
 ### Sort order
 
