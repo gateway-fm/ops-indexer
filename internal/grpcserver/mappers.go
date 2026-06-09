@@ -478,6 +478,16 @@ func mapDailyStats(rows []types.DailyStats) []*indexerv1.DailyStats {
 			Blocks:          uint64(r.TotalBlocks),
 			GasUsed:         uint64(r.TotalGasUsed),
 			TotalFees:       &indexerv1.BigInt{}, // schema has avg_gas_price only; total fees not stored directly
+
+			CumulativeTransactions: uint64(r.CumulativeTransactions),
+			CumulativeAddresses:    uint64(r.CumulativeAddresses),
+			CumulativeContracts:    uint64(r.CumulativeContracts),
+			SuccessCount:           uint64(r.SuccessfulTxs),
+			FailedCount:            uint64(r.FailedTxs),
+			NewContracts:           uint64(r.NewContracts),
+			TokenTransferCount:     uint64(r.TokenTransferCount),
+			AvgBlockTime:           r.AvgBlockTime,
+			AvgBlockSize:           uint64(r.AvgBlockSize),
 		}
 	}
 	return out

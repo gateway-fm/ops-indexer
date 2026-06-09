@@ -456,6 +456,10 @@ func (x *GetGasPricesRequest) GetSampleBlockCount() uint32 {
 }
 
 // DailyStats is a pre-aggregated row for one UTC day.
+//
+// The cumulative_* fields are running totals as of the end of this day
+// (inclusive), so charts can plot growth without summing on the client.
+// success_count + failed_count partition `transactions` by receipt status.
 type DailyStats struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Date            string                 `protobuf:"bytes,1,opt,name=date,proto3" json:"date,omitempty"` // "YYYY-MM-DD" in UTC
@@ -465,8 +469,19 @@ type DailyStats struct {
 	Blocks          uint64                 `protobuf:"varint,5,opt,name=blocks,proto3" json:"blocks,omitempty"`
 	GasUsed         uint64                 `protobuf:"varint,6,opt,name=gas_used,json=gasUsed,proto3" json:"gas_used,omitempty"`
 	TotalFees       *BigInt                `protobuf:"bytes,7,opt,name=total_fees,json=totalFees,proto3" json:"total_fees,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Running totals through the end of this day (inclusive).
+	CumulativeTransactions uint64 `protobuf:"varint,8,opt,name=cumulative_transactions,json=cumulativeTransactions,proto3" json:"cumulative_transactions,omitempty"`
+	CumulativeAddresses    uint64 `protobuf:"varint,9,opt,name=cumulative_addresses,json=cumulativeAddresses,proto3" json:"cumulative_addresses,omitempty"`
+	CumulativeContracts    uint64 `protobuf:"varint,10,opt,name=cumulative_contracts,json=cumulativeContracts,proto3" json:"cumulative_contracts,omitempty"`
+	// Receipt-status partition of `transactions`.
+	SuccessCount       uint64  `protobuf:"varint,11,opt,name=success_count,json=successCount,proto3" json:"success_count,omitempty"`
+	FailedCount        uint64  `protobuf:"varint,12,opt,name=failed_count,json=failedCount,proto3" json:"failed_count,omitempty"`
+	NewContracts       uint64  `protobuf:"varint,13,opt,name=new_contracts,json=newContracts,proto3" json:"new_contracts,omitempty"`
+	TokenTransferCount uint64  `protobuf:"varint,14,opt,name=token_transfer_count,json=tokenTransferCount,proto3" json:"token_transfer_count,omitempty"`
+	AvgBlockTime       float64 `protobuf:"fixed64,15,opt,name=avg_block_time,json=avgBlockTime,proto3" json:"avg_block_time,omitempty"` // mean inter-block gap in seconds for this day
+	AvgBlockSize       uint64  `protobuf:"varint,16,opt,name=avg_block_size,json=avgBlockSize,proto3" json:"avg_block_size,omitempty"`  // mean block size in bytes for this day
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *DailyStats) Reset() {
@@ -546,6 +561,69 @@ func (x *DailyStats) GetTotalFees() *BigInt {
 		return x.TotalFees
 	}
 	return nil
+}
+
+func (x *DailyStats) GetCumulativeTransactions() uint64 {
+	if x != nil {
+		return x.CumulativeTransactions
+	}
+	return 0
+}
+
+func (x *DailyStats) GetCumulativeAddresses() uint64 {
+	if x != nil {
+		return x.CumulativeAddresses
+	}
+	return 0
+}
+
+func (x *DailyStats) GetCumulativeContracts() uint64 {
+	if x != nil {
+		return x.CumulativeContracts
+	}
+	return 0
+}
+
+func (x *DailyStats) GetSuccessCount() uint64 {
+	if x != nil {
+		return x.SuccessCount
+	}
+	return 0
+}
+
+func (x *DailyStats) GetFailedCount() uint64 {
+	if x != nil {
+		return x.FailedCount
+	}
+	return 0
+}
+
+func (x *DailyStats) GetNewContracts() uint64 {
+	if x != nil {
+		return x.NewContracts
+	}
+	return 0
+}
+
+func (x *DailyStats) GetTokenTransferCount() uint64 {
+	if x != nil {
+		return x.TokenTransferCount
+	}
+	return 0
+}
+
+func (x *DailyStats) GetAvgBlockTime() float64 {
+	if x != nil {
+		return x.AvgBlockTime
+	}
+	return 0
+}
+
+func (x *DailyStats) GetAvgBlockSize() uint64 {
+	if x != nil {
+		return x.AvgBlockSize
+	}
+	return 0
 }
 
 type GetDailyStatsRequest struct {
@@ -753,7 +831,7 @@ const file_chain_indexer_v1_stats_proto_rawDesc = "" +
 	"\bbase_fee\x18\x04 \x01(\v2\x18.chain_indexer.v1.BigIntR\abaseFee\x12,\n" +
 	"\x12sample_block_count\x18\x05 \x01(\x04R\x10sampleBlockCount\"C\n" +
 	"\x13GetGasPricesRequest\x12,\n" +
-	"\x12sample_block_count\x18\x01 \x01(\rR\x10sampleBlockCount\"\x80\x02\n" +
+	"\x12sample_block_count\x18\x01 \x01(\rR\x10sampleBlockCount\"\x8a\x05\n" +
 	"\n" +
 	"DailyStats\x12\x12\n" +
 	"\x04date\x18\x01 \x01(\tR\x04date\x12\"\n" +
@@ -763,7 +841,17 @@ const file_chain_indexer_v1_stats_proto_rawDesc = "" +
 	"\x06blocks\x18\x05 \x01(\x04R\x06blocks\x12\x19\n" +
 	"\bgas_used\x18\x06 \x01(\x04R\agasUsed\x127\n" +
 	"\n" +
-	"total_fees\x18\a \x01(\v2\x18.chain_indexer.v1.BigIntR\ttotalFees\"L\n" +
+	"total_fees\x18\a \x01(\v2\x18.chain_indexer.v1.BigIntR\ttotalFees\x127\n" +
+	"\x17cumulative_transactions\x18\b \x01(\x04R\x16cumulativeTransactions\x121\n" +
+	"\x14cumulative_addresses\x18\t \x01(\x04R\x13cumulativeAddresses\x121\n" +
+	"\x14cumulative_contracts\x18\n" +
+	" \x01(\x04R\x13cumulativeContracts\x12#\n" +
+	"\rsuccess_count\x18\v \x01(\x04R\fsuccessCount\x12!\n" +
+	"\ffailed_count\x18\f \x01(\x04R\vfailedCount\x12#\n" +
+	"\rnew_contracts\x18\r \x01(\x04R\fnewContracts\x120\n" +
+	"\x14token_transfer_count\x18\x0e \x01(\x04R\x12tokenTransferCount\x12$\n" +
+	"\x0eavg_block_time\x18\x0f \x01(\x01R\favgBlockTime\x12$\n" +
+	"\x0eavg_block_size\x18\x10 \x01(\x04R\favgBlockSize\"L\n" +
 	"\x14GetDailyStatsRequest\x12\x1b\n" +
 	"\tfrom_date\x18\x01 \x01(\tR\bfromDate\x12\x17\n" +
 	"\ato_date\x18\x02 \x01(\tR\x06toDate\"I\n" +

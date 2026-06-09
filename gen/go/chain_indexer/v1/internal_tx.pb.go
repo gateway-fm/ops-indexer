@@ -250,8 +250,11 @@ type ListInternalTransactionsResponse struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	InternalTransactions []*InternalTransaction `protobuf:"bytes,1,rep,name=internal_transactions,json=internalTransactions,proto3" json:"internal_transactions,omitempty"`
 	Page                 *PageResponse          `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Total number of internal transactions matching the request filter
+	// (ignoring pagination), so consumers can render a true "of N" count.
+	TotalCount    int64 `protobuf:"varint,3,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ListInternalTransactionsResponse) Reset() {
@@ -296,6 +299,13 @@ func (x *ListInternalTransactionsResponse) GetPage() *PageResponse {
 		return x.Page
 	}
 	return nil
+}
+
+func (x *ListInternalTransactionsResponse) GetTotalCount() int64 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
 }
 
 type ListInternalTransactionsRequest_BlockFilter struct {
@@ -414,10 +424,12 @@ const file_chain_indexer_v1_internal_tx_proto_rawDesc = "" +
 	"\x06number\x18\x01 \x01(\x04H\x00R\x06number\x12\x14\n" +
 	"\x04hash\x18\x02 \x01(\tH\x00R\x04hashB\n" +
 	"\n" +
-	"\bselector\"\xb2\x01\n" +
+	"\bselector\"\xd3\x01\n" +
 	" ListInternalTransactionsResponse\x12Z\n" +
 	"\x15internal_transactions\x18\x01 \x03(\v2%.chain_indexer.v1.InternalTransactionR\x14internalTransactions\x122\n" +
-	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04pageBGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1b\x06proto3"
+	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04page\x12\x1f\n" +
+	"\vtotal_count\x18\x03 \x01(\x03R\n" +
+	"totalCountBGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1b\x06proto3"
 
 var (
 	file_chain_indexer_v1_internal_tx_proto_rawDescOnce sync.Once

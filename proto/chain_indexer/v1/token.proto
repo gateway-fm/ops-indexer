@@ -94,6 +94,10 @@ message ListTokenTransfersRequest {
 message ListTokenTransfersResponse {
   repeated TokenTransfer transfers = 1;
   PageResponse page = 2;
+
+  // Total number of transfers matching the request filter (ignoring
+  // pagination), so consumers can render a true "of N" count.
+  int64 total_count = 3;
 }
 
 // Global, unfiltered transfer feed for the explorer's "Token Transfers" page.

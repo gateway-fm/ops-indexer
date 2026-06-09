@@ -614,9 +614,12 @@ func (x *ListTokenTransfersRequest) GetBlockRange() *BlockRange {
 }
 
 type ListTokenTransfersResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Transfers     []*TokenTransfer       `protobuf:"bytes,1,rep,name=transfers,proto3" json:"transfers,omitempty"`
-	Page          *PageResponse          `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Transfers []*TokenTransfer       `protobuf:"bytes,1,rep,name=transfers,proto3" json:"transfers,omitempty"`
+	Page      *PageResponse          `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
+	// Total number of transfers matching the request filter (ignoring
+	// pagination), so consumers can render a true "of N" count.
+	TotalCount    int64 `protobuf:"varint,3,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -663,6 +666,13 @@ func (x *ListTokenTransfersResponse) GetPage() *PageResponse {
 		return x.Page
 	}
 	return nil
+}
+
+func (x *ListTokenTransfersResponse) GetTotalCount() int64 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
 }
 
 // Global, unfiltered transfer feed for the explorer's "Token Transfers" page.
@@ -1362,10 +1372,12 @@ const file_chain_indexer_v1_token_proto_rawDesc = "" +
 	"by_address\x18\x03 \x01(\tR\tbyAddress\x12\x19\n" +
 	"\bby_token\x18\x04 \x01(\tR\abyToken\x12=\n" +
 	"\vblock_range\x18\x05 \x01(\v2\x1c.chain_indexer.v1.BlockRangeR\n" +
-	"blockRange\"\x8f\x01\n" +
+	"blockRange\"\xb0\x01\n" +
 	"\x1aListTokenTransfersResponse\x12=\n" +
 	"\ttransfers\x18\x01 \x03(\v2\x1f.chain_indexer.v1.TokenTransferR\ttransfers\x122\n" +
-	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04page\"\x93\x01\n" +
+	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04page\x12\x1f\n" +
+	"\vtotal_count\x18\x03 \x01(\x03R\n" +
+	"totalCount\"\x93\x01\n" +
 	"\x1cListAllTokenTransfersRequest\x127\n" +
 	"\x04page\x18\x01 \x01(\v2#.chain_indexer.v1.OffsetPageRequestR\x04page\x12:\n" +
 	"\n" +

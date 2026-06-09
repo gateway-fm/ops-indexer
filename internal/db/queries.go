@@ -698,6 +698,17 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 	return scanTokenTransfers(rows)
 }
 
+// CountTransfersByAddress returns the total number of transfers where the
+// address is sender or receiver, ignoring pagination. Mirrors the WHERE clause
+// of GetTransfersByAddress so consumers can show a true "of N" total.
+func (d *DB) CountTransfersByAddress(ctx context.Context, address string) (int64, error) {
+	var total int64
+	addr := strings.ToLower(address)
+	err := d.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM token_transfers WHERE from_address = $1 OR to_address = $1`, addr).Scan(&total)
+	return total, err
+}
+
 func (d *DB) GetTransfersByTransaction(ctx context.Context, txHash string) ([]types.TokenTransfer, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
@@ -1291,6 +1302,39 @@ func (d *DB) GetLogs(ctx context.Context, address *string, topic0 *string, fromB
 	}
 	defer rows.Close()
 	return scanLogs(rows)
+}
+
+// CountLogs returns the total number of logs matching the given filters,
+// ignoring pagination. Mirrors the WHERE clause of GetLogs.
+func (d *DB) CountLogs(ctx context.Context, address *string, topic0 *string, fromBlock *uint64, toBlock *uint64) (int64, error) {
+	query := `SELECT COUNT(*) FROM logs WHERE 1=1`
+	args := []interface{}{}
+	argIdx := 1
+
+	if address != nil {
+		query += fmt.Sprintf(" AND address = LOWER($%d)", argIdx)
+		args = append(args, *address)
+		argIdx++
+	}
+	if topic0 != nil {
+		query += fmt.Sprintf(" AND topic0 = $%d", argIdx)
+		args = append(args, *topic0)
+		argIdx++
+	}
+	if fromBlock != nil {
+		query += fmt.Sprintf(" AND block_number >= $%d", argIdx)
+		args = append(args, *fromBlock)
+		argIdx++
+	}
+	if toBlock != nil {
+		query += fmt.Sprintf(" AND block_number <= $%d", argIdx)
+		args = append(args, *toBlock)
+		argIdx++
+	}
+
+	var total int64
+	err := d.pool.QueryRow(ctx, query, args...).Scan(&total)
+	return total, err
 }
 
 func scanLogs(rows pgx.Rows) ([]types.Log, error) {

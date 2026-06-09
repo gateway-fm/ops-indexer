@@ -39,6 +39,8 @@ service IndexerService {
   // ----- Transactions -----
   rpc GetTransaction(GetTransactionRequest) returns (Transaction);
   rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
+  // Offset-paginated global feed with a true total_items (for browse-style UIs).
+  rpc ListTransactionsPaginated(ListTransactionsPaginatedRequest) returns (ListTransactionsPaginatedResponse);
   rpc BatchGetAddressTransactionCounts(BatchGetAddressTransactionCountsRequest) returns (BatchGetAddressTransactionCountsResponse);
 
   // ----- Logs -----

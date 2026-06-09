@@ -223,9 +223,13 @@ func (x *ListLogsRequest) GetBlockRange() *BlockRange {
 }
 
 type ListLogsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Logs          []*Log                 `protobuf:"bytes,1,rep,name=logs,proto3" json:"logs,omitempty"`
-	Page          *PageResponse          `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Logs  []*Log                 `protobuf:"bytes,1,rep,name=logs,proto3" json:"logs,omitempty"`
+	Page  *PageResponse          `protobuf:"bytes,2,opt,name=page,proto3" json:"page,omitempty"`
+	// Total number of logs matching the request filter (ignoring pagination),
+	// so consumers can render a true "of N" count. 0 when no filter yields a
+	// countable set.
+	TotalCount    int64 `protobuf:"varint,3,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -274,6 +278,13 @@ func (x *ListLogsResponse) GetPage() *PageResponse {
 	return nil
 }
 
+func (x *ListLogsResponse) GetTotalCount() int64 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
 var File_chain_indexer_v1_log_proto protoreflect.FileDescriptor
 
 const file_chain_indexer_v1_log_proto_rawDesc = "" +
@@ -300,10 +311,12 @@ const file_chain_indexer_v1_log_proto_rawDesc = "" +
 	"by_address\x18\x03 \x01(\tR\tbyAddress\x12\x16\n" +
 	"\x06topic0\x18\x04 \x01(\tR\x06topic0\x12=\n" +
 	"\vblock_range\x18\x05 \x01(\v2\x1c.chain_indexer.v1.BlockRangeR\n" +
-	"blockRange\"q\n" +
+	"blockRange\"\x92\x01\n" +
 	"\x10ListLogsResponse\x12)\n" +
 	"\x04logs\x18\x01 \x03(\v2\x15.chain_indexer.v1.LogR\x04logs\x122\n" +
-	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04pageBGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1b\x06proto3"
+	"\x04page\x18\x02 \x01(\v2\x1e.chain_indexer.v1.PageResponseR\x04page\x12\x1f\n" +
+	"\vtotal_count\x18\x03 \x01(\x03R\n" +
+	"totalCountBGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1;indexerv1b\x06proto3"
 
 var (
 	file_chain_indexer_v1_log_proto_rawDescOnce sync.Once

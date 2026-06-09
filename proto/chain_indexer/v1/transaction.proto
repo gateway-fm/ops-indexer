@@ -121,6 +121,21 @@ message ListTransactionsResponse {
   PageResponse page = 2;
 }
 
+// ListTransactionsPaginated is the offset-paginated variant of the global
+// transaction feed. Unlike the cursor-based ListTransactions, it returns a
+// true chain-wide total in OffsetPageResponse.total_items so browse-style
+// consumers can render "page X of Y" / "N total". Sorted newest-first.
+// No filters: this is the unfiltered global feed (use ListTransactions for
+// by-address / by-block feeds).
+message ListTransactionsPaginatedRequest {
+  OffsetPageRequest page = 1;
+}
+
+message ListTransactionsPaginatedResponse {
+  repeated Transaction transactions = 1;
+  OffsetPageResponse page = 2;
+}
+
 // BatchGetAddressTransactionCounts returns tx counts for multiple addresses.
 // Used by consumers avoiding N+1 on account-list rendering.
 message BatchGetAddressTransactionCountsRequest {

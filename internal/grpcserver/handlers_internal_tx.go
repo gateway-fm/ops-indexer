@@ -20,14 +20,16 @@ func (s *Server) ListInternalTransactions(ctx context.Context, req *indexerv1.Li
 	}
 
 	var rows []types.InternalTransaction
+	var total int64
 	var err error
 	switch {
 	case hasTx:
+		// A tx's internal txs are fully returned, so len is the true total.
 		rows, err = s.db.GetInternalTransactionsByTx(ctx, req.GetByTxHash())
+		total = int64(len(rows))
 	case hasAddr:
 		// Offset-based DB method; cursor pagination pending DB support.
-		rs, _, derr := s.db.GetInternalTransactionsByAddress(ctx, strings.ToLower(req.GetByAddress()), limit, 0)
-		rows, err = rs, derr
+		rows, total, err = s.db.GetInternalTransactionsByAddress(ctx, strings.ToLower(req.GetByAddress()), limit, 0)
 	case hasBlock:
 		switch b := req.GetByBlock().GetSelector().(type) {
 		case *indexerv1.ListInternalTransactionsRequest_BlockFilter_Number:
@@ -44,6 +46,8 @@ func (s *Server) ListInternalTransactions(ctx context.Context, req *indexerv1.Li
 		default:
 			return nil, invalidArgument("by_block selector is required")
 		}
+		// A block's internal txs are fully returned, so len is the true total.
+		total = int64(len(rows))
 	}
 	if err != nil {
 		slog.Error("ListInternalTransactions", "error", err)
@@ -53,5 +57,6 @@ func (s *Server) ListInternalTransactions(ctx context.Context, req *indexerv1.Li
 	return &indexerv1.ListInternalTransactionsResponse{
 		InternalTransactions: mapInternalTxs(rows),
 		Page:                 &indexerv1.PageResponse{}, // cursor pagination pending
+		TotalCount:           total,
 	}, nil
 }
