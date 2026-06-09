@@ -79,10 +79,11 @@ func (d *DB) Migrate() error {
 	// bypassed the live-increment path (e.g. pre-existing rows on first deploy).
 	if _, err := d.pool.Exec(ctx, `
 		INSERT INTO chain_counters (name, count, updated_at) VALUES
-			('blocks_total',       (SELECT COUNT(*) FROM blocks),        NOW()),
-			('transactions_total', (SELECT COUNT(*) FROM transactions),  NOW()),
-			('addresses_total',    (SELECT COUNT(*) FROM address_stats), NOW()),
-			('tokens_total',       (SELECT COUNT(*) FROM tokens),        NOW())
+			('blocks_total',       (SELECT COUNT(*) FROM blocks),          NOW()),
+			('transactions_total', (SELECT COUNT(*) FROM transactions),    NOW()),
+			('addresses_total',    (SELECT COUNT(*) FROM address_stats),   NOW()),
+			('tokens_total',       (SELECT COUNT(*) FROM tokens),          NOW()),
+			('transfers_total',    (SELECT COUNT(*) FROM token_transfers), NOW())
 		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`); err != nil {
 		return fmt.Errorf("failed to re-seed chain_counters: %w", err)
 	}

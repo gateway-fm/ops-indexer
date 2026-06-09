@@ -247,6 +247,16 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 	// independently ordered+limited, and merging keeps it at O(limit): the
 	// outer sort sees at most 3*limit rows regardless of table size
 	// (~0.2ms on the same data).
+	//
+	// The transfer branch limits by DISTINCT tx_hash (GROUP BY tx_hash, ORDER
+	// BY MAX(block_number)), not by transfer-log row: a single recent tx can
+	// emit many Transfer logs to the address (airdrops, batch transfers, swaps,
+	// NFT mints), and a plain row LIMIT would let those collapse the candidate
+	// set to a handful of hashes, silently dropping older transfer-only txs
+	// that belong on the page. Limiting to the latest `limit` distinct hashes
+	// preserves the unbounded-subquery semantics (a global top-`limit`
+	// transfer-tx can't sit past position `limit` within its block-ordered
+	// branch).
 	addr := strings.ToLower(address)
 
 	const cols = `t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
@@ -269,7 +279,8 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				 WHERE t.block_number < $2 AND t.hash IN (
 					SELECT tx_hash FROM token_transfers
 					WHERE (from_address = $1 OR to_address = $1) AND block_number < $2
-					ORDER BY block_number DESC LIMIT $3)
+					GROUP BY tx_hash
+					ORDER BY MAX(block_number) DESC LIMIT $3)
 				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3)
 			) t
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`
@@ -290,7 +301,8 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				 WHERE t.hash IN (
 					SELECT tx_hash FROM token_transfers
 					WHERE from_address = $1 OR to_address = $1
-					ORDER BY block_number DESC LIMIT $2)
+					GROUP BY tx_hash
+					ORDER BY MAX(block_number) DESC LIMIT $2)
 				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2)
 			) t
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`
@@ -720,8 +732,17 @@ func (d *DB) GetTransfersByToken(ctx context.Context, tokenAddress string, limit
 // GetAllTokenTransfers returns the global, chain-wide transfer feed ordered by
 // most recent first, with offset pagination and an accurate total. tokenType is
 // one of "ERC20"/"ERC721"/"ERC1155" to filter by standard, or "" for all.
-// Backed by idx_transfer_block_log / idx_transfer_tokentype_block_log so both
-// the page and the COUNT stay index-only.
+//
+// The page itself is index-only via idx_transfer_block_log /
+// idx_transfer_tokentype_block_log. The total is the expensive part: a bare
+// COUNT(*) over token_transfers is a full (parallel) seq scan — O(N) and paid
+// on every page load, which becomes hundreds of ms to seconds at chain scale.
+// For the unfiltered (default, hottest) feed we therefore read the O(1)
+// transfers_total running counter maintained in chain_counters by the batch
+// writer instead of counting. The per-type filter keeps a live COUNT: it's the
+// less-trafficked path, and per-type counters would desync on the ERC20→ERC721
+// reclassification that happens on reindex, so an always-correct count is the
+// safer trade there.
 func (d *DB) GetAllTokenTransfers(ctx context.Context, tokenType string, limit, offset int) ([]types.TokenTransfer, int64, error) {
 	const cols = `id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 			timestamp, transfer_type, token_type, token_id, is_internal`
@@ -740,8 +761,13 @@ func (d *DB) GetAllTokenTransfers(ctx context.Context, tokenType string, limit, 
 			FROM token_transfers WHERE token_type = $1
 			ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, tokenType, limit, offset)
 	} else {
-		if cerr := d.pool.QueryRow(ctx,
-			"SELECT COUNT(*) FROM token_transfers",
+		// O(1): read the running total instead of COUNT(*). COALESCE to a live
+		// count only if the counter row is somehow absent (defensive; the
+		// migrate-time re-seed normally guarantees it exists).
+		if cerr := d.pool.QueryRow(ctx, `
+			SELECT COALESCE(
+				(SELECT count FROM chain_counters WHERE name = 'transfers_total'),
+				(SELECT COUNT(*) FROM token_transfers))`,
 		).Scan(&total); cerr != nil {
 			return nil, 0, cerr
 		}

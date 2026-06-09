@@ -52,7 +52,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	}
 	defer tx.Rollback(ctx)
 
-	var deltaBlocks, deltaTxs, deltaTokens, deltaAddresses int64
+	var deltaBlocks, deltaTxs, deltaTokens, deltaAddresses, deltaTransfers int64
 
 	if data.Block != nil {
 		ct, err := tx.Exec(ctx, `
@@ -204,6 +204,15 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 		}
 		br := tx.SendBatch(ctx, batch)
+		for range data.Transfers {
+			ct, err := br.Exec()
+			if err != nil {
+				_ = br.Close()
+				return err
+			}
+			// ON CONFLICT DO NOTHING ⇒ only genuinely new rows count toward the total.
+			deltaTransfers += ct.RowsAffected()
+		}
 		if err := br.Close(); err != nil {
 			return err
 		}
@@ -258,17 +267,18 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		}
 	}
 
-	if deltaBlocks|deltaTxs|deltaTokens|deltaAddresses != 0 {
+	if deltaBlocks|deltaTxs|deltaTokens|deltaAddresses|deltaTransfers != 0 {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO chain_counters (name, count, updated_at) VALUES
 				('blocks_total',       $1, NOW()),
 				('transactions_total', $2, NOW()),
 				('tokens_total',       $3, NOW()),
-				('addresses_total',    $4, NOW())
+				('addresses_total',    $4, NOW()),
+				('transfers_total',    $5, NOW())
 			ON CONFLICT (name) DO UPDATE
 				SET count = chain_counters.count + EXCLUDED.count,
 					updated_at = NOW()`,
-			deltaBlocks, deltaTxs, deltaTokens, deltaAddresses)
+			deltaBlocks, deltaTxs, deltaTokens, deltaAddresses, deltaTransfers)
 		if err != nil {
 			return err
 		}
