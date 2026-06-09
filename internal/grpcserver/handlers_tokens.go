@@ -107,6 +107,39 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 	}, nil
 }
 
+func (s *Server) ListAllTokenTransfers(ctx context.Context, req *indexerv1.ListAllTokenTransfersRequest) (*indexerv1.ListAllTokenTransfersResponse, error) {
+	page := int(req.GetPage().GetPage())
+	if page < 1 {
+		page = 1
+	}
+	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
+	offset := (page - 1) * pageSize
+
+	tokenType := ""
+	switch req.GetTokenType() {
+	case indexerv1.TokenType_TOKEN_TYPE_ERC20:
+		tokenType = "ERC20"
+	case indexerv1.TokenType_TOKEN_TYPE_ERC721:
+		tokenType = "ERC721"
+	case indexerv1.TokenType_TOKEN_TYPE_ERC1155:
+		tokenType = "ERC1155"
+	}
+
+	rows, total, err := s.db.GetAllTokenTransfers(ctx, tokenType, pageSize, offset)
+	if err != nil {
+		slog.Error("ListAllTokenTransfers", "error", err)
+		return nil, internalErr(err, "ListAllTokenTransfers")
+	}
+	return &indexerv1.ListAllTokenTransfersResponse{
+		Transfers: mapTokenTransfers(rows),
+		Page: &indexerv1.OffsetPageResponse{
+			Page:       int32(page),
+			PageSize:   int32(pageSize),
+			TotalItems: total,
+		},
+	}, nil
+}
+
 func (s *Server) ListTokenHolders(ctx context.Context, req *indexerv1.ListTokenHoldersRequest) (*indexerv1.ListTokenHoldersResponse, error) {
 	if req.GetTokenAddress() == "" {
 		return nil, invalidArgument("token_address is required")
