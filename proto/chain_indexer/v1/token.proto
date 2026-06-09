@@ -96,6 +96,20 @@ message ListTokenTransfersResponse {
   PageResponse page = 2;
 }
 
+// Global, unfiltered transfer feed for the explorer's "Token Transfers" page.
+// Unlike ListTokenTransfers (which requires a tx/address/token filter and uses
+// cursor pagination), this returns every transfer chain-wide with offset
+// pagination and an accurate total, plus an optional token-standard filter.
+message ListAllTokenTransfersRequest {
+  OffsetPageRequest page = 1;
+  TokenType token_type = 2;  // UNSPECIFIED = all standards
+}
+
+message ListAllTokenTransfersResponse {
+  repeated TokenTransfer transfers = 1;
+  OffsetPageResponse page = 2;
+}
+
 message ListTokenHoldersRequest {
   OffsetPageRequest page = 1;
   string token_address = 2;
