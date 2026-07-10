@@ -1,0 +1,49 @@
+# Git
+.git/
+.gitignore
+
+# Local state and secrets
+.env
+.env.*
+!.env.example
+.claude/
+.agents/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+bin/
+dist/
+coverage/
+coverage.*
+*.out
+*.test
+
+# Dependencies rebuilt in the container
+vendor/
+
+# Documentation and repo automation not needed in the runtime image
+*.md
+!THIRD_PARTY_NOTICES.md
+docs/
+.github/
+scripts/
+
+# Tests are not needed for the runtime image
+*_test.go
+**/*_test.go
+
+# Logs and local databases
+*.log
+logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

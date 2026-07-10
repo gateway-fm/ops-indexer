@@ -1,0 +1,15 @@
+chain-indexer
+Copyright 2026 Gateway.fm and contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+This repository includes protocol definitions and generated Go code for the
+chain-indexer API under proto/chain_indexer/v1 and gen/go/chain_indexer/v1.
+The generated code is derived from the protocol definitions in this repository.
+
+Third-party dependencies retain their own licenses. See
+THIRD_PARTY_NOTICES.md for the source-only third-party notice starter.
+
+The names Gateway, Ethereum, Optimism, OP Stack, PostgreSQL, Docker, Go, and
+other third-party marks are the property of their respective owners. This
+NOTICE does not grant trademark rights.
