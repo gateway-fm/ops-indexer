@@ -21,8 +21,8 @@ Include:
 - Impact and affected deployment assumptions.
 - Suggested mitigation, if known.
 
-Maintainers should acknowledge reports within 3 business days and provide an
-initial triage response within 10 business days.
+Maintainers acknowledge and triage reports on a best-effort basis and will
+respond as quickly as they can.
 
 ## Public Disclosure
 
