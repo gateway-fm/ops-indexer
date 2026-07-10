@@ -1,0 +1,51 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  signed-off:
+    name: Signed-off-by
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify DCO sign-off trailers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base="$(git rev-parse HEAD^1)"
+          head="$(git rev-parse HEAD^2)"
+          missing=0
+
+          while read -r commit; do
+            author_email="$(git show -s --format='%ae' "$commit")"
+            if ! git log -1 --format=%B "$commit" |
+              git interpret-trailers --parse |
+              awk -v email="<$author_email>" '
+                BEGIN { found = 0 }
+                tolower($0) ~ /^signed-off-by:/ && index(tolower($0), tolower(email)) > 0 { found = 1 }
+                END { exit found ? 0 : 1 }
+              '; then
+              short="$(git rev-parse --short "$commit")"
+              echo "::error title=Missing DCO sign-off::commit ${short} lacks a Signed-off-by trailer for ${author_email}"
+              missing=1
+            fi
+          done < <(git rev-list --reverse --no-merges "$base..$head")
+
+          if [ "$missing" -ne 0 ]; then
+            echo "Every non-merge commit must include a Signed-off-by trailer."
+            echo "Use git commit -s, or amend with git commit --amend -s."
+            exit 1
+          fi

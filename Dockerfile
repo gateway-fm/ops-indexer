@@ -16,6 +16,7 @@ FROM gcr.io/distroless/static-debian13:nonroot@sha256:963fa6c544fe5ce420f1f54fb8
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /indexer /indexer
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /licenses/
 
 USER nonroot:nonroot
 

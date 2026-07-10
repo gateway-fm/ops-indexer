@@ -18,6 +18,10 @@ coverage.*
 *.local.*
 docker-compose.override.yml
 
+# Local agent state
+.claude/
+.agents/
+
 # Editor
 .idea/
 .vscode/
