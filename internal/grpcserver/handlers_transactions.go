@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
+	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 )
 
@@ -35,15 +36,23 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 			return nil, invalidArgument("address is required")
 		}
 		addr := strings.ToLower(f.ByAddress.GetAddress())
-		var beforeBlock *uint64
+		// Position priority: opaque cursor (full (block, tx_index) keyset —
+		// RD-1148: resuming mid-block must not skip the block's remaining
+		// rows), else block_range.to_block as an inclusive whole-block upper
+		// bound (lets callers that page by block number, e.g. the privacy
+		// proxy's legacy ?before=, position without knowing the cursor
+		// encoding).
+		var before *db.AddressFeedBound
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur txFeedCursor
 			if err := decodeCursor(c, &cur); err != nil {
 				return nil, err
 			}
-			beforeBlock = &cur.BlockNumber
+			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.TransactionIndex}
+		} else if tb := req.GetBlockRange().GetToBlock(); tb > 0 {
+			before = &db.AddressFeedBound{Block: tb, Inclusive: true}
 		}
-		rows, err := s.db.GetTransactionsByAddress(ctx, addr, int(limit)+1, beforeBlock)
+		rows, err := s.db.GetTransactionsByAddress(ctx, addr, int(limit)+1, before)
 		if err != nil {
 			slog.Error("ListTransactions by address", "error", err)
 			return nil, internalErr(err, "ListTransactions")

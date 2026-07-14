@@ -77,8 +77,7 @@ func TestGetTransactionsByAddress_TransferOnlyTxNotDropped(t *testing.T) {
 	assertBothReturned("no-cursor", txs)
 
 	// Deep-pagination branch has the same subquery shape — exercise it too.
-	before := uint64(200)
-	txs, err = d.GetTransactionsByAddress(ctx, A, lim, &before)
+	txs, err = d.GetTransactionsByAddress(ctx, A, lim, &AddressFeedBound{Block: 200})
 	require.NoError(t, err)
 	assertBothReturned("beforeBlock", txs)
 }
