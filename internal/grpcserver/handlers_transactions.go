@@ -38,10 +38,10 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 		addr := strings.ToLower(f.ByAddress.GetAddress())
 		// Position priority: opaque cursor (full (block, tx_index) keyset —
 		// RD-1148: resuming mid-block must not skip the block's remaining
-		// rows), else block_range.to_block as an inclusive whole-block upper
-		// bound (lets callers that page by block number, e.g. the privacy
-		// proxy's legacy ?before=, position without knowing the cursor
-		// encoding).
+		// rows), else block_range.to_block as an EXCLUSIVE whole-block upper
+		// bound, per the proto contract (BlockRange is half-open; to_block
+		// exclusive, 0 = unbounded) — lets block-paging callers position
+		// without knowing the cursor encoding.
 		var before *db.AddressFeedBound
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur txFeedCursor
@@ -50,7 +50,7 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 			}
 			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.TransactionIndex}
 		} else if tb := req.GetBlockRange().GetToBlock(); tb > 0 {
-			before = &db.AddressFeedBound{Block: tb, Inclusive: true}
+			before = &db.AddressFeedBound{Block: tb}
 		}
 		rows, err := s.db.GetTransactionsByAddress(ctx, addr, int(limit)+1, before)
 		if err != nil {

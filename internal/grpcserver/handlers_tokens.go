@@ -78,8 +78,8 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 		total = int64(len(rows))
 	case hasAddr:
 		// Position priority mirrors ListTransactions by-address: opaque cursor
-		// (full (block, log_index) keyset — RD-1148), else block_range.to_block
-		// as an inclusive whole-block upper bound.
+		// (full (block, log_index) keyset — RD-1148), else block_range.to_block as an
+		// EXCLUSIVE whole-block upper bound (proto: half-open, 0 = unbounded).
 		var before *db.AddressFeedBound
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur transferFeedCursor
@@ -88,7 +88,7 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 			}
 			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.LogIndex}
 		} else if tb := req.GetBlockRange().GetToBlock(); tb > 0 {
-			before = &db.AddressFeedBound{Block: tb, Inclusive: true}
+			before = &db.AddressFeedBound{Block: tb}
 		}
 		addr := strings.ToLower(req.GetByAddress())
 		rows, err = s.db.GetTransfersByAddress(ctx, addr, limit+1, before)
