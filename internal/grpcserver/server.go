@@ -1,12 +1,12 @@
-// Package grpcserver implements the chain-indexer gRPC read API.
+// Package grpcserver implements the ops-indexer gRPC read API.
 //
 // The server wraps the indexer's postgres store (internal/db) and exposes it
 // via IndexerService defined in proto/chain_indexer/v1/.
 //
 // Trust model: the server does not authenticate callers, does not filter by
-// viewer identity, and does not redact. Consumers (privacy-proxy for privacy
-// mode, block-explorer api in standalone mode) handle access control at their
-// own layer. See docs/API.md and RD-855 for the rationale.
+// viewer identity, and does not redact. Consumers (Open Privacy Suite for
+// privacy mode, ops-explorer api in standalone mode) handle access control at
+// their own layer. See docs/API.md and RD-855 for the rationale.
 package grpcserver
 
 import (

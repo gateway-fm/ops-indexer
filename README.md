@@ -1,6 +1,6 @@
-# chain-indexer
+# ops-indexer
 
-A standalone EVM chain indexer with a gRPC read API. Polls an EVM node, writes to a private postgres, serves chain data to consumers (privacy-proxy, block-explorer) via gRPC.
+A standalone EVM chain indexer with a gRPC read API. Polls an EVM node, writes to a private postgres, serves chain data to consumers (Open Privacy Suite, ops-explorer) via gRPC.
 
 **Scope.** Pure chain data: blocks, transactions, logs, addresses, tokens, transfers, contracts, internal txs, gas stats, daily aggregates, OP-Stack deposits. No RBAC, no privacy logic, no redaction. Consumers handle access control at their own layer.
 
@@ -20,7 +20,7 @@ Generated Go stubs are checked in under `gen/` so consumers don't need `buf` or 
 
 ## Origins
 
-Extracted from `gateway-fm/block-explorer` (commit TBD) as part of RD-855 (privacy mode must physically prevent block-explorer from bypassing privacy-proxy). The indexer previously lived inside block-explorer's trust boundary; moving it to its own repo + service makes the trust boundary structural.
+Extracted from `gateway-fm/ops-explorer` (formerly `block-explorer`; commit TBD) as part of RD-855 (privacy mode must physically prevent ops-explorer from bypassing Open Privacy Suite). The indexer previously lived inside ops-explorer's trust boundary; moving it to its own repo + service makes the trust boundary structural.
 
 ## Non-goals
 
