@@ -1,10 +1,10 @@
-chain-indexer
+ops-indexer
 Copyright 2026 Gateway.fm and contributors
 
 This product is licensed under the Apache License, Version 2.0.
 
 This repository includes protocol definitions and generated Go code for the
-chain-indexer API under proto/chain_indexer/v1 and gen/go/chain_indexer/v1.
+ops-indexer API under proto/chain_indexer/v1 and gen/go/chain_indexer/v1.
 The generated code is derived from the protocol definitions in this repository.
 
 Third-party dependencies retain their own licenses. See

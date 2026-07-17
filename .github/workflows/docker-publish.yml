@@ -13,11 +13,11 @@ name: Docker Publish
 # immutability enabled, which rejects any push that would overwrite an
 # existing tag. Operators should pin to a specific semver.
 #
-# Why both registries: privacy-proxy and block-explorer publish to Docker
-# Hub under the gatewayfm org; chain-indexer was the odd one out at GHCR.
+# Why both registries: Open Privacy Suite and ops-explorer publish to Docker
+# Hub under the gatewayfm org; this repo was the odd one out at GHCR.
 # Operators pulling the full Open Privacy Suite previously had to log into
 # two registries. We keep the GHCR push for backwards compatibility with
-# existing privacy-proxy compose manifests until they cut over.
+# existing Open Privacy Suite compose manifests until they cut over.
 #
 # Auth:
 #   - GHCR     -> GITHUB_TOKEN (OIDC-friendly, no static secrets, no PAT).

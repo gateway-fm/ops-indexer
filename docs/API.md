@@ -1,4 +1,4 @@
-# chain-indexer API design
+# ops-indexer API design
 
 Conventions for `chain_indexer.v1.IndexerService`. This document is the reference for consumer implementers and for future API changes. Breaking changes require a new package version (`v2`), never a mutation of `v1`.
 
@@ -6,12 +6,12 @@ Conventions for `chain_indexer.v1.IndexerService`. This document is the referenc
 
 The indexer is **not a security layer.** It returns whatever is requested. Authentication, authorization, privacy filtering, and redaction are consumer concerns.
 
-In the privacy-suite deployment:
+In the Open Privacy Suite deployment:
 - The indexer listens on a trusted Docker / k8s network only.
-- privacy-proxy is the sole authorized consumer and applies per-viewer redaction before serving data to clients.
+- Open Privacy Suite is the sole authorized consumer and applies per-viewer redaction before serving data to clients.
 
-In the standalone block-explorer deployment:
-- The indexer serves the block-explorer api directly.
+In the standalone ops-explorer deployment:
+- The indexer serves the ops-explorer api directly.
 - Data is public by intent; no redaction happens.
 
 The indexer does not do tenant-aware access control, rate limiting, or audit logging on its own. Consumers apply those concerns.
@@ -146,7 +146,7 @@ The indexer never puts PII or DB internals into error messages. Messages are sho
 A few concrete design choices flow from "indexer is not a security layer":
 
 - **No `viewer` field on any request.** The indexer has no concept of who is asking. If a consumer needs per-viewer filtering, it does that filtering after receiving the response.
-- **No redaction.** `Transaction.from`, `Address.address`, `Log.address` are always the real values. Pseudonyms and address masking are privacy-proxy's layer.
+- **No redaction.** `Transaction.from`, `Address.address`, `Log.address` are always the real values. Pseudonyms and address masking are Open Privacy Suite's layer.
 - **No ACL checks.** Any consumer with gRPC access can read any data.
 - **No audit logging of consumer reads.** Consumers run their own audit pipelines. The indexer may log at the method level for operational observability, but not for compliance.
 
@@ -155,7 +155,7 @@ A few concrete design choices flow from "indexer is not a security layer":
 These are **deliberately not** in v1:
 
 - **Subscriptions / streaming.** Deferred until product confirms WS is a requirement. See RD-855 rationale.
-- **Contract ABI, source code, verified flag.** Not chain data. Lives with block-explorer's api in standalone mode; absent in privacy mode by product decision.
+- **Contract ABI, source code, verified flag.** Not chain data. Lives with ops-explorer's api in standalone mode; absent in privacy mode by product decision.
 - **Price history time series for tokens.** Price is pulled from external feeds (CoinGecko, etc.) by consumers; the indexer carries only a single current `price_usd`.
 - **Cross-chain queries.** One indexer instance indexes one chain. Multi-chain deployments run multiple indexers.
 - **Mutations / writes.** No RPC writes. The indexer's own workers are the only writers to its DB.
@@ -179,13 +179,13 @@ These are internal targets for the indexer implementation. Consumers should add 
 
 ## Consumer integration notes
 
-### privacy-proxy
+### Open Privacy Suite
 
 - Drops direct SQL to the chain-data DB. Replaces `internal/explorer/store.go` with a thin gRPC client.
 - `RedactionEngine` redacts gRPC responses (mutates addresses / values / logs in-place on the response objects) before serializing to JSON for the client.
 - A feature flag controls cutover during Phase 3; both code paths exist side-by-side briefly.
 
-### block-explorer (standalone mode only)
+### ops-explorer (standalone mode only)
 
 - api service calls the indexer for chain data and merges with its own small DB for verification metadata (ABI, source, verified).
 - WS hub is deleted in Phase 4. No replacement in v1.
@@ -193,6 +193,6 @@ These are internal targets for the indexer implementation. Consumers should add 
 
 ### Privacy-mode deployment
 
-- block-explorer api, block-explorer's own postgres, and block-explorer's own indexer are **not deployed**.
-- block-explorer frontend nginx routes `/api/*` to privacy-proxy. `/ws` returns 404.
-- Indexer listens on the trust network; privacy-proxy's backend is the only consumer.
+- ops-explorer api, ops-explorer's own postgres, and ops-explorer's own indexer are **not deployed**.
+- ops-explorer frontend nginx routes `/api/*` to Open Privacy Suite. `/ws` returns 404.
+- Indexer listens on the trust network; Open Privacy Suite's backend is the only consumer.

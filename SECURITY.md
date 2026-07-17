@@ -33,7 +33,7 @@ unless maintainers and the reporter agree on a different disclosure timeline.
 
 In scope:
 
-- chain-indexer service code, protocol definitions, generated Go stubs, and
+- ops-indexer service code, protocol definitions, generated Go stubs, and
   deployment materials in this repository.
 - Source release materials such as scripts, docs, examples, and generated code.
 

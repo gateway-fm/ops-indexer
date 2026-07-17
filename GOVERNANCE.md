@@ -1,6 +1,6 @@
 # Governance
 
-chain-indexer is maintained by Gateway.fm and project maintainers designated by
+ops-indexer is maintained by Gateway.fm and project maintainers designated by
 Gateway.fm.
 
 ## Maintainer Responsibilities

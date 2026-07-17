@@ -9,7 +9,7 @@
 -- columns) in EIP-55 checksum case, the format eth_getTransactionByHash
 -- returns. SQL equality is case-sensitive, so every callsite that passes a
 -- lowercased address (the industry-canonical wire format used by
--- Etherscan / Blockscout / The Graph / privacy-proxy) got zero rows back.
+-- Etherscan / Blockscout / The Graph / Open Privacy Suite) got zero rows back.
 -- v0.2.0's fix wrapped the read side in LOWER(col) = LOWER($1) — correct
 -- but expensive: it bypasses the btree indexes on these columns unless
 -- functional indexes are added (which they aren't), and pays the

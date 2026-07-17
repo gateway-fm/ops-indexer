@@ -393,7 +393,7 @@ func mapContract(c *types.Contract) *indexerv1.Contract {
 		Bytecode:             c.Bytecode,
 		// Proxy fields not tracked in the existing schema; left zero. A future
 		// migration adds them from the proxy detection already performed in
-		// privacy-proxy's bytecode analyzer.
+		// Open Privacy Suite's bytecode analyzer.
 	}
 }
 

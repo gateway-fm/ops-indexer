@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for contributing to chain-indexer.
+Thank you for contributing to ops-indexer.
 
 ## License
 
