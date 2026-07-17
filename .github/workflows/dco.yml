@@ -54,7 +54,7 @@ jobs:
 
             # Skip Dependabot's own commits on a Dependabot PR (see rationale
             # above). Human commits on the same PR fall through and are checked.
-            if [ "$dependabot_pr" = true ] && [ "$author_name" = "dependabot[bot]" ]; then
+            if [[ "$dependabot_pr" == "true" && "$author_name" == "dependabot[bot]" && "$author_email" == *"dependabot[bot]"*@users.noreply.github.com ]]; then
               echo "Skipping DCO check for Dependabot commit $(git rev-parse --short "$commit")"
               continue
             fi
