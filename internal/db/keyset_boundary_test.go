@@ -145,9 +145,11 @@ func TestGetTransfersByAddress_KeysetBlockBoundary(t *testing.T) {
 	require.Equal(t, want, got, "keyset walk must return every transfer exactly once, in feed order")
 }
 
-// TestAddressFeedBound_InclusiveBlock verifies the block_range.to_block
-// mapping: Inclusive=true bounds by block_number <= Block (rows in the bound
-// block itself are returned), Inclusive=false by block_number < Block.
+// TestAddressFeedBound_InclusiveBlock verifies rowBound's whole-block
+// normalization: Inclusive=false bounds by block_number < Block — the proto
+// block_range.to_block (exclusive) mapping the handlers pass — while
+// Inclusive=true bounds by block_number <= Block (the non-proto inclusive
+// convenience). A set Index always wins over the whole-block flag.
 func TestAddressFeedBound_InclusiveBlock(t *testing.T) {
 	b := AddressFeedBound{Block: 100, Inclusive: true}
 	blk, idx := b.rowBound()
@@ -164,4 +166,78 @@ func TestAddressFeedBound_InclusiveBlock(t *testing.T) {
 	blk, idx = b.rowBound()
 	require.Equal(t, uint64(100), blk)
 	require.Equal(t, uint32(7), idx)
+}
+
+// TestGetTransactionsByAddress_TransferOnlyKeysetBoundary guards the transfer-
+// only branch of the tx feed (RD-1148 / Copilot review on #27): a transaction
+// where the address is only a Transfer party (never the tx from/to) must still
+// page correctly when a single block holds more than `limit` such txs. The old
+// candidate subquery ordered distinct hashes by MAX(block_number) with a bare
+// LIMIT, so intra-block ties were unstable and a block with >limit transfer-only
+// txs could drop rows the outer keyset never revisited.
+func TestGetTransactionsByAddress_TransferOnlyKeysetBoundary(t *testing.T) {
+	d, cleanup := setupMigration005TestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const (
+		A   = "0xaaaa000000000000000000000000000000000031"
+		oth = "0xbbbb000000000000000000000000000000000032"
+		tok = "0xcccc000000000000000000000000000000000033"
+	)
+
+	seedBlock := func(n uint64) {
+		_, err := d.pool.Exec(ctx, `
+			INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count, miner, size, difficulty, total_difficulty, nonce, extra_data, state_root, transactions_root, receipts_root)
+			VALUES ($1, $2, $3, $4, 21000, 30000000, 1, $5, 500, '0', '0', '0x0', '', '', '', '')`,
+			n, fmt.Sprintf("0xtob%061x", n), fmt.Sprintf("0xtob%061x", n-1), 1_700_000_000+int64(n), oth)
+		require.NoError(t, err)
+	}
+	// A is NOT the tx from/to (oth is) — A appears only as a token-transfer
+	// recipient, so the tx can surface only via the transfer-only branch.
+	seedTransferOnlyTx := func(block uint64, txIndex int) string {
+		hash := fmt.Sprintf("0xtot%03d%056x", txIndex, block)
+		_, err := d.pool.Exec(ctx, `
+			INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price, nonce, tx_type, input_data, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 0, 21000, 1, 0, 0, '0x', 1)`,
+			hash, block, 1_700_000_000+int64(block), txIndex, oth, oth)
+		require.NoError(t, err)
+		_, err = d.pool.Exec(ctx, `
+			INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value, block_number, timestamp, transfer_type, token_type)
+			VALUES ($1, 0, $2, $3, $4, 1, $5, $6, 'transfer', 'ERC20')`,
+			hash, tok, oth, A, block, 1_700_000_000+int64(block))
+		require.NoError(t, err)
+		return hash
+	}
+
+	// Block 301 holds 4 transfer-only txs; with limit 2 the candidate LIMIT
+	// falls inside the block — the case the old MAX(block_number) ordering could
+	// silently drop.
+	seedBlock(300)
+	seedBlock(301)
+	seedBlock(302)
+	var want []string
+	want = append(want, seedTransferOnlyTx(302, 0))
+	for i := 3; i >= 0; i-- {
+		want = append(want, seedTransferOnlyTx(301, i))
+	}
+	want = append(want, seedTransferOnlyTx(300, 0))
+
+	const limit = 2
+	var got []string
+	var bound *AddressFeedBound
+	for range [10]int{} { // hard stop — the walk must finish well within this
+		page, err := d.GetTransactionsByAddress(ctx, A, limit, bound)
+		require.NoError(t, err)
+		if len(page) == 0 {
+			break
+		}
+		for _, tx := range page {
+			got = append(got, tx.Hash)
+		}
+		last := page[len(page)-1]
+		idx := uint32(last.TxIndex)
+		bound = &AddressFeedBound{Block: last.BlockNumber, Index: &idx}
+	}
+	require.Equal(t, want, got, "transfer-only keyset walk must return every tx exactly once, in feed order")
 }

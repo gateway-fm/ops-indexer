@@ -232,9 +232,11 @@ func (d *DB) GetTransactionsByBlock(ctx context.Context, blockNumber uint64) ([]
 //
 //   - Cursor position (Index set): rows strictly after the cursor row —
 //     resuming mid-block cannot skip that block's remaining rows.
-//   - Whole-block bound (Index nil): Inclusive=true means block_number <=
-//     Block (proto block_range.to_block semantics), false means < Block
-//     (legacy "before block" paging).
+//   - Whole-block bound (Index nil): Inclusive=false means block_number <
+//     Block — this is the proto block_range.to_block bound the handlers pass
+//     (to_block is exclusive / half-open) and the legacy "before block"
+//     paging. Inclusive=true means block_number <= Block, a non-proto
+//     convenience for inclusive upper bounds (currently only used in tests).
 type AddressFeedBound struct {
 	Block     uint64
 	Index     *uint32
@@ -278,15 +280,17 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 	// outer sort sees at most 3*limit rows regardless of table size
 	// (~0.2ms on the same data).
 	//
-	// The transfer branch limits by DISTINCT tx_hash (GROUP BY tx_hash, ORDER
-	// BY MAX(block_number)), not by transfer-log row: a single recent tx can
-	// emit many Transfer logs to the address (airdrops, batch transfers, swaps,
-	// NFT mints), and a plain row LIMIT would let those collapse the candidate
-	// set to a handful of hashes, silently dropping older transfer-only txs
-	// that belong on the page. Limiting to the latest `limit` distinct hashes
-	// preserves the unbounded-subquery semantics (a global top-`limit`
-	// transfer-tx can't sit past position `limit` within its block-ordered
-	// branch).
+	// The transfer branch limits by DISTINCT tx_hash (GROUP BY tx_hash), not by
+	// transfer-log row: a single recent tx can emit many Transfer logs to the
+	// address (airdrops, batch transfers, swaps, NFT mints), and a plain row
+	// LIMIT would let those collapse the candidate set to a handful of hashes,
+	// silently dropping older transfer-only txs that belong on the page. The
+	// candidate hashes are ordered and bounded by the SAME (block_number,
+	// tx_index) keyset as the outer query (joining transactions for tx_index),
+	// so the top-`limit` distinct candidates line up exactly with the page.
+	// Ordering candidates by MAX(block_number) alone left intra-block ties
+	// unstable: a block holding more than `limit` transfer-only txs could then
+	// drop rows the outer keyset never revisits (Copilot review on #27).
 	addr := strings.ToLower(address)
 
 	const cols = `t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
@@ -298,9 +302,9 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 		// (block_number, tx_index) < ($2, $3) resumes exactly after the cursor
 		// row, so a page boundary inside a block cannot skip the block's
 		// remaining transactions (bare `block_number < $2` did). The
-		// transfer-candidate subquery keeps a loose whole-block prefilter
-		// (block_number <= $2) — boundary-block transfer-only txs must stay
-		// candidates; row-level exclusion happens in the outer condition.
+		// transfer-candidate subquery applies the same (block, tx_index) keyset
+		// bound and ordering (via a join to transactions) so its top-`limit`
+		// distinct hashes are exactly the ones the outer query needs.
 		// $1 = addr, $2 = bound block, $3 = bound idx, $4 = limit
 		bBlock, bIdx := before.rowBound()
 		query := `
@@ -315,10 +319,12 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				UNION
 				(SELECT ` + cols + ` FROM transactions t
 				 WHERE (t.block_number, t.tx_index) < ($2, $3) AND t.hash IN (
-					SELECT tx_hash FROM token_transfers
-					WHERE (from_address = $1 OR to_address = $1) AND block_number <= $2
-					GROUP BY tx_hash
-					ORDER BY MAX(block_number) DESC LIMIT $4)
+					SELECT tt.tx_hash FROM token_transfers tt
+					JOIN transactions ct ON ct.hash = tt.tx_hash
+					WHERE (tt.from_address = $1 OR tt.to_address = $1)
+					  AND (ct.block_number, ct.tx_index) < ($2, $3)
+					GROUP BY tt.tx_hash, ct.block_number, ct.tx_index
+					ORDER BY ct.block_number DESC, ct.tx_index DESC LIMIT $4)
 				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
 			) t
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4`
@@ -337,10 +343,11 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				UNION
 				(SELECT ` + cols + ` FROM transactions t
 				 WHERE t.hash IN (
-					SELECT tx_hash FROM token_transfers
-					WHERE from_address = $1 OR to_address = $1
-					GROUP BY tx_hash
-					ORDER BY MAX(block_number) DESC LIMIT $2)
+					SELECT tt.tx_hash FROM token_transfers tt
+					JOIN transactions ct ON ct.hash = tt.tx_hash
+					WHERE tt.from_address = $1 OR tt.to_address = $1
+					GROUP BY tt.tx_hash, ct.block_number, ct.tx_index
+					ORDER BY ct.block_number DESC, ct.tx_index DESC LIMIT $2)
 				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2)
 			) t
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`
