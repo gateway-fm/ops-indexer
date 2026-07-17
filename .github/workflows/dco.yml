@@ -22,8 +22,20 @@ jobs:
 
       - name: Verify DCO sign-off trailers
         shell: bash
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
+
+          # Dependabot opens automated dependency PRs under the trusted
+          # dependabot[bot] identity and cannot certify the DCO. Skip the
+          # sign-off requirement for those PRs. PR_AUTHOR comes from GitHub
+          # (pull_request.user.login) and cannot be forged by PR content; it
+          # is read via env rather than inline ${{ }} to avoid script injection.
+          if [ "${PR_AUTHOR:-}" = "dependabot[bot]" ]; then
+            echo "PR opened by Dependabot; skipping DCO sign-off requirement."
+            exit 0
+          fi
 
           base="$(git rev-parse HEAD^1)"
           head="$(git rev-parse HEAD^2)"
