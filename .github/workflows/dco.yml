@@ -28,13 +28,20 @@ jobs:
           set -euo pipefail
 
           # Dependabot opens automated dependency PRs under the trusted
-          # dependabot[bot] identity and cannot certify the DCO. Skip the
-          # sign-off requirement for those PRs. PR_AUTHOR comes from GitHub
-          # (pull_request.user.login) and cannot be forged by PR content; it
-          # is read via env rather than inline ${{ }} to avoid script injection.
+          # dependabot[bot] identity and cannot certify the DCO, so its own
+          # commits are exempt from the sign-off requirement. The exemption is
+          # gated on BOTH:
+          #   - the PR author (github.event.pull_request.user.login), which is
+          #     provided by GitHub and cannot be forged by PR content, so a
+          #     human PR cannot bypass DCO by spoofing a commit's author; and
+          #   - each commit's own author (checked in the loop below), so human
+          #     commits pushed onto a Dependabot PR branch (e.g. conflict fixes)
+          #     still require a sign-off.
+          # PR_AUTHOR is read via env rather than inline ${{ }} to avoid script
+          # injection.
+          dependabot_pr=false
           if [ "${PR_AUTHOR:-}" = "dependabot[bot]" ]; then
-            echo "PR opened by Dependabot; skipping DCO sign-off requirement."
-            exit 0
+            dependabot_pr=true
           fi
 
           base="$(git rev-parse HEAD^1)"
@@ -43,6 +50,15 @@ jobs:
 
           while read -r commit; do
             author_email="$(git show -s --format='%ae' "$commit")"
+            author_name="$(git show -s --format='%an' "$commit")"
+
+            # Skip Dependabot's own commits on a Dependabot PR (see rationale
+            # above). Human commits on the same PR fall through and are checked.
+            if [ "$dependabot_pr" = true ] && [ "$author_name" = "dependabot[bot]" ]; then
+              echo "Skipping DCO check for Dependabot commit $(git rev-parse --short "$commit")"
+              continue
+            fi
+
             if ! git log -1 --format=%B "$commit" |
               git interpret-trailers --parse |
               awk -v email="<$author_email>" '
