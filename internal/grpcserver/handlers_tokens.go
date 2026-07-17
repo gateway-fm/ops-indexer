@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
+	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 )
 
@@ -76,16 +77,21 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 		rows, err = s.db.GetTransfersByTransaction(ctx, req.GetByTxHash())
 		total = int64(len(rows))
 	case hasAddr:
-		var beforeBlock *uint64
+		// Position priority mirrors ListTransactions by-address: opaque cursor
+		// (full (block, log_index) keyset — RD-1148), else block_range.to_block as an
+		// EXCLUSIVE whole-block upper bound (proto: half-open, 0 = unbounded).
+		var before *db.AddressFeedBound
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur transferFeedCursor
 			if derr := decodeCursor(c, &cur); derr != nil {
 				return nil, derr
 			}
-			beforeBlock = &cur.BlockNumber
+			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.LogIndex}
+		} else if tb := req.GetBlockRange().GetToBlock(); tb > 0 {
+			before = &db.AddressFeedBound{Block: tb}
 		}
 		addr := strings.ToLower(req.GetByAddress())
-		rows, err = s.db.GetTransfersByAddress(ctx, addr, limit+1, beforeBlock)
+		rows, err = s.db.GetTransfersByAddress(ctx, addr, limit+1, before)
 		if err == nil {
 			total, err = s.db.CountTransfersByAddress(ctx, addr)
 		}

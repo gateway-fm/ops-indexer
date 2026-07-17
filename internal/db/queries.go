@@ -224,7 +224,39 @@ func (d *DB) GetTransactionsByBlock(ctx context.Context, blockNumber uint64) ([]
 	return scanTransactionsWithTimestamp(rows)
 }
 
-func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit int, beforeBlock *uint64) ([]types.Transaction, error) {
+// AddressFeedBound bounds a page of a descending address feed (RD-1148).
+//
+// The feeds order by (block_number DESC, idx DESC) where idx is tx_index for
+// transactions and log_index for token transfers. A bound normalizes to one
+// exclusive row-value comparison `(block_number, idx) < (Block, Idx)`:
+//
+//   - Cursor position (Index set): rows strictly after the cursor row —
+//     resuming mid-block cannot skip that block's remaining rows.
+//   - Whole-block bound (Index nil): Inclusive=false means block_number <
+//     Block — this is the proto block_range.to_block bound the handlers pass
+//     (to_block is exclusive / half-open) and the legacy "before block"
+//     paging. Inclusive=true means block_number <= Block, a non-proto
+//     convenience for inclusive upper bounds (currently only used in tests).
+type AddressFeedBound struct {
+	Block     uint64
+	Index     *uint32
+	Inclusive bool
+}
+
+// rowBound normalizes the bound to the exclusive (block, idx) pair used in
+// the row-value comparison: cursor → (Block, Idx); block_number <= B →
+// (B+1, 0); block_number < B → (B, 0).
+func (b *AddressFeedBound) rowBound() (uint64, uint32) {
+	if b.Index != nil {
+		return b.Block, *b.Index
+	}
+	if b.Inclusive {
+		return b.Block + 1, 0
+	}
+	return b.Block, 0
+}
+
+func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit int, before *AddressFeedBound) ([]types.Transaction, error) {
 	var rows pgx.Rows
 	var err error
 
@@ -248,43 +280,55 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 	// outer sort sees at most 3*limit rows regardless of table size
 	// (~0.2ms on the same data).
 	//
-	// The transfer branch limits by DISTINCT tx_hash (GROUP BY tx_hash, ORDER
-	// BY MAX(block_number)), not by transfer-log row: a single recent tx can
-	// emit many Transfer logs to the address (airdrops, batch transfers, swaps,
-	// NFT mints), and a plain row LIMIT would let those collapse the candidate
-	// set to a handful of hashes, silently dropping older transfer-only txs
-	// that belong on the page. Limiting to the latest `limit` distinct hashes
-	// preserves the unbounded-subquery semantics (a global top-`limit`
-	// transfer-tx can't sit past position `limit` within its block-ordered
-	// branch).
+	// The transfer branch limits by DISTINCT tx_hash (GROUP BY tx_hash), not by
+	// transfer-log row: a single recent tx can emit many Transfer logs to the
+	// address (airdrops, batch transfers, swaps, NFT mints), and a plain row
+	// LIMIT would let those collapse the candidate set to a handful of hashes,
+	// silently dropping older transfer-only txs that belong on the page. The
+	// candidate hashes are ordered and bounded by the SAME (block_number,
+	// tx_index) keyset as the outer query (joining transactions for tx_index),
+	// so the top-`limit` distinct candidates line up exactly with the page.
+	// Ordering candidates by MAX(block_number) alone left intra-block ties
+	// unstable: a block holding more than `limit` transfer-only txs could then
+	// drop rows the outer keyset never revisits (Copilot review on #27).
 	addr := strings.ToLower(address)
 
 	const cols = `t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
 		t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 		t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at`
 
-	if beforeBlock != nil {
-		// $1 = addr, $2 = beforeBlock, $3 = limit
+	if before != nil {
+		// Keyset seek (RD-1148): the exclusive row-value comparison
+		// (block_number, tx_index) < ($2, $3) resumes exactly after the cursor
+		// row, so a page boundary inside a block cannot skip the block's
+		// remaining transactions (bare `block_number < $2` did). The
+		// transfer-candidate subquery applies the same (block, tx_index) keyset
+		// bound and ordering (via a join to transactions) so its top-`limit`
+		// distinct hashes are exactly the ones the outer query needs.
+		// $1 = addr, $2 = bound block, $3 = bound idx, $4 = limit
+		bBlock, bIdx := before.rowBound()
 		query := `
 			SELECT * FROM (
 				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.from_address = $1 AND t.block_number < $2
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3)
+				 WHERE t.from_address = $1 AND (t.block_number, t.tx_index) < ($2, $3)
+				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
 				UNION
 				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.to_address = $1 AND t.block_number < $2
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3)
+				 WHERE t.to_address = $1 AND (t.block_number, t.tx_index) < ($2, $3)
+				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
 				UNION
 				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.block_number < $2 AND t.hash IN (
-					SELECT tx_hash FROM token_transfers
-					WHERE (from_address = $1 OR to_address = $1) AND block_number < $2
-					GROUP BY tx_hash
-					ORDER BY MAX(block_number) DESC LIMIT $3)
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3)
+				 WHERE (t.block_number, t.tx_index) < ($2, $3) AND t.hash IN (
+					SELECT tt.tx_hash FROM token_transfers tt
+					JOIN transactions ct ON ct.hash = tt.tx_hash
+					WHERE (tt.from_address = $1 OR tt.to_address = $1)
+					  AND (ct.block_number, ct.tx_index) < ($2, $3)
+					GROUP BY tt.tx_hash, ct.block_number, ct.tx_index
+					ORDER BY ct.block_number DESC, ct.tx_index DESC LIMIT $4)
+				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
 			) t
-			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $3`
-		rows, err = d.pool.Query(ctx, query, addr, *beforeBlock, limit)
+			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4`
+		rows, err = d.pool.Query(ctx, query, addr, bBlock, bIdx, limit)
 	} else {
 		// $1 = addr, $2 = limit
 		query := `
@@ -299,10 +343,11 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 				UNION
 				(SELECT ` + cols + ` FROM transactions t
 				 WHERE t.hash IN (
-					SELECT tx_hash FROM token_transfers
-					WHERE from_address = $1 OR to_address = $1
-					GROUP BY tx_hash
-					ORDER BY MAX(block_number) DESC LIMIT $2)
+					SELECT tt.tx_hash FROM token_transfers tt
+					JOIN transactions ct ON ct.hash = tt.tx_hash
+					WHERE tt.from_address = $1 OR tt.to_address = $1
+					GROUP BY tt.tx_hash, ct.block_number, ct.tx_index
+					ORDER BY ct.block_number DESC, ct.tx_index DESC LIMIT $2)
 				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2)
 			) t
 			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`
@@ -669,7 +714,7 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) er
 	return err
 }
 
-func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit int, beforeBlock *uint64) ([]types.TokenTransfer, error) {
+func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit int, before *AddressFeedBound) ([]types.TokenTransfer, error) {
 	var rows pgx.Rows
 	var err error
 
@@ -678,12 +723,16 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 	// LOWER() on the column side (which would otherwise defeat
 	// idx_transfer_from / idx_transfer_to).
 	addr := strings.ToLower(address)
-	if beforeBlock != nil {
+	if before != nil {
+		// Keyset seek (RD-1148): see GetTransactionsByAddress — the row-value
+		// comparison on (block_number, log_index) cannot skip a boundary
+		// block's remaining transfers the way bare `block_number < $2` did.
+		bBlock, bIdx := before.rowBound()
 		rows, err = d.pool.Query(ctx, `
 			SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 				timestamp, transfer_type, token_type, token_id, is_internal
-			FROM token_transfers WHERE (from_address = $1 OR to_address = $1) AND block_number < $2
-			ORDER BY block_number DESC, log_index DESC LIMIT $3`, addr, *beforeBlock, limit)
+			FROM token_transfers WHERE (from_address = $1 OR to_address = $1) AND (block_number, log_index) < ($2, $3)
+			ORDER BY block_number DESC, log_index DESC LIMIT $4`, addr, bBlock, bIdx, limit)
 	} else {
 		rows, err = d.pool.Query(ctx, `
 			SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
