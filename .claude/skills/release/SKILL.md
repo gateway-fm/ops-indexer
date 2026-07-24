@@ -75,7 +75,7 @@ Rules: no section longer than it needs to be; omit the optional empty section (D
 
 ## 5. Enforcement — this skill is guidance; the CI lint is the gate
 
-The format is enforced independently of this skill by **`.github/workflows/release-notes-lint.yml`**, which pipes the release body into **`scripts/lint-release-notes.sh`** on `release: published`/`edited` and fails the check when a required section is missing (`## Highlights`, `## ⚠️ Action required on upgrade`, `## Docker images`, `## Verify after deploy`, and a `Full changelog:` line). Keep the headers in §3 verbatim so a release authored **without** this skill still passes. Check a draft locally before publishing: `scripts/lint-release-notes.sh <notes-file>`.
+The format is enforced independently of this skill by **`.github/workflows/release-notes-lint.yml`**, which pipes the release body into **`scripts/lint-release-notes.sh`** on `release: published`/`edited` and fails the check when a required section header is missing (`## Highlights`, `## ⚠️ Action required on upgrade`, `## Incompatibilities / breaking`, `## Docker images`, `## Verify after deploy`, and a `Full changelog:` line). The lint matches real `##` header lines (emoji-agnostic — the ⚠️ is optional), so the phrase in prose does not satisfy it. Keep the headers in §3 verbatim so a release authored **without** this skill still passes. Check a draft locally before publishing: `scripts/lint-release-notes.sh <notes-file>`.
 
 ## Notes
 

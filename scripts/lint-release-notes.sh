@@ -21,23 +21,36 @@ else
   body="$(cat)"
 fi
 
-# Required markers, kept in sync with the skill's §3 format. The
-# "Action required" / "Verify after deploy" markers omit the emoji so the
-# match is robust to emoji encoding in the release body.
-required=(
+# Required sections, kept in sync with the skill's §3 format.
+#
+# Each header is matched against a real Markdown header LINE (`^## …`), not an
+# arbitrary substring — so the phrase appearing in prose (e.g. inside a
+# Highlights bullet) does not satisfy the check. The match is emoji-agnostic:
+# `## ⚠️ Action required on upgrade` passes with or without the ⚠️, whatever
+# its encoding. "Full changelog:" is a bold line rather than a header, so it is
+# matched as a line.
+labels=(
   "## Highlights"
-  "Action required on upgrade"
+  "## ⚠️ Action required on upgrade"
+  "## Incompatibilities / breaking"
   "## Docker images"
-  "Verify after deploy"
+  "## Verify after deploy"
   "Full changelog:"
+)
+patterns=(
+  '^##[[:space:]]+Highlights([[:space:]]|$)'
+  '^##[[:space:]].*Action required on upgrade'
+  '^##[[:space:]].*Incompatibilities'
+  '^##[[:space:]].*Docker images'
+  '^##[[:space:]].*Verify after deploy'
+  'Full changelog:'
 )
 
 missing=()
-for marker in "${required[@]}"; do
-  case "$body" in
-    *"$marker"*) : ;;
-    *) missing+=("$marker") ;;
-  esac
+for i in "${!labels[@]}"; do
+  if ! printf '%s\n' "$body" | grep -qE "${patterns[$i]}"; then
+    missing+=("${labels[$i]}")
+  fi
 done
 
 if [ "${#missing[@]}" -ne 0 ]; then
