@@ -1,0 +1,26 @@
+name: Release Notes Lint
+
+# Enforces the canonical release-notes structure (see
+# .claude/skills/release/SKILL.md) independently of whether the /release
+# skill was used to author them. Runs when a release is published or its
+# notes are edited, and fails the check if a required section is missing.
+
+on:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    # Drafts have no stable published body yet — skip them.
+    if: ${{ !github.event.release.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Lint release notes
+        env:
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: printf '%s' "$RELEASE_BODY" | bash scripts/lint-release-notes.sh -

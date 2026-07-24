@@ -18,8 +18,9 @@ coverage.*
 *.local.*
 docker-compose.override.yml
 
-# Local agent state
-.claude/
+# Local agent state (but keep shared skills versioned)
+.claude/*
+!.claude/skills/
 .agents/
 
 # Editor
