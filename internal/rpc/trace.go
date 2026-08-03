@@ -40,16 +40,39 @@ type TraceBlockResult struct {
 	Result CallFrame `json:"result"`
 }
 
+// methodAbsentSignals are the error substrings that mean the node genuinely
+// lacks debug_traceBlockByNumber, as opposed to a transient failure.
+var methodAbsentSignals = []string{
+	"method not found",
+	"not supported",
+	"does not exist",
+	"not available",
+	"unsupported method",
+}
+
 func (c *Client) CheckTracingSupport(ctx context.Context) (bool, error) {
-	var result json.RawMessage
-	err := c.raw.CallContext(ctx, &result, "debug_traceBlockByNumber", "0x0", &TraceConfig{Tracer: "callTracer"})
+	// Probe a recent block, not genesis: many nodes cannot trace block 0
+	// (Infura returns "genesis is not traceable"), which makes the probe
+	// ambiguous even where tracing works on the blocks the indexer reads.
+	blockNumber, err := c.BlockNumber(ctx)
 	if err != nil {
-		if strings.Contains(err.Error(), "method not found") ||
-		   strings.Contains(err.Error(), "not supported") ||
-		   strings.Contains(err.Error(), "does not exist") {
-			return false, nil
+		return false, fmt.Errorf("tracing support check: block number: %w", err)
+	}
+	if blockNumber > 3 {
+		blockNumber -= 3
+	}
+
+	var result json.RawMessage
+	err = c.raw.CallContext(ctx, &result, "debug_traceBlockByNumber", fmt.Sprintf("0x%x", blockNumber), &TraceConfig{Tracer: "callTracer"})
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		for _, signal := range methodAbsentSignals {
+			if strings.Contains(msg, signal) {
+				return false, nil
+			}
 		}
-		return true, nil
+		// Anything else is transient: report it instead of assuming support.
+		return false, fmt.Errorf("tracing support check: debug_traceBlockByNumber on block %d: %w", blockNumber, err)
 	}
 	return true, nil
 }
