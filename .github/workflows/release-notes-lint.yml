@@ -20,6 +20,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # Aikido: this job never pushes, so the checkout token is not needed.
+        with:
+          persist-credentials: false
       - name: Lint release notes
         env:
           RELEASE_BODY: ${{ github.event.release.body }}
