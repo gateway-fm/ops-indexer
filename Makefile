@@ -1,4 +1,4 @@
-.PHONY: help proto-gen proto-lint build test run-local migrate-up migrate-down docker-build
+.PHONY: help proto-gen proto-lint build test test-integration bench bench-quick run-local migrate-up migrate-down docker-build clean
 
 BIN_DIR := bin
 GEN_DIR := gen
@@ -28,6 +28,16 @@ test: ## Run unit tests
 
 test-integration: ## Run integration tests (requires docker)
 	go test -tags=integration ./...
+
+# Benchmarks need docker: each sub-benchmark starts its own postgres via
+# testcontainers, seeds it to the target table size and tears it down.
+# -benchtime Nx pins the iteration count so the framework runs one trial per
+# sub-benchmark instead of ramping b.N and re-seeding for each ramp step.
+bench: ## Run all benchmarks at the full 10k/100k/1M table sizes (requires docker, slow)
+	go test ./internal/db -run '^$$' -bench . -benchtime 30x -timeout 60m
+
+bench-quick: ## Run the write-path benchmark at 10k rows only (requires docker)
+	BENCH_SCALES=10000 go test ./internal/db -run '^$$' -bench InsertBlockDataBatch -benchtime 30x -timeout 20m
 
 run-local: ## Run the indexer against a local docker-compose dev stack
 	docker compose -f scripts/docker-compose.dev.yml up -d postgres anvil

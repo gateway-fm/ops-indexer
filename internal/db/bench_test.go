@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,9 +15,42 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// 1M takes ~30-60s to seed and needs ~500MB RAM. Set BENCH_SCALES=10000 for
-// quick checks.
-var benchScales = []int{10_000, 100_000, 1_000_000}
+// benchScales is the set of pre-existing table sizes every benchmark is run
+// against, so the cost curve as the table grows is measured rather than
+// assumed.
+//
+// 1M takes ~30-60s to seed and needs ~500MB RAM, and seed() runs again for
+// every trial the framework schedules at a growing b.N, so the full set is
+// expensive. Override it for quick checks:
+//
+//	BENCH_SCALES=10000 go test ./internal/db -bench InsertBlockDataBatch
+var benchScales = mustParseBenchScales(os.Getenv("BENCH_SCALES"))
+
+// mustParseBenchScales reads a comma-separated scale list, falling back to the
+// full set when unset. A malformed value panics rather than silently reverting
+// to the slow default -- an override that quietly does nothing is how the
+// previous version of this escape hatch went unnoticed.
+func mustParseBenchScales(env string) []int {
+	if strings.TrimSpace(env) == "" {
+		return []int{10_000, 100_000, 1_000_000}
+	}
+	var out []int
+	for _, field := range strings.Split(env, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		n, err := strconv.Atoi(field)
+		if err != nil || n <= 0 {
+			panic(fmt.Sprintf("BENCH_SCALES: %q is not a positive integer", field))
+		}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		panic("BENCH_SCALES: set but contained no scales")
+	}
+	return out
+}
 
 func setupBenchDB(b *testing.B) (*DB, func()) {
 	b.Helper()
