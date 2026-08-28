@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -129,6 +130,12 @@ func setupBenchDB(b *testing.B) (*DB, func()) {
 // seed bulk-loads nTxs transactions via COPY (the batch-insert path would take
 // minutes at 1M), then re-seeds chain_counters since COPY bypasses the live
 // increment path.
+//
+// Every COPY here generates its rows one at a time through pgx.CopyFromSlice
+// rather than building a [][]any first. Materialising them is what the obvious
+// version does, and it costs roughly 800 bytes per transaction -- about 8 GB at
+// the default 10M scale, which is more memory than the database server itself
+// is usually given. Measured: 113 MB of client RSS at 100k.
 func seed(b *testing.B, d *DB, nTxs int) {
 	b.Helper()
 	ctx := context.Background()
@@ -154,22 +161,20 @@ func seed(b *testing.B, d *DB, nTxs int) {
 	}
 	firstBlock := have / txsPerBlock
 
-	rows := make([][]any, 0, nBlocks-firstBlock)
-	for i := firstBlock; i < nBlocks; i++ {
-		ts := now - int64(2*(nBlocks-i))
-		rows = append(rows, []any{
-			int64(i + 1),
-			fmt.Sprintf("0xblock%010d", i),
-			fmt.Sprintf("0xparent%09d", i),
-			ts,
-			int64(21000), int64(30000000),
-			int64(txsPerBlock),
-		})
-	}
 	if _, err := d.pool.CopyFrom(ctx,
 		[]string{"blocks"},
 		[]string{"number", "hash", "parent_hash", "timestamp", "gas_used", "gas_limit", "transaction_count"},
-		copyRows(rows),
+		pgx.CopyFromSlice(nBlocks-firstBlock, func(j int) ([]any, error) {
+			i := firstBlock + j
+			return []any{
+				int64(i + 1),
+				fmt.Sprintf("0xblock%010d", i),
+				fmt.Sprintf("0xparent%09d", i),
+				now - int64(2*(nBlocks-i)),
+				int64(21000), int64(30000000),
+				int64(txsPerBlock),
+			}, nil
+		}),
 	); err != nil {
 		b.Fatalf("seed blocks: %v", err)
 	}
@@ -178,66 +183,57 @@ func seed(b *testing.B, d *DB, nTxs int) {
 	for i := range addrPool {
 		addrPool[i] = fmt.Sprintf("0xaddr%036d", i)
 	}
-	txRows := make([][]any, 0, nTxs-have)
-	for i := have; i < nTxs; i++ {
-		blockNum := int64(i/txsPerBlock + 1)
-		ts := now - int64(2*(nBlocks-int(blockNum)))
-		from := addrPool[i%len(addrPool)]
-		to := addrPool[(i+1)%len(addrPool)]
-		txRows = append(txRows, []any{
-			fmt.Sprintf("0xtx%062d", i),
-			blockNum,
-			ts,
-			int64(i % txsPerBlock),
-			from, to,
-			"1",
-			int64(21000), int64(20_000_000),
-			int64(21000),
-			int64(0),
-			"0x",
-			int64(1),
-			int16(0),
-		})
-	}
 	if _, err := d.pool.CopyFrom(ctx,
 		[]string{"transactions"},
 		[]string{"hash", "block_number", "block_timestamp", "tx_index", "from_address", "to_address",
 			"value", "gas_used", "gas_price", "gas_limit", "tx_type", "input_data", "status", "categories"},
-		copyRows(txRows),
+		pgx.CopyFromSlice(nTxs-have, func(j int) ([]any, error) {
+			i := have + j
+			blockNum := int64(i/txsPerBlock + 1)
+			return []any{
+				fmt.Sprintf("0xtx%062d", i),
+				blockNum,
+				now - int64(2*(nBlocks-int(blockNum))),
+				int64(i % txsPerBlock),
+				addrPool[i%len(addrPool)], addrPool[(i+1)%len(addrPool)],
+				"1",
+				int64(21000), int64(20_000_000),
+				int64(21000),
+				int64(0),
+				"0x",
+				int64(1),
+				int16(0),
+			}, nil
+		}),
 	); err != nil {
 		b.Fatalf("seed transactions: %v", err)
 	}
 
-	asRows := make([][]any, 0, len(addrPool))
-	for _, a := range addrPool {
-		asRows = append(asRows, []any{a, int32(nTxs / len(addrPool)), int32(0), int32(0), int64(0), int64(nBlocks), false})
-	}
 	if firstBlock == 0 {
 		if _, err := d.pool.CopyFrom(ctx,
 			[]string{"address_stats"},
 			[]string{"address", "tx_count", "internal_tx_count", "token_transfer_count", "first_seen", "last_seen", "is_contract"},
-			copyRows(asRows),
+			pgx.CopyFromSlice(len(addrPool), func(i int) ([]any, error) {
+				return []any{addrPool[i], int32(nTxs / len(addrPool)), int32(0), int32(0),
+					int64(0), int64(nBlocks), false}, nil
+			}),
 		); err != nil {
 			b.Fatalf("seed address_stats: %v", err)
 		}
-	}
 
-	cRows := make([][]any, 0, 5)
-	for i := 0; i < 5; i++ {
-		cRows = append(cRows, []any{
-			fmt.Sprintf("0xcontract%030d", i),
-			"0x60",
-			fmt.Sprintf("0xtx%062d", i),
-			addrPool[0],
-			int64(1),
-			false,
-		})
-	}
-	if firstBlock == 0 {
 		if _, err := d.pool.CopyFrom(ctx,
 			[]string{"contracts"},
 			[]string{"address", "bytecode", "creation_tx", "creator", "block_number", "is_verified"},
-			copyRows(cRows),
+			pgx.CopyFromSlice(5, func(i int) ([]any, error) {
+				return []any{
+					fmt.Sprintf("0xcontract%030d", i),
+					"0x60",
+					fmt.Sprintf("0xtx%062d", i),
+					addrPool[0],
+					int64(1),
+					false,
+				}, nil
+			}),
 		); err != nil {
 			b.Fatalf("seed contracts: %v", err)
 		}
@@ -281,16 +277,6 @@ func humanize(n int) string {
 		return strconv.Itoa(n)
 	}
 }
-
-type copyRowsSource struct {
-	rows [][]any
-	i    int
-}
-
-func copyRows(rows [][]any) *copyRowsSource      { return &copyRowsSource{rows: rows} }
-func (s *copyRowsSource) Next() bool             { s.i++; return s.i <= len(s.rows) }
-func (s *copyRowsSource) Values() ([]any, error) { return s.rows[s.i-1], nil }
-func (s *copyRowsSource) Err() error             { return nil }
 
 func BenchmarkGetChainStats(b *testing.B) {
 	runScaled(b, func(b *testing.B, d *DB) {

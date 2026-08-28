@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Derived-counter benchmarks.
@@ -142,31 +144,33 @@ func benchSeedTokenHistory(b *testing.B, d *DB) string {
 	}
 
 	burn := "0x0000000000000000000000000000000000000000"
-	transferRows := make([][]any, 0, nTxs-have)
-	for i := have; i < nTxs; i++ {
-		from := fmt.Sprintf("0xholder%035d", i/benchHoldersPerTransfer)
-		to := from
-		// A slice of transfers are mints from the zero address, so the
-		// total_supply subquery in the UPDATE has non-trivial work rather than
-		// summing a column of zeroes.
-		if i%100 == 0 {
-			from = burn
-		}
-		transferRows = append(transferRows, []any{
-			fmt.Sprintf("0xtx%062d", i), // seeded transaction hash
-			0,
-			token,
-			from, to,
-			"1000000000000000",
-			int64(i/125 + 1),
-			"transfer", "ERC20",
-		})
-	}
+	// Generated one row at a time, for the same reason seed() does: at the
+	// default 10M scale a materialised slice of these is several GB of client
+	// memory that the benchmark has no other use for.
 	if _, err := d.pool.CopyFrom(ctx,
 		[]string{"token_transfers"},
 		[]string{"tx_hash", "log_index", "token_address", "from_address", "to_address",
 			"value", "block_number", "transfer_type", "token_type"},
-		copyRows(transferRows),
+		pgx.CopyFromSlice(nTxs-have, func(j int) ([]any, error) {
+			i := have + j
+			from := fmt.Sprintf("0xholder%035d", i/benchHoldersPerTransfer)
+			to := from
+			// A slice of transfers are mints from the zero address, so the
+			// total_supply subquery in the UPDATE has non-trivial work rather
+			// than summing a column of zeroes.
+			if i%100 == 0 {
+				from = burn
+			}
+			return []any{
+				fmt.Sprintf("0xtx%062d", i), // seeded transaction hash
+				0,
+				token,
+				from, to,
+				"1000000000000000",
+				int64(i/125 + 1),
+				"transfer", "ERC20",
+			}, nil
+		}),
 	); err != nil {
 		b.Fatalf("seed token_transfers: %v", err)
 	}
@@ -175,21 +179,18 @@ func benchSeedTokenHistory(b *testing.B, d *DB) string {
 	// the number of snapshots per holder is part of the cost, not just the
 	// number of holders.
 	nHolders := nTxs / benchHoldersPerTransfer
-	balanceRows := make([][]any, 0, nHolders*benchSnapshotsPerHolder)
-	for h := 0; h < nHolders; h++ {
-		for s := 0; s < benchSnapshotsPerHolder; s++ {
-			balanceRows = append(balanceRows, []any{
+	if _, err := d.pool.CopyFrom(ctx,
+		[]string{"balances"},
+		[]string{"address", "token_address", "block_number", "balance"},
+		pgx.CopyFromSlice(nHolders*benchSnapshotsPerHolder, func(j int) ([]any, error) {
+			h, s := j/benchSnapshotsPerHolder, j%benchSnapshotsPerHolder
+			return []any{
 				fmt.Sprintf("0xholder%035d", h),
 				token,
 				int64(h*benchSnapshotsPerHolder + s + 1),
 				"1000000000000000",
-			})
-		}
-	}
-	if _, err := d.pool.CopyFrom(ctx,
-		[]string{"balances"},
-		[]string{"address", "token_address", "block_number", "balance"},
-		copyRows(balanceRows),
+			}, nil
+		}),
 	); err != nil {
 		b.Fatalf("seed balances: %v", err)
 	}
