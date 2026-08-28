@@ -62,6 +62,18 @@ func mustParseBenchScales(env string) []int {
 	return out
 }
 
+// newBenchDB builds a DB the way New() does rather than by filling in the pool
+// alone. HiddenTxTypes is the reason it has to: New() sets it to an empty slice,
+// a bare &DB{pool: pool} leaves it nil, and pgx sends a nil []int as SQL NULL.
+// `NOT (tx_type = ANY(NULL))` is NULL for every row, so the listing queries match
+// nothing -- and instead of an indexed walk that stops at the LIMIT, the planner
+// picks a parallel sequential scan of the whole table and returns zero rows.
+// BenchmarkGetTransactionsWithCategories_latest10 was timing that: 1.17 s at 10M
+// for a query that takes 0.2 ms when the parameter is an empty array.
+func newBenchDB(pool *pgxpool.Pool) *DB {
+	return &DB{pool: pool, HiddenTxTypes: []int{}}
+}
+
 // setupBenchDB returns a benchmark database. By default it starts a throwaway
 // Postgres via testcontainers, which is convenient but caps the usable scale at
 // whatever the local machine can hold -- and inherits the host's page cache, so
@@ -79,7 +91,7 @@ func setupBenchDB(b *testing.B) (*DB, func()) {
 		if err != nil {
 			b.Fatalf("connect to BENCH_DATABASE_URL: %v", err)
 		}
-		d := &DB{pool: pool}
+		d := newBenchDB(pool)
 		if err := d.Migrate(); err != nil {
 			pool.Close()
 			b.Fatalf("migrate BENCH_DATABASE_URL: %v", err)
@@ -114,7 +126,7 @@ func setupBenchDB(b *testing.B) (*DB, func()) {
 		b.Fatalf("failed to create pool: %v", err)
 	}
 
-	d := &DB{pool: pool}
+	d := newBenchDB(pool)
 	if err := d.Migrate(); err != nil {
 		pool.Close()
 		_ = pgC.Terminate(ctx)
@@ -326,7 +338,10 @@ func BenchmarkGetContract(b *testing.B) {
 func BenchmarkGetAddressStats(b *testing.B) {
 	runScaled(b, func(b *testing.B, d *DB) {
 		ctx := context.Background()
-		addr := "0xaddr00000000000000000000000000000000003"
+		// Must match seed()'s "0xaddr%036d" exactly. It was one zero short,
+		// which made this benchmark time a row that does not exist -- an index
+		// probe that misses, not the lookup it claims to measure.
+		addr := fmt.Sprintf("0xaddr%036d", 3)
 		for i := 0; i < b.N; i++ {
 			if _, err := d.GetAddressStats(ctx, addr); err != nil {
 				b.Fatal(err)

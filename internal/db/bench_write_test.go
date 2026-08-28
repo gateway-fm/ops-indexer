@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -40,6 +42,9 @@ type blockShape struct {
 	transfersPerTx   int
 	gasPerTx         uint64
 	skipAddressStats bool
+	// scatterHashes generates transaction hashes that are uniformly
+	// distributed instead of ascending. See benchScatteredHash.
+	scatterHashes bool
 }
 
 // gasPerTx are the ordinary EVM costs: 21,000 for a bare value transfer,
@@ -52,6 +57,24 @@ var blockShapes = []blockShape{
 	// deadlock (PRST-4495). Measuring it as its own shape isolates what
 	// address_stats maintenance costs on the realtime path.
 	{name: "erc20-no-address-stats", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000, skipAddressStats: true},
+	// transactions.hash is the PRIMARY KEY, so the distribution of the hashes
+	// decides how much of that index has to be resident. The shapes above use
+	// ascending hashes, which only ever touch the right-hand edge of the
+	// B-tree; real hashes are uniformly distributed and dirty a random leaf per
+	// row. This shape is otherwise identical to erc20, so the delta between the
+	// two is the cost of key distribution alone.
+	{name: "erc20-scattered-hash", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000, scatterHashes: true},
+}
+
+// benchScatteredHash returns a hash of exactly the same LENGTH as the ascending
+// one makeBenchBlockData otherwise builds, with the characters scattered across
+// the keyspace. Holding the length constant matters: a real 66-character hash
+// would change both the distribution and the index key size at once, and only
+// the distribution is under test here. Deterministic, so runs are comparable.
+func benchScatteredHash(blockNum uint64, i int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", blockNum, i)))
+	// "0xbenchtx" + two %020d is 49 characters; match it.
+	return "0x" + hex.EncodeToString(sum[:])[:47]
 }
 
 func BenchmarkInsertBlockDataBatch(b *testing.B) {
@@ -132,6 +155,9 @@ func makeBenchBlockData(blockNum uint64, shape blockShape) *BlockData {
 
 	for i := 0; i < benchTxsPerBlock; i++ {
 		hash := fmt.Sprintf("0xbenchtx%020d%020d", blockNum, i)
+		if shape.scatterHashes {
+			hash = benchScatteredHash(blockNum, i)
+		}
 		from := benchSeededAddr(i)
 		// Senders come from the pool seed() already wrote, so address_stats
 		// takes its ON CONFLICT DO UPDATE branch -- the steady-state hot path.

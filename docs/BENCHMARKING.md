@@ -1,11 +1,12 @@
 # Benchmarking ingest
 
-Three measurements, answering different questions. None substitutes for another.
+Four measurements, answering different questions. None substitutes for another.
 
 | | question | needs |
 |---|---|---|
 | [Write-path benchmark](#write-path-benchmark) | did this commit make the inserts faster or slower? | docker, or a Postgres |
 | [Derived-counter benchmarks](#derived-counter-benchmarks) | did it change `RefreshTokenStats`, or the real per-block cost? | same |
+| [Read-path benchmarks](#read-path-benchmarks) | how slow are the explorer's queries as history grows? | same |
 | [End-to-end ingest](#end-to-end-ingest-on-a-live-chain) | what sustained rate do we actually achieve? | a live chain + the indexer deployed |
 
 **Pick the right one.** `BenchmarkInsertBlockDataBatch` covers the inserts only. On a real
@@ -50,11 +51,26 @@ lands on the right-hand edge of each B-tree and touches a handful of pages per i
 the table size. At 10M the index cache-hit rate was still **100.00%**, single-digit block
 reads per table, with every miss in the heap. There is no index-residency cliff on this path.
 
-> Two caveats. The synthetic hashes are **sequential**, whereas real transaction hashes are
-> uniformly random — a random-key B-tree dirties a random leaf per insert and is far more
-> sensitive to cache residency, so this is an optimistic bound on real index maintenance. And
-> at 10M the run-to-run spread widens to ~25% (checkpoint and autovacuum pressure) from under
-> 5% at 100k, so treat small deltas at the top scale with more suspicion, not less.
+The obvious objection is that `transactions.hash` is the PRIMARY KEY and the synthetic hashes
+ascend, whereas real hashes are uniformly distributed — so the ascending shapes would only
+ever touch the right-hand edge of that index and flatter the result. That is what
+`erc20-scattered-hash` exists to test: it is identical to `erc20` except that hashes are
+scattered across the keyspace, at the same key length, so the delta is distribution alone.
+
+**It is 14% faster, not slower** (≈6,800 vs ≈5,950 tx/s at 10M). Postgres compares `text`
+btree keys through an abbreviated key — the leading bytes packed into an integer — and every
+ascending hash here shares the prefix `0xbencht`, so that fast path never discriminates and
+each comparison degrades to a full byte-wise compare. Scattered keys resolve in one integer
+comparison, and that saving outweighs the lost cache locality. So the ascending shapes are
+**conservative** on this axis, and the no-cliff result holds under either distribution.
+
+> Real hashes are also 66 characters against these 49, which makes the real index larger than
+> either shape measured here; key size and key distribution are separate effects.
+
+At 10M, treat a single trial with more suspicion than at 100k, but not much: once the server
+has settled, three consecutive `plain` trials landed inside 0.6%. The wide spread (~25%) shows
+up only while checkpoints from the bulk seed are still draining, which is exactly when the
+first trial after seeding runs.
 
 **The derived-counter path is where scale changes the answer**, because its cost tracks
 stored history rather than the current block, and it grows very nearly linearly. A small
@@ -191,6 +207,40 @@ benchstat before.txt after.txt
 `-benchtime 30x` pins the iteration count. Without it the framework ramps `b.N`
 and re-seeds the table for every ramp step, which is both slow and means
 successive trials measure different table sizes.
+
+## Read-path benchmarks
+
+The six `BenchmarkGet*` benchmarks time query latency against the same seeded table. At 10M,
+on the constrained server, five of the six are microseconds and one is not:
+
+| benchmark | at 10M |
+|---|---|
+| `GetChainStats` | 100 µs |
+| `GetTransaction_byHash` | 109 µs |
+| `GetContract` | 69 µs |
+| `GetAddressStats` | 64 µs |
+| `GetTransactionsWithCategories_latest10` | 258 µs |
+| **`GetTransactionHistory_24h`** | **852 ms** |
+
+`GetTransactionHistory` is the outlier and it is not a caching or indexing accident: to return
+24 hourly points it joins every transaction in the window — **4.9M rows** on a chain producing
+a block every two seconds at ~125 tx/block — and aggregates them, on every call. It is fully
+resident in cache; the time is spent walking the join. A rollup would fix it, and the schema
+already carries an unused `daily_stats` table.
+
+**Two traps that made these benchmarks measure nothing, both now fixed.** Both are the same
+mistake: a lookup key that does not match what `seed()` writes, which fails silently because
+"row not found" is a perfectly good benchmark result.
+
+- `GetAddressStats` searched for an address one character short of the seeded one, so it timed
+  an index probe that missed.
+- `setupBenchDB` built `&DB{pool: pool}` instead of going through a constructor, leaving
+  `HiddenTxTypes` nil where `New()` sets an empty slice. pgx sends nil as SQL NULL, and
+  `NOT (tx_type = ANY(NULL))` is NULL for every row — so the listing query matched nothing and
+  the planner chose a parallel sequential scan over all 10M rows. That benchmark read
+  **1.17 s**; with the parameter corrected it is **258 µs**, a factor of 4,500.
+
+When adding a read benchmark, assert it returns a row before trusting its timing.
 
 ## End-to-end ingest on a live chain
 
