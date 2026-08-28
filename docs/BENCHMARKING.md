@@ -36,15 +36,29 @@ BENCH_SCALES=100000,1000000 go test ./internal/db -run '^$' -bench InsertBlockDa
 The default is **10M rows**, which is deliberately not a convenient number.
 
 At a sustained 500 tx/s a chain reaches 1M transactions in about **half an hour** and 43M in
-a **day**, so a 1M-row table describes the first minutes of a chain's life. More importantly,
-insert cost does not degrade smoothly as a table grows: index depth rises only
-logarithmically (a B-tree over 1M rows is ~3 levels, 100M ~4, 2B ~5), so what actually
-governs throughput is whether the index pages are resident in memory. That makes the curve a
-**cliff, not a slope** — flat while the working set fits, sharply worse once it does not.
+a **day**, so a 1M-row table describes the first minutes of a chain's life.
 
-A small scale on a large machine sits entirely on the flat side and reports a reassuring
-"table size barely matters" result that says nothing about a deployed system, where indexes
-routinely exceed `shared_buffers` several times over.
+Scale matters far more for the derived-counter benchmarks than for the insert benchmark, and
+it is worth knowing which is which before spending an hour seeding.
+
+**Insert cost barely moves with table size, and that is not an artefact of too small a
+scale.** Measured against a server constrained to the deployed configuration
+(`shared_buffers = 2GB`, 3 CPU, gp3), growing 100k → 10M transactions — 100×, ending with a
+10 GB database whose indexes total 2.3× `shared_buffers` — cost the `erc20` insert path about
+20%. Ingest is **append-ordered**: block numbers and hashes only increase, so every insert
+lands on the right-hand edge of each B-tree and touches a handful of pages per index whatever
+the table size. At 10M the index cache-hit rate was still **100.00%**, single-digit block
+reads per table, with every miss in the heap. There is no index-residency cliff on this path.
+
+> Two caveats. The synthetic hashes are **sequential**, whereas real transaction hashes are
+> uniformly random — a random-key B-tree dirties a random leaf per insert and is far more
+> sensitive to cache residency, so this is an optimistic bound on real index maintenance. And
+> at 10M the run-to-run spread widens to ~25% (checkpoint and autovacuum pressure) from under
+> 5% at 100k, so treat small deltas at the top scale with more suspicion, not less.
+
+**The derived-counter path is where scale changes the answer**, because its cost tracks
+stored history rather than the current block, and it grows very nearly linearly. A small
+scale understates it by roughly the factor it understates the history. See below.
 
 So: size the scale against the *deployment*, and constrain the server's memory so the
 working-set-to-RAM ratio resembles production. Shrinking the server is much cheaper than
@@ -60,10 +74,31 @@ BENCH_DATABASE_URL='postgres://user:pass@host:5432/benchdb?sslmode=disable' \
   BENCH_SCALES=10000000 go test ./internal/db -run '^$' -bench . -benchtime 30x -timeout 4h
 ```
 
-Seeding is incremental: it counts what is already there and tops up, so a database can be
-reused across runs and across ascending scales without re-seeding from scratch. The
-benchmark writes to whatever you point it at and never drops anything — use a throwaway
-database, not a real one.
+Seeding is incremental: it counts what is already there and tops up, so re-running the *same*
+scale against the same database skips seeding entirely. The benchmark writes to whatever you
+point it at and never drops anything — use a throwaway database, not a real one.
+
+**Use a fresh database for each scale.** Reusing one across *ascending* scales does not work,
+and fails confusingly rather than cleanly. Seeding resumes from `COUNT(*) FROM transactions`,
+but the benchmarks themselves also insert transactions, so after a run the row count no
+longer matches the contiguous block of synthetic rows the seed laid down. The next scale
+therefore skips a range of transaction hashes, and `benchSeedTokenHistory` — which derives
+the `tx_hash` it hangs each token transfer off from a row index — generates hashes inside
+that gap:
+
+```
+ERROR: insert or update on table "token_transfers" violates foreign key constraint
+       "token_transfers_tx_hash_fkey"
+DETAIL: Key (tx_hash)=(0xtx…) is not present in table "transactions".
+```
+
+So drive a multi-scale sweep as one invocation per scale, each against its own database,
+rather than passing several scales in `BENCH_SCALES` with a persistent
+`BENCH_DATABASE_URL`. (A `BENCH_SCALES` list is still fine on testcontainers, where every
+sub-benchmark gets a brand-new container.)
+
+Seeding generates rows one at a time rather than materialising them, so the client side costs
+tens of MB regardless of scale; the memory that matters is the server's.
 
 ### Reading the output
 
@@ -108,6 +143,37 @@ over `token_transfers`, a `DISTINCT ON (address)` over `balances`, and a `SUM(..
 `token_transfers` inside the `UPDATE`. None is bounded by the block being processed, so cost
 grows with the token's lifetime. A chain with one dominant token is the worst case, and is
 what these benchmarks seed.
+
+### What this costs, measured
+
+Same constrained server as above (PG 17, `shared_buffers = 2GB`, 3 CPU, gp3), 250 tx/block,
+one dominant ERC-20:
+
+| scale | `RefreshTokenStats` | `BlockCycle` | `BlockCycle` tx/s |
+|---|---|---|---|
+| 100k | 32 ms | 71 ms | 3,521 |
+| 1M | 264 ms | 305 ms | 820 |
+| 10M | ~2.4 s | 2.53 s | **99** |
+
+The 10M refresh figure is the sum of its three statements measured once the server had
+settled. `BenchmarkRefreshTokenStats` itself reported 3.07 s, but it runs immediately after
+the bulk seed while autovacuum is still working through the freshly loaded table, so it is
+inflated; the number to quote is ~2.4 s.
+
+Two things follow, and both are structural rather than tuning problems.
+
+**It is very nearly linear in history.** Ten times the history costs about ten times as much,
+per block, forever. The per-block cycle therefore collapsed **35×** between 100k and 10M, and
+at 10M a single refresh costs about as much as sixty of the inserts it accompanies.
+
+**It is CPU-bound, not I/O-bound.** At 10M only the `SUM` leaves `shared_buffers` at all, and
+its disk I/O is ~176 ms of a 1,107 ms statement — the other 84%, and effectively all of the
+other two statements, is CPU spent walking and aggregating rows that are already in memory.
+Raising `shared_buffers` or moving to faster disks will not fix this; not recomputing
+whole-history aggregates per block is the only thing that will.
+
+That is also why `BenchmarkInsertBlockDataBatch` cannot be the regression gate for ingest:
+at 10M it accounts for under 2% of the per-block cost that `BenchmarkBlockCycle` measures.
 
 ### Comparing across commits
 
