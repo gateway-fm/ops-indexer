@@ -1,0 +1,201 @@
+package db
+
+import (
+	"context"
+	"fmt"
+	"testing"
+)
+
+// Derived-counter benchmarks.
+//
+// BenchmarkInsertBlockDataBatch measures the inserts. This file measures what
+// runs immediately after them in the indexer's per-block loop: RefreshTokenStats,
+// once per token touched by the block. The two together are the real per-block
+// cost, and the split matters because they scale on different axes:
+//
+//   - inserts scale with rows written per block, and barely at all with how much
+//     history is already stored;
+//   - RefreshTokenStats scales with the history of the token being refreshed,
+//     and not at all with how many rows this block wrote.
+//
+// That second axis is why a benchmark that only covers inserts cannot detect a
+// change to the derived-counter path, in either direction.
+//
+// For an ERC-20 token, one RefreshTokenStats call issues three
+// history-proportional statements against a single token:
+//
+//	COUNT(*)              over token_transfers for that token
+//	DISTINCT ON (address) over balances        for that token, then COUNT
+//	SUM(...)              over token_transfers for that token, inside the UPDATE
+//
+// None of them is bounded by the block being processed.
+
+// benchHoldersPerTransfer and benchSnapshotsPerHolder shape the balances history
+// the holder_count query has to walk. One balance row per holder would let
+// DISTINCT ON stop immediately; real chains carry many snapshots per holder
+// because a row is written per address per block the balance changed in.
+const (
+	benchHoldersPerTransfer = 10 // 1 holder per 10 transfers
+	benchSnapshotsPerHolder = 2
+)
+
+// BenchmarkRefreshTokenStats measures one RefreshTokenStats call against a token
+// whose history is the size of the seeded scale.
+//
+// Seeding all n transfers onto a single token models a chain with one dominant
+// ERC-20 -- which is both the load-test shape and the worst case, and makes the
+// number directly comparable to BenchmarkInsertBlockDataBatch at the same scale.
+func BenchmarkRefreshTokenStats(b *testing.B) {
+	runScaled(b, func(b *testing.B, d *DB) {
+		ctx := context.Background()
+		b.StopTimer()
+		token := benchSeedTokenHistory(b, d)
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := d.RefreshTokenStats(ctx, token); err != nil {
+				b.Fatalf("RefreshTokenStats: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkBlockCycle measures what the indexer actually does per block:
+// InsertBlockDataBatch followed by RefreshTokenStats for each token the block
+// touched. This is the number to watch when changing the ingest path -- neither
+// half alone predicts it.
+func BenchmarkBlockCycle(b *testing.B) {
+	shape := blockShape{name: "erc20", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000}
+
+	runScaled(b, func(b *testing.B, d *DB) {
+		ctx := context.Background()
+		b.StopTimer()
+
+		token := benchSeedTokenHistory(b, d)
+
+		var head uint64
+		if err := d.pool.QueryRow(ctx, `SELECT COALESCE(MAX(number), 0) FROM blocks`).Scan(&head); err != nil {
+			b.Fatalf("read seeded head: %v", err)
+		}
+		batches := make([]*BlockData, b.N)
+		for i := range batches {
+			batches[i] = makeBenchBlockData(head+uint64(i)+1, shape)
+		}
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := d.InsertBlockDataBatch(ctx, batches[i]); err != nil {
+				b.Fatalf("InsertBlockDataBatch: %v", err)
+			}
+			// The indexer refreshes once per distinct token in the block; every
+			// transfer this benchmark generates carries the same token address.
+			if err := d.RefreshTokenStats(ctx, token); err != nil {
+				b.Fatalf("RefreshTokenStats: %v", err)
+			}
+		}
+
+		b.StopTimer()
+		if elapsed := b.Elapsed().Seconds(); elapsed > 0 {
+			blocks := float64(b.N)
+			txs := blocks * benchTxsPerBlock
+			b.ReportMetric(blocks/elapsed, "blocks/s")
+			b.ReportMetric(txs/elapsed, "tx/s")
+			b.ReportMetric(txs*float64(shape.gasPerTx)/elapsed, "gas/s")
+		}
+	})
+}
+
+// benchSeedTokenHistory gives one ERC-20 token a transfer and balance history
+// sized to the transactions already seeded, and returns its address. Transfers
+// hang off the seeded transactions because token_transfers.tx_hash is a foreign
+// key into transactions(hash).
+func benchSeedTokenHistory(b *testing.B, d *DB) string {
+	b.Helper()
+	ctx := context.Background()
+
+	token := fmt.Sprintf("0xtoken%035d", 1)
+
+	var nTxs int
+	if err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions`).Scan(&nTxs); err != nil {
+		b.Fatalf("count seeded transactions: %v", err)
+	}
+	if nTxs == 0 {
+		b.Fatal("no seeded transactions to hang token transfers off")
+	}
+
+	// The token row must exist or RefreshTokenStats returns early and the
+	// benchmark silently measures a single indexed lookup.
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number)
+		VALUES ($1, 'BENCH', 'Benchmark Token', 18, 'ERC20', 1)
+		ON CONFLICT (address) DO NOTHING`, token); err != nil {
+		b.Fatalf("seed token: %v", err)
+	}
+
+	var have int
+	if err := d.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, token).Scan(&have); err != nil {
+		b.Fatalf("count existing transfers: %v", err)
+	}
+	if have >= nTxs {
+		return token
+	}
+
+	burn := "0x0000000000000000000000000000000000000000"
+	transferRows := make([][]any, 0, nTxs-have)
+	for i := have; i < nTxs; i++ {
+		from := fmt.Sprintf("0xholder%035d", i/benchHoldersPerTransfer)
+		to := from
+		// A slice of transfers are mints from the zero address, so the
+		// total_supply subquery in the UPDATE has non-trivial work rather than
+		// summing a column of zeroes.
+		if i%100 == 0 {
+			from = burn
+		}
+		transferRows = append(transferRows, []any{
+			fmt.Sprintf("0xtx%062d", i), // seeded transaction hash
+			0,
+			token,
+			from, to,
+			"1000000000000000",
+			int64(i/125 + 1),
+			"transfer", "ERC20",
+		})
+	}
+	if _, err := d.pool.CopyFrom(ctx,
+		[]string{"token_transfers"},
+		[]string{"tx_hash", "log_index", "token_address", "from_address", "to_address",
+			"value", "block_number", "transfer_type", "token_type"},
+		copyRows(transferRows),
+	); err != nil {
+		b.Fatalf("seed token_transfers: %v", err)
+	}
+
+	// holder_count walks every balance row for the token via DISTINCT ON, so
+	// the number of snapshots per holder is part of the cost, not just the
+	// number of holders.
+	nHolders := nTxs / benchHoldersPerTransfer
+	balanceRows := make([][]any, 0, nHolders*benchSnapshotsPerHolder)
+	for h := 0; h < nHolders; h++ {
+		for s := 0; s < benchSnapshotsPerHolder; s++ {
+			balanceRows = append(balanceRows, []any{
+				fmt.Sprintf("0xholder%035d", h),
+				token,
+				int64(h*benchSnapshotsPerHolder + s + 1),
+				"1000000000000000",
+			})
+		}
+	}
+	if _, err := d.pool.CopyFrom(ctx,
+		[]string{"balances"},
+		[]string{"address", "token_address", "block_number", "balance"},
+		copyRows(balanceRows),
+	); err != nil {
+		b.Fatalf("seed balances: %v", err)
+	}
+
+	if _, err := d.pool.Exec(ctx, "ANALYZE token_transfers, balances, tokens"); err != nil {
+		b.Fatalf("analyze: %v", err)
+	}
+	return token
+}

@@ -23,7 +23,16 @@ import (
 // every trial the framework schedules at a growing b.N, so the full set is
 // expensive. Override it for quick checks:
 //
-//	BENCH_SCALES=10000 go test ./internal/db -bench InsertBlockDataBatch
+//	BENCH_SCALES=100000 go test ./internal/db -bench InsertBlockDataBatch
+//
+// The default floor is 10M rows on purpose. At a sustained 500 tx/s a chain
+// reaches 1M transactions in about half an hour and 43M in a day, so anything
+// smaller measures only the first minutes of a chain's life -- and, more
+// importantly, stays inside the regime where the whole working set is resident
+// in RAM. Insert cost is flat there and falls off a cliff when the indexes stop
+// fitting, so a small scale reports a flat curve that says nothing about the
+// deployed system. Running the default needs roughly 8 GB of disk per scale;
+// use BENCH_DATABASE_URL to point it at a properly sized server.
 var benchScales = mustParseBenchScales(os.Getenv("BENCH_SCALES"))
 
 // mustParseBenchScales reads a comma-separated scale list, falling back to the
@@ -32,7 +41,7 @@ var benchScales = mustParseBenchScales(os.Getenv("BENCH_SCALES"))
 // previous version of this escape hatch went unnoticed.
 func mustParseBenchScales(env string) []int {
 	if strings.TrimSpace(env) == "" {
-		return []int{10_000, 100_000, 1_000_000}
+		return []int{10_000_000}
 	}
 	var out []int
 	for _, field := range strings.Split(env, ",") {
@@ -52,9 +61,30 @@ func mustParseBenchScales(env string) []int {
 	return out
 }
 
+// setupBenchDB returns a benchmark database. By default it starts a throwaway
+// Postgres via testcontainers, which is convenient but caps the usable scale at
+// whatever the local machine can hold -- and inherits the host's page cache, so
+// the working set stays resident far longer than it would on a real server.
+//
+// Set BENCH_DATABASE_URL to run against an existing Postgres instead. The
+// benchmark then does NOT create or drop anything beyond the schema, so point it
+// only at a database you are willing to have written to.
 func setupBenchDB(b *testing.B) (*DB, func()) {
 	b.Helper()
 	ctx := context.Background()
+
+	if url := strings.TrimSpace(os.Getenv("BENCH_DATABASE_URL")); url != "" {
+		pool, err := pgxpool.New(ctx, url)
+		if err != nil {
+			b.Fatalf("connect to BENCH_DATABASE_URL: %v", err)
+		}
+		d := &DB{pool: pool}
+		if err := d.Migrate(); err != nil {
+			pool.Close()
+			b.Fatalf("migrate BENCH_DATABASE_URL: %v", err)
+		}
+		return d, func() { pool.Close() }
+	}
 
 	pgC, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("postgres:15-alpine"),
@@ -107,8 +137,25 @@ func seed(b *testing.B, d *DB, nTxs int) {
 	nBlocks := (nTxs + txsPerBlock - 1) / txsPerBlock
 	now := time.Now().Unix()
 
-	rows := make([][]any, 0, nBlocks)
-	for i := 0; i < nBlocks; i++ {
+	// With BENCH_DATABASE_URL the database persists across runs and across
+	// ascending scales, so seeding has to top up rather than start from zero --
+	// every row here has a primary key that would otherwise collide. Row
+	// identities are a pure function of the index, so resuming at `have` keeps
+	// block numbers and hashes contiguous.
+	var have int
+	if err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions`).Scan(&have); err != nil {
+		b.Fatalf("count existing transactions: %v", err)
+	}
+	if have >= nTxs {
+		if _, err := d.pool.Exec(ctx, "ANALYZE"); err != nil {
+			b.Fatalf("analyze: %v", err)
+		}
+		return
+	}
+	firstBlock := have / txsPerBlock
+
+	rows := make([][]any, 0, nBlocks-firstBlock)
+	for i := firstBlock; i < nBlocks; i++ {
 		ts := now - int64(2*(nBlocks-i))
 		rows = append(rows, []any{
 			int64(i + 1),
@@ -131,8 +178,8 @@ func seed(b *testing.B, d *DB, nTxs int) {
 	for i := range addrPool {
 		addrPool[i] = fmt.Sprintf("0xaddr%036d", i)
 	}
-	txRows := make([][]any, 0, nTxs)
-	for i := 0; i < nTxs; i++ {
+	txRows := make([][]any, 0, nTxs-have)
+	for i := have; i < nTxs; i++ {
 		blockNum := int64(i/txsPerBlock + 1)
 		ts := now - int64(2*(nBlocks-int(blockNum)))
 		from := addrPool[i%len(addrPool)]
@@ -165,12 +212,14 @@ func seed(b *testing.B, d *DB, nTxs int) {
 	for _, a := range addrPool {
 		asRows = append(asRows, []any{a, int32(nTxs / len(addrPool)), int32(0), int32(0), int64(0), int64(nBlocks), false})
 	}
-	if _, err := d.pool.CopyFrom(ctx,
-		[]string{"address_stats"},
-		[]string{"address", "tx_count", "internal_tx_count", "token_transfer_count", "first_seen", "last_seen", "is_contract"},
-		copyRows(asRows),
-	); err != nil {
-		b.Fatalf("seed address_stats: %v", err)
+	if firstBlock == 0 {
+		if _, err := d.pool.CopyFrom(ctx,
+			[]string{"address_stats"},
+			[]string{"address", "tx_count", "internal_tx_count", "token_transfer_count", "first_seen", "last_seen", "is_contract"},
+			copyRows(asRows),
+		); err != nil {
+			b.Fatalf("seed address_stats: %v", err)
+		}
 	}
 
 	cRows := make([][]any, 0, 5)
@@ -184,12 +233,14 @@ func seed(b *testing.B, d *DB, nTxs int) {
 			false,
 		})
 	}
-	if _, err := d.pool.CopyFrom(ctx,
-		[]string{"contracts"},
-		[]string{"address", "bytecode", "creation_tx", "creator", "block_number", "is_verified"},
-		copyRows(cRows),
-	); err != nil {
-		b.Fatalf("seed contracts: %v", err)
+	if firstBlock == 0 {
+		if _, err := d.pool.CopyFrom(ctx,
+			[]string{"contracts"},
+			[]string{"address", "bytecode", "creation_tx", "creator", "block_number", "is_verified"},
+			copyRows(cRows),
+		); err != nil {
+			b.Fatalf("seed contracts: %v", err)
+		}
 	}
 
 	if _, err := d.pool.Exec(ctx, `

@@ -1,12 +1,17 @@
 # Benchmarking ingest
 
-Two measurements, answering different questions. Run both — neither substitutes
-for the other.
+Three measurements, answering different questions. None substitutes for another.
 
 | | question | needs |
 |---|---|---|
-| [Write-path benchmark](#write-path-benchmark) | did this commit make the insert path faster or slower? | docker |
+| [Write-path benchmark](#write-path-benchmark) | did this commit make the inserts faster or slower? | docker, or a Postgres |
+| [Derived-counter benchmarks](#derived-counter-benchmarks) | did it change `RefreshTokenStats`, or the real per-block cost? | same |
 | [End-to-end ingest](#end-to-end-ingest-on-a-live-chain) | what sustained rate do we actually achieve? | a live chain + the indexer deployed |
+
+**Pick the right one.** `BenchmarkInsertBlockDataBatch` covers the inserts only. On a real
+chain the inserts have been a small fraction of total database time, with derived-counter
+maintenance dominating — so a change to that path moves nothing in the insert benchmark.
+`BenchmarkBlockCycle` is the number to watch when changing ingest.
 
 ## Write-path benchmark
 
@@ -16,17 +21,49 @@ realtime write path: one Postgres transaction per block covering `blocks`,
 `address_stats` and `chain_counters`.
 
 ```bash
-make bench-quick      # write path, 10k-row table, minutes
-make bench            # everything, 10k/100k/1M tables, considerably longer
+make bench-quick      # write path, small table, minutes
+make bench            # everything at the default scale, considerably longer
 ```
 
-Each sub-benchmark starts its own Postgres via testcontainers, seeds it to the
-target table size, and tears it down. Override the table sizes with a
-comma-separated list:
+Override the table sizes with a comma-separated list:
 
 ```bash
-BENCH_SCALES=10000,100000 go test ./internal/db -run '^$' -bench InsertBlockDataBatch -benchtime 30x
+BENCH_SCALES=100000,1000000 go test ./internal/db -run '^$' -bench InsertBlockDataBatch -benchtime 30x
 ```
+
+### Choosing a scale, and why the default is large
+
+The default is **10M rows**, which is deliberately not a convenient number.
+
+At a sustained 500 tx/s a chain reaches 1M transactions in about **half an hour** and 43M in
+a **day**, so a 1M-row table describes the first minutes of a chain's life. More importantly,
+insert cost does not degrade smoothly as a table grows: index depth rises only
+logarithmically (a B-tree over 1M rows is ~3 levels, 100M ~4, 2B ~5), so what actually
+governs throughput is whether the index pages are resident in memory. That makes the curve a
+**cliff, not a slope** — flat while the working set fits, sharply worse once it does not.
+
+A small scale on a large machine sits entirely on the flat side and reports a reassuring
+"table size barely matters" result that says nothing about a deployed system, where indexes
+routinely exceed `shared_buffers` several times over.
+
+So: size the scale against the *deployment*, and constrain the server's memory so the
+working-set-to-RAM ratio resembles production. Shrinking the server is much cheaper than
+growing the table and reaches the same regime.
+
+### Running against a real Postgres
+
+testcontainers is convenient but caps the usable scale at what the local machine holds, and
+inherits the host page cache. Set `BENCH_DATABASE_URL` to use an existing server instead:
+
+```bash
+BENCH_DATABASE_URL='postgres://user:pass@host:5432/benchdb?sslmode=disable' \
+  BENCH_SCALES=10000000 go test ./internal/db -run '^$' -bench . -benchtime 30x -timeout 4h
+```
+
+Seeding is incremental: it counts what is already there and tops up, so a database can be
+reused across runs and across ascending scales without re-seeding from scratch. The
+benchmark writes to whatever you point it at and never drops anything — use a throwaway
+database, not a real one.
 
 ### Reading the output
 
@@ -51,10 +88,26 @@ increment are covered too.
 
 ### What it deliberately excludes
 
-`RefreshTokenStats` is not on this path — it runs a level up, in the indexer —
-so these numbers are insert cost alone. Derived-counter maintenance has to be
-measured separately, and on a real chain it can dominate total database time by
-a wide margin.
+`RefreshTokenStats` is not on this path — it runs a level up, in the indexer — so these
+numbers are insert cost alone. See the next section.
+
+## Derived-counter benchmarks
+
+`BenchmarkRefreshTokenStats` times one `RefreshTokenStats` call, and
+`BenchmarkBlockCycle` times what the indexer actually does per block: the insert batch
+followed by a refresh for each token the block touched.
+
+These matter because the two halves scale on **different axes**:
+
+- inserts scale with rows written per block, and barely with stored history;
+- `RefreshTokenStats` scales with the history of the token being refreshed, and not at all
+  with what the current block wrote.
+
+For an ERC-20 token, one call issues three history-proportional statements — a `COUNT(*)`
+over `token_transfers`, a `DISTINCT ON (address)` over `balances`, and a `SUM(...)` over
+`token_transfers` inside the `UPDATE`. None is bounded by the block being processed, so cost
+grows with the token's lifetime. A chain with one dominant token is the worst case, and is
+what these benchmarks seed.
 
 ### Comparing across commits
 

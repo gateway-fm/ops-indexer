@@ -33,11 +33,11 @@ test-integration: ## Run integration tests (requires docker)
 # testcontainers, seeds it to the target table size and tears it down.
 # -benchtime Nx pins the iteration count so the framework runs one trial per
 # sub-benchmark instead of ramping b.N and re-seeding for each ramp step.
-bench: ## Run all benchmarks at the full 10k/100k/1M table sizes (requires docker, slow)
-	go test ./internal/db -run '^$$' -bench . -benchtime 30x -timeout 60m
+bench: ## Run all benchmarks at the default 10M scale (needs ~8GB disk; slow)
+	go test ./internal/db -run '^$$' -bench . -benchtime 30x -timeout 4h
 
-bench-quick: ## Run the write-path benchmark at 10k rows only (requires docker)
-	BENCH_SCALES=10000 go test ./internal/db -run '^$$' -bench InsertBlockDataBatch -benchtime 30x -timeout 20m
+bench-quick: ## Run the write-path benchmark at a small table size (requires docker)
+	BENCH_SCALES=100000 go test ./internal/db -run '^$$' -bench InsertBlockDataBatch -benchtime 30x -timeout 20m
 
 run-local: ## Run the indexer against a local docker-compose dev stack
 	docker compose -f scripts/docker-compose.dev.yml up -d postgres anvil
