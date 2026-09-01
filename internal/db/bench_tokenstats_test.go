@@ -79,9 +79,11 @@ func BenchmarkBlockCycle(b *testing.B) {
 		if err := d.pool.QueryRow(ctx, `SELECT COALESCE(MAX(number), 0) FROM blocks`).Scan(&head); err != nil {
 			b.Fatalf("read seeded head: %v", err)
 		}
+		seededTxs, _ := benchSeedProgress(b, d)
+		poolSize := benchAddrPoolSize(seededTxs)
 		batches := make([]*BlockData, b.N)
 		for i := range batches {
-			batches[i] = makeBenchBlockData(head+uint64(i)+1, shape)
+			batches[i] = makeBenchBlockData(head+uint64(i)+1, shape, poolSize)
 		}
 		b.StartTimer()
 
@@ -89,8 +91,11 @@ func BenchmarkBlockCycle(b *testing.B) {
 			if err := d.InsertBlockDataBatch(ctx, batches[i]); err != nil {
 				b.Fatalf("InsertBlockDataBatch: %v", err)
 			}
-			// The indexer refreshes once per distinct token in the block; every
-			// transfer this benchmark generates carries the same token address.
+			// The indexer refreshes once per distinct token in the block. The
+			// block's own transfers are written against benchTransferToken while
+			// this refreshes benchRefreshToken, so the history being measured
+			// stays the size of the seeded scale for every iteration instead of
+			// growing by 250 rows each time round.
 			if err := d.RefreshTokenStats(ctx, token); err != nil {
 				b.Fatalf("RefreshTokenStats: %v", err)
 			}
@@ -111,18 +116,20 @@ func BenchmarkBlockCycle(b *testing.B) {
 // sized to the transactions already seeded, and returns its address. Transfers
 // hang off the seeded transactions because token_transfers.tx_hash is a foreign
 // key into transactions(hash).
-func benchSeedTokenHistory(b *testing.B, d *DB) string {
-	b.Helper()
+func benchSeedTokenHistory(tb testing.TB, d *DB) string {
+	tb.Helper()
 	ctx := context.Background()
 
-	token := fmt.Sprintf("0xtoken%035d", 1)
+	token := benchRefreshToken
 
-	var nTxs int
-	if err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions`).Scan(&nTxs); err != nil {
-		b.Fatalf("count seeded transactions: %v", err)
-	}
+	// The target is the number of rows seed() wrote, NOT COUNT(*) FROM
+	// transactions. The two diverge as soon as a benchmark inserts anything, and
+	// since each transfer hangs off the tx_hash at its own row index, counting
+	// the benchmark's rows made this generate hashes seed() never wrote -- which
+	// the token_transfers.tx_hash foreign key rejected, failing the whole COPY.
+	nTxs, have := benchSeedProgress(tb, d)
 	if nTxs == 0 {
-		b.Fatal("no seeded transactions to hang token transfers off")
+		tb.Fatal("no seeded transactions to hang token transfers off")
 	}
 
 	// The token row must exist or RefreshTokenStats returns early and the
@@ -131,14 +138,9 @@ func benchSeedTokenHistory(b *testing.B, d *DB) string {
 		INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number)
 		VALUES ($1, 'BENCH', 'Benchmark Token', 18, 'ERC20', 1)
 		ON CONFLICT (address) DO NOTHING`, token); err != nil {
-		b.Fatalf("seed token: %v", err)
+		tb.Fatalf("seed token: %v", err)
 	}
 
-	var have int
-	if err := d.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, token).Scan(&have); err != nil {
-		b.Fatalf("count existing transfers: %v", err)
-	}
 	if have >= nTxs {
 		return token
 	}
@@ -172,31 +174,40 @@ func benchSeedTokenHistory(b *testing.B, d *DB) string {
 			}, nil
 		}),
 	); err != nil {
-		b.Fatalf("seed token_transfers: %v", err)
+		tb.Fatalf("seed token_transfers: %v", err)
 	}
 
 	// holder_count walks every balance row for the token via DISTINCT ON, so
 	// the number of snapshots per holder is part of the cost, not just the
 	// number of holders.
+	// Balances resume too. Generating from holder 0 every time collided with the
+	// balances primary key (address, token_address, block_number) the moment a
+	// larger scale ran against a database that already held a smaller one.
 	nHolders := nTxs / benchHoldersPerTransfer
-	if _, err := d.pool.CopyFrom(ctx,
-		[]string{"balances"},
-		[]string{"address", "token_address", "block_number", "balance"},
-		pgx.CopyFromSlice(nHolders*benchSnapshotsPerHolder, func(j int) ([]any, error) {
-			h, s := j/benchSnapshotsPerHolder, j%benchSnapshotsPerHolder
-			return []any{
-				fmt.Sprintf("0xholder%035d", h),
-				token,
-				int64(h*benchSnapshotsPerHolder + s + 1),
-				"1000000000000000",
-			}, nil
-		}),
-	); err != nil {
-		b.Fatalf("seed balances: %v", err)
+	haveHolders := have / benchHoldersPerTransfer
+	if nHolders > haveHolders {
+		if _, err := d.pool.CopyFrom(ctx,
+			[]string{"balances"},
+			[]string{"address", "token_address", "block_number", "balance"},
+			pgx.CopyFromSlice((nHolders-haveHolders)*benchSnapshotsPerHolder, func(j int) ([]any, error) {
+				h := haveHolders + j/benchSnapshotsPerHolder
+				s := j % benchSnapshotsPerHolder
+				return []any{
+					fmt.Sprintf("0xholder%035d", h),
+					token,
+					int64(h*benchSnapshotsPerHolder + s + 1),
+					"1000000000000000",
+				}, nil
+			}),
+		); err != nil {
+			tb.Fatalf("seed balances: %v", err)
+		}
 	}
 
+	recordBenchSeedProgress(tb, d, "seeded_transfers", nTxs)
+
 	if _, err := d.pool.Exec(ctx, "ANALYZE token_transfers, balances, tokens"); err != nil {
-		b.Fatalf("analyze: %v", err)
+		tb.Fatalf("analyze: %v", err)
 	}
 	return token
 }

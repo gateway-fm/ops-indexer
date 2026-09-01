@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -28,13 +30,36 @@ import (
 //
 // The default floor is 10M rows on purpose. At a sustained 500 tx/s a chain
 // reaches 1M transactions in about half an hour and 43M in a day, so anything
-// smaller measures only the first minutes of a chain's life -- and, more
-// importantly, stays inside the regime where the whole working set is resident
-// in RAM. Insert cost is flat there and falls off a cliff when the indexes stop
-// fitting, so a small scale reports a flat curve that says nothing about the
-// deployed system. Running the default needs roughly 8 GB of disk per scale;
-// use BENCH_DATABASE_URL to point it at a properly sized server.
+// smaller measures only the first minutes of a chain's life. Measured, the
+// insert path barely notices the growth -- ingest is append-ordered, so it only
+// touches the right-hand edge of each index -- but the derived-counter
+// benchmarks scale almost linearly with stored history, and at a small scale
+// they understate the deployed cost by about the factor they understate the
+// history. Running the default needs roughly 12 GB of disk per scale; use
+// BENCH_DATABASE_URL to point it at a properly sized server.
 var benchScales = mustParseBenchScales(os.Getenv("BENCH_SCALES"))
+
+// requirePinnedBenchtime fails unless -benchtime is pinned to a fixed iteration
+// count (`30x`), rather than a duration.
+//
+// With a duration, the framework re-invokes the benchmark body at a growing b.N
+// until the wall clock is filled, and every one of those attempts calls
+// setupBenchDB and seed again. On testcontainers that means a brand-new
+// container and a full re-seed per ramp step. That was survivable while the
+// default scale was 10k; at 10M a plain `go test -bench .` will appear to hang.
+// The correct invocation is cheap to state and impossible to infer from a stall,
+// so state it.
+func requirePinnedBenchtime(tb testing.TB) {
+	tb.Helper()
+	f := flag.Lookup("test.benchtime")
+	if f == nil {
+		return
+	}
+	if v := f.Value.String(); !strings.HasSuffix(v, "x") {
+		tb.Fatalf("benchtime is %q, which ramps b.N and re-seeds the table at every step; "+
+			"pin the iteration count instead, e.g. -benchtime 30x (see `make bench`)", v)
+	}
+}
 
 // mustParseBenchScales reads a comma-separated scale list, falling back to the
 // full set when unset. A malformed value panics rather than silently reverting
@@ -82,19 +107,19 @@ func newBenchDB(pool *pgxpool.Pool) *DB {
 // Set BENCH_DATABASE_URL to run against an existing Postgres instead. The
 // benchmark then does NOT create or drop anything beyond the schema, so point it
 // only at a database you are willing to have written to.
-func setupBenchDB(b *testing.B) (*DB, func()) {
-	b.Helper()
+func setupBenchDB(tb testing.TB) (*DB, func()) {
+	tb.Helper()
 	ctx := context.Background()
 
 	if url := strings.TrimSpace(os.Getenv("BENCH_DATABASE_URL")); url != "" {
 		pool, err := pgxpool.New(ctx, url)
 		if err != nil {
-			b.Fatalf("connect to BENCH_DATABASE_URL: %v", err)
+			tb.Fatalf("connect to BENCH_DATABASE_URL: %v", err)
 		}
 		d := newBenchDB(pool)
 		if err := d.Migrate(); err != nil {
 			pool.Close()
-			b.Fatalf("migrate BENCH_DATABASE_URL: %v", err)
+			tb.Fatalf("migrate BENCH_DATABASE_URL: %v", err)
 		}
 		return d, func() { pool.Close() }
 	}
@@ -111,31 +136,78 @@ func setupBenchDB(b *testing.B) (*DB, func()) {
 		),
 	)
 	if err != nil {
-		b.Skipf("skipping: could not start postgres container (is Docker running?): %v", err)
+		tb.Skipf("skipping: could not start postgres container (is Docker running?): %v", err)
 	}
 
 	connStr, err := pgC.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		_ = pgC.Terminate(ctx)
-		b.Fatalf("failed to get connection string: %v", err)
+		tb.Fatalf("failed to get connection string: %v", err)
 	}
 
 	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
 		_ = pgC.Terminate(ctx)
-		b.Fatalf("failed to create pool: %v", err)
+		tb.Fatalf("failed to create pool: %v", err)
 	}
 
 	d := newBenchDB(pool)
 	if err := d.Migrate(); err != nil {
 		pool.Close()
 		_ = pgC.Terminate(ctx)
-		b.Fatalf("failed to run migrations: %v", err)
+		tb.Fatalf("failed to run migrations: %v", err)
 	}
 
 	return d, func() {
 		pool.Close()
 		_ = pgC.Terminate(ctx)
+	}
+}
+
+// benchSeedStateDDL tracks how many rows seed() itself has written.
+//
+// Resumption cannot be derived from COUNT(*) FROM transactions, which is what
+// this used to do. Every row identity here -- hash, block number, sender -- is a
+// pure function of a row index, so topping up requires knowing exactly how far
+// the synthetic range extends. But the benchmarks insert transactions too, at a
+// different hash prefix and a different block density (250 per block against
+// seed's 125), so that count drifts away from the range seed owns. The
+// consequences were a foreign-key failure when the token seeder generated
+// tx_hashes inside the resulting gap, a primary-key collision when the balance
+// seeder restarted from holder 0, and silent holes in block numbering. Keying
+// off a counter only seed() writes fixes all three at the assumption.
+const benchSeedStateDDL = `
+CREATE TABLE IF NOT EXISTS bench_seed_state (
+    id                int PRIMARY KEY,
+    seeded_txs        bigint NOT NULL DEFAULT 0,
+    seeded_transfers  bigint NOT NULL DEFAULT 0,
+    CONSTRAINT bench_seed_state_singleton CHECK (id = 1)
+)`
+
+// benchSeedProgress reads the singleton row, creating the table on first use.
+func benchSeedProgress(tb testing.TB, d *DB) (seededTxs, seededTransfers int) {
+	tb.Helper()
+	ctx := context.Background()
+	if _, err := d.pool.Exec(ctx, benchSeedStateDDL); err != nil {
+		tb.Fatalf("create bench_seed_state: %v", err)
+	}
+	err := d.pool.QueryRow(ctx,
+		`SELECT seeded_txs, seeded_transfers FROM bench_seed_state WHERE id = 1`,
+	).Scan(&seededTxs, &seededTransfers)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		tb.Fatalf("read bench_seed_state: %v", err)
+	}
+	return seededTxs, seededTransfers
+}
+
+func recordBenchSeedProgress(tb testing.TB, d *DB, column string, n int) {
+	tb.Helper()
+	// column is one of two compile-time constants below, never user input.
+	q := fmt.Sprintf(`
+		INSERT INTO bench_seed_state (id, %s) VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET %s = EXCLUDED.%s`, column, column, column)
+	if _, err := d.pool.Exec(context.Background(), q, n); err != nil {
+		tb.Fatalf("record bench_seed_state.%s: %v", column, err)
 	}
 }
 
@@ -145,29 +217,21 @@ func setupBenchDB(b *testing.B) (*DB, func()) {
 //
 // Every COPY here generates its rows one at a time through pgx.CopyFromSlice
 // rather than building a [][]any first. Materialising them is what the obvious
-// version does, and it costs roughly 800 bytes per transaction -- about 8 GB at
+// version does, and it costs roughly 780 bytes per transaction -- about 8 GB at
 // the default 10M scale, which is more memory than the database server itself
 // is usually given. Measured: 113 MB of client RSS at 100k.
-func seed(b *testing.B, d *DB, nTxs int) {
-	b.Helper()
+func seed(tb testing.TB, d *DB, nTxs int) {
+	tb.Helper()
 	ctx := context.Background()
 
 	const txsPerBlock = 125
 	nBlocks := (nTxs + txsPerBlock - 1) / txsPerBlock
 	now := time.Now().Unix()
 
-	// With BENCH_DATABASE_URL the database persists across runs and across
-	// ascending scales, so seeding has to top up rather than start from zero --
-	// every row here has a primary key that would otherwise collide. Row
-	// identities are a pure function of the index, so resuming at `have` keeps
-	// block numbers and hashes contiguous.
-	var have int
-	if err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions`).Scan(&have); err != nil {
-		b.Fatalf("count existing transactions: %v", err)
-	}
+	have, _ := benchSeedProgress(tb, d)
 	if have >= nTxs {
 		if _, err := d.pool.Exec(ctx, "ANALYZE"); err != nil {
-			b.Fatalf("analyze: %v", err)
+			tb.Fatalf("analyze: %v", err)
 		}
 		return
 	}
@@ -188,12 +252,13 @@ func seed(b *testing.B, d *DB, nTxs int) {
 			}, nil
 		}),
 	); err != nil {
-		b.Fatalf("seed blocks: %v", err)
+		tb.Fatalf("seed blocks: %v", err)
 	}
 
-	addrPool := make([]string, 20)
+	poolSize := benchAddrPoolSize(nTxs)
+	addrPool := make([]string, poolSize)
 	for i := range addrPool {
-		addrPool[i] = fmt.Sprintf("0xaddr%036d", i)
+		addrPool[i] = benchSeededAddr(i)
 	}
 	if _, err := d.pool.CopyFrom(ctx,
 		[]string{"transactions"},
@@ -218,21 +283,31 @@ func seed(b *testing.B, d *DB, nTxs int) {
 			}, nil
 		}),
 	); err != nil {
-		b.Fatalf("seed transactions: %v", err)
+		tb.Fatalf("seed transactions: %v", err)
 	}
 
-	if firstBlock == 0 {
+	// address_stats is topped up like everything else. It used to be written
+	// only on the first pass and only ever held 20 rows, which meant the table
+	// was byte-for-byte identical at 100k and at 10M -- so the ON CONFLICT DO
+	// UPDATE that InsertBlockDataBatch performs was always hitting a two-level
+	// index that could not miss cache, at any scale. That flattered every shape
+	// and specifically gutted erc20-no-address-stats, whose entire purpose is to
+	// price address_stats maintenance.
+	havePool := benchAddrPoolSize(have)
+	if poolSize > havePool {
 		if _, err := d.pool.CopyFrom(ctx,
 			[]string{"address_stats"},
 			[]string{"address", "tx_count", "internal_tx_count", "token_transfer_count", "first_seen", "last_seen", "is_contract"},
-			pgx.CopyFromSlice(len(addrPool), func(i int) ([]any, error) {
-				return []any{addrPool[i], int32(nTxs / len(addrPool)), int32(0), int32(0),
+			pgx.CopyFromSlice(poolSize-havePool, func(j int) ([]any, error) {
+				return []any{addrPool[havePool+j], int32(nTxs / poolSize), int32(0), int32(0),
 					int64(0), int64(nBlocks), false}, nil
 			}),
 		); err != nil {
-			b.Fatalf("seed address_stats: %v", err)
+			tb.Fatalf("seed address_stats: %v", err)
 		}
+	}
 
+	if firstBlock == 0 {
 		if _, err := d.pool.CopyFrom(ctx,
 			[]string{"contracts"},
 			[]string{"address", "bytecode", "creation_tx", "creator", "block_number", "is_verified"},
@@ -247,7 +322,7 @@ func seed(b *testing.B, d *DB, nTxs int) {
 				}, nil
 			}),
 		); err != nil {
-			b.Fatalf("seed contracts: %v", err)
+			tb.Fatalf("seed contracts: %v", err)
 		}
 	}
 
@@ -258,15 +333,43 @@ func seed(b *testing.B, d *DB, nTxs int) {
 			('addresses_total',    (SELECT COUNT(*) FROM address_stats), NOW()),
 			('tokens_total',       (SELECT COUNT(*) FROM tokens),        NOW())
 		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`); err != nil {
-		b.Fatalf("reseed counters: %v", err)
+		tb.Fatalf("reseed counters: %v", err)
 	}
 
+	recordBenchSeedProgress(tb, d, "seeded_txs", nTxs)
+
 	if _, err := d.pool.Exec(ctx, "ANALYZE"); err != nil {
-		b.Fatalf("analyze: %v", err)
+		tb.Fatalf("analyze: %v", err)
 	}
 }
 
+// benchAddrPoolSize is how many distinct addresses a given scale seeds.
+//
+// It has to grow with the scale, or address_stats stays a toy table while
+// transactions grows to gigabytes. One address per ten transactions is in the
+// range real chains show, and it keeps the UPSERT hitting an index whose depth
+// tracks the rest of the database. It also sets how many distinct senders a
+// block can draw on, which is what decides the size of the AddressStats map
+// InsertBlockDataBatch has to reconcile.
+func benchAddrPoolSize(nTxs int) int {
+	if nTxs <= 0 {
+		return 0
+	}
+	if n := nTxs / 10; n > 1000 {
+		return n
+	}
+	return 1000
+}
+
+// benchSeededAddr is the address at a given index in the seeded pool. Both
+// seed() and the block generator derive senders from it, so a delta always
+// lands on a row that already exists and takes the steady-state UPDATE branch.
+func benchSeededAddr(i int) string {
+	return fmt.Sprintf("0xaddr%036d", i)
+}
+
 func runScaled(b *testing.B, fn func(b *testing.B, d *DB)) {
+	requirePinnedBenchtime(b)
 	for _, n := range benchScales {
 		n := n
 		b.Run(fmt.Sprintf("n=%s", humanize(n)), func(b *testing.B) {

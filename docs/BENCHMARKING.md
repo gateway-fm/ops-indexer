@@ -42,14 +42,15 @@ a **day**, so a 1M-row table describes the first minutes of a chain's life.
 Scale matters far more for the derived-counter benchmarks than for the insert benchmark, and
 it is worth knowing which is which before spending an hour seeding.
 
-**Insert cost barely moves with table size, and that is not an artefact of too small a
-scale.** Measured against a server constrained to the deployed configuration
-(`shared_buffers = 2GB`, 3 CPU, gp3), growing 100k → 10M transactions — 100×, ending with a
-10 GB database whose indexes total 2.3× `shared_buffers` — cost the `erc20` insert path about
-20%. Ingest is **append-ordered**: block numbers and hashes only increase, so every insert
-lands on the right-hand edge of each B-tree and touches a handful of pages per index whatever
-the table size. At 10M the index cache-hit rate was still **100.00%**, single-digit block
-reads per table, with every miss in the heap. There is no index-residency cliff on this path.
+**Insert cost degrades gently with table size, not off a cliff.** Measured against a server
+constrained to the deployed configuration (`shared_buffers = 2GB`, 3 CPU, gp3), growing
+100k → 10M transactions — 100×, ending with a 12 GB database whose indexes total 3.1×
+`shared_buffers` — cost the `erc20` insert path about 20%. Ingest is **append-ordered** on the
+primary key and on `block_number`: those only increase, so an insert lands on the right-hand
+edge of the tree and the pages it touches stay hot however large the table is. At 10M the index
+cache-hit rate was 99.3% on `transactions` and 98.7% on `address_stats`, with the bulk of the
+misses in the heap. Indexes do begin to miss, but gradually — there is no residency cliff on
+this path.
 
 The obvious objection is that `transactions.hash` is the PRIMARY KEY and the synthetic hashes
 ascend, whereas real hashes are uniformly distributed — so the ascending shapes would only
@@ -57,20 +58,24 @@ ever touch the right-hand edge of that index and flatter the result. That is wha
 `erc20-scattered-hash` exists to test: it is identical to `erc20` except that hashes are
 scattered across the keyspace, at the same key length, so the delta is distribution alone.
 
-**It is 14% faster, not slower** (≈6,800 vs ≈5,950 tx/s at 10M). Postgres compares `text`
-btree keys through an abbreviated key — the leading bytes packed into an integer — and every
-ascending hash here shares the prefix `0xbencht`, so that fast path never discriminates and
-each comparison degrades to a full byte-wise compare. Scattered keys resolve in one integer
+**It is 16% faster, not slower** (4,068 against 3,504 tx/s at 10M). Postgres compares `text`
+btree keys through an abbreviated key — the leading bytes packed into an integer — and the
+ascending hashes here share a long run of leading zeroes, so that fast path never discriminates
+and each comparison degrades to a full byte-wise compare. Scattered keys resolve in one integer
 comparison, and that saving outweighs the lost cache locality. So the ascending shapes are
 **conservative** on this axis, and the no-cliff result holds under either distribution.
 
-> Real hashes are also 66 characters against these 49, which makes the real index larger than
-> either shape measured here; key size and key distribution are separate effects.
+> Index size is dominated by **address** cardinality, not by hashes. Giving the seed a
+> realistic address pool roughly doubled `idx_tx_from` and `idx_tx_to` — 1,035 MB each at 10M,
+> against a `transactions_pkey` of 937 MB. With only 20 distinct addresses, btree
+> deduplication had been compressing those two indexes to a fraction of their real size, which
+> understated the total far more than hash length ever did.
 
-At 10M, treat a single trial with more suspicion than at 100k, but not much: once the server
-has settled, three consecutive `plain` trials landed inside 0.6%. The wide spread (~25%) shows
-up only while checkpoints from the bulk seed are still draining, which is exactly when the
-first trial after seeding runs.
+Variance on a settled server is small: three consecutive trials of every shape landed inside
+1–3.5% at both 100k and 10M. A much wider spread (~25%) appears only while checkpoints from the
+bulk seed are still draining, which is exactly when the first trial after seeding runs — so
+prefer `-count 3` and read the median, and distrust a single trial taken immediately after a
+fresh seed.
 
 **The derived-counter path is where scale changes the answer**, because its cost tracks
 stored history rather than the current block, and it grows very nearly linearly. A small
@@ -90,31 +95,35 @@ BENCH_DATABASE_URL='postgres://user:pass@host:5432/benchdb?sslmode=disable' \
   BENCH_SCALES=10000000 go test ./internal/db -run '^$' -bench . -benchtime 30x -timeout 4h
 ```
 
-Seeding is incremental: it counts what is already there and tops up, so re-running the *same*
-scale against the same database skips seeding entirely. The benchmark writes to whatever you
-point it at and never drops anything — use a throwaway database, not a real one.
+Seeding is incremental and resumable: a database can be reused across runs and across
+ascending scales, and re-running the same scale skips seeding entirely. The benchmark writes
+to whatever you point it at and never drops anything — use a throwaway database, not a real
+one.
 
-**Use a fresh database for each scale.** Reusing one across *ascending* scales does not work,
-and fails confusingly rather than cleanly. Seeding resumes from `COUNT(*) FROM transactions`,
-but the benchmarks themselves also insert transactions, so after a run the row count no
-longer matches the contiguous block of synthetic rows the seed laid down. The next scale
-therefore skips a range of transaction hashes, and `benchSeedTokenHistory` — which derives
-the `tx_hash` it hangs each token transfer off from a row index — generates hashes inside
-that gap:
+Resumption keys off a counter in a `bench_seed_state` table that only `seed()` writes, not
+off `COUNT(*) FROM transactions`. That matters more than it sounds. Every synthetic row
+identity here — hash, block number, sender — is a pure function of a row index, so topping up
+requires knowing exactly how far the synthetic range extends; but the benchmarks insert
+transactions too, at a different hash prefix and 250 rather than 125 per block, so a raw
+`COUNT(*)` drifts away from the range the seed owns. When it did, the token seeder generated
+`tx_hash` values inside the resulting gap and the foreign key rejected the whole COPY:
 
 ```
 ERROR: insert or update on table "token_transfers" violates foreign key constraint
        "token_transfers_tx_hash_fkey"
-DETAIL: Key (tx_hash)=(0xtx…) is not present in table "transactions".
 ```
 
-So drive a multi-scale sweep as one invocation per scale, each against its own database,
-rather than passing several scales in `BENCH_SCALES` with a persistent
-`BENCH_DATABASE_URL`. (A `BENCH_SCALES` list is still fine on testcontainers, where every
-sub-benchmark gets a brand-new container.)
+The balance seeder restarted from holder 0 and collided with the `balances` primary key, and
+block numbering grew silent holes. All three were the same wrong assumption, and all three
+are gone. If you see any of them again, suspect something reading a table count where it
+should be reading `bench_seed_state`.
 
 Seeding generates rows one at a time rather than materialising them, so the client side costs
 tens of MB regardless of scale; the memory that matters is the server's.
+
+`-benchtime` must be pinned to an iteration count (`30x`), and the harness now fails with
+that instruction rather than letting a duration ramp `b.N` and re-seed the table at every
+step. At the 10M default that ramp looks like a hang.
 
 ### Reading the output
 
@@ -123,7 +132,7 @@ is one block.
 
 **Never quote `tx/s` on its own.** Ingest cost tracks block count and gas as
 well as transaction count, so a bare `tx/s` figure is not comparable against
-another run unless the shape matches. The benchmark defines three shapes for
+another run unless the shape matches. The benchmark defines five shapes for
 exactly this reason:
 
 | shape | per tx | what it exercises |
@@ -131,11 +140,47 @@ exactly this reason:
 | `plain` | value transfer only | the `blocks` + `transactions` + `address_stats` floor |
 | `erc20` | 1 log + 1 token transfer | the realistic path, including `logs` and `token_transfers` |
 | `erc20-no-address-stats` | as above, `SkipAddressStats` | isolates the cost of `address_stats` maintenance |
+| `erc20-scattered-hash` | as `erc20`, hashes spread across the keyspace | isolates the cost of key *distribution* in the primary key |
+| `erc20-internal-calls` | as `erc20`, plus 2 traced internal calls | the `internal_transactions` branch, which no other shape reaches |
 
 Senders come from a pool the seed already wrote, so `address_stats` takes its
 `ON CONFLICT DO UPDATE` branch — the steady-state hot path. Every tenth
 recipient is new, so the `INSERT` branch and the `addresses_total` counter
 increment are covered too.
+
+**Address cardinality is a scale axis, not a constant.** The pool grows with the seeded scale
+(one address per ten transactions), so a 250-transaction block presents around 500 distinct
+address deltas and `address_stats` grows alongside `transactions`. It used to hold 20 rows at
+every scale — byte-for-byte identical at 100k and at 10M — which meant the UPSERT always hit a
+two-level index that could not miss cache. That flattered every shape and made
+`erc20-no-address-stats` nearly free; correcting it moved that shape's advantage from about 3%
+to nearly 30%. If you shrink the pool, you are no longer measuring `address_stats`.
+
+Transaction hashes are 66 characters, as production, in every shape. `seed()` always wrote
+production-length hashes; the benchmark's own rows did not, so their index keys were 17 bytes
+short of everything around them. Note that this only ever affected the rows a run inserts —
+a fraction of a percent of the table — so it moved index *size*, and therefore the point where
+the working set stops fitting, hardly at all.
+
+### What this costs, measured
+
+Same constrained server (PG 17, `shared_buffers = 2GB`, 3 CPU, gp3), 250 tx/block, median of
+three trials on a settled server:
+
+| shape | 100k | 1M | 10M |
+|---|---|---|---|
+| `plain` | 8,451 | 7,350 | 6,173 |
+| `erc20` | 4,242 | 4,068 | 3,504 |
+| `erc20-no-address-stats` | 5,021 | 5,197 | 4,480 |
+| `erc20-scattered-hash` | 5,103 | 4,618 | 4,068 |
+| `erc20-internal-calls` | 2,838 | 2,664 | 2,521 |
+
+tx/s. Read them next to their shape and never on their own.
+
+Worth noting from that table: `SkipAddressStats` buys about **28%** at 10M, so catchup mode's
+workaround for the `address_stats` deadlock is also a real throughput win — and two traced
+internal calls per transaction cost about **28%**, which is the first measurement of that
+branch at all.
 
 ### What it deliberately excludes
 
@@ -165,22 +210,24 @@ what these benchmarks seed.
 Same constrained server as above (PG 17, `shared_buffers = 2GB`, 3 CPU, gp3), 250 tx/block,
 one dominant ERC-20:
 
-| scale | `RefreshTokenStats` | `BlockCycle` | `BlockCycle` tx/s |
-|---|---|---|---|
-| 100k | 32 ms | 71 ms | 3,521 |
-| 1M | 264 ms | 305 ms | 820 |
-| 10M | ~2.4 s | 2.53 s | **99** |
+| scale | `RefreshTokenStats` | `BlockCycle` | `BlockCycle` tx/s | blocks/s | gas/s |
+|---|---|---|---|---|---|
+| 100k | 32 ms | 93 ms | 2,693 | 10.8 | 175 M |
+| 1M | 280 ms | 370 ms | 676 | 2.70 | 43.9 M |
+| 10M | 2.85 s | 2.74 s | **91** | 0.365 | 5.9 M |
 
-The 10M refresh figure is the sum of its three statements measured once the server had
-settled. `BenchmarkRefreshTokenStats` itself reported 3.07 s, but it runs immediately after
-the bulk seed while autovacuum is still working through the freshly loaded table, so it is
-inflated; the number to quote is ~2.4 s.
+`BenchmarkRefreshTokenStats` runs immediately after the bulk seed, while autovacuum is still
+working through the freshly loaded table, so it reads slightly high. Timing the three
+statements individually on a settled server gives 2.46 s at 10M — 443 ms for the `COUNT(*)`,
+892 ms for the `DISTINCT ON` over `balances`, 1,122 ms for the `total_supply` `SUM`. Quote
+~2.5 s.
 
 Two things follow, and both are structural rather than tuning problems.
 
-**It is very nearly linear in history.** Ten times the history costs about ten times as much,
-per block, forever. The per-block cycle therefore collapsed **35×** between 100k and 10M, and
-at 10M a single refresh costs about as much as sixty of the inserts it accompanies.
+**It is very nearly linear in history.** Ten times the history costs about ten times as much
+(8.6× then 10.2× across these three scales), per block, forever. The per-block cycle therefore
+collapsed **30×** between 100k and 10M, and at 10M a single refresh costs around thirty-five
+times the insert it accompanies.
 
 **It is CPU-bound, not I/O-bound.** At 10M only the `SUM` leaves `shared_buffers` at all, and
 its disk I/O is ~176 ms of a 1,107 ms statement — the other 84%, and effectively all of the
@@ -189,7 +236,15 @@ Raising `shared_buffers` or moving to faster disks will not fix this; not recomp
 whole-history aggregates per block is the only thing that will.
 
 That is also why `BenchmarkInsertBlockDataBatch` cannot be the regression gate for ingest:
-at 10M it accounts for under 2% of the per-block cost that `BenchmarkBlockCycle` measures.
+at 10M it accounts for about 2.5% of the per-block cost that `BenchmarkBlockCycle` measures.
+
+`BenchmarkBlockCycle` writes its transfers against a different token from the one it
+refreshes, so a run cannot extend the history it is timing. That is not cosmetic: refresh cost
+tracks the history of the token being refreshed, and when the block extended that same token
+each iteration measured a slightly larger table than the last. At the 10M default the 250 rows
+an iteration adds are noise, but at the small scale recommended just below for before/after
+work they nearly double the history mid-run — non-stationary in exactly the configuration
+proposed for comparisons.
 
 ### Comparing across commits
 
@@ -241,6 +296,29 @@ mistake: a lookup key that does not match what `seed()` writes, which fails sile
   **1.17 s**; with the parameter corrected it is **258 µs**, a factor of 4,500.
 
 When adding a read benchmark, assert it returns a row before trusting its timing.
+
+## Keeping the harness honest
+
+`TestBenchmarkHarnessMeasuresRealWork` exists because a benchmark has no oracle. A test
+asserts a value and fails; a benchmark prints a number, and a number produced by doing nothing
+is indistinguishable from a number produced by doing the work. Every benchmark defect found so
+far was of that kind — a nil parameter that matched no row, a lookup key one character short
+of the seeded one, a table no generated batch ever wrote — and every one of them *passed*.
+
+So the test runs at a small scale and asserts the harness actually did something:
+
+- each shape changes the row count of every table it claims to exercise, and of none it does not;
+- a block presents a realistic number of distinct address deltas;
+- transaction hashes are production length and unique, so no insert is silently an
+  `ON CONFLICT DO NOTHING` no-op;
+- `RefreshTokenStats` has history to walk and writes a non-zero result back;
+- each read benchmark returns rows — `GetAddressStats` in particular returns a zero-valued
+  struct with a nil error when the row is missing, so only a populated field distinguishes a
+  hit from a miss;
+- `BenchmarkBlockCycle` does not write to the token it refreshes.
+
+It is cheap and it runs in CI. Add a case to it whenever you add a benchmark: the failure mode
+being guarded against is not a wrong number, it is a plausible number that means nothing.
 
 ## End-to-end ingest on a live chain
 

@@ -16,9 +16,13 @@ import (
 //
 // InsertBlockDataBatch is the whole realtime ingest write path: one Postgres
 // transaction per block covering blocks, transactions, logs, token_transfers,
-// internal_transactions, address_stats and chain_counters. Nothing here calls
-// RefreshTokenStats -- that runs a level up in the indexer and is measured
-// separately (PRST-4493), so these numbers are the insert cost alone.
+// internal_transactions, address_stats and chain_counters. Which of those a run
+// actually exercises depends on the shape -- only erc20-internal-calls reaches
+// internal_transactions, and only the shapes with transfersPerTx > 0 reach
+// token_transfers -- so read the shape table before quoting a number as
+// covering the write path. Nothing here calls RefreshTokenStats; that runs a
+// level up in the indexer and is measured separately (PRST-4493), so these
+// numbers are the insert cost alone.
 
 // benchTxsPerBlock is the block density the write path is measured at. A quiet
 // chain sits in the tens of transactions per block and a busy one in the low
@@ -40,11 +44,36 @@ type blockShape struct {
 	name             string
 	logsPerTx        int
 	transfersPerTx   int
+	internalPerTx    int
 	gasPerTx         uint64
 	skipAddressStats bool
 	// scatterHashes generates transaction hashes that are uniformly
 	// distributed instead of ascending. See benchScatteredHash.
 	scatterHashes bool
+}
+
+// The two token addresses the write path uses.
+//
+// Blocks write their transfers against benchTransferToken, while the seeded
+// history and every RefreshTokenStats call target benchRefreshToken. Keeping
+// them apart is what makes BenchmarkBlockCycle stationary: refresh cost tracks
+// the history of the token being refreshed, so if a block extended that token
+// then each iteration would measure a slightly larger table than the last. At
+// the 10M default the 250 rows an iteration adds are noise, but at the
+// BENCH_SCALES=10000 the docs recommend for before/after comparison they nearly
+// double the history mid-run -- non-stationary in exactly the configuration
+// proposed for A/B work.
+var (
+	benchRefreshToken  = fmt.Sprintf("0xtoken%035d", 1)
+	benchTransferToken = fmt.Sprintf("0xtoken%035d", 2)
+)
+
+// benchAscendingHash is a monotonically increasing transaction hash at the same
+// 66 characters as a real one ("0x" plus 64 hex digits). seed() already writes
+// production-length hashes; these did not, so the benchmark's own rows were
+// keyed 17 bytes shorter than everything around them.
+func benchAscendingHash(blockNum uint64, i int) string {
+	return fmt.Sprintf("0x%048x%016x", blockNum, i)
 }
 
 // gasPerTx are the ordinary EVM costs: 21,000 for a bare value transfer,
@@ -64,17 +93,21 @@ var blockShapes = []blockShape{
 	// row. This shape is otherwise identical to erc20, so the delta between the
 	// two is the cost of key distribution alone.
 	{name: "erc20-scattered-hash", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000, scatterHashes: true},
+	// A contract call that emits a transfer and two traced internal calls, which
+	// is what a swap or a multicall looks like to the indexer. This is the only
+	// shape that writes internal_transactions; without it that INSERT branch is
+	// never executed, however loudly the header comment claims otherwise.
+	{name: "erc20-internal-calls", logsPerTx: 1, transfersPerTx: 1, internalPerTx: 2, gasPerTx: 120_000},
 }
 
-// benchScatteredHash returns a hash of exactly the same LENGTH as the ascending
-// one makeBenchBlockData otherwise builds, with the characters scattered across
-// the keyspace. Holding the length constant matters: a real 66-character hash
-// would change both the distribution and the index key size at once, and only
-// the distribution is under test here. Deterministic, so runs are comparable.
+// benchScatteredHash returns a hash of exactly the same length as the ascending
+// one -- 66 characters, as production -- with the bits spread across the
+// keyspace. Holding the length constant is what makes the delta between the two
+// shapes attributable to distribution alone rather than to key size.
+// Deterministic, so runs stay comparable.
 func benchScatteredHash(blockNum uint64, i int) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", blockNum, i)))
-	// "0xbenchtx" + two %020d is 49 characters; match it.
-	return "0x" + hex.EncodeToString(sum[:])[:47]
+	return "0x" + hex.EncodeToString(sum[:])
 }
 
 func BenchmarkInsertBlockDataBatch(b *testing.B) {
@@ -98,13 +131,15 @@ func benchInsertBlockData(b *testing.B, d *DB, shape blockShape) {
 	if err := d.pool.QueryRow(ctx, `SELECT COALESCE(MAX(number), 0) FROM blocks`).Scan(&head); err != nil {
 		b.Fatalf("read seeded head: %v", err)
 	}
+	seededTxs, _ := benchSeedProgress(b, d)
+	poolSize := benchAddrPoolSize(seededTxs)
 
 	// Build every batch up front: generating them is not what we are
 	// measuring. b.N stays small because one iteration is a multi-statement
 	// round trip, so holding them all is cheap.
 	batches := make([]*BlockData, b.N)
 	for i := range batches {
-		batches[i] = makeBenchBlockData(head+uint64(i)+1, shape)
+		batches[i] = makeBenchBlockData(head+uint64(i)+1, shape, poolSize)
 	}
 	b.StartTimer()
 
@@ -130,7 +165,9 @@ func benchInsertBlockData(b *testing.B, d *DB, shape blockShape) {
 // makeBenchBlockData builds one block's worth of ingest input for the given
 // shape. Logs and transfers reference transactions in the same batch, because
 // both tables carry a foreign key to transactions(hash).
-func makeBenchBlockData(blockNum uint64, shape blockShape) *BlockData {
+// poolSize is how many distinct seeded addresses the block may draw on, which
+// decides how large an AddressStats map InsertBlockDataBatch has to reconcile.
+func makeBenchBlockData(blockNum uint64, shape blockShape, poolSize int) *BlockData {
 	ts := uint64(time.Now().Unix()) + blockNum
 
 	data := &BlockData{
@@ -143,28 +180,40 @@ func makeBenchBlockData(blockNum uint64, shape blockShape) *BlockData {
 			GasLimit:         30_000_000,
 			TransactionCount: benchTxsPerBlock,
 		},
-		Transactions:     make([]*types.Transaction, 0, benchTxsPerBlock),
-		Logs:             make([]*types.Log, 0, benchTxsPerBlock*shape.logsPerTx),
-		Transfers:        make([]*types.TokenTransfer, 0, benchTxsPerBlock*shape.transfersPerTx),
-		AddressStats:     make(map[string]*AddressStatsDelta, benchTxsPerBlock),
-		SkipAddressStats: shape.skipAddressStats,
+		Transactions:         make([]*types.Transaction, 0, benchTxsPerBlock),
+		Logs:                 make([]*types.Log, 0, benchTxsPerBlock*shape.logsPerTx),
+		Transfers:            make([]*types.TokenTransfer, 0, benchTxsPerBlock*shape.transfersPerTx),
+		InternalTransactions: make([]*types.InternalTransaction, 0, benchTxsPerBlock*shape.internalPerTx),
+		AddressStats:         make(map[string]*AddressStatsDelta, 2*benchTxsPerBlock),
+		SkipAddressStats:     shape.skipAddressStats,
 	}
 
-	token := fmt.Sprintf("0xtoken%035d", 1)
+	// Transfers are written against a different token from the one
+	// BenchmarkBlockCycle refreshes, so that a run cannot extend the history it
+	// is timing a refresh over. See benchRefreshToken.
+	token := benchTransferToken
 	topic0 := erc20TransferTopic
+	callType := "call"
+
+	// A 250-transaction block should touch on the order of 500 distinct
+	// addresses, not the ~45 this produced when senders were drawn from a
+	// 20-address pool with i%20. Sender and recipient windows are offset by half
+	// the pool so they do not overlap, and the whole window advances with the
+	// block number so consecutive blocks land on different parts of the index.
+	base := int(blockNum) * benchTxsPerBlock
 
 	for i := 0; i < benchTxsPerBlock; i++ {
-		hash := fmt.Sprintf("0xbenchtx%020d%020d", blockNum, i)
+		hash := benchAscendingHash(blockNum, i)
 		if shape.scatterHashes {
 			hash = benchScatteredHash(blockNum, i)
 		}
-		from := benchSeededAddr(i)
+		from := benchSeededAddr((base + i) % poolSize)
 		// Senders come from the pool seed() already wrote, so address_stats
 		// takes its ON CONFLICT DO UPDATE branch -- the steady-state hot path.
 		// Every tenth recipient is brand new so the INSERT branch, and the
 		// addresses_total counter increment that depends on it, are covered
 		// too.
-		to := benchSeededAddr(i + 1)
+		to := benchSeededAddr((base + i + poolSize/2) % poolSize)
 		if i%10 == 0 {
 			to = fmt.Sprintf("0xnew%025d%012d", blockNum, i)
 		}
@@ -217,17 +266,31 @@ func makeBenchBlockData(blockNum uint64, shape blockShape) *BlockData {
 			})
 		}
 
+		// internal_transactions is one of the tables InsertBlockDataBatch writes,
+		// and until this shape existed no batch ever populated it, so that
+		// branch was never timed despite being claimed as covered.
+		for j := 0; j < shape.internalPerTx; j++ {
+			gas, gasUsed := shape.gasPerTx, shape.gasPerTx/2
+			target := from
+			data.InternalTransactions = append(data.InternalTransactions, &types.InternalTransaction{
+				TxHash:       hash,
+				BlockNumber:  blockNum,
+				TraceAddress: fmt.Sprintf("%d", j),
+				From:         to,
+				To:           &target,
+				Value:        types.JSONString("1000"),
+				Gas:          &gas,
+				GasUsed:      &gasUsed,
+				CallType:     callType,
+				Timestamp:    &blockTS,
+			})
+		}
+
 		addBenchDelta(data.AddressStats, from, blockNum, shape.transfersPerTx)
 		addBenchDelta(data.AddressStats, to, blockNum, shape.transfersPerTx)
 	}
 
 	return data
-}
-
-// benchSeededAddr mirrors the 20-address pool seed() writes, so deltas against
-// it hit rows that already exist.
-func benchSeededAddr(i int) string {
-	return fmt.Sprintf("0xaddr%036d", i%20)
 }
 
 func addBenchDelta(m map[string]*AddressStatsDelta, addr string, blockNum uint64, transfers int) {
