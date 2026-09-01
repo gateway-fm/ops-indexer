@@ -39,6 +39,11 @@ import (
 // BENCH_DATABASE_URL to point it at a properly sized server.
 var benchScales = mustParseBenchScales(os.Getenv("BENCH_SCALES"))
 
+// benchSeedTxsPerBlock is the block density seed() writes at. The benchmarks
+// insert at benchTxsPerBlock instead, which is why a raw table count cannot be
+// used to work out how far the synthetic range extends.
+const benchSeedTxsPerBlock = 125
+
 // requirePinnedBenchtime fails unless -benchtime is pinned to a fixed iteration
 // count (`30x`), rather than a duration.
 //
@@ -181,23 +186,85 @@ CREATE TABLE IF NOT EXISTS bench_seed_state (
     id                int PRIMARY KEY,
     seeded_txs        bigint NOT NULL DEFAULT 0,
     seeded_transfers  bigint NOT NULL DEFAULT 0,
+    ts_origin         bigint NOT NULL DEFAULT 0,
     CONSTRAINT bench_seed_state_singleton CHECK (id = 1)
 )`
 
 // benchSeedProgress reads the singleton row, creating the table on first use.
 func benchSeedProgress(tb testing.TB, d *DB) (seededTxs, seededTransfers int) {
 	tb.Helper()
+	s := readBenchSeedState(tb, d)
+	return s.seededTxs, s.seededTransfers
+}
+
+type benchSeedStateRow struct {
+	seededTxs       int
+	seededTransfers int
+	// tsOrigin is the timestamp of block 1, fixed at the first seed and never
+	// recomputed. Deriving each block's timestamp from it keeps timestamps
+	// monotonic in block number across top-ups. Computing them as
+	// `now - 2*(nBlocks-i)` instead, which is the obvious version, re-anchors
+	// the whole timeline to whatever the current target scale is while only
+	// writing the new rows -- so after 100k -> 1M, block 801 landed 14,398
+	// seconds EARLIER than block 800.
+	tsOrigin int64
+}
+
+func readBenchSeedState(tb testing.TB, d *DB) benchSeedStateRow {
+	tb.Helper()
 	ctx := context.Background()
 	if _, err := d.pool.Exec(ctx, benchSeedStateDDL); err != nil {
 		tb.Fatalf("create bench_seed_state: %v", err)
 	}
+	var s benchSeedStateRow
 	err := d.pool.QueryRow(ctx,
-		`SELECT seeded_txs, seeded_transfers FROM bench_seed_state WHERE id = 1`,
-	).Scan(&seededTxs, &seededTransfers)
+		`SELECT seeded_txs, seeded_transfers, ts_origin FROM bench_seed_state WHERE id = 1`,
+	).Scan(&s.seededTxs, &s.seededTransfers, &s.tsOrigin)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		tb.Fatalf("read bench_seed_state: %v", err)
 	}
-	return seededTxs, seededTransfers
+	return s
+}
+
+// restoreSeededState removes the rows a benchmark inserted, so the next shape
+// and the next -count trial each start from the seeded table instead of one the
+// previous ones grew.
+//
+// Without it a run measures a progressively larger table: at 100k, pass A adds
+// 46% and five shapes at -count 3 add 116%, and at the BENCH_SCALES=10000 the
+// docs suggest for benchstat work, six counts of five shapes add 2,325% -- the
+// table grows 24x during the comparison, systematically favouring whichever
+// shape ran first.
+//
+// Deleting the blocks is enough for transactions, and through them logs,
+// token_transfers and internal_transactions, which all cascade. Row counts and
+// index sizes therefore return to the seeded state exactly. The increments the
+// run made to counter COLUMNS on pre-existing address_stats and chain_counters
+// rows are not unwound, which changes no row count, no index size and no
+// measurement.
+// Errorf rather than Fatalf: this runs from a deferred call, including while a
+// failing benchmark is already unwinding, and a second Goexit there would hide
+// the original failure.
+func restoreSeededState(tb testing.TB, d *DB, head uint64) {
+	tb.Helper()
+	ctx := context.Background()
+	if _, err := d.pool.Exec(ctx, `DELETE FROM blocks WHERE number > $1`, head); err != nil {
+		tb.Errorf("restore seeded state: delete blocks above %d: %v", head, err)
+		return
+	}
+	// Recipients the block invented are new address_stats rows, and those do
+	// not hang off blocks, so they need removing explicitly.
+	if _, err := d.pool.Exec(ctx, `DELETE FROM address_stats WHERE address LIKE '0xnew%'`); err != nil {
+		tb.Errorf("restore seeded state: delete invented addresses: %v", err)
+	}
+}
+
+// seededBlockHead is the highest block number seed() owns, so anything above it
+// belongs to a benchmark.
+func seededBlockHead(tb testing.TB, d *DB) uint64 {
+	tb.Helper()
+	s := readBenchSeedState(tb, d)
+	return uint64((s.seededTxs + benchSeedTxsPerBlock - 1) / benchSeedTxsPerBlock)
 }
 
 func recordBenchSeedProgress(tb testing.TB, d *DB, column string, n int) {
@@ -224,18 +291,34 @@ func seed(tb testing.TB, d *DB, nTxs int) {
 	tb.Helper()
 	ctx := context.Background()
 
-	const txsPerBlock = 125
+	const txsPerBlock = benchSeedTxsPerBlock
 	nBlocks := (nTxs + txsPerBlock - 1) / txsPerBlock
-	now := time.Now().Unix()
 
-	have, _ := benchSeedProgress(tb, d)
+	state := readBenchSeedState(tb, d)
+	have := state.seededTxs
 	if have >= nTxs {
 		if _, err := d.pool.Exec(ctx, "ANALYZE"); err != nil {
 			tb.Fatalf("analyze: %v", err)
 		}
 		return
 	}
-	firstBlock := have / txsPerBlock
+
+	// Fixed once, so every top-up continues the same timeline. Chosen so that at
+	// the first seed the newest block is roughly now; a later top-up to a larger
+	// scale extends forward from here, which can carry the head past wall-clock.
+	tsOrigin := state.tsOrigin
+	if tsOrigin == 0 {
+		tsOrigin = time.Now().Unix() - int64(2*(nBlocks-1))
+		recordBenchSeedProgress(tb, d, "ts_origin", int(tsOrigin))
+	}
+	blockTS := func(blockNumber int64) int64 { return tsOrigin + 2*(blockNumber-1) }
+
+	// CEIL, not floor: `have` need not land on a block boundary, and the block
+	// holding row `have` already exists. Rounding down re-copies it -- going from
+	// 10001 to 20000, floor gives 80 and tries to insert block 81 a second time,
+	// which the primary key rejects. The transactions COPY below resumes at row
+	// `have` and so fills that partial block in correctly.
+	firstBlock := (have + txsPerBlock - 1) / txsPerBlock
 
 	if _, err := d.pool.CopyFrom(ctx,
 		[]string{"blocks"},
@@ -246,7 +329,7 @@ func seed(tb testing.TB, d *DB, nTxs int) {
 				int64(i + 1),
 				fmt.Sprintf("0xblock%010d", i),
 				fmt.Sprintf("0xparent%09d", i),
-				now - int64(2*(nBlocks-i)),
+				blockTS(int64(i + 1)),
 				int64(21000), int64(30000000),
 				int64(txsPerBlock),
 			}, nil
@@ -270,7 +353,7 @@ func seed(tb testing.TB, d *DB, nTxs int) {
 			return []any{
 				fmt.Sprintf("0xtx%062d", i),
 				blockNum,
-				now - int64(2*(nBlocks-int(blockNum))),
+				blockTS(blockNum),
 				int64(i % txsPerBlock),
 				addrPool[i%len(addrPool)], addrPool[(i+1)%len(addrPool)],
 				"1",
@@ -376,6 +459,11 @@ func runScaled(b *testing.B, fn func(b *testing.B, d *DB)) {
 			d, cleanup := setupBenchDB(b)
 			defer cleanup()
 			seed(b, d, n)
+			// Runs before the deferred pool close above (defers are LIFO), so
+			// every shape and every -count trial is measured against the seeded
+			// size rather than one its predecessors grew. Owned by the harness so
+			// a new benchmark cannot forget it.
+			defer restoreSeededState(b, d, seededBlockHead(b, d))
 			b.ResetTimer()
 			fn(b, d)
 		})

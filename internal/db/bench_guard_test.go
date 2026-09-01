@@ -149,6 +149,70 @@ func TestBenchmarkHarnessMeasuresRealWork(t *testing.T) {
 		}
 	})
 
+	// seededHead is the highest block number seed() owns. Anything above it was
+	// written by a benchmark, and the two share a keyspace: the benchmark appends
+	// at MAX(number)+1, which is a number a later, larger seed will want. Only
+	// restoreSeededState keeps them from colliding, which is why the write
+	// benchmarks register it as cleanup.
+	seededHead := func() uint64 {
+		seededTxs, _ := benchSeedProgress(t, d)
+		return uint64((seededTxs + 124) / 125)
+	}
+
+	t.Run("restoring seeded state undoes everything a run inserted", func(t *testing.T) {
+		restoreSeededState(t, d, seededHead())
+
+		tables := []string{"blocks", "transactions", "logs", "token_transfers",
+			"internal_transactions", "address_stats"}
+		before := map[string]int{}
+		for _, table := range tables {
+			before[table] = countRows(t, d, table)
+		}
+
+		head := seededHead()
+		shape := blockShape{name: "erc20-internal-calls", logsPerTx: 1, transfersPerTx: 1,
+			internalPerTx: 2, gasPerTx: 120_000}
+		if err := d.InsertBlockDataBatch(ctx,
+			makeBenchBlockData(head+1, shape, benchAddrPoolSize(scale))); err != nil {
+			t.Fatalf("InsertBlockDataBatch: %v", err)
+		}
+
+		restoreSeededState(t, d, head)
+
+		for _, table := range tables {
+			if got := countRows(t, d, table); got != before[table] {
+				t.Errorf("%s has %d rows after restore, want %d: a run that leaves rows behind makes "+
+					"every later shape and -count trial measure a bigger table", table, got, before[table])
+			}
+		}
+	})
+
+	t.Run("seeding resumes across scales that are not block-aligned", func(t *testing.T) {
+		// 2001 and 3000 straddle a partial block: rounding the resume point down
+		// re-copies the block holding row 2000 and trips the primary key.
+		restoreSeededState(t, d, seededHead())
+		seed(t, d, 2_001)
+		seed(t, d, 3_000)
+		if got := countRows(t, d, "transactions"); got < 3_000 {
+			t.Errorf("transactions has %d rows after topping up to 3000, want at least 3000", got)
+		}
+	})
+
+	// Checked after the top-ups above, since that is the case that used to break.
+	t.Run("block timestamps are monotonic in block number", func(t *testing.T) {
+		var breaks int
+		if err := d.pool.QueryRow(ctx, `
+			SELECT count(*) FROM (
+				SELECT timestamp, lag(timestamp) OVER (ORDER BY number) AS prev FROM blocks
+			) s WHERE prev IS NOT NULL AND timestamp <= prev`).Scan(&breaks); err != nil {
+			t.Fatalf("check timestamp monotonicity: %v", err)
+		}
+		if breaks > 0 {
+			t.Errorf("%d blocks are not newer than their predecessor: re-anchoring the timeline on a "+
+				"top-up while writing only the new rows distorts GetTransactionHistory_24h", breaks)
+		}
+	})
+
 	t.Run("BlockCycle does not extend the token it refreshes", func(t *testing.T) {
 		batch := makeBenchBlockData(1, blockShape{
 			name: "erc20", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000,
