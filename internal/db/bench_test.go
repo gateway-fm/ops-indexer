@@ -210,11 +210,32 @@ type benchSeedStateRow struct {
 	tsOrigin int64
 }
 
+// benchSeedStateMigrations bring a bench_seed_state created by an earlier
+// version up to date. CREATE TABLE IF NOT EXISTS does nothing to a table that
+// already exists, so a database seeded before ts_origin was introduced fails on
+// the SELECT below with SQLSTATE 42703.
+//
+// The backfill is the load-bearing half. Left at 0, seed() reads it as "unset"
+// and computes a fresh now-relative origin, which re-anchors the timeline
+// against rows that are already on disk -- precisely the bug ts_origin exists to
+// prevent. Block 1's timestamp IS the origin, since ts(n) = origin + 2*(n-1).
+var benchSeedStateMigrations = []string{
+	`ALTER TABLE bench_seed_state ADD COLUMN IF NOT EXISTS ts_origin bigint NOT NULL DEFAULT 0`,
+	`UPDATE bench_seed_state
+	    SET ts_origin = COALESCE((SELECT timestamp FROM blocks WHERE number = 1), 0)
+	  WHERE ts_origin = 0`,
+}
+
 func readBenchSeedState(tb testing.TB, d *DB) benchSeedStateRow {
 	tb.Helper()
 	ctx := context.Background()
 	if _, err := d.pool.Exec(ctx, benchSeedStateDDL); err != nil {
 		tb.Fatalf("create bench_seed_state: %v", err)
+	}
+	for _, m := range benchSeedStateMigrations {
+		if _, err := d.pool.Exec(ctx, m); err != nil {
+			tb.Fatalf("migrate bench_seed_state: %v", err)
+		}
 	}
 	var s benchSeedStateRow
 	err := d.pool.QueryRow(ctx,

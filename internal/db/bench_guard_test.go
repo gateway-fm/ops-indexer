@@ -187,6 +187,50 @@ func TestBenchmarkHarnessMeasuresRealWork(t *testing.T) {
 		}
 	})
 
+	// Row counts returning to baseline is not the same as the database returning
+	// to baseline. DELETE leaves dead tuples and, more importantly, B-tree pages
+	// that are never handed back -- measured at 100k, a full run left
+	// token_transfers' indexes 70% larger than a pristine seed and transactions'
+	// 23% larger, with the heaps reclaimed by autovacuum. That is bounded rather
+	// than unbounded, and its effect on throughput measured under 1%, but the
+	// previous guard compared only COUNT(*) and so could not see it at all.
+	t.Run("repeated restore does not grow the indexes without bound", func(t *testing.T) {
+		restoreSeededState(t, d, seededHead())
+		indexBytes := func() int64 {
+			var n int64
+			if err := d.pool.QueryRow(ctx, `
+				SELECT COALESCE(sum(pg_indexes_size(relid)), 0) FROM pg_stat_user_tables
+				 WHERE relname IN ('transactions', 'token_transfers', 'blocks')`).Scan(&n); err != nil {
+				t.Fatalf("read index size: %v", err)
+			}
+			return n
+		}
+
+		before := indexBytes()
+		shape := blockShape{name: "erc20", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000}
+		const cycles = 10
+		for i := 0; i < cycles; i++ {
+			head := seededHead()
+			if err := d.InsertBlockDataBatch(ctx,
+				makeBenchBlockData(head+1, shape, benchAddrPoolSize(scale))); err != nil {
+				t.Fatalf("cycle %d: InsertBlockDataBatch: %v", i, err)
+			}
+			restoreSeededState(t, d, head)
+		}
+		after := indexBytes()
+
+		t.Logf("index bytes over %d insert/restore cycles: %d -> %d (%+.1f%%)",
+			cycles, before, after, 100*float64(after-before)/float64(before))
+
+		// A bound, not a target. Bloat that keeps climbing means a run's later
+		// shapes are measured against a materially different database.
+		if limit := before * 3; after > limit {
+			t.Errorf("indexes grew from %d to %d bytes over %d insert/restore cycles, past the %d bound: "+
+				"DELETE is no longer holding physical state near the seeded baseline, so cross-shape "+
+				"comparisons need a fresh database per result", before, after, cycles, limit)
+		}
+	})
+
 	t.Run("seeding resumes across scales that are not block-aligned", func(t *testing.T) {
 		// 2001 and 3000 straddle a partial block: rounding the resume point down
 		// re-copies the block holding row 2000 and trips the primary key.

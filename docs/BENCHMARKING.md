@@ -152,6 +152,37 @@ a run interrupted before it can clean up will make the next top-up fail with a d
 error on `blocks`. That is deliberate — a loud failure beats a table that silently mixes seeded
 and benchmark rows. Drop the database and reseed.
 
+**What that restore does not do is return the database to its physical state.** `DELETE`
+recovers the row counts, and autovacuum recovers the heap, but B-tree pages freed by a delete
+are not handed back — they are only reusable for keys in the same range. Measured at 100k, a
+full five-shape run at `-count 3` left `token_transfers`' indexes **70% larger** than a pristine
+seed and `transactions`' **23% larger**, at identical live row counts. So later shapes in a run
+are measured against physically larger indexes than earlier ones.
+
+How much that matters depends entirely on scale, because it is driven by churn as a fraction of
+the table:
+
+- at 10M, a run inserts and deletes 7,750 rows against 10,000,000 — **0.078%**, structurally
+  negligible;
+- at 100k it is material in principle, but measured under 1%: `erc20` alone against a pristine
+  database gave a median of 4,037 tx/s against 4,013 in the full run.
+
+So the numbers in this document are sound, and `TestBenchmarkHarnessMeasuresRealWork` now
+bounds the bloat rather than ignoring it. But if you need publication-grade cross-shape
+comparison — especially at a small scale, where the churn fraction is largest — **use a fresh
+database per measured result** rather than trusting the restore:
+
+```bash
+for shape in plain erc20 erc20-no-address-stats erc20-scattered-hash erc20-internal-calls; do
+  dropdb --if-exists "bench_$shape"; createdb "bench_$shape"
+  BENCH_DATABASE_URL="postgres://…/bench_$shape?sslmode=disable" BENCH_SCALES=100000 \
+    go test ./internal/db -run '^$' -bench "InsertBlockDataBatch/$shape\$" -benchtime 30x -count 3
+done
+```
+
+That is the only way to get byte-identical starting conditions. It costs a full reseed per
+shape, which is why it is not the default.
+
 `-benchtime` must be pinned to an iteration count (`30x`), and the harness now fails with
 that instruction rather than letting a duration ramp `b.N` and re-seed the table at every
 step. At the 10M default that ramp looks like a hang.
