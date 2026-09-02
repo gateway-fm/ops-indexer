@@ -376,10 +376,13 @@ func (c *Client) FetchTokenMetadataBatch(ctx context.Context, addresses []common
 	return results, nil
 }
 
-// NFTURIRequest identifies a single token whose tokenURI should be fetched.
+// NFTURIRequest identifies a single token whose metadata URI should be fetched.
+// Selector is the 4-byte accessor selector (hex, e.g. "0x0e89341c" for ERC-1155
+// uri(uint256)); empty defaults to ERC-721 tokenURI(uint256).
 type NFTURIRequest struct {
-	Address common.Address
-	TokenID *big.Int
+	Address  common.Address
+	TokenID  *big.Int
+	Selector string
 }
 
 // FetchTokenURIsBatch calls tokenURI(uint256) for each request concurrently and
@@ -403,9 +406,14 @@ func (c *Client) FetchTokenURIsBatch(ctx context.Context, reqs []NFTURIRequest, 
 			if err := limiter.Wait(ctx); err != nil {
 				return nil
 			}
-			// tokenURI(uint256): selector 0xc87b56dd + 32-byte big-endian id.
+			// selector + 32-byte big-endian id. Defaults to tokenURI(uint256)
+			// (0xc87b56dd); ERC-1155 passes uri(uint256) (0x0e89341c).
+			selector := req.Selector
+			if selector == "" {
+				selector = "0xc87b56dd"
+			}
 			data := make([]byte, 4+32)
-			copy(data, common.FromHex("0xc87b56dd"))
+			copy(data, common.FromHex(selector))
 			if req.TokenID != nil {
 				req.TokenID.FillBytes(data[4:])
 			}

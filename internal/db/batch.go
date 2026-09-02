@@ -31,6 +31,7 @@ type BlockData struct {
 	Contracts            []*types.Contract
 	Tokens               []*types.Token
 	NFTTokens            []*types.NFTToken
+	ERC1155Holdings      []*types.ERC1155Holding
 	InternalTransactions []*types.InternalTransaction
 	AddressStats         map[string]*AddressStatsDelta
 	SkipAddressStats     bool // Skip address_stats updates (for catchup mode to avoid deadlocks)
@@ -177,6 +178,28 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		}
 	}
 
+	if len(data.ERC1155Holdings) > 0 {
+		batch := &pgx.Batch{}
+		for _, h := range data.ERC1155Holdings {
+			batch.Queue(`
+				INSERT INTO erc1155_holdings (token_address, token_id, owner, balance, token_uri, block_number)
+				VALUES (LOWER($1), $2, LOWER($3), $4, $5, $6)
+				ON CONFLICT (token_address, token_id, owner) DO UPDATE SET
+					-- balances are accumulated from signed transfer deltas.
+					balance = erc1155_holdings.balance + EXCLUDED.balance,
+					-- uri(id) is captured once at mint; later transfers carry no
+					-- URI, so keep the existing value rather than nulling it.
+					token_uri = COALESCE(erc1155_holdings.token_uri, EXCLUDED.token_uri),
+					block_number = EXCLUDED.block_number,
+					updated_at = NOW()`,
+				h.TokenAddress, h.TokenID, h.Owner, h.Delta, h.TokenURI, h.BlockNumber)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
 	if len(data.Logs) > 0 {
 		batch := &pgx.Batch{}
 		for _, l := range data.Logs {
@@ -199,7 +222,9 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 				INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 					block_number, timestamp, transfer_type, token_type, token_id, is_internal)
 				VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
-				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				-- token_id is part of the key so an ERC-1155 TransferBatch
+				-- (one log, many ids) keeps a row per id; see migration 007.
+				ON CONFLICT (tx_hash, log_index, token_id) DO NOTHING`,
 				t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 		}

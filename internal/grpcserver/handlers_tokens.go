@@ -216,10 +216,20 @@ func mapInventoryItems(rows []types.TokenInventoryItem) []*indexerv1.TokenInvent
 		if r.TokenURI != nil {
 			uri = *r.TokenURI
 		}
+		quantity := ""
+		if r.Quantity != nil {
+			quantity = *r.Quantity
+		}
+		var holders int64
+		if r.Holders != nil {
+			holders = *r.Holders
+		}
 		out = append(out, &indexerv1.TokenInventoryItem{
 			TokenId:  bigIntFromString(r.TokenID),
 			Owner:    r.Owner,
 			TokenUri: uri,
+			Quantity: quantity,
+			Holders:  holders,
 		})
 	}
 	return out
