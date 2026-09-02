@@ -1973,6 +1973,12 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"logs",
 		"token_transfers",
 		"balances",
+		// Must be wiped with balances. It is a cache of balances' winning rows,
+		// and leaving it behind on a chain reset is worse than merely stale:
+		// re-indexing from block 0 writes LOWER block numbers, which the
+		// maintenance upsert's highest-block-wins guard then refuses, so the
+		// old chain's holders would be served indefinitely.
+		"token_balances_current",
 		"op_deposits",
 		"contracts",
 		"transactions",

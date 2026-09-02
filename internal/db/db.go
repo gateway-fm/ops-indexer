@@ -96,42 +96,29 @@ func (d *DB) Migrate() error {
 	return nil
 }
 
-// reconcileTokenBalancesCurrent repairs token_balances_current from balances if
-// it has fallen behind.
+// reconcileTokenBalancesCurrent repairs token_balances_current from balances.
 //
-// It runs on every startup rather than only on migration, because the table is
-// maintained by the writer and a build that predates that writer keeps
-// advancing balances while leaving this table frozen. The 008 migration has
-// already been recorded as applied by then, so nothing would ever repair it --
-// a downgrade followed by an upgrade would silently serve a stale holder_count
-// forever. That is not hypothetical: PRST-4493's first attempt was deployed and
-// rolled back on the same day.
+// It runs unconditionally on every startup, because the table is maintained by
+// the writer and a build without that writer keeps appending to balances while
+// leaving this table behind. Migration 008 is recorded as applied by then, so
+// nothing else would ever repair it, and holder_count would stay wrong
+// indefinitely.
 //
-// The probe is a range scan against idx_balances_block and costs nothing on a
-// healthy database, which is the normal path -- including first deploy, where
-// the migration has just backfilled and the watermark is current.
+// There is no cheap staleness probe, and that is deliberate. Balance writes are
+// not ordered: the missing-range collector reprocesses historical blocks
+// continuously, so a previously unseen (token, address) can be written at a low
+// block number while some other row already holds a much higher global maximum.
+// Any watermark-style detector misses exactly that case, and a detector that
+// does not -- comparing the source's winning rows against the cache -- is the
+// same query as the repair. Measured on a multi-million-row balances table, a
+// distinct-key count costs within a few percent of the full comparison and
+// still cannot see a stale value on an existing key. Detection cheaper than
+// repair does not exist here, so there is nothing to gain by detecting first.
 //
-// A global watermark cannot by itself see a stale row sitting BELOW it, which
-// out-of-order balance writes can produce. It does not need to: the repair is a
-// full pass, so it only has to be triggered once, and any gap during which
-// balances drifted is a gap during which the chain advanced -- which puts rows
-// above the watermark and fires the probe. A gap with no new balances is a gap
-// in which nothing drifted. Hence the deliberate asymmetry: cheap detection,
-// total repair. A windowed repair would have needed the detection to be exact.
+// The IS DISTINCT FROM clause is what keeps that affordable: on a healthy cache
+// it writes zero rows rather than rewriting every one of them, which also makes
+// the logged count mean "rows repaired" instead of "rows examined".
 func (d *DB) reconcileTokenBalancesCurrent(ctx context.Context) error {
-	var behind int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM balances
-		WHERE block_number > COALESCE((SELECT MAX(block_number) FROM token_balances_current), -1)`,
-	).Scan(&behind); err != nil {
-		return fmt.Errorf("failed to probe token_balances_current staleness: %w", err)
-	}
-	if behind == 0 {
-		return nil
-	}
-
-	log.Info("token_balances_current is behind balances, reconciling", "balance_rows_ahead", behind)
-
 	tag, err := d.pool.Exec(ctx, `
 		INSERT INTO token_balances_current (token_address, address, balance, block_number)
 		SELECT DISTINCT ON (token_address, address) token_address, address, balance, block_number
@@ -140,11 +127,21 @@ func (d *DB) reconcileTokenBalancesCurrent(ctx context.Context) error {
 		ON CONFLICT (token_address, address) DO UPDATE
 			SET balance = EXCLUDED.balance,
 				block_number = EXCLUDED.block_number
-			WHERE EXCLUDED.block_number >= token_balances_current.block_number`)
+			WHERE EXCLUDED.block_number >= token_balances_current.block_number
+			  AND (token_balances_current.balance, token_balances_current.block_number)
+				  IS DISTINCT FROM (EXCLUDED.balance, EXCLUDED.block_number)`)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile token_balances_current: %w", err)
 	}
-	log.Info("token_balances_current reconciled", "rows", tag.RowsAffected())
+
+	// Anything other than zero means the cache had drifted, which should not
+	// happen while the writer is the only thing touching balances -- so it is
+	// worth noticing rather than logging at Info alongside normal startup.
+	if n := tag.RowsAffected(); n > 0 {
+		log.Warn("token_balances_current had drifted and was repaired", "rows", n)
+	} else {
+		log.Info("token_balances_current reconciled, no drift")
+	}
 
 	return nil
 }

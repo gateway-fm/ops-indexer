@@ -249,6 +249,104 @@ func TestCurrentBalances_ReconcileRepairsDrift(t *testing.T) {
 	require.Equal(t, "3000", bal, "the deleted row must be restored")
 }
 
+// TestCurrentBalances_ReconcileRepairsDriftBelowTheWatermark is the case that
+// killed the original watermark-probe design, so it gets its own test.
+//
+// Balance writes are not ordered: the missing-range collector reprocesses
+// historical blocks continuously, so a build without the maintenance path can
+// introduce a previously unseen (token, address) at a LOW block number while
+// some unrelated row already holds a far higher global maximum. A probe asking
+// "is there a balance row above the cache's highest block?" sees nothing and
+// skips, and that holder is missing from the count forever.
+//
+// The reconcile must therefore not depend on any watermark.
+func TestCurrentBalances_ReconcileRepairsDriftBelowTheWatermark(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newBalFixture(t, d, 5, 4_493_500_000)
+	defer drop()
+
+	// One holder at a very high block, cached properly. This is what pins the
+	// global watermark high.
+	f.writeBal(t, d, [3]int64{1, 400_000, 1000})
+
+	// Now a build without the maintenance path introduces a NEW holder at a low
+	// block: straight into balances, nothing in the cache, and far below the
+	// watermark the row above just established.
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO balances (address, token_address, block_number, balance)
+		VALUES ($1, $2, $3, $4)`,
+		fmt.Sprintf("0xbalholder%031d", 2), f.token, f.base+7, 5000)
+	require.NoError(t, err)
+
+	// Precondition: the cache is wrong, and wrong in a way no watermark can see.
+	var cacheMax, rowsAbove int64
+	require.NoError(t, d.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(block_number), -1) FROM token_balances_current`).Scan(&cacheMax))
+	require.NoError(t, d.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM balances WHERE block_number > $1`, cacheMax).Scan(&rowsAbove))
+	require.Zero(t, rowsAbove,
+		"precondition: nothing sits above the cache watermark, so a watermark probe would skip")
+
+	stale, err := d.countTokenHolders(ctx, f.token)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), stale, "precondition: the new holder is missing from the cache")
+	require.Equal(t, int64(2), f.holdersViaHistory(t, d), "but present in balances")
+
+	require.NoError(t, d.reconcileTokenBalancesCurrent(ctx))
+
+	got, err := d.countTokenHolders(ctx, f.token)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), got, "reconcile must find drift that sits below the watermark")
+	require.Equal(t, f.holdersViaHistory(t, d), got)
+
+	bal, blk := f.currentRow(t, d, 2)
+	require.Equal(t, "5000", bal)
+	require.Equal(t, f.base+7, blk)
+}
+
+// TestCurrentBalances_WipedWithBalancesOnChainReset covers the FORCE_REINDEX
+// path. WipeAllData truncates balances; leaving the cache behind is worse than
+// stale, because re-indexing from block 0 writes LOWER block numbers and the
+// maintenance guard is highest-block-wins -- so the old chain's rows would
+// refuse to be replaced and would be served indefinitely.
+func TestCurrentBalances_WipedWithBalancesOnChainReset(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newBalFixture(t, d, 6, 4_493_600_000)
+	defer drop()
+
+	// "Old chain": a holder cached at a high block.
+	f.writeBal(t, d, [3]int64{1, 500_000, 9999})
+	require.Equal(t, int64(1), mustCount(t, d, f.token))
+
+	require.NoError(t, d.WipeAllData(ctx))
+
+	require.Zero(t, mustCount(t, d, f.token),
+		"the cache must be truncated along with balances, or the old chain's holders survive")
+
+	// "New chain" from block 0: a LOWER block number than the wiped row held.
+	// Without the wipe this write would have been refused by the guard.
+	newFixture := balFixture{token: f.token, base: 0}
+	newFixture.writeBal(t, d, [3]int64{1, 3, 1234})
+
+	bal, blk := newFixture.currentRow(t, d, 1)
+	require.Equal(t, "1234", bal, "the re-indexed chain's balance must win after a wipe")
+	require.Equal(t, int64(3), blk)
+}
+
+func mustCount(t *testing.T, d *DB, token string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, d.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM token_balances_current WHERE token_address = $1`, token).Scan(&n))
+	return n
+}
+
 // TestCurrentBalances_BackfillIsIdempotent runs the migration's backfill body
 // against a table that already holds the rows. The migration is marked applied
 // after the first run, but the same statement is reachable through the
