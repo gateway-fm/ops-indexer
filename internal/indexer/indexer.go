@@ -179,52 +179,80 @@ const (
 	missingBlocksInterval = 5 * time.Minute
 )
 
+// refreshProgress updates the cheap gauges and reports the chain head.
+func (i *Indexer) refreshProgress(ctx context.Context) (head uint64, ok bool) {
+	head, err := i.rpc.BlockNumber(ctx)
+	if err != nil {
+		log.Debug("progress metrics: chain head unavailable", "error", err)
+		return 0, false
+	}
+	metrics.SetChainHead(head)
+
+	if indexed, err := i.db.GetLatestBlockNumber(ctx); err == nil {
+		metrics.SetLastIndexed(indexed)
+	}
+	if i.balanceWorkers != nil {
+		metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
+	}
+	return head, true
+}
+
+// missingBlockCount is the number of blocks in [startBlock, head] absent from
+// the database. The range starts at startBlock, not genesis: assuming genesis
+// makes a fully caught-up database report startBlock missing forever.
+func missingBlockCount(startBlock, head uint64, count int64) int64 {
+	if head < startBlock {
+		return 0
+	}
+	missing := int64(head-startBlock+1) - count
+	if missing < 0 {
+		return 0
+	}
+	return missing
+}
+
+// refreshMissingBlocks counts real holes, which head-last_indexed cannot see:
+// that only measures the tip and reads zero while blocks behind it are absent.
+func (i *Indexer) refreshMissingBlocks(ctx context.Context, head uint64) {
+	if head < i.startBlock {
+		metrics.SetMissingBlocks(0)
+		return
+	}
+	count, err := i.db.GetBlockCount(ctx)
+	if err != nil {
+		return
+	}
+	metrics.SetMissingBlocks(missingBlockCount(i.startBlock, head, count))
+}
+
 func (i *Indexer) publishProgressMetrics(ctx context.Context) {
 	ticker := time.NewTicker(progressMetricsInterval)
 	defer ticker.Stop()
 	missingTicker := time.NewTicker(missingBlocksInterval)
 	defer missingTicker.Stop()
 
-	var head uint64
+	// Seed before the first tick. Gauges register at zero and a ticker does not
+	// fire immediately, so otherwise every restart reports no lag and no missing
+	// blocks for five minutes -- suppressing the alerts these exist to raise.
+	head, ok := i.refreshProgress(ctx)
+	if ok {
+		i.refreshMissingBlocks(ctx, head)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
 		case <-ticker.C:
-			h, err := i.rpc.BlockNumber(ctx)
-			if err != nil {
-				log.Debug("progress metrics: chain head unavailable", "error", err)
-				continue
-			}
-			head = h
-			metrics.SetChainHead(head)
-
-			if indexed, err := i.db.GetLatestBlockNumber(ctx); err == nil {
-				metrics.SetLastIndexed(indexed)
-			}
-			if i.catchupIndexer != nil {
-				metrics.SetQueueDepth(metrics.QueueCatchup, i.catchupIndexer.QueueDepth())
-			}
-			if i.balanceWorkers != nil {
-				metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
+			if h, o := i.refreshProgress(ctx); o {
+				head, ok = h, true
 			}
 
 		case <-missingTicker.C:
-			if head == 0 {
-				continue
+			if ok {
+				i.refreshMissingBlocks(ctx, head)
 			}
-			// Counts real holes. head-last_indexed only measures the tip, and
-			// reads zero while blocks behind it are still absent.
-			count, err := i.db.GetBlockCount(ctx)
-			if err != nil {
-				continue
-			}
-			missing := int64(head) + 1 - count
-			if missing < 0 {
-				missing = 0
-			}
-			metrics.SetMissingBlocks(missing)
 		}
 	}
 }

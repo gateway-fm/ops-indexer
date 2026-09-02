@@ -564,3 +564,42 @@ func TestChainResetDetection(t *testing.T) {
 		mockDB.AssertNotCalled(t, "DeleteBlock", mock.Anything, mock.Anything)
 	})
 }
+
+func TestMissingBlockCount(t *testing.T) {
+	tests := []struct {
+		name       string
+		startBlock uint64
+		head       uint64
+		count      int64
+		want       int64
+	}{
+		{"from genesis, fully caught up", 0, 99, 100, 0},
+		{"from genesis, holes behind the tip", 0, 99, 60, 40},
+		// Without accounting for START_BLOCK this reports 10000 missing forever
+		// on a database that is completely caught up.
+		{"start_block offset, fully caught up", 10000, 10099, 100, 0},
+		{"start_block offset, holes behind the tip", 10000, 10099, 90, 10},
+		{"head below start_block", 10000, 500, 0, 0},
+		{"count ahead of range never goes negative", 0, 10, 50, 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := missingBlockCount(tc.startBlock, tc.head, tc.count); got != tc.want {
+				t.Errorf("missingBlockCount(%d, %d, %d) = %d, want %d",
+					tc.startBlock, tc.head, tc.count, got, tc.want)
+			}
+		})
+	}
+}
+
+// The chain has not reached the configured start yet, so there is nothing to
+// index and no reason to run a COUNT(*) over blocks.
+func TestRefreshMissingBlocksSkipsQueryBelowStartBlock(t *testing.T) {
+	mockDB := new(MockDatabase)
+	idx := &Indexer{db: mockDB, startBlock: 10000}
+
+	idx.refreshMissingBlocks(context.Background(), 500)
+
+	mockDB.AssertNotCalled(t, "GetBlockCount", mock.Anything)
+}

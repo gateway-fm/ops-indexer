@@ -9,6 +9,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 )
 
 type CatchupConfig struct {
@@ -299,6 +300,7 @@ func (c *CatchupIndexer) worker(id int) {
 			}
 
 			processed := atomic.AddInt64(&c.processedBlocks, 1)
+			metrics.SetQueueDepth(metrics.QueueCatchup, len(c.workQueue))
 
 			if time.Since(c.lastLogTime) > 5*time.Second {
 				c.lastLogTime = time.Now()

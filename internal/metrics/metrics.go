@@ -6,6 +6,7 @@
 package metrics
 
 import (
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -101,6 +102,8 @@ const (
 	QueueCatchup = "catchup"
 )
 
+var strategyMu sync.Mutex
+
 var (
 	receiptPaths = []string{"batch", "logs", "per_tx", "none"}
 	tracePaths   = []string{"batch", "per_tx"}
@@ -127,9 +130,15 @@ func SetReceiptStrategy(path string) { setStrategy("receipts", path, receiptPath
 
 func SetTraceStrategy(path string) { setStrategy("traces", path, tracePaths) }
 
-// Every alternative is written, not just the active one: an alert cannot fire
-// on a series that is absent.
+// Every alternative is written, not just the active one: an alert cannot fire on
+// a series that is absent.
+//
+// Locked because one logical update is several independent Set calls and
+// catchup fetches blocks concurrently. Interleaved loops can otherwise leave
+// every path at 0, a state that never resolves.
 func setStrategy(kind, path string, all []string) {
+	strategyMu.Lock()
+	defer strategyMu.Unlock()
 	for _, p := range all {
 		v := 0.0
 		if p == path {

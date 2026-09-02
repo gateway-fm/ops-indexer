@@ -6,8 +6,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
@@ -142,5 +145,67 @@ func TestBalanceQueueDroppedIgnoresNonPositive(t *testing.T) {
 	BalanceQueueDropped(2)
 	if !strings.Contains(scrape(t), "indexer_balance_queue_dropped_total 2") {
 		t.Error("expected the dropped counter to reach 2")
+	}
+}
+
+// TestSetStrategyStaysCoherentUnderConcurrency pins the invariant that exactly
+// one path per kind is 1. One logical update is several Set calls, so two
+// interleaved callers can leave every path at 0 — a state that never resolves
+// and silently disables the fallback alert.
+//
+// The reader takes the same mutex the writer does, so it observes a snapshot
+// only when the update is genuinely atomic. Checking after the writers finish
+// is NOT enough: the last writer usually leaves a coherent state, so that
+// version of this test passes even with the locking removed.
+func TestSetStrategyStaysCoherentUnderConcurrency(t *testing.T) {
+	const writers = 8
+
+	// Seed before sampling: WithLabelValues creates a series lazily at 0, so an
+	// unseeded read is incoherent for reasons that have nothing to do with
+	// interleaving. Without this the test depends on an earlier test having run.
+	SetReceiptStrategy("batch")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < writers; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			path := receiptPaths[g%len(receiptPaths)]
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					SetReceiptStrategy(path)
+				}
+			}
+		}(g)
+	}
+
+	var incoherent, samples int
+	for samples = 0; samples < 20000; samples++ {
+		strategyMu.Lock()
+		active := 0
+		for _, p := range receiptPaths {
+			var m dto.Metric
+			if err := rpcStrategy.WithLabelValues("receipts", p).Write(&m); err == nil {
+				if m.GetGauge().GetValue() == 1 {
+					active++
+				}
+			}
+		}
+		strategyMu.Unlock()
+		if active != 1 {
+			incoherent++
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+
+	if incoherent > 0 {
+		t.Errorf("observed %d incoherent snapshots of %d: a receipt strategy update is not atomic",
+			incoherent, samples)
 	}
 }
