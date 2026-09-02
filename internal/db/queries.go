@@ -600,16 +600,23 @@ func (d *DB) UpdateTokenStats(ctx context.Context, address string, holderCount i
 	return err
 }
 
-// RefreshTokenStats recomputes holder_count, transfer_count, and total_supply
-// for a single token from the underlying token_transfers / balances / nft_tokens
-// tables, then writes the result onto the tokens row. Cheap and idempotent. The
-// token row must already exist; if not, the call is a no-op.
+// RefreshTokenTransferStats recomputes transfer_count and total_supply for a
+// single token from token_transfers / nft_tokens and writes them onto the tokens
+// row. The token row must already exist; if not, the call is a no-op.
 //
-// holder_count counts addresses whose latest balance for this token is > 0.
 // transfer_count is COUNT(*) over token_transfers.
 // total_supply is mints−burns for ERC20, and the live (non-burned) token-id
 // count for ERC721; left untouched for other standards.
-func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
+//
+// holder_count is deliberately NOT refreshed here. It is a function of the
+// balances table, which no part of the per-block ingest path writes: balances
+// are fetched over RPC by the async balance workers and queued only after the
+// block has been committed, so a refresh running for block N cannot observe
+// block N's balances. Recomputing it here re-derived a value the current block
+// could not have changed, at the cost of the most expensive statement in the
+// database. It is refreshed by RefreshTokenHolderCount instead, on the path
+// that actually writes balances. See PRST-4493.
+func (d *DB) RefreshTokenTransferStats(ctx context.Context, tokenAddress string) error {
 	addr := strings.ToLower(tokenAddress)
 
 	var tokenType string
@@ -619,34 +626,20 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		if err == pgx.ErrNoRows {
 			return nil
 		}
-		return fmt.Errorf("RefreshTokenStats: read token_type: %w", err)
+		return fmt.Errorf("RefreshTokenTransferStats: read token_type: %w", err)
 	}
 
 	var transferCount int64
 	if err := d.pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, addr,
 	).Scan(&transferCount); err != nil {
-		return fmt.Errorf("RefreshTokenStats: count transfers: %w", err)
-	}
-
-	var holderCount int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM (
-			SELECT DISTINCT ON (address) balance
-			FROM balances
-			WHERE token_address = $1
-			ORDER BY address, block_number DESC
-		) latest
-		WHERE balance > 0`, addr,
-	).Scan(&holderCount); err != nil {
-		return fmt.Errorf("RefreshTokenStats: count holders: %w", err)
+		return fmt.Errorf("RefreshTokenTransferStats: count transfers: %w", err)
 	}
 
 	if tokenType == "ERC20" {
 		_, err := d.pool.Exec(ctx, `
 			UPDATE tokens
-			SET holder_count = $2,
-			    transfer_count = $3,
+			SET transfer_count = $2,
 			    total_supply = (
 			        SELECT COALESCE(
 			            SUM(CASE WHEN from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
@@ -657,9 +650,9 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 			        WHERE token_address = $1 AND token_type = 'ERC20'
 			    )
 			WHERE address = $1`,
-			addr, holderCount, transferCount)
+			addr, transferCount)
 		if err != nil {
-			return fmt.Errorf("RefreshTokenStats: update ERC20 stats: %w", err)
+			return fmt.Errorf("RefreshTokenTransferStats: update ERC20 stats: %w", err)
 		}
 		return nil
 	}
@@ -669,26 +662,65 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		// ids, tracked per-instance in nft_tokens.
 		_, err := d.pool.Exec(ctx, `
 			UPDATE tokens
-			SET holder_count = $2,
-			    transfer_count = $3,
+			SET transfer_count = $2,
 			    total_supply = (
 			        SELECT COUNT(*) FROM nft_tokens
 			        WHERE LOWER(token_address) = $1
 			          AND owner <> '0x0000000000000000000000000000000000000000'
 			    )
 			WHERE LOWER(address) = $1`,
-			addr, holderCount, transferCount)
+			addr, transferCount)
 		if err != nil {
-			return fmt.Errorf("RefreshTokenStats: update ERC721 stats: %w", err)
+			return fmt.Errorf("RefreshTokenTransferStats: update ERC721 stats: %w", err)
 		}
 		return nil
 	}
 
 	_, err := d.pool.Exec(ctx, `
-		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = $1`,
-		addr, holderCount, transferCount)
+		UPDATE tokens SET transfer_count = $2 WHERE address = $1`,
+		addr, transferCount)
 	if err != nil {
-		return fmt.Errorf("RefreshTokenStats: update stats: %w", err)
+		return fmt.Errorf("RefreshTokenTransferStats: update stats: %w", err)
+	}
+	return nil
+}
+
+// RefreshTokenHolderCount recomputes holder_count for a single token -- the
+// number of addresses whose latest balance for it is > 0 -- and writes it onto
+// the tokens row. The token row must already exist; if not, the call is a no-op.
+//
+// This belongs on the balance-write path, not the per-block ingest path: only a
+// write to balances can change the answer.
+//
+// The DISTINCT ON here is unbounded in the token's balance history, because
+// balances is append-only (PK (address, token_address, block_number)) and gains
+// a row per address per block its balance changed in. That is the remaining
+// unbounded scan; a current-balances table replaces it. See PRST-4493.
+func (d *DB) RefreshTokenHolderCount(ctx context.Context, tokenAddress string) error {
+	addr := strings.ToLower(tokenAddress)
+
+	// One statement rather than a count followed by an update: the count is an
+	// uncorrelated subquery, so Postgres runs it as an InitPlan that is only
+	// evaluated if the UPDATE's target scan produces a row. An unknown token
+	// therefore costs an index probe and skips the scan entirely, which is the
+	// early return the combined refresh used to get from its token_type lookup.
+	// Both call sites pass addresses taken from Transfer events, which can
+	// arrive before the token row is written, so that case is worth keeping
+	// cheap.
+	if _, err := d.pool.Exec(ctx, `
+		UPDATE tokens
+		SET holder_count = (
+		    SELECT COUNT(*) FROM (
+		        SELECT DISTINCT ON (address) balance
+		        FROM balances
+		        WHERE token_address = $1
+		        ORDER BY address, block_number DESC
+		    ) latest
+		    WHERE balance > 0
+		)
+		WHERE address = $1`, addr,
+	); err != nil {
+		return fmt.Errorf("RefreshTokenHolderCount: update holder_count: %w", err)
 	}
 	return nil
 }

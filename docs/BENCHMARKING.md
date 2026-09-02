@@ -5,7 +5,7 @@ Four measurements, answering different questions. None substitutes for another.
 | | question | needs |
 |---|---|---|
 | [Write-path benchmark](#write-path-benchmark) | did this commit make the inserts faster or slower? | docker, or a Postgres |
-| [Derived-counter benchmarks](#derived-counter-benchmarks) | did it change `RefreshTokenStats`, or the real per-block cost? | same |
+| [Derived-counter benchmarks](#derived-counter-benchmarks) | did it change a derived-counter refresh, or the real per-block cost? | same |
 | [Read-path benchmarks](#read-path-benchmarks) | how slow are the explorer's queries as history grows? | same |
 | [End-to-end ingest](#end-to-end-ingest-on-a-live-chain) | what sustained rate do we actually achieve? | a live chain + the indexer deployed |
 
@@ -250,43 +250,64 @@ Three things worth taking from that table:
 
 ### What it deliberately excludes
 
-`RefreshTokenStats` is not on this path — it runs a level up, in the indexer — so these
-numbers are insert cost alone. See the next section.
+The derived-counter refreshes are not on this path — they run a level up, in the indexer — so
+these numbers are insert cost alone. See the next section.
 
 ## Derived-counter benchmarks
 
-`BenchmarkRefreshTokenStats` times one `RefreshTokenStats` call, and
 `BenchmarkBlockCycle` times what the indexer actually does per block: the insert batch
 followed by a refresh for each token the block touched.
+`BenchmarkRefreshTokenTransferStats` and `BenchmarkRefreshTokenHolderCount` time the two
+refreshes individually.
 
 These matter because the two halves scale on **different axes**:
 
 - inserts scale with rows written per block, and barely with stored history;
-- `RefreshTokenStats` scales with the history of the token being refreshed, and not at all
+- the refreshes scale with the history of the token being refreshed, and not at all
   with what the current block wrote.
 
-For an ERC-20 token, one call issues three history-proportional statements — a `COUNT(*)`
-over `token_transfers`, a `DISTINCT ON (address)` over `balances`, and a `SUM(...)` over
-`token_transfers` inside the `UPDATE`. None is bounded by the block being processed, so cost
-grows with the token's lifetime. A chain with one dominant token is the worst case, and is
-what these benchmarks seed.
+Each refresh issues history-proportional statements against a single token, none of them
+bounded by the block being processed, so cost grows with the token's lifetime. A chain with
+one dominant token is the worst case, and is what these benchmarks seed.
+
+**The refresh is split across two paths, and only one of them is per-block.**
+`RefreshTokenTransferStats` maintains `transfer_count` and `total_supply` and runs once per
+token per block, from the ingest loop — a `COUNT(*)` over `token_transfers` and, for ERC20, a
+mint-minus-burn `SUM(...)` over the same table inside the `UPDATE`. `RefreshTokenHolderCount`
+maintains `holder_count` with a `DISTINCT ON (address)` over `balances`, and runs once per
+token per **balance flush**, from the balance worker pool.
+
+That split is why there are two benchmarks rather than one, and **measuring only
+`BenchmarkBlockCycle` will overstate a change that merely moves cost between the two.**
+`holder_count` cannot be maintained on the per-block path at all: balances are fetched over
+RPC by the async workers and queued only after the block commits, so a refresh running for
+block N cannot observe block N's balances. Its cost still reaches ingest, just indirectly —
+the balance workers call it inline, so a slow one backs the balance queue up until
+`QueueWorkBatch` starts dropping work.
 
 ### What this costs, measured
 
 Same constrained server as above (PG 17, `shared_buffers = 2GB`, 3 CPU, gp3), 250 tx/block,
 one dominant ERC-20:
 
-| scale | `RefreshTokenStats` | `BlockCycle` | `BlockCycle` tx/s | blocks/s | gas/s |
+These are the figures for the **combined** refresh, as it stood before it was split — one
+call doing all three counters, on both paths:
+
+| scale | combined refresh | `BlockCycle` | `BlockCycle` tx/s | blocks/s | gas/s |
 |---|---|---|---|---|---|
 | 100k | 28 ms | 94 ms | 2,663 | 10.6 | 173 M |
 | 1M | 281 ms | 341 ms | 734 | 2.94 | 47.7 M |
 | 10M | 2.86 s | 2.64 s | **95** | 0.378 | 6.1 M |
 
-`BenchmarkRefreshTokenStats` runs immediately after the bulk seed, while autovacuum is still
-working through the freshly loaded table, so it reads slightly high. Timing the three
+The refresh benchmarks run immediately after the bulk seed, while autovacuum is still
+working through the freshly loaded table, so they read slightly high. Timing the three
 statements individually on a settled server gives 2.44 s at 10M — 440 ms for the `COUNT(*)`,
 863 ms for the `DISTINCT ON` over `balances`, 1,140 ms for the `total_supply` `SUM`. Quote
 ~2.5 s.
+
+Note how that 2.44 s divides across the split: the `COUNT(*)` and the `SUM` (1,580 ms) went to
+`RefreshTokenTransferStats`, on the per-block path; the `DISTINCT ON` (863 ms) went to
+`RefreshTokenHolderCount`, on the flush path.
 
 Two things follow, and both are structural rather than tuning problems.
 
@@ -377,7 +398,7 @@ So the test runs at a small scale and asserts the harness actually did something
 - a block presents a realistic number of distinct address deltas;
 - transaction hashes are production length and unique, so no insert is silently an
   `ON CONFLICT DO NOTHING` no-op;
-- `RefreshTokenStats` has history to walk and writes a non-zero result back;
+- both refreshes have history to walk and write a non-zero result back;
 - each read benchmark returns rows — `GetAddressStats` in particular returns a zero-valued
   struct with a nil error when the row is missing, so only a populated field distinguishes a
   hit from a miss;

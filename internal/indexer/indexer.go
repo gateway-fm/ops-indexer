@@ -139,13 +139,15 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		idx.balanceWorkers = NewBalanceWorkerPool(database, rpcClient, cfg.BalanceWorkers, cfg.RPCRateLimit)
 		// When balances actually land in the DB, refresh holder_count for the
 		// affected tokens so the cached count on the tokens row matches the
-		// new balance set without waiting for the next transfer.
+		// new balance set without waiting for the next transfer. This is the
+		// only path that can change holder_count, and therefore the only path
+		// that recomputes it.
 		idx.balanceWorkers.SetOnFlush(func(tokenAddresses []string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			for _, addr := range tokenAddresses {
-				if err := database.RefreshTokenStats(ctx, addr); err != nil {
-					log.Warn("refresh token stats after balance flush failed", "token", addr, "error", err)
+				if err := database.RefreshTokenHolderCount(ctx, addr); err != nil {
+					log.Warn("refresh holder count after balance flush failed", "token", addr, "error", err)
 				}
 			}
 		})
@@ -942,17 +944,19 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		return err
 	}
 
-	// Refresh derived stats (transfer_count, total_supply, holder_count) for
-	// each token touched in this block. Cheap aggregate queries; runs
-	// synchronously so the new counts are visible on the next read.
+	// Refresh transfer_count and total_supply for each token touched in this
+	// block, synchronously, so the new counts are visible on the next read.
+	// holder_count is not refreshed here: it is a function of balances, which
+	// this block has not written yet -- the balance work is queued below and
+	// fetched asynchronously over RPC. It is refreshed on that path instead.
 	if len(blockData.Transfers) > 0 {
 		touched := make(map[string]struct{}, len(blockData.Transfers))
 		for _, t := range blockData.Transfers {
 			touched[strings.ToLower(t.TokenAddress)] = struct{}{}
 		}
 		for tokenAddr := range touched {
-			if err := i.db.RefreshTokenStats(ctx, tokenAddr); err != nil {
-				log.Warn("refresh token stats failed", "token", tokenAddr, "error", err)
+			if err := i.db.RefreshTokenTransferStats(ctx, tokenAddr); err != nil {
+				log.Warn("refresh token transfer stats failed", "token", tokenAddr, "error", err)
 			}
 		}
 	}

@@ -10,27 +10,31 @@ import (
 
 // Derived-counter benchmarks.
 //
-// BenchmarkInsertBlockDataBatch measures the inserts. This file measures what
-// runs immediately after them in the indexer's per-block loop: RefreshTokenStats,
-// once per token touched by the block. The two together are the real per-block
-// cost, and the split matters because they scale on different axes:
+// BenchmarkInsertBlockDataBatch measures the inserts. This file measures the
+// derived-counter refreshes that accompany them. The two together are the real
+// per-block cost, and the split matters because they scale on different axes:
 //
 //   - inserts scale with rows written per block, and barely at all with how much
 //     history is already stored;
-//   - RefreshTokenStats scales with the history of the token being refreshed,
-//     and not at all with how many rows this block wrote.
+//   - the refreshes scale with the history of the token being refreshed, and not
+//     at all with how many rows this block wrote.
 //
 // That second axis is why a benchmark that only covers inserts cannot detect a
 // change to the derived-counter path, in either direction.
 //
-// For an ERC-20 token, one RefreshTokenStats call issues three
-// history-proportional statements against a single token:
+// The refresh is split in two, because the two halves run on different paths and
+// only one of them is on the per-block ingest path:
 //
-//	COUNT(*)              over token_transfers for that token
-//	DISTINCT ON (address) over balances        for that token, then COUNT
-//	SUM(...)              over token_transfers for that token, inside the UPDATE
+//	RefreshTokenTransferStats  per token per block, from the ingest loop
+//	  COUNT(*)  over token_transfers for that token
+//	  SUM(...)  over token_transfers for that token, inside the UPDATE
 //
-// None of them is bounded by the block being processed.
+//	RefreshTokenHolderCount    per token per balance flush, from the workers
+//	  DISTINCT ON (address) over balances for that token, then COUNT
+//
+// None of those statements is bounded by the block being processed. Benchmark
+// both: a change that moves cost from one path to the other is not the same as
+// a change that removes it, and only measuring both tells them apart.
 
 // benchHoldersPerTransfer and benchSnapshotsPerHolder shape the balances history
 // the holder_count query has to walk. One balance row per holder would let
@@ -41,13 +45,14 @@ const (
 	benchSnapshotsPerHolder = 2
 )
 
-// BenchmarkRefreshTokenStats measures one RefreshTokenStats call against a token
-// whose history is the size of the seeded scale.
+// BenchmarkRefreshTokenTransferStats measures one RefreshTokenTransferStats call
+// -- the refresh the per-block ingest path runs -- against a token whose history
+// is the size of the seeded scale.
 //
 // Seeding all n transfers onto a single token models a chain with one dominant
 // ERC-20 -- which is both the load-test shape and the worst case, and makes the
 // number directly comparable to BenchmarkInsertBlockDataBatch at the same scale.
-func BenchmarkRefreshTokenStats(b *testing.B) {
+func BenchmarkRefreshTokenTransferStats(b *testing.B) {
 	runScaled(b, func(b *testing.B, d *DB) {
 		ctx := context.Background()
 		b.StopTimer()
@@ -55,17 +60,45 @@ func BenchmarkRefreshTokenStats(b *testing.B) {
 		b.StartTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := d.RefreshTokenStats(ctx, token); err != nil {
-				b.Fatalf("RefreshTokenStats: %v", err)
+			if err := d.RefreshTokenTransferStats(ctx, token); err != nil {
+				b.Fatalf("RefreshTokenTransferStats: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkRefreshTokenHolderCount measures one RefreshTokenHolderCount call --
+// the refresh the balance-flush path runs, and the only remaining unbounded scan
+// -- against the same seeded token.
+//
+// It is not on the per-block path, so it does not appear in BenchmarkBlockCycle.
+// It still has to be measured: the balance workers call it once per distinct
+// token per flush, so its cost lands on ingest indirectly, through the balance
+// queue backing up.
+func BenchmarkRefreshTokenHolderCount(b *testing.B) {
+	runScaled(b, func(b *testing.B, d *DB) {
+		ctx := context.Background()
+		b.StopTimer()
+		token := benchSeedTokenHistory(b, d)
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := d.RefreshTokenHolderCount(ctx, token); err != nil {
+				b.Fatalf("RefreshTokenHolderCount: %v", err)
 			}
 		}
 	})
 }
 
 // BenchmarkBlockCycle measures what the indexer actually does per block:
-// InsertBlockDataBatch followed by RefreshTokenStats for each token the block
-// touched. This is the number to watch when changing the ingest path -- neither
-// half alone predicts it.
+// InsertBlockDataBatch followed by RefreshTokenTransferStats for each token the
+// block touched. This is the number to watch when changing the ingest path --
+// neither half alone predicts it.
+//
+// holder_count is not part of the cycle, because the per-block path cannot
+// change it: balances are queued for the async workers after the block commits,
+// so a refresh here would recompute a value this block has not touched. See
+// BenchmarkRefreshTokenHolderCount for that path's cost.
 func BenchmarkBlockCycle(b *testing.B) {
 	shape := blockShape{name: "erc20", logsPerTx: 1, transfersPerTx: 1, gasPerTx: 65_000}
 
@@ -96,8 +129,8 @@ func BenchmarkBlockCycle(b *testing.B) {
 			// this refreshes benchRefreshToken, so the history being measured
 			// stays the size of the seeded scale for every iteration instead of
 			// growing by 250 rows each time round.
-			if err := d.RefreshTokenStats(ctx, token); err != nil {
-				b.Fatalf("RefreshTokenStats: %v", err)
+			if err := d.RefreshTokenTransferStats(ctx, token); err != nil {
+				b.Fatalf("RefreshTokenTransferStats: %v", err)
 			}
 		}
 
@@ -132,8 +165,8 @@ func benchSeedTokenHistory(tb testing.TB, d *DB) string {
 		tb.Fatal("no seeded transactions to hang token transfers off")
 	}
 
-	// The token row must exist or RefreshTokenStats returns early and the
-	// benchmark silently measures a single indexed lookup.
+	// The token row must exist or RefreshTokenTransferStats returns early and
+	// the benchmark silently measures a single indexed lookup.
 	if _, err := d.pool.Exec(ctx, `
 		INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number)
 		VALUES ($1, 'BENCH', 'Benchmark Token', 18, 'ERC20', 1)

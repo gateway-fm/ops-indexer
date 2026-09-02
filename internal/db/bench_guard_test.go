@@ -99,21 +99,34 @@ func TestBenchmarkHarnessMeasuresRealWork(t *testing.T) {
 		}
 	})
 
-	t.Run("RefreshTokenStats has history to walk and writes a result", func(t *testing.T) {
+	t.Run("both refreshes have history to walk and write a result", func(t *testing.T) {
 		token := benchSeedTokenHistory(t, d)
-		if err := d.RefreshTokenStats(ctx, token); err != nil {
-			t.Fatalf("RefreshTokenStats: %v", err)
+		if err := d.RefreshTokenTransferStats(ctx, token); err != nil {
+			t.Fatalf("RefreshTokenTransferStats: %v", err)
+		}
+		if err := d.RefreshTokenHolderCount(ctx, token); err != nil {
+			t.Fatalf("RefreshTokenHolderCount: %v", err)
 		}
 		var transferCount, holderCount int64
+		var totalSupply string
 		if err := d.pool.QueryRow(ctx,
-			`SELECT COALESCE(transfer_count, 0), COALESCE(holder_count, 0) FROM tokens WHERE address = $1`,
-			token).Scan(&transferCount, &holderCount); err != nil {
+			`SELECT COALESCE(transfer_count, 0), COALESCE(holder_count, 0), COALESCE(total_supply, 0)::text
+			 FROM tokens WHERE address = $1`,
+			token).Scan(&transferCount, &holderCount, &totalSupply); err != nil {
 			t.Fatalf("read refreshed token: %v", err)
 		}
-		if transferCount == 0 || holderCount == 0 {
-			t.Errorf("refreshed token has transfer_count=%d holder_count=%d; RefreshTokenStats returns "+
-				"nil early when the token row is absent, so zero is what a skipped refresh looks like",
-				transferCount, holderCount)
+		// Both refreshes return nil early when the token row is absent, so zero
+		// is exactly what a skipped refresh looks like. Assert each counter the
+		// two of them are between them responsible for, so a benchmark cannot
+		// time a refresh that touched nothing.
+		if transferCount == 0 {
+			t.Errorf("refreshed token has transfer_count=0; RefreshTokenTransferStats measured nothing")
+		}
+		if totalSupply == "0" {
+			t.Errorf("refreshed token has total_supply=0; the mint/burn SUM measured nothing")
+		}
+		if holderCount == 0 {
+			t.Errorf("refreshed token has holder_count=0; RefreshTokenHolderCount measured nothing")
 		}
 	})
 
