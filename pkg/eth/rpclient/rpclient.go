@@ -9,10 +9,33 @@ import (
 	"math/big"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/hexutil"
 )
+
+// JSON-RPC call outcomes reported to Observer.
+const (
+	OutcomeOK             = "ok"
+	OutcomeTransportError = "transport_error"
+	OutcomeRPCError       = "rpc_error"
+	OutcomeDecodeError    = "decode_error"
+)
+
+// Observer, if set, is called once per JSON-RPC call. It is the single funnel
+// through which every call in the binary passes, so wiring it here covers block,
+// receipt, trace, call, balance and code fetches uniformly.
+//
+// Set it once at startup, before any call is made: it is read on the hot path
+// without synchronisation.
+var Observer func(method, outcome string, d time.Duration)
+
+func observe(method, outcome string, start time.Time) {
+	if Observer != nil {
+		Observer(method, outcome, time.Since(start))
+	}
+}
 
 type Client struct {
 	url        string
@@ -55,6 +78,10 @@ func (e *jsonrpcError) Error() string {
 }
 
 func (c *Client) CallContext(ctx context.Context, result any, method string, args ...any) error {
+	start := time.Now()
+	outcome := OutcomeTransportError
+	defer func() { observe(method, outcome, start) }()
+
 	if args == nil {
 		args = []any{}
 	}
@@ -90,18 +117,27 @@ func (c *Client) CallContext(ctx context.Context, result any, method string, arg
 
 	var rpcResp jsonrpcResponse
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		outcome = OutcomeDecodeError
 		return fmt.Errorf("rpc: unmarshal response: %w", err)
 	}
 
 	if rpcResp.Error != nil {
+		outcome = OutcomeRPCError
 		return rpcResp.Error
 	}
 
 	if result == nil {
+		outcome = OutcomeOK
 		return nil
 	}
 
-	return json.Unmarshal(rpcResp.Result, result)
+	if err := json.Unmarshal(rpcResp.Result, result); err != nil {
+		outcome = OutcomeDecodeError
+		return err
+	}
+
+	outcome = OutcomeOK
+	return nil
 }
 
 type Receipt struct {

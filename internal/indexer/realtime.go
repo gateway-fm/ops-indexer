@@ -8,6 +8,7 @@ import (
 
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
@@ -301,6 +302,7 @@ func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (
 }
 
 func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) error {
+	metrics.ReorgDetected()
 	log.Info("realtime: reverting blocks due to reorg", "from_block", fromBlock)
 
 	lastIndexed, err := r.db.GetLatestBlockNumber(ctx)

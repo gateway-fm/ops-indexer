@@ -11,6 +11,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
@@ -170,7 +171,67 @@ func (i *Indexer) IndexBlock(ctx context.Context, blockNumber uint64) error {
 	}
 }
 
+const (
+	progressMetricsInterval = 15 * time.Second
+
+	// GetBlockCount is a COUNT(*) over blocks, so it runs far less often than
+	// the cheap gauges. Backfill holes change slowly; lag does not.
+	missingBlocksInterval = 5 * time.Minute
+)
+
+func (i *Indexer) publishProgressMetrics(ctx context.Context) {
+	ticker := time.NewTicker(progressMetricsInterval)
+	defer ticker.Stop()
+	missingTicker := time.NewTicker(missingBlocksInterval)
+	defer missingTicker.Stop()
+
+	var head uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			h, err := i.rpc.BlockNumber(ctx)
+			if err != nil {
+				log.Debug("progress metrics: chain head unavailable", "error", err)
+				continue
+			}
+			head = h
+			metrics.SetChainHead(head)
+
+			if indexed, err := i.db.GetLatestBlockNumber(ctx); err == nil {
+				metrics.SetLastIndexed(indexed)
+			}
+			if i.catchupIndexer != nil {
+				metrics.SetQueueDepth(metrics.QueueCatchup, i.catchupIndexer.QueueDepth())
+			}
+			if i.balanceWorkers != nil {
+				metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
+			}
+
+		case <-missingTicker.C:
+			if head == 0 {
+				continue
+			}
+			// Counts real holes. head-last_indexed only measures the tip, and
+			// reads zero while blocks behind it are still absent.
+			count, err := i.db.GetBlockCount(ctx)
+			if err != nil {
+				continue
+			}
+			missing := int64(head) + 1 - count
+			if missing < 0 {
+				missing = 0
+			}
+			metrics.SetMissingBlocks(missing)
+		}
+	}
+}
+
 func (i *Indexer) Start(ctx context.Context) error {
+	go i.publishProgressMetrics(ctx)
+
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)
 	if err != nil {
 		log.Error("failed to get latest indexed block", "error", err)
@@ -231,6 +292,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 	// Detect chain reset: if the chain head is significantly behind our last
 	// indexed block, this is a chain reset (e.g. Anvil restart), not a reorg.
 	if lastIndexed > 0 && latestOnChain+maxReorgDepth < lastIndexed {
+		metrics.ChainResetDetected()
 		log.Error("CHAIN RESET DETECTED: chain head is far behind last indexed block",
 			"chain_head", latestOnChain,
 			"last_indexed", lastIndexed,
@@ -520,6 +582,7 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 }
 
 func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
+	metrics.ReorgDetected()
 	log.Info("reverting blocks due to reorg", "from_block", fromBlock)
 
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)
@@ -572,11 +635,16 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 		ReceiptsRoot:     rawBlock.ReceiptsRoot.Hex(),
 	}
 
-	return i.db.InsertBlock(ctx, b)
+	if err := i.db.InsertBlock(ctx, b); err != nil {
+		return err
+	}
+	metrics.BlockIndexed(0, uint64(rawBlock.GasUsed))
+	return nil
 }
 
 func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.RawBlock) error {
 	start := time.Now()
+	defer metrics.StageTimer(metrics.StageBlockTotal)()
 	blockNumber := rawBlock.NumberU64()
 	rawTxs := rawBlock.Transactions
 	blockTimestamp := uint64(rawBlock.Timestamp)
@@ -938,9 +1006,11 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		}
 	}
 
+	commitStart := time.Now()
 	if err := i.db.InsertBlockDataBatch(ctx, blockData); err != nil {
 		return err
 	}
+	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
 
 	// Refresh derived stats (transfer_count, total_supply, holder_count) for
 	// each token touched in this block. Cheap aggregate queries; runs
@@ -951,17 +1021,21 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			touched[strings.ToLower(t.TokenAddress)] = struct{}{}
 		}
 		for tokenAddr := range touched {
+			refreshStart := time.Now()
 			if err := i.db.RefreshTokenStats(ctx, tokenAddr); err != nil {
 				log.Warn("refresh token stats failed", "token", tokenAddr, "error", err)
 			}
+			metrics.ObserveStage(metrics.StageRefreshTokenStats, time.Since(refreshStart))
 		}
 	}
 
 	if i.balanceWorkers != nil && len(balanceWork) > 0 {
 		queued := i.balanceWorkers.QueueWorkBatch(balanceWork)
 		if queued < len(balanceWork) {
+			metrics.BalanceQueueDropped(len(balanceWork) - queued)
 			log.Warn("balance queue full, dropped items", "dropped", len(balanceWork)-queued)
 		}
+		metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
 	}
 
 	if i.eventBus != nil {
@@ -970,6 +1044,8 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			i.eventBus.PublishNewTransaction(tx)
 		}
 	}
+
+	metrics.BlockIndexed(len(rawTxs), uint64(rawBlock.GasUsed))
 
 	elapsed := time.Since(start)
 	if blockNumber%100 == 0 || elapsed > 2*time.Second {

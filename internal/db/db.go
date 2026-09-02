@@ -36,6 +36,10 @@ func New(databaseURL string) (*DB, error) {
 	return &DB{pool: pool, HiddenTxTypes: []int{}}, nil
 }
 
+func (d *DB) PoolStat() *pgxpool.Stat {
+	return d.pool.Stat()
+}
+
 func (d *DB) Close() {
 	d.pool.Close()
 }

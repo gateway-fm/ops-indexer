@@ -225,6 +225,10 @@ func (c *CatchupIndexer) Stop() {
 	c.wg.Wait()
 }
 
+func (c *CatchupIndexer) QueueDepth() int {
+	return len(c.workQueue)
+}
+
 func (c *CatchupIndexer) Progress() (processed int64, total uint64, percentComplete float64) {
 	processed = atomic.LoadInt64(&c.processedBlocks)
 
@@ -306,16 +310,9 @@ func (c *CatchupIndexer) worker(id int) {
 					remaining, _ = c.db.GetTotalMissingBlocks(c.ctx)
 				}
 
-				total := processed + remaining
-				percent := float64(0)
-				if total > 0 {
-					percent = float64(processed) / float64(total) * 100
-				}
-
-				log.Info("catchup: progress",
-					"processed", processed,
-					"remaining", remaining,
-					"percent", percent)
+				log.Info("catchup: queue drain",
+					"blocks_processed_since_start", processed,
+					"queue_remaining", remaining)
 			}
 		}
 	}
