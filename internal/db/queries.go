@@ -600,6 +600,31 @@ func (d *DB) UpdateTokenStats(ctx context.Context, address string, holderCount i
 	return err
 }
 
+// countTokenHolders returns the number of addresses whose current balance of
+// the token is greater than zero. The address must already be lowercased.
+//
+// This reads token_balances_current, which holds one row per (token, address)
+// carrying that address's current balance. The equivalent query over the
+// append-only balances table -- DISTINCT ON (address) ... ORDER BY address,
+// block_number DESC, then count the non-zero rows -- returns the same answer
+// but its cost grows with stored history rather than with the number of
+// holders, so at multi-million-row scale it runs for seconds per call while
+// this stays in the low hundreds of milliseconds for an identical count.
+//
+// That gap is not only about speed. Callers of this run under a context
+// deadline, and an operation that cannot finish inside it never updates the
+// counter at all. See PRST-4493.
+func (d *DB) countTokenHolders(ctx context.Context, lowercasedToken string) (int64, error) {
+	var holderCount int64
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM token_balances_current
+		WHERE token_address = $1 AND balance > 0`, lowercasedToken,
+	).Scan(&holderCount); err != nil {
+		return 0, fmt.Errorf("count holders: %w", err)
+	}
+	return holderCount, nil
+}
+
 // RefreshTokenStats recomputes holder_count, transfer_count, and total_supply
 // for a single token from the underlying token_transfers / balances / nft_tokens
 // tables, then writes the result onto the tokens row. Cheap and idempotent. The
@@ -629,17 +654,9 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		return fmt.Errorf("RefreshTokenStats: count transfers: %w", err)
 	}
 
-	var holderCount int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM (
-			SELECT DISTINCT ON (address) balance
-			FROM balances
-			WHERE token_address = $1
-			ORDER BY address, block_number DESC
-		) latest
-		WHERE balance > 0`, addr,
-	).Scan(&holderCount); err != nil {
-		return fmt.Errorf("RefreshTokenStats: count holders: %w", err)
+	holderCount, err := d.countTokenHolders(ctx, addr)
+	if err != nil {
+		return fmt.Errorf("RefreshTokenStats: %w", err)
 	}
 
 	if tokenType == "ERC20" {
@@ -684,10 +701,9 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		return nil
 	}
 
-	_, err := d.pool.Exec(ctx, `
+	if _, err := d.pool.Exec(ctx, `
 		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = $1`,
-		addr, holderCount, transferCount)
-	if err != nil {
+		addr, holderCount, transferCount); err != nil {
 		return fmt.Errorf("RefreshTokenStats: update stats: %w", err)
 	}
 	return nil

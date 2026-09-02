@@ -405,6 +405,37 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 			VALUES (LOWER($1), LOWER($2), $3, $4)
 			ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
 			b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
+
+		// token_balances_current caches the row that a DISTINCT ON (address)
+		// ... ORDER BY block_number DESC over balances would have returned, so
+		// the guard has to preserve exactly that: highest block_number wins.
+		// >= rather than > because the upsert above is last-write-wins for an
+		// identical block_number, and the two must not disagree.
+		//
+		// The guard is also what makes this safe under concurrency: a second
+		// transaction touching the same row blocks on the row lock, then
+		// re-evaluates this WHERE against the updated row, so the highest
+		// block_number survives whatever order the writes arrive in. Plain
+		// last-write-wins would have been arrival-order dependent.
+		//
+		// One statement per row, matching the insert above, so repeated
+		// (token, address) pairs within one flush batch stay separate
+		// commands; a single INSERT whose VALUES list conflicts with itself
+		// fails with "ON CONFLICT DO UPDATE command cannot affect row a
+		// second time".
+		//
+		// block_number is the block that TRIGGERED the read, not the block the
+		// balance was read at -- the balance workers read at latest. balances
+		// carries the same defect, and this mirrors it rather than diverging
+		// from the query it replaces. See PRST-4508.
+		batch.Queue(`
+			INSERT INTO token_balances_current (token_address, address, balance, block_number)
+			VALUES (LOWER($1), LOWER($2), $3, $4)
+			ON CONFLICT (token_address, address) DO UPDATE
+				SET balance = EXCLUDED.balance,
+					block_number = EXCLUDED.block_number
+				WHERE EXCLUDED.block_number >= token_balances_current.block_number`,
+			b.TokenAddress, b.Address, b.Balance, b.BlockNumber)
 	}
 
 	br := tx.SendBatch(ctx, batch)
