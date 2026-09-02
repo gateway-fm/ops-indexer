@@ -684,6 +684,33 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		return nil
 	}
 
+	if tokenType == "ERC1155" {
+		// For a multi-token contract, holders and supply come from
+		// erc1155_holdings (the `balances` table has no per-id dimension).
+		// holder_count = distinct owners holding any id; total_supply = number
+		// of distinct token ids with a positive live supply.
+		_, err := d.pool.Exec(ctx, `
+			UPDATE tokens
+			SET holder_count = (
+			        SELECT COUNT(DISTINCT owner) FROM erc1155_holdings
+			        WHERE LOWER(token_address) = $1 AND balance > 0
+			    ),
+			    transfer_count = $2,
+			    total_supply = (
+			        SELECT COUNT(*) FROM (
+			            SELECT token_id FROM erc1155_holdings
+			            WHERE LOWER(token_address) = $1
+			            GROUP BY token_id HAVING SUM(balance) > 0
+			        ) t
+			    )
+			WHERE LOWER(address) = $1`,
+			addr, transferCount)
+		if err != nil {
+			return fmt.Errorf("RefreshTokenStats: update ERC1155 stats: %w", err)
+		}
+		return nil
+	}
+
 	_, err := d.pool.Exec(ctx, `
 		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = $1`,
 		addr, holderCount, transferCount)
@@ -708,7 +735,9 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) er
 		INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 			block_number, timestamp, transfer_type, token_type, token_id, is_internal)
 		VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+		-- token_id is part of the key so an ERC-1155 TransferBatch (one log,
+		-- many ids) keeps a row per id; see migration 008.
+		ON CONFLICT (tx_hash, log_index, token_id) DO NOTHING`,
 		t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 		t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 	return err
@@ -921,11 +950,22 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 	return holders, total, rows.Err()
 }
 
-// GetTokenInventory lists live (non-burned) NFT instances of a collection,
-// ordered by token id. Owner and tokenURI come straight from nft_tokens, which
-// the indexer maintains per (token_address, token_id). A non-empty tokenID
-// filters to a single instance (used by the per-NFT detail lookup).
+// GetTokenInventory lists the live instances of a collection, ordered by token
+// id. A non-empty tokenID filters to a single id (used by the per-NFT detail
+// lookup). The shape depends on the token standard: ERC721 returns one row per
+// id with its current owner (from nft_tokens); ERC1155 returns one row per id
+// with its total live supply (Quantity) and distinct holder count (Holders),
+// aggregated from erc1155_holdings, with Owner left empty.
 func (d *DB) GetTokenInventory(ctx context.Context, tokenAddress string, tokenID string, limit int, offset int) ([]types.TokenInventoryItem, int64, error) {
+	var tokenType string
+	d.pool.QueryRow(ctx,
+		`SELECT token_type FROM tokens WHERE LOWER(address) = LOWER($1)`,
+		tokenAddress).Scan(&tokenType)
+
+	if tokenType == types.TokenTypeERC1155 {
+		return d.getERC1155Inventory(ctx, tokenAddress, tokenID, limit, offset)
+	}
+
 	var total int64
 	d.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM nft_tokens
@@ -953,6 +993,54 @@ func (d *DB) GetTokenInventory(ctx context.Context, tokenAddress string, tokenID
 		if err := rows.Scan(&it.TokenID, &it.Owner, &it.TokenURI); err != nil {
 			return nil, 0, err
 		}
+		items = append(items, it)
+	}
+	return items, total, rows.Err()
+}
+
+// getERC1155Inventory aggregates erc1155_holdings into one entry per token id:
+// the total live supply across all owners and the count of distinct holders
+// with a positive balance. Ids whose supply has dropped to zero (fully burned)
+// are excluded.
+func (d *DB) getERC1155Inventory(ctx context.Context, tokenAddress string, tokenID string, limit int, offset int) ([]types.TokenInventoryItem, int64, error) {
+	var total int64
+	d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT token_id
+			FROM erc1155_holdings
+			WHERE LOWER(token_address) = LOWER($1)
+			  AND ($2 = '' OR token_id = $2::numeric)
+			GROUP BY token_id
+			HAVING SUM(balance) > 0
+		) t`, tokenAddress, tokenID).Scan(&total)
+
+	rows, err := d.pool.Query(ctx, `
+		SELECT token_id::text,
+		       MAX(token_uri) AS token_uri,
+		       SUM(balance)::text AS quantity,
+		       COUNT(*) FILTER (WHERE balance > 0) AS holders
+		FROM erc1155_holdings
+		WHERE LOWER(token_address) = LOWER($1)
+		  AND ($2 = '' OR token_id = $2::numeric)
+		GROUP BY token_id
+		HAVING SUM(balance) > 0
+		ORDER BY token_id
+		LIMIT $3 OFFSET $4`, tokenAddress, tokenID, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var items []types.TokenInventoryItem
+	for rows.Next() {
+		var it types.TokenInventoryItem
+		var quantity string
+		var holders int64
+		if err := rows.Scan(&it.TokenID, &it.TokenURI, &quantity, &holders); err != nil {
+			return nil, 0, err
+		}
+		it.Quantity = &quantity
+		it.Holders = &holders
 		items = append(items, it)
 	}
 	return items, total, rows.Err()
