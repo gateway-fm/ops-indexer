@@ -5,6 +5,8 @@
 //     to postgres (backfill + realtime).
 //  2. A gRPC server exposes the indexed data to consumers via
 //     chain_indexer.v1.IndexerService.
+//  3. A metrics server exposes /metrics for Prometheus, plus an optional
+//     pprof listener on a separate port.
 //
 // Both share the same database handle. On SIGINT / SIGTERM the service
 // gracefully drains in-flight work and shuts down.
@@ -25,7 +27,9 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/grpcserver"
 	"github.com/gateway-fm/chain-indexer/internal/indexer"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 func main() {
@@ -49,6 +53,8 @@ func main() {
 	}
 	defer database.Close()
 	database.RebuildWorkMem = cfg.RebuildWorkMem
+	metrics.RegisterPoolStats(database.PoolStat)
+	rpclient.Observer = metrics.ObserveRPC
 
 	// Hidden tx types affect indexer receipt fetching and post-indexing filters.
 	skipReceipts := make(map[int]bool)
@@ -136,6 +142,30 @@ func main() {
 			cancel()
 		}
 	}()
+
+	if cfg.MetricsEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := metrics.ServeMetrics(ctx, cfg.MetricsListenAddr); err != nil {
+				log.Error("metrics server error", "error", err)
+				cancel()
+			}
+		}()
+	} else {
+		log.Warn("metrics disabled, /metrics will not be served")
+	}
+
+	if cfg.PprofEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := metrics.ServePprof(ctx, cfg.PprofListenAddr); err != nil {
+				log.Error("pprof server error", "error", err)
+				cancel()
+			}
+		}()
+	}
 
 	wg.Wait()
 	log.Info("chain-indexer stopped")
