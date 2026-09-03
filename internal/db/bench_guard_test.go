@@ -104,16 +104,33 @@ func TestBenchmarkHarnessMeasuresRealWork(t *testing.T) {
 		if err := d.RefreshTokenStats(ctx, token); err != nil {
 			t.Fatalf("RefreshTokenStats: %v", err)
 		}
-		var transferCount, holderCount int64
+		var holderCount int64
 		if err := d.pool.QueryRow(ctx,
-			`SELECT COALESCE(transfer_count, 0), COALESCE(holder_count, 0) FROM tokens WHERE address = $1`,
-			token).Scan(&transferCount, &holderCount); err != nil {
+			`SELECT COALESCE(holder_count, 0) FROM tokens WHERE address = $1`,
+			token).Scan(&holderCount); err != nil {
 			t.Fatalf("read refreshed token: %v", err)
 		}
-		if transferCount == 0 || holderCount == 0 {
-			t.Errorf("refreshed token has transfer_count=%d holder_count=%d; RefreshTokenStats returns "+
-				"nil early when the token row is absent, so zero is what a skipped refresh looks like",
-				transferCount, holderCount)
+		// holder_count is all RefreshTokenStats writes now, so it is the only
+		// signal that the call did anything. RefreshTokenStats returns nil
+		// early when the token row is absent, so zero is what a skipped
+		// refresh looks like.
+		if holderCount == 0 {
+			t.Errorf("refreshed token has holder_count=%d; expected the seeded holders", holderCount)
+		}
+
+		// transfer_count no longer comes from the refresh, so the seeder owns
+		// it. A zero here means the seeder's counter reseed stopped matching
+		// the rows it COPYs, which would make the benchmarks time a token the
+		// derived counters disagree with.
+		var transferCount int64
+		if err := d.pool.QueryRow(ctx,
+			`SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = $1`,
+			token).Scan(&transferCount); err != nil {
+			t.Fatalf("read seeded transfer_count: %v", err)
+		}
+		if transferCount == 0 {
+			t.Errorf("seeded token has transfer_count=0; the bench seeder's COPY into token_transfers " +
+				"bypasses the delta path, so it must reseed the counter itself")
 		}
 	})
 

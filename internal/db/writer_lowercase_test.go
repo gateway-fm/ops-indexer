@@ -212,6 +212,59 @@ func TestWriter_LowercasesLogAndTransferAddresses(t *testing.T) {
 	}
 }
 
+// TestWriter_LowercasesBalanceAddresses covers the two address-bearing INSERTs
+// in InsertBalancesBatch: balances, and the token_balances_current cache that
+// PRST-4493 added alongside it.
+//
+// 005_lowercase_addresses.sql is explicit that the writer side wraps every
+// address parameter in an INSERT with LOWER(), which is what lets the read side
+// use plain equality and hit the btree indexes. token_balances_current arrived
+// in migration 008, after that sweep, so nothing had pinned it -- and a
+// checksum-cased row there is worse than a slow read: holder_count reads this
+// table, and the same holder stored under two casings would be counted twice.
+//
+// This is also the batch path rather than a single-row insert, so it covers the
+// LOWER() in batch.go specifically.
+func TestWriter_LowercasesBalanceAddresses(t *testing.T) {
+	d, cleanup := setupLowercaseTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	require.NoError(t, d.InsertBalancesBatch(ctx, []*types.Balance{{
+		Address:      checksumFromAddr,
+		TokenAddress: checksumTokenAddr,
+		BlockNumber:  7,
+		Balance:      "1234",
+	}}))
+
+	var bAddr, bToken string
+	require.NoError(t, d.pool.QueryRow(ctx,
+		"SELECT address, token_address FROM balances WHERE block_number = 7").Scan(&bAddr, &bToken))
+	if bAddr != expectedFromLower {
+		t.Errorf("balances.address stored as %q, want %q", bAddr, expectedFromLower)
+	}
+	if bToken != expectedTokenLow {
+		t.Errorf("balances.token_address stored as %q, want %q", bToken, expectedTokenLow)
+	}
+
+	var cAddr, cToken string
+	require.NoError(t, d.pool.QueryRow(ctx,
+		"SELECT address, token_address FROM token_balances_current").Scan(&cAddr, &cToken))
+	if cAddr != expectedFromLower {
+		t.Errorf("token_balances_current.address stored as %q, want %q", cAddr, expectedFromLower)
+	}
+	if cToken != expectedTokenLow {
+		t.Errorf("token_balances_current.token_address stored as %q, want %q", cToken, expectedTokenLow)
+	}
+
+	// The lowercased key is the one holder_count matches on, so a checksum-cased
+	// write would read back as zero holders even though the row exists.
+	holders, err := d.countTokenHolders(ctx, expectedTokenLow)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), holders,
+		"holder_count must find the row it just wrote; a non-canonical key makes it invisible")
+}
+
 // strRepeat avoids pulling in strings just for the helper.
 func strRepeat(s string, n int) string {
 	out := make([]byte, 0, len(s)*n)
