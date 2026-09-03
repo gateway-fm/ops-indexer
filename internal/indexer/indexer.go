@@ -1040,9 +1040,12 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	}
 	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
 
-	// Refresh derived stats (transfer_count, total_supply, holder_count) for
-	// each token touched in this block. Cheap aggregate queries; runs
-	// synchronously so the new counts are visible on the next read.
+	// Refresh holder_count for each token touched in this block. transfer_count
+	// and total_supply are already maintained by the delta writes inside
+	// InsertBlockDataBatch above, in the same transaction as the transfers, so
+	// they need nothing here.
+	//
+	// Runs synchronously so the new count is visible on the next read.
 	if len(blockData.Transfers) > 0 {
 		touched := make(map[string]struct{}, len(blockData.Transfers))
 		for _, t := range blockData.Transfers {

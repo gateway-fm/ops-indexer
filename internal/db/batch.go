@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"regexp"
 	"sort"
 	"strings"
@@ -37,6 +38,36 @@ type BlockData struct {
 	SkipAddressStats     bool // Skip address_stats updates (for catchup mode to avoid deadlocks)
 }
 
+// zeroAddress is the mint/burn counterparty. Addresses are canonical lowercase
+// from migration 005 onward, and every write path lowercases, so a plain
+// comparison is enough.
+const zeroAddress = "0x0000000000000000000000000000000000000000"
+
+// tokenStatsFromTransfers derives a token's two history-scale counters from
+// token_transfers in one pass: the transfer row count, and the ERC20
+// mint-minus-burn supply. $1 is the lowercased token address.
+//
+// The token_type filter sits inside the CASE rather than in the WHERE so that
+// COUNT(*) still spans every transfer of the token while the sums stay
+// ERC20-only -- the same split the two separate queries in RefreshTokenStats
+// used to make, at one scan instead of two.
+const tokenStatsFromTransfers = `
+	SELECT COUNT(*),
+	       COALESCE(
+	           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '` + zeroAddress + `' THEN value ELSE 0 END)
+	         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '` + zeroAddress + `' THEN value ELSE 0 END),
+	           0)
+	FROM token_transfers WHERE token_address = $1`
+
+// tokenStatsDelta is one token's counter movement contributed by a single
+// batch: the transfer rows that genuinely landed, and the ERC20 supply change
+// those rows imply. Both are applied in the batch's own transaction, so a read
+// that follows the commit sees them.
+type tokenStatsDelta struct {
+	transferDelta int64
+	supplyDelta   *big.Int
+}
+
 type AddressStatsDelta struct {
 	Address              string
 	TxCountDelta         int
@@ -54,6 +85,13 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	defer tx.Rollback(ctx)
 
 	var deltaBlocks, deltaTxs, deltaTokens, deltaAddresses, deltaTransfers int64
+
+	// Per-token counters, maintained here rather than recomputed per block.
+	// tokenDeltas accumulates this batch's movement; seedTokens lists rows
+	// that this batch created and therefore have to be reconciled against
+	// whatever history already exists.
+	tokenDeltas := map[string]*tokenStatsDelta{}
+	var seedTokens []string
 
 	if data.Block != nil {
 		ct, err := tx.Exec(ctx, `
@@ -142,7 +180,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
 		}
 		br := tx.SendBatch(ctx, batch)
-		for range data.Tokens {
+		for _, t := range data.Tokens {
 			var wasNew bool
 			if err := br.QueryRow().Scan(&wasNew); err != nil {
 				_ = br.Close()
@@ -150,8 +188,35 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			}
 			if wasNew {
 				deltaTokens++
+				seedTokens = append(seedTokens, strings.ToLower(t.Address))
 			}
 		}
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	// A tokens row can be created long after the token's first transfer was
+	// stored. Discovery needs an RPC metadata fetch, and a fetch that fails is
+	// retried on a later block while the transfers keep landing -- so those
+	// earlier transfers never reached a delta. Seed each freshly created row
+	// from the history already on disk, before this batch's own transfers are
+	// added on top below. Absolute recompute made the old code immune to this
+	// by accident; the deltas have to say it out loud.
+	//
+	// This runs once per token over that token's own index range, and for a
+	// token discovered on its first transfer it aggregates zero rows.
+	if len(seedTokens) > 0 {
+		batch := &pgx.Batch{}
+		for _, addr := range seedTokens {
+			batch.Queue(`
+				UPDATE tokens SET
+					transfer_count = s.cnt,
+					total_supply = CASE WHEN tokens.token_type = 'ERC20' THEN s.supply ELSE tokens.total_supply END
+				FROM (`+tokenStatsFromTransfers+`) AS s(cnt, supply)
+				WHERE tokens.address = $1`, addr)
+		}
+		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {
 			return err
 		}
@@ -205,15 +270,73 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 		}
 		br := tx.SendBatch(ctx, batch)
-		for range data.Transfers {
+		// Results come back in queue order, so the i-th result belongs to the
+		// i-th transfer -- which is what lets a row be attributed to its token.
+		for _, t := range data.Transfers {
 			ct, err := br.Exec()
 			if err != nil {
 				_ = br.Close()
 				return err
 			}
 			// ON CONFLICT DO NOTHING ⇒ only genuinely new rows count toward the total.
+			if ct.RowsAffected() == 0 {
+				continue
+			}
 			deltaTransfers += ct.RowsAffected()
+
+			token := strings.ToLower(t.TokenAddress)
+			d := tokenDeltas[token]
+			if d == nil {
+				d = &tokenStatsDelta{supplyDelta: new(big.Int)}
+				tokenDeltas[token] = d
+			}
+			d.transferDelta++
+
+			// Mirror the supply definition exactly: ERC20 rows only, mints add
+			// and burns subtract, and a 0x0 -> 0x0 row does both and so nets
+			// to zero rather than being treated as one or the other.
+			if t.TokenType != types.TokenTypeERC20 {
+				continue
+			}
+			v, ok := new(big.Int).SetString(string(t.Value), 10)
+			if !ok {
+				// NUMERIC(78,0) NOT NULL upstream; an unparseable value would
+				// silently skew supply, so refuse the batch instead.
+				_ = br.Close()
+				return fmt.Errorf("transfer %s/%d: invalid value %q", t.TxHash, t.LogIndex, string(t.Value))
+			}
+			if strings.ToLower(t.From) == zeroAddress {
+				d.supplyDelta.Add(d.supplyDelta, v)
+			}
+			if strings.ToLower(t.To) == zeroAddress {
+				d.supplyDelta.Sub(d.supplyDelta, v)
+			}
 		}
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
+
+	// Apply the per-token counters. Same transaction as the transfer rows they
+	// describe, so the two can never be observed out of step -- these two
+	// counters are read-after-write correct today and stay that way.
+	//
+	// total_supply moves only for ERC20 tokens, matching the branch in
+	// RefreshTokenStats that used to own it; NULL means "never computed", so
+	// COALESCE is what turns the first delta into a real number.
+	if len(tokenDeltas) > 0 {
+		batch := &pgx.Batch{}
+		for token, d := range tokenDeltas {
+			batch.Queue(`
+				UPDATE tokens SET
+					transfer_count = COALESCE(transfer_count, 0) + $2,
+					total_supply = CASE
+						WHEN token_type = 'ERC20' THEN COALESCE(total_supply, 0) + $3::NUMERIC
+						ELSE total_supply
+					END
+				WHERE address = $1`, token, d.transferDelta, d.supplyDelta.String())
+		}
+		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {
 			return err
 		}
@@ -396,8 +519,10 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	// Every token_balances_current upsert takes a row lock on (token, address)
 	// and holds it to commit, which the balances insert alone never did: its key
 	// carries block_number, so two workers at different blocks touched different
-	// rows and never contended. There are 15 balance workers, each flushing its
-	// own unordered batch, so without a discipline two of them can hold the row
+	// rows and never contended. Balance workers each flush their own unordered
+	// batch -- 30 of them by default (indexer.go newDefaultConfig), 15 as the
+	// Tickr deployment sets BALANCE_WORKERS -- so on either count, without a
+	// discipline two of them can hold the row
 	// the other wants. flushBatch retries a 40P01 three times and then DROPS the
 	// batch, so a deadlock costs balances outright, and a missing balance is a
 	// wrong holder_count.

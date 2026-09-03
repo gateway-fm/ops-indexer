@@ -23,14 +23,17 @@ import (
 // That second axis is why a benchmark that only covers inserts cannot detect a
 // change to the derived-counter path, in either direction.
 //
-// For an ERC-20 token, one RefreshTokenStats call issues three
-// history-proportional statements against a single token:
+// RefreshTokenStats used to issue three history-proportional statements per
+// ERC-20 token -- a COUNT(*) over token_transfers, a holder count over
+// balances, and a mints-minus-burns SUM inside the UPDATE. Two of those are
+// gone: transfer_count and total_supply are now maintained by deltas in
+// InsertBlockDataBatch, so they cost nothing per block and scale with the block
+// rather than with history (PRST-4493).
 //
-//	COUNT(*)              over token_transfers for that token
-//	DISTINCT ON (address) over balances        for that token, then COUNT
-//	SUM(...)              over token_transfers for that token, inside the UPDATE
-//
-// None of them is bounded by the block being processed.
+// What remains on this axis is holder_count, one indexed count over
+// token_balances_current, which is unbounded by the block being processed
+// because it scales with the token's holders. It is the number these
+// benchmarks now exist to watch.
 
 // benchHoldersPerTransfer and benchSnapshotsPerHolder shape the balances history
 // the holder_count query has to walk. One balance row per holder would let
@@ -175,6 +178,29 @@ func benchSeedTokenHistory(tb testing.TB, d *DB) string {
 		}),
 	); err != nil {
 		tb.Fatalf("seed token_transfers: %v", err)
+	}
+
+	// The token_transfers COPY above bypasses InsertBlockDataBatch, which is
+	// what maintains tokens.transfer_count and tokens.total_supply by delta.
+	// Nothing recomputes them from history any more, so without this the token
+	// row would report zero transfers against millions of seeded rows -- and
+	// any benchmark or test reading those counters would be reading a value the
+	// seeder never wrote. Same failure the token_balances_current reseed below
+	// exists to prevent, one table over.
+	if _, err := d.pool.Exec(ctx, `
+		UPDATE tokens t SET
+			transfer_count = s.cnt,
+			total_supply = s.supply
+		FROM (
+			SELECT COUNT(*) AS cnt,
+			       COALESCE(
+			           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+			         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
+			           0) AS supply
+			FROM token_transfers WHERE token_address = $1
+		) s
+		WHERE t.address = $1`, token); err != nil {
+		tb.Fatalf("seed token transfer counters: %v", err)
 	}
 
 	// holder_count walks every balance row for the token via DISTINCT ON, so

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -593,13 +594,6 @@ func (d *DB) GetTokens(ctx context.Context, limit int, offset int, tokenType, se
 	return tokens, total, rows.Err()
 }
 
-func (d *DB) UpdateTokenStats(ctx context.Context, address string, holderCount int, transferCount int) error {
-	_, err := d.pool.Exec(ctx, `
-		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = LOWER($1)`,
-		address, holderCount, transferCount)
-	return err
-}
-
 // countTokenHolders returns the number of addresses whose current balance of
 // the token is greater than zero. The address must already be lowercased.
 //
@@ -625,15 +619,28 @@ func (d *DB) countTokenHolders(ctx context.Context, lowercasedToken string) (int
 	return holderCount, nil
 }
 
-// RefreshTokenStats recomputes holder_count, transfer_count, and total_supply
-// for a single token from the underlying token_transfers / balances / nft_tokens
-// tables, then writes the result onto the tokens row. Cheap and idempotent. The
+// RefreshTokenStats recomputes the stats on a token row that cannot be
+// maintained incrementally, then writes them onto that row. Idempotent. The
 // token row must already exist; if not, the call is a no-op.
 //
-// holder_count counts addresses whose latest balance for this token is > 0.
-// transfer_count is COUNT(*) over token_transfers.
-// total_supply is mints−burns for ERC20, and the live (non-burned) token-id
-// count for ERC721; left untouched for other standards.
+// holder_count counts addresses whose latest balance for this token is > 0. It
+// is the only counter left here, and it has to be recomputed because nothing
+// on the per-block ingest path writes `balances` -- balance rows arrive later,
+// from a worker pool, so there is no batch-local delta to derive it from. That
+// also makes it the one stat here that is only eventually consistent.
+//
+// transfer_count and total_supply used to be recomputed here too, each by a
+// query whose cost grew with the token's whole stored history -- a COUNT(*)
+// over token_transfers, and for ERC20 a mints-minus-burns SUM with no usable
+// index, which degenerated into a parallel sequential scan of the entire
+// table. Both are now derived incrementally in InsertBlockDataBatch, in the
+// same transaction as the transfer rows they describe, so they stay
+// read-after-write correct while costing nothing per block. See PRST-4493.
+//
+// ERC721 total_supply is still recomputed: it counts live token ids in
+// nft_tokens, which is a per-instance table small enough on these chains for
+// the scan not to matter, and unlike the transfer counters it is mutated by
+// ownership changes rather than only appended to.
 func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 	addr := strings.ToLower(tokenAddress)
 
@@ -647,63 +654,32 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		return fmt.Errorf("RefreshTokenStats: read token_type: %w", err)
 	}
 
-	var transferCount int64
-	if err := d.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, addr,
-	).Scan(&transferCount); err != nil {
-		return fmt.Errorf("RefreshTokenStats: count transfers: %w", err)
-	}
-
 	holderCount, err := d.countTokenHolders(ctx, addr)
 	if err != nil {
 		return fmt.Errorf("RefreshTokenStats: %w", err)
 	}
 
-	if tokenType == "ERC20" {
-		_, err := d.pool.Exec(ctx, `
-			UPDATE tokens
-			SET holder_count = $2,
-			    transfer_count = $3,
-			    total_supply = (
-			        SELECT COALESCE(
-			            SUM(CASE WHEN from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
-			          - SUM(CASE WHEN to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
-			            0
-			        )
-			        FROM token_transfers
-			        WHERE token_address = $1 AND token_type = 'ERC20'
-			    )
-			WHERE address = $1`,
-			addr, holderCount, transferCount)
-		if err != nil {
-			return fmt.Errorf("RefreshTokenStats: update ERC20 stats: %w", err)
-		}
-		return nil
-	}
-
-	if tokenType == "ERC721" {
+	if tokenType == types.TokenTypeERC721 {
 		// Supply for an NFT collection is the number of live (non-burned) token
 		// ids, tracked per-instance in nft_tokens.
-		_, err := d.pool.Exec(ctx, `
+		if _, err := d.pool.Exec(ctx, `
 			UPDATE tokens
 			SET holder_count = $2,
-			    transfer_count = $3,
 			    total_supply = (
 			        SELECT COUNT(*) FROM nft_tokens
 			        WHERE LOWER(token_address) = $1
 			          AND owner <> '0x0000000000000000000000000000000000000000'
 			    )
 			WHERE LOWER(address) = $1`,
-			addr, holderCount, transferCount)
-		if err != nil {
+			addr, holderCount); err != nil {
 			return fmt.Errorf("RefreshTokenStats: update ERC721 stats: %w", err)
 		}
 		return nil
 	}
 
 	if _, err := d.pool.Exec(ctx, `
-		UPDATE tokens SET holder_count = $2, transfer_count = $3 WHERE address = $1`,
-		addr, holderCount, transferCount); err != nil {
+		UPDATE tokens SET holder_count = $2 WHERE address = $1`,
+		addr, holderCount); err != nil {
 		return fmt.Errorf("RefreshTokenStats: update stats: %w", err)
 	}
 	return nil
@@ -719,15 +695,67 @@ func (d *DB) UpdateTokenPrice(ctx context.Context, address string, price float64
 
 // Token transfer operations
 
+// InsertTokenTransfer writes a single transfer row. The bulk ingest path uses
+// InsertBlockDataBatch instead; this exists for the Database interface and for
+// single-row callers.
+//
+// It carries the same counter maintenance as the batch path, deliberately. Any
+// writer of token_transfers that skips it silently desyncs tokens.transfer_count
+// and tokens.total_supply, and nothing recomputes them from history any more.
+// Tx wrap keeps the counter bumps atomic with the row insert.
 func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) error {
-	_, err := d.pool.Exec(ctx, `
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	ct, err := tx.Exec(ctx, `
 		INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 			block_number, timestamp, transfer_type, token_type, token_id, is_internal)
 		VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
 		t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 		t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
-	return err
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return tx.Commit(ctx)
+	}
+
+	supplyDelta := new(big.Int)
+	if t.TokenType == types.TokenTypeERC20 {
+		v, ok := new(big.Int).SetString(string(t.Value), 10)
+		if !ok {
+			return fmt.Errorf("InsertTokenTransfer: invalid value %q", string(t.Value))
+		}
+		if strings.ToLower(t.From) == zeroAddress {
+			supplyDelta.Add(supplyDelta, v)
+		}
+		if strings.ToLower(t.To) == zeroAddress {
+			supplyDelta.Sub(supplyDelta, v)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE tokens SET
+			transfer_count = COALESCE(transfer_count, 0) + 1,
+			total_supply = CASE
+				WHEN token_type = 'ERC20' THEN COALESCE(total_supply, 0) + $2::NUMERIC
+				ELSE total_supply
+			END
+		WHERE address = LOWER($1)`, t.TokenAddress, supplyDelta.String()); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO chain_counters (name, count, updated_at) VALUES ('transfers_total', $1, NOW())
+		ON CONFLICT (name) DO UPDATE SET count = chain_counters.count + EXCLUDED.count, updated_at = NOW()`,
+		ct.RowsAffected()); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit int, before *AddressFeedBound) ([]types.TokenTransfer, error) {
@@ -1979,6 +2007,9 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		// maintenance upsert's highest-block-wins guard then refuses, so the
 		// old chain's holders would be served indefinitely.
 		"token_balances_current",
+		// ERC721 total_supply counts live ids here, so rows left behind by a
+		// wipe would keep a reset chain reporting the old chain's supply.
+		"nft_tokens",
 		"op_deposits",
 		"contracts",
 		"transactions",

@@ -23,8 +23,8 @@ import (
 //   - the count over the table equals the count the old query returns,
 //     including addresses that cross zero in both directions;
 //   - the upsert guard keeps the highest block_number whatever order the
-//     writes arrive in, since balance writes are produced concurrently by 15
-//     workers and are not ordered;
+//     writes arrive in, since balance writes are produced concurrently by the
+//     balance worker pool (30 by default, 15 on Tickr) and are not ordered;
 //   - the startup reconcile repairs the table, which is what makes a rollback
 //     to a build that does not maintain it survivable;
 //   - the migration's backfill is idempotent.
@@ -515,4 +515,133 @@ func TestCurrentBalances_ConcurrentOverlappingBatchesDoNotDeadlock(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, int64(keys), got)
 	require.Equal(t, f.holdersViaHistory(t, d), got)
+}
+
+// TestCurrentBalances_TakesAllBalancesLocksBeforeAnyCurrentLock pins the phase
+// split in InsertBalancesBatch: every balances row is written before any
+// token_balances_current row, across the whole batch.
+//
+// TestCurrentBalances_ConcurrentOverlappingBatchesDoNotDeadlock cannot see
+// this. It gives each writer its own block numbers, so neither ever holds two
+// blocks for one key -- and one batch holding two blocks for a key is the exact
+// shape the split defends: it would otherwise take current(k) between
+// balances(k,5) and balances(k,7) and could still cycle with a batch holding
+// only (k,7). Reverting the split while keeping the sort leaves that test
+// passing, so the discipline needs asserting directly rather than by outcome.
+//
+// A cycle also cannot be provoked on demand -- it needs two transactions to
+// interleave at one instant -- so this observes the order the statements
+// actually run in instead. An AFTER trigger on both tables appends to an audit
+// table as rows land, and within the batch's single transaction those audit
+// rows are stamped in execution order.
+func TestCurrentBalances_TakesAllBalancesLocksBeforeAnyCurrentLock(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newBalFixture(t, d, 9, 4_493_900_000)
+	defer drop()
+
+	// Scoped to this fixture's token so a trigger left on a shared table cannot
+	// perturb another suite's rows.
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS lock_order_audit (
+			seq BIGSERIAL PRIMARY KEY, tbl TEXT NOT NULL, addr TEXT NOT NULL, blk BIGINT NOT NULL)`,
+		`CREATE OR REPLACE FUNCTION audit_lock_order() RETURNS TRIGGER AS $$
+		 BEGIN
+			IF NEW.token_address = '` + f.token + `' THEN
+				INSERT INTO lock_order_audit (tbl, addr, blk)
+				VALUES (TG_TABLE_NAME, NEW.address, NEW.block_number);
+			END IF;
+			RETURN NULL;
+		 END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER trg_audit_balances AFTER INSERT OR UPDATE ON balances
+			FOR EACH ROW EXECUTE FUNCTION audit_lock_order()`,
+		`CREATE TRIGGER trg_audit_current AFTER INSERT OR UPDATE ON token_balances_current
+			FOR EACH ROW EXECUTE FUNCTION audit_lock_order()`,
+	} {
+		_, err := d.pool.Exec(ctx, stmt)
+		require.NoError(t, err)
+	}
+	defer func() {
+		for _, stmt := range []string{
+			`DROP TRIGGER IF EXISTS trg_audit_balances ON balances`,
+			`DROP TRIGGER IF EXISTS trg_audit_current ON token_balances_current`,
+			`DROP FUNCTION IF EXISTS audit_lock_order()`,
+			`DROP TABLE IF EXISTS lock_order_audit`,
+		} {
+			if _, err := d.pool.Exec(ctx, stmt); err != nil {
+				t.Errorf("teardown %q: %v", stmt, err)
+			}
+		}
+	}()
+
+	// Several keys, and two blocks for each -- the shape that makes the split
+	// load-bearing. Deliberately shuffled so the sort has work to do.
+	const keys = 6
+	var batch []*types.Balance
+	for _, k := range []int{4, 1, 5, 0, 3, 2} {
+		for _, off := range []int64{7, 5} {
+			batch = append(batch, &types.Balance{
+				Address:      fmt.Sprintf("0xbalholder%031d", 200+k),
+				TokenAddress: f.token,
+				BlockNumber:  uint64(f.base + off),
+				Balance:      types.JSONString(fmt.Sprintf("%d", 500+k)),
+			})
+		}
+	}
+	require.NoError(t, d.InsertBalancesBatch(ctx, batch))
+
+	rows, err := d.pool.Query(ctx,
+		`SELECT tbl, addr, blk FROM lock_order_audit ORDER BY seq`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	type op struct {
+		tbl, addr string
+		blk       int64
+	}
+	var ops []op
+	for rows.Next() {
+		var o op
+		require.NoError(t, rows.Scan(&o.tbl, &o.addr, &o.blk))
+		ops = append(ops, o)
+	}
+	require.NoError(t, rows.Err())
+
+	// keys*2 balances rows, then one current row per key.
+	require.Len(t, ops, keys*2+keys, "audit should hold every write the batch made")
+
+	firstCurrent := -1
+	for i, o := range ops {
+		if o.tbl == "token_balances_current" && firstCurrent == -1 {
+			firstCurrent = i
+		}
+		if o.tbl == "balances" && firstCurrent != -1 {
+			t.Fatalf("balances write at index %d (%s@%d) came AFTER a token_balances_current "+
+				"write at index %d: the phase split is gone, and a batch holding two blocks for "+
+				"one key can deadlock against a batch holding one", i, o.addr, o.blk, firstCurrent)
+		}
+	}
+	require.Equal(t, keys*2, firstCurrent,
+		"every balances row must be written before the first token_balances_current row")
+
+	// Phase one must also be in the sorted total order the discipline relies on:
+	// ascending address, then ascending block within an address.
+	for i := 1; i < firstCurrent; i++ {
+		prev, cur := ops[i-1], ops[i]
+		if cur.addr == prev.addr {
+			require.Greater(t, cur.blk, prev.blk,
+				"blocks for %s are not ascending: the stable sort by (token, address, block) is gone", cur.addr)
+			continue
+		}
+		require.Greater(t, cur.addr, prev.addr,
+			"addresses are not ascending at index %d: the lock ordering sort is gone", i)
+	}
+
+	// And the guard still settled on the highest block for every key.
+	for k := 0; k < keys; k++ {
+		_, blk := f.currentRow(t, d, int64(200+k))
+		require.Equal(t, f.base+7, blk, "key %d should have kept the highest block", k)
+	}
 }
