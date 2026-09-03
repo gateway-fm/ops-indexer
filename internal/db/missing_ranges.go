@@ -218,6 +218,17 @@ func (d *DB) GetBlockCount(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+// GetBlockCountInRange counts indexed blocks within [from, to]. A whole-table
+// count cannot be compared against a bounded range: rows outside it cancel
+// genuine holes and make the missing-block gauge read zero.
+func (d *DB) GetBlockCountInRange(ctx context.Context, from, to uint64) (int64, error) {
+	var count int64
+	err := d.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM blocks WHERE number >= $1 AND number <= $2`,
+		from, to).Scan(&count)
+	return count, err
+}
+
 // RequeueMissingBlock re-inserts a single block as a missing range so it will
 // be retried by the catchup worker. Used when processBlock fails — without this,
 // the block is permanently lost because the parent range was already deleted from

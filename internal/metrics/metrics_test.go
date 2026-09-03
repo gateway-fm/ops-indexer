@@ -209,3 +209,23 @@ func TestSetStrategyStaysCoherentUnderConcurrency(t *testing.T) {
 			incoherent, samples)
 	}
 }
+
+// TestStrategySeriesExistBeforeAnyFetch guards the claim that every alternative
+// is exported as 0 rather than absent. GaugeVec series are lazy, so before this
+// was pre-initialised the trace series did not exist at all on a deployment with
+// tracing disabled — and an alert cannot fire on a series that is not there.
+//
+// Deliberately never calls SetTraceStrategy: the trace series must be present
+// purely from package initialisation.
+func TestStrategySeriesExistBeforeAnyFetch(t *testing.T) {
+	body := scrape(t)
+
+	for _, want := range []string{
+		`indexer_rpc_strategy{kind="traces",path="batch"} 0`,
+		`indexer_rpc_strategy{kind="traces",path="per_tx"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing pre-initialised series %q; a disabled-tracing deployment would export nothing", want)
+		}
+	}
+}

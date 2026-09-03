@@ -218,7 +218,7 @@ func (i *Indexer) refreshMissingBlocks(ctx context.Context, head uint64) {
 		metrics.SetMissingBlocks(0)
 		return
 	}
-	count, err := i.db.GetBlockCount(ctx)
+	count, err := i.db.GetBlockCountInRange(ctx, i.startBlock, head)
 	if err != nil {
 		return
 	}
@@ -610,13 +610,13 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 }
 
 func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
-	metrics.ReorgDetected()
 	log.Info("reverting blocks due to reorg", "from_block", fromBlock)
 
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)
 	if err != nil {
 		return err
 	}
+	metrics.ReorgDetected()
 
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
 		if err := i.db.DeleteBlock(ctx, blockNum); err != nil {

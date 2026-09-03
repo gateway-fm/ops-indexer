@@ -302,7 +302,6 @@ func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (
 }
 
 func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) error {
-	metrics.ReorgDetected()
 	log.Info("realtime: reverting blocks due to reorg", "from_block", fromBlock)
 
 	lastIndexed, err := r.db.GetLatestBlockNumber(ctx)
@@ -313,11 +312,14 @@ func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) err
 	// Detect chain reset: if we need to revert more than maxReorgDepth blocks,
 	// this is not a reorg, it is a chain reset.
 	if lastIndexed > fromBlock && lastIndexed-fromBlock > maxReorgDepth {
+		metrics.ChainResetDetected()
 		return fmt.Errorf(
 			"chain reset detected: need to revert %d blocks (max reorg depth: %d). "+
 				"Restart with FORCE_REINDEX=true to auto-wipe",
 			lastIndexed-fromBlock, maxReorgDepth)
 	}
+
+	metrics.ReorgDetected()
 
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
 		if err := r.db.DeleteBlock(ctx, blockNum); err != nil {

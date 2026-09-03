@@ -109,6 +109,19 @@ var (
 	tracePaths   = []string{"batch", "per_tx"}
 )
 
+// GaugeVec series are created lazily, so without this the alternatives do not
+// exist until the first fetch -- and never at all for traces when tracing is
+// disabled. An alert cannot fire on a series that is absent, which is the whole
+// point of exporting the zeros.
+func init() {
+	for _, p := range receiptPaths {
+		rpcStrategy.WithLabelValues("receipts", p).Set(0)
+	}
+	for _, p := range tracePaths {
+		rpcStrategy.WithLabelValues("traces", p).Set(0)
+	}
+}
+
 func SetChainHead(block uint64) { chainHeadBlock.Set(float64(block)) }
 
 func SetLastIndexed(block uint64) { lastIndexedBlock.Set(float64(block)) }

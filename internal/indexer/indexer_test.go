@@ -35,6 +35,11 @@ func (m *MockDatabase) GetBlockCount(ctx context.Context) (int64, error) {
 	return args.Get(0).(int64), args.Error(1)
 }
 
+func (m *MockDatabase) GetBlockCountInRange(ctx context.Context, from, to uint64) (int64, error) {
+	args := m.Called(ctx, from, to)
+	return args.Get(0).(int64), args.Error(1)
+}
+
 func (m *MockDatabase) GetBlock(ctx context.Context, number uint64) (*types.Block, error) {
 	args := m.Called(ctx, number)
 	if args.Get(0) == nil {
@@ -448,6 +453,7 @@ func TestChainResetDetection(t *testing.T) {
 		// Simulate: DB says we indexed up to block 25000, but chain head is at 5.
 		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(25000), nil)
 		mockDB.On("GetBlockCount", mock.Anything).Return(int64(25000), nil)
+		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(25000), nil).Maybe()
 		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(5), nil)
 		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
 		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
@@ -472,6 +478,7 @@ func TestChainResetDetection(t *testing.T) {
 		// Simulate: DB says we indexed up to block 25000, but chain head is at 5.
 		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(25000), nil)
 		mockDB.On("GetBlockCount", mock.Anything).Return(int64(25000), nil)
+		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(25000), nil).Maybe()
 		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(5), nil)
 		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
 		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
@@ -520,6 +527,7 @@ func TestChainResetDetection(t *testing.T) {
 		// Chain head at 900, last indexed at 1000 — delta of 100, within maxReorgDepth (128)
 		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(1000), nil)
 		mockDB.On("GetBlockCount", mock.Anything).Return(int64(1000), nil)
+		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(1000), nil).Maybe()
 		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(900), nil)
 		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
 		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
@@ -601,5 +609,19 @@ func TestRefreshMissingBlocksSkipsQueryBelowStartBlock(t *testing.T) {
 
 	idx.refreshMissingBlocks(context.Background(), 500)
 
+	mockDB.AssertNotCalled(t, "GetBlockCount", mock.Anything)
+}
+
+// The count must be bounded by the indexed range. A whole-table count lets rows
+// outside [startBlock, head] cancel genuine holes, making the gauge read zero.
+func TestRefreshMissingBlocksCountsOnlyTheIndexedRange(t *testing.T) {
+	mockDB := new(MockDatabase)
+	mockDB.On("GetBlockCountInRange", mock.Anything, uint64(10000), uint64(10099)).
+		Return(int64(90), nil)
+
+	idx := &Indexer{db: mockDB, startBlock: 10000}
+	idx.refreshMissingBlocks(context.Background(), 10099)
+
+	mockDB.AssertExpectations(t)
 	mockDB.AssertNotCalled(t, "GetBlockCount", mock.Anything)
 }

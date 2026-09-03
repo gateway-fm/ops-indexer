@@ -266,6 +266,9 @@ func (c *CatchupIndexer) worker(id int) {
 			if !ok {
 				return
 			}
+			// Every dequeue, not just the successful ones: the paths below that
+			// skip a block still drain the queue.
+			metrics.SetQueueDepth(metrics.QueueCatchup, len(c.workQueue))
 
 			// Block may have been indexed by another process in the meantime
 			exists, err := c.db.HasBlock(c.ctx, blockNum)
@@ -300,7 +303,6 @@ func (c *CatchupIndexer) worker(id int) {
 			}
 
 			processed := atomic.AddInt64(&c.processedBlocks, 1)
-			metrics.SetQueueDepth(metrics.QueueCatchup, len(c.workQueue))
 
 			if time.Since(c.lastLogTime) > 5*time.Second {
 				c.lastLogTime = time.Now()
