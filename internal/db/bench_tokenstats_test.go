@@ -204,9 +204,30 @@ func benchSeedTokenHistory(tb testing.TB, d *DB) string {
 		}
 	}
 
+	// The balances COPY above bypasses InsertBalancesBatch, which is what keeps
+	// token_balances_current in step. holder_count reads that table, so without
+	// this the derived-counter benchmarks would time a count over an empty
+	// table and report a holder count of zero -- a benchmark measuring nothing.
+	// TestBenchmarkHarnessMeasuresRealWork is what catches it.
+	//
+	// Idempotent, and scoped to this token, so it composes with the incremental
+	// balance seeding above rather than rebuilding the whole table per top-up.
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO token_balances_current (token_address, address, balance, block_number)
+		SELECT DISTINCT ON (token_address, address) token_address, address, balance, block_number
+		FROM balances
+		WHERE token_address = $1
+		ORDER BY token_address, address, block_number DESC
+		ON CONFLICT (token_address, address) DO UPDATE
+			SET balance = EXCLUDED.balance,
+				block_number = EXCLUDED.block_number
+			WHERE EXCLUDED.block_number >= token_balances_current.block_number`, token); err != nil {
+		tb.Fatalf("seed token_balances_current: %v", err)
+	}
+
 	recordBenchSeedProgress(tb, d, "seeded_transfers", nTxs)
 
-	if _, err := d.pool.Exec(ctx, "ANALYZE token_transfers, balances, tokens"); err != nil {
+	if _, err := d.pool.Exec(ctx, "ANALYZE token_transfers, balances, tokens, token_balances_current"); err != nil {
 		tb.Fatalf("analyze: %v", err)
 	}
 	return token
