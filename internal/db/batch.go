@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -392,6 +393,41 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 		return nil
 	}
 
+	// Every token_balances_current upsert takes a row lock on (token, address)
+	// and holds it to commit, which the balances insert alone never did: its key
+	// carries block_number, so two workers at different blocks touched different
+	// rows and never contended. There are 15 balance workers, each flushing its
+	// own unordered batch, so without a discipline two of them can hold the row
+	// the other wants. flushBatch retries a 40P01 three times and then DROPS the
+	// batch, so a deadlock costs balances outright, and a missing balance is a
+	// wrong holder_count.
+	//
+	// Two rules make a cycle impossible. Every transaction takes its locks in
+	// the same total order, and it takes all of its balances locks before any
+	// current lock. Sorting alone is not enough: a batch holding two blocks for
+	// one key would take current(k) between balances(k,5) and balances(k,7) and
+	// could still cycle with a batch holding only (k,7). With the phases split,
+	// a transaction waiting on a current row can only be waiting on one that has
+	// finished phase one, and those wait on each other in sorted order.
+	//
+	// Stable, so rows sharing a key keep arrival order and the last-write-wins
+	// tie-break on an identical (address, token, block) resolves as before. The
+	// copy is because the caller reuses its slice after this returns.
+	ordered := make([]*types.Balance, len(balances))
+	copy(ordered, balances)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		a, b := ordered[i], ordered[j]
+		at, bt := strings.ToLower(a.TokenAddress), strings.ToLower(b.TokenAddress)
+		if at != bt {
+			return at < bt
+		}
+		aa, ba := strings.ToLower(a.Address), strings.ToLower(b.Address)
+		if aa != ba {
+			return aa < ba
+		}
+		return a.BlockNumber < b.BlockNumber
+	})
+
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -399,35 +435,44 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	defer tx.Rollback(ctx)
 
 	batch := &pgx.Batch{}
-	for _, b := range balances {
+	for _, b := range ordered {
 		batch.Queue(`
 			INSERT INTO balances (address, token_address, block_number, balance)
 			VALUES (LOWER($1), LOWER($2), $3, $4)
 			ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
 			b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
+	}
 
-		// token_balances_current caches the row that a DISTINCT ON (address)
-		// ... ORDER BY block_number DESC over balances would have returned, so
-		// the guard has to preserve exactly that: highest block_number wins.
-		// >= rather than > because the upsert above is last-write-wins for an
-		// identical block_number, and the two must not disagree.
-		//
-		// The guard is also what makes this safe under concurrency: a second
-		// transaction touching the same row blocks on the row lock, then
-		// re-evaluates this WHERE against the updated row, so the highest
-		// block_number survives whatever order the writes arrive in. Plain
-		// last-write-wins would have been arrival-order dependent.
-		//
-		// One statement per row, matching the insert above, so repeated
-		// (token, address) pairs within one flush batch stay separate
-		// commands; a single INSERT whose VALUES list conflicts with itself
-		// fails with "ON CONFLICT DO UPDATE command cannot affect row a
-		// second time".
-		//
-		// block_number is the block that TRIGGERED the read, not the block the
-		// balance was read at -- the balance workers read at latest. balances
-		// carries the same defect, and this mirrors it rather than diverging
-		// from the query it replaces. See PRST-4508.
+	// token_balances_current caches the row that a DISTINCT ON (address) ...
+	// ORDER BY block_number DESC over balances would have returned, so the guard
+	// has to preserve exactly that: highest block_number wins. >= rather than >
+	// because the insert above is last-write-wins for an identical block_number,
+	// and the two must not disagree.
+	//
+	// The guard is also what keeps this correct across transactions: a second
+	// transaction touching the same row blocks on the row lock, then re-evaluates
+	// this WHERE against the updated row, so the highest block_number survives
+	// whatever order the writes arrive in. Plain last-write-wins would have been
+	// arrival-order dependent.
+	//
+	// One statement per distinct key rather than per row. The sort puts a key's
+	// rows in one ascending run, so its last element is the row the guard would
+	// have settled on anyway -- highest block, latest arrival on a tie -- and
+	// collapsing the run takes the key's lock once instead of once per row.
+	// Folding the run into a single multi-row INSERT instead is not available:
+	// a VALUES list that conflicts with itself fails with "ON CONFLICT DO UPDATE
+	// command cannot affect row a second time".
+	//
+	// block_number is the block that TRIGGERED the read, not the block the
+	// balance was read at -- the balance workers read at latest. balances
+	// carries the same defect, and this mirrors it rather than diverging from
+	// the query it replaces. See PRST-4508.
+	for i, b := range ordered {
+		if next := i + 1; next < len(ordered) &&
+			strings.EqualFold(ordered[next].TokenAddress, b.TokenAddress) &&
+			strings.EqualFold(ordered[next].Address, b.Address) {
+			continue
+		}
 		batch.Queue(`
 			INSERT INTO token_balances_current (token_address, address, balance, block_number)
 			VALUES (LOWER($1), LOWER($2), $3, $4)

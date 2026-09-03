@@ -3,6 +3,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -189,9 +192,6 @@ func TestCurrentBalances_ReconcileRepairsDrift(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	// Highest block range of any fixture here: the staleness probe compares a
-	// GLOBAL watermark, so this fixture has to own the maximum for the probe to
-	// fire once its rows are removed.
 	f, drop := newBalFixture(t, d, 3, 4_493_900_000)
 	defer drop()
 
@@ -203,9 +203,9 @@ func TestCurrentBalances_ReconcileRepairsDrift(t *testing.T) {
 	require.Equal(t, int64(2), f.holdersViaHistory(t, d))
 
 	// Now behave like a build that writes balances but not the cache: insert
-	// straight into balances, bypassing InsertBalancesBatch. Holder 3 acquires
-	// a balance and holder 1's changes, at blocks ABOVE the cache's watermark,
-	// which is what an advancing chain does during a rollback window.
+	// straight into balances, bypassing InsertBalancesBatch. Holder 3 acquires a
+	// balance and holder 1's changes, at later blocks, which is what an advancing
+	// chain does during a rollback window.
 	for _, r := range [][3]int64{{3, 5, 3000}, {1, 6, 4000}} {
 		_, err := d.pool.Exec(ctx, `
 			INSERT INTO balances (address, token_address, block_number, balance)
@@ -214,8 +214,9 @@ func TestCurrentBalances_ReconcileRepairsDrift(t *testing.T) {
 		require.NoError(t, err)
 	}
 	// Plus drift the cache can only have acquired earlier: one row stale, one
-	// gone. Both sit BELOW the watermark, so the probe cannot see them --
-	// they are repaired anyway because the repair is total once it fires.
+	// gone. Both sit below every block written above, which is the shape no
+	// watermark-style detector could have seen; the reconcile is total, so it
+	// repairs them regardless.
 	_, err := d.pool.Exec(ctx, `
 		UPDATE token_balances_current SET balance = 1
 		WHERE token_address = $1 AND address = $2`,
@@ -312,7 +313,20 @@ func TestCurrentBalances_ReconcileRepairsDriftBelowTheWatermark(t *testing.T) {
 // stale, because re-indexing from block 0 writes LOWER block numbers and the
 // maintenance guard is highest-block-wins -- so the old chain's rows would
 // refuse to be replaced and would be served indefinitely.
+//
+// The only test here that does not confine itself to its fixture's rows:
+// WipeAllData truncates every indexed table, which is fine on the throwaway
+// container and destructive on a BENCH_DATABASE_URL server, where the seeded
+// rows are meant to be reused across runs. Worse than losing them: it does not
+// take bench_seed_state with it -- that table is not in the wipe list -- so the
+// seeder would go on claiming rows that no longer exist and every later
+// benchmark would run against an empty table. Skipped there rather than made
+// safe: nothing makes truncating the whole database safe on a shared server.
 func TestCurrentBalances_WipedWithBalancesOnChainReset(t *testing.T) {
+	if url := strings.TrimSpace(os.Getenv("BENCH_DATABASE_URL")); url != "" {
+		t.Skip("skipping: this test truncates every table, and BENCH_DATABASE_URL points at a reusable database")
+	}
+
 	d, cleanup := setupBenchDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -391,4 +405,114 @@ func TestCurrentBalances_BackfillIsIdempotent(t *testing.T) {
 	bal, blk := f.currentRow(t, d, 1)
 	require.Equal(t, "1000", bal, "the newest balance must survive a re-run")
 	require.Equal(t, f.base+2, blk)
+}
+
+// TestCurrentBalances_RepeatedKeyInOneBatchKeepsTheWinner pins the collapse of a
+// key's rows inside a single batch. One flush routinely carries several blocks
+// for the same (token, address) -- the queue is not deduplicated -- and the
+// batch now issues one upsert per key instead of one per row, so the row it
+// picks has to be the one the per-row guard would have settled on.
+func TestCurrentBalances_RepeatedKeyInOneBatchKeepsTheWinner(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newBalFixture(t, d, 7, 4_493_700_000)
+	defer drop()
+
+	// One batch, one key, blocks out of order: the highest block wins, not the
+	// last one queued.
+	//
+	// Holder 2 repeats an identical block in the same batch, where the guard's
+	// >= makes it last-write-wins; balances resolves that pair the same way, and
+	// the two must not disagree.
+	f.writeBal(t, d,
+		[3]int64{1, 5, 500},
+		[3]int64{1, 9, 900},
+		[3]int64{1, 2, 200},
+		[3]int64{2, 3, 111},
+		[3]int64{2, 3, 222},
+	)
+
+	bal, blk := f.currentRow(t, d, 1)
+	require.Equal(t, "900", bal, "the highest block in the batch must win, not the last queued")
+	require.Equal(t, f.base+9, blk)
+
+	bal, _ = f.currentRow(t, d, 2)
+	require.Equal(t, "222", bal, "an identical block repeated in one batch is last-write-wins")
+
+	got, err := d.countTokenHolders(ctx, f.token)
+	require.NoError(t, err)
+	require.Equal(t, f.holdersViaHistory(t, d), got)
+}
+
+// TestCurrentBalances_ConcurrentOverlappingBatchesDoNotDeadlock covers what the
+// cache introduced: a row lock per (token, address), held to commit, where
+// balances alone never contended because its key carries block_number. Two of
+// the 15 workers flushing overlapping keys in opposite orders could each hold
+// the row the other wanted; flushBatch retries a 40P01 three times and then
+// drops the batch, so the cost is lost balances and a wrong holder_count.
+//
+// Opposite orders over a wide key set is the shape that produces the cycle. The
+// assertion is that every write succeeds -- InsertBalancesBatch has to be
+// deadlock-free by construction, since its caller's retries are finite.
+func TestCurrentBalances_ConcurrentOverlappingBatchesDoNotDeadlock(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newBalFixture(t, d, 8, 4_493_800_000)
+	defer drop()
+
+	const keys, rounds = 50, 20
+
+	// Each writer owns its own block numbers, so the highest block -- and
+	// therefore the row the guard keeps -- is the same whatever order the two
+	// arrive in, and the final state is assertable.
+	batchFor := func(round, writer int, reverse bool) []*types.Balance {
+		out := make([]*types.Balance, 0, keys)
+		for i := 0; i < keys; i++ {
+			k := i
+			if reverse {
+				k = keys - 1 - i
+			}
+			out = append(out, &types.Balance{
+				Address:      fmt.Sprintf("0xbalholder%031d", 100+k),
+				TokenAddress: f.token,
+				BlockNumber:  uint64(f.base + int64(round*2+writer)),
+				Balance:      types.JSONString(fmt.Sprintf("%d", 1000+round*2+writer)),
+			})
+		}
+		return out
+	}
+
+	for round := 0; round < rounds; round++ {
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for writer := 0; writer < 2; writer++ {
+			wg.Add(1)
+			go func(writer int) {
+				defer wg.Done()
+				errs[writer] = d.InsertBalancesBatch(ctx, batchFor(round, writer, writer == 1))
+			}(writer)
+		}
+		wg.Wait()
+		for writer, err := range errs {
+			require.NoErrorf(t, err, "round %d writer %d: concurrent overlapping batches must not deadlock", round, writer)
+		}
+	}
+
+	// The last writer of the last round holds the highest block for every key.
+	wantBlock := f.base + int64((rounds-1)*2+1)
+	wantBalance := fmt.Sprintf("%d", 1000+(rounds-1)*2+1)
+	for k := 0; k < keys; k++ {
+		bal, blk := f.currentRow(t, d, int64(100+k))
+		require.Equal(t, wantBalance, bal, "key %d", k)
+		require.Equal(t, wantBlock, blk, "key %d", k)
+	}
+
+	got, err := d.countTokenHolders(ctx, f.token)
+	require.NoError(t, err)
+	require.Equal(t, int64(keys), got)
+	require.Equal(t, f.holdersViaHistory(t, d), got)
 }
