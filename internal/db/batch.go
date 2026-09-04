@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math/big"
 	"regexp"
 	"sort"
@@ -59,6 +60,30 @@ const zeroAddress = "0x0000000000000000000000000000000000000000"
 // what the column can hold is already outside what this schema can describe, so
 // the derived figure saturates and ingest continues.
 const numeric78Max = `(10::numeric^78 - 1)`
+
+// tokenLockKeys maps token addresses to the ascending, deduplicated advisory
+// keys that guard them. The hash is FNV-64a over the lowercased address rather
+// than the address bytes themselves, so it needs no assumption about the
+// address being well-formed hex; a collision between two distinct addresses
+// costs a little needless serialisation and nothing else. Sorting is by key,
+// not by address -- the acquisition order has to be the order of the thing
+// actually being locked.
+func tokenLockKeys(addrs []string) []int64 {
+	seen := make(map[int64]struct{}, len(addrs))
+	keys := make([]int64, 0, len(addrs))
+	for _, a := range addrs {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(strings.ToLower(a)))
+		k := int64(h.Sum64())
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
 
 // clampSupply bounds a total_supply expression to what the column can store.
 func clampSupply(expr string) string {
@@ -197,13 +222,33 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	// then took a high address (discovered) before a low one (transfer), while
 	// another with a warm cache took the low one first.
 	//
-	// A row that does not exist yet is not locked here and is created by the
-	// upsert instead, which cannot cycle: a row absent now cannot be held by
-	// another transaction as an existing row, and two transactions creating the
-	// same row serialise on the primary key. New rows are created in sorted
-	// order for the same reason.
+	// Row locks alone cannot carry that total order, because a row that does
+	// not exist yet cannot be locked. SELECT ... FOR UPDATE locks only the rows
+	// committed when the statement starts and Postgres takes no gap or
+	// predicate lock, so an address in the union with no tokens row leaves this
+	// pass holding nothing for it -- and the delta UPDATE at the end then takes
+	// that row's lock as its first acquisition, out of order, whenever another
+	// transaction created the row in between. Two transfers of a token whose
+	// metadata fetch has not succeeded yet is all it takes: indexer.go drops
+	// such a token from blockData.Tokens while its transfers stay in the batch.
 	//
-	// One statement, so one round trip. ORDER BY makes the acquisition order
+	// So the union is guarded by transaction-scoped advisory locks first. An
+	// advisory key exists whether or not its row does, which closes the gap.
+	// No transaction takes a tokens row lock before it holds every advisory
+	// key in its union, so two transactions past this pass have disjoint
+	// unions -- and therefore disjoint row locks -- while two with an
+	// overlapping union serialise here, in ascending key order. Key collisions
+	// between distinct addresses only widen that serialisation; they cannot
+	// reorder it, because the order is the key's.
+	//
+	// The row pass below is kept on top of it: writers that do not come through
+	// here (reorg compensation, RefreshTokenStats, UpdateTokenSupply) take row
+	// locks and no advisory ones, and the ascending row pass is what keeps this
+	// transaction ordered against them.
+	//
+	// One statement each, so one round trip each. unnest emits in array order
+	// and nothing above it reorders, so the keys are acquired in the order Go
+	// sorted them. ORDER BY on the row pass makes its acquisition order
 	// explicit rather than leaving it to the plan, and on the primary-key btree
 	// it is the same order anyway.
 	lockTokens := make(map[string]struct{}, len(data.Tokens)+len(data.Transfers))
@@ -219,6 +264,14 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			ordered = append(ordered, addr)
 		}
 		sort.Strings(ordered)
+
+		keys := tokenLockKeys(ordered)
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k`,
+			keys); err != nil {
+			return err
+		}
+
 		if _, err := tx.Exec(ctx,
 			`SELECT 1 FROM tokens WHERE address = ANY($1::text[]) ORDER BY address FOR UPDATE`,
 			ordered); err != nil {
@@ -404,12 +457,13 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	// RefreshTokenStats that used to own it; NULL means "never computed", so
 	// COALESCE is what turns the first delta into a real number.
 	if len(tokenDeltas) > 0 {
-		// Every row these touch was already locked by the pass at the top of
-		// this function, so this acquires nothing new and its order cannot
-		// contribute to a cycle. Sorted anyway, so the statements read in the
-		// same order the locks were taken and a reader is not invited to
-		// conclude the order here is what makes it safe -- it is not, and
-		// sorting these alone was exactly the incomplete fix.
+		// Every row these touch is inside the union the pass at the top of this
+		// function guarded, so no cycle can form here: a row that existed then
+		// is already row-locked, and a row created since is covered by the
+		// advisory key this transaction still holds. Sorted anyway, so the
+		// statements read in the same order the locks were taken and a reader
+		// is not invited to conclude the order here is what makes it safe -- it
+		// is not, and sorting these alone was exactly the incomplete fix.
 		tokens := make([]string, 0, len(tokenDeltas))
 		for token := range tokenDeltas {
 			tokens = append(tokens, token)

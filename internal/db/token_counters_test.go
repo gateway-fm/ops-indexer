@@ -782,3 +782,191 @@ func TestTokenCounters_ReorgRevertsChainCounters(t *testing.T) {
 	require.Equal(t, int64(seed), read("addresses_total"),
 		"addresses_total must not move: the cascade does not reach address_stats")
 }
+
+// waitForLockWaiters blocks until at least n backends are waiting on a lock, so
+// the staging below can advance on the state it actually needs rather than on a
+// sleep long enough to be a guess.
+func waitForLockWaiters(t *testing.T, d *DB, n int) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		require.NoError(t, d.pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity
+			 WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()`).Scan(&waiting))
+		if waiting >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d backends waiting on a lock, wanted %d", waiting, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestTokenCounters_LockingCoversTokensNotYetCreated is the gap a row pre-lock
+// cannot close on its own.
+//
+// SELECT ... FOR UPDATE locks only rows committed when the statement starts, and
+// Postgres takes no gap or predicate lock, so an address in the union with no
+// tokens row leaves the pre-lock holding nothing for it. The delta UPDATE at the
+// end is then that row's FIRST acquisition by this transaction -- out of order
+// -- whenever something created the row in between. It is not a corner case: a
+// token whose metadata fetch has not succeeded is dropped from blockData.Tokens
+// while its transfers stay in the batch, so a union with addresses that have no
+// row is the ordinary shape.
+//
+// The staging is that interleaving, made deterministic rather than raced for.
+// The absent addresses sort BELOW the present ones, so a transaction that
+// pre-locks before they exist holds high and later wants low, while one that
+// pre-locks after they exist takes low and then wants high.
+//
+//	stall    holds a transactions row that writer 1's transfers reference, so
+//	         writer 1 parks between its pre-lock and its delta phase
+//	writer 1 pre-locks the union while low is absent -> holds high only
+//	creator  creates the low rows
+//	writer 2 pre-locks the union now that low exists -> takes low, wants high
+//	release  writer 1 resumes into its delta phase and wants low
+//
+// The property is the absence of a 40P01. Guarding the union with advisory keys
+// is what supplies it: a key exists whether or not its row does, so the creator
+// and writer 2 both queue behind writer 1 instead of interleaving into a cycle.
+func TestTokenCounters_LockingCoversTokensNotYetCreated(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newCtrFixture(t, d, 14, 5_400_000)
+	defer drop()
+
+	// "a" sorts below "b"; the low half is the half deleted each round.
+	const half = 3
+	var low, high, all []string
+	for i := 0; i < half; i++ {
+		low = append(low, fmt.Sprintf("0xctrgapa%030d", i))
+		high = append(high, fmt.Sprintf("0xctrgapb%030d", i))
+	}
+	all = append(append(all, low...), high...)
+
+	defer func() {
+		for _, addr := range all {
+			if _, err := d.pool.Exec(ctx, `DELETE FROM token_transfers WHERE token_address = $1`, addr); err != nil {
+				t.Errorf("cleanup transfers %s: %v", addr, err)
+			}
+			if _, err := d.pool.Exec(ctx, `DELETE FROM tokens WHERE address = $1`, addr); err != nil {
+				t.Errorf("cleanup token %s: %v", addr, err)
+			}
+		}
+	}()
+
+	// A transfer-only batch over every address: the shape indexer.go produces
+	// when a token's metadata fetch failed and only its transfers survive.
+	transfersOver := func(per int) *BlockData {
+		bd := &BlockData{}
+		for _, addr := range all {
+			for i := 0; i < per; i++ {
+				tr := f.transfer(t, d, zeroAddr, "0xholder1", "1", types.TokenTypeERC20)
+				tr.TokenAddress = addr
+				bd.Transfers = append(bd.Transfers, tr)
+			}
+		}
+		return bd
+	}
+
+	const rounds = 3
+	for round := 0; round < rounds; round++ {
+		for _, addr := range low {
+			_, err := d.pool.Exec(ctx, `DELETE FROM tokens WHERE address = $1`, addr)
+			require.NoError(t, err)
+		}
+		for _, addr := range high {
+			_, err := d.pool.Exec(ctx,
+				`INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number)
+				 VALUES ($1, 'GAP', 'Gap', 18, 'ERC20', $2)
+				 ON CONFLICT (address) DO NOTHING`, addr, f.base)
+			require.NoError(t, err)
+		}
+
+		// Built up front so the fixture's own inserts are not racing the
+		// batches under test.
+		first := transfersOver(4)
+		second := transfersOver(4)
+		creator := &BlockData{}
+		for _, addr := range low {
+			creator.Tokens = append(creator.Tokens, &types.Token{
+				Address:     addr,
+				Symbol:      "GAP",
+				Decimals:    18,
+				TokenType:   types.TokenTypeERC20,
+				BlockNumber: uint64(f.base),
+			})
+		}
+
+		// token_transfers.tx_hash references transactions(hash), so inserting a
+		// transfer takes FOR KEY SHARE on the parent row. Holding FOR UPDATE on
+		// it parks writer 1 in its transfers insert -- past the pre-lock, short
+		// of the deltas.
+		stall, err := d.pool.Begin(ctx)
+		require.NoError(t, err)
+		_, err = stall.Exec(ctx,
+			`SELECT 1 FROM transactions WHERE hash = $1 FOR UPDATE`, first.Transfers[0].TxHash)
+		require.NoError(t, err)
+
+		var wg sync.WaitGroup
+		errs := make(map[string]error, 3)
+		var mu sync.Mutex
+		run := func(name string, bd *BlockData) <-chan struct{} {
+			done := make(chan struct{})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer close(done)
+				err := d.InsertBlockDataBatch(ctx, bd)
+				mu.Lock()
+				errs[name] = err
+				mu.Unlock()
+			}()
+			return done
+		}
+
+		run("writer 1", first)
+		waitForLockWaiters(t, d, 1) // writer 1 parked on the stalled parent row
+
+		// The creator has to COMMIT before writer 2 pre-locks, or writer 2 sees
+		// the same absent low rows writer 1 did and there is no disagreement to
+		// cycle on. Waiting on it is also the observation the fix makes: once
+		// the union is guarded by keys that exist without their rows, the
+		// creator cannot slip in here at all and this wait times out instead.
+		select {
+		case <-run("creator", creator):
+		case <-time.After(2 * time.Second):
+		}
+
+		run("writer 2", second)
+		waitForLockWaiters(t, d, 2) // writer 1, plus whoever queued behind it
+
+		require.NoError(t, stall.Rollback(ctx))
+		wg.Wait()
+
+		for _, name := range []string{"writer 1", "creator", "writer 2"} {
+			require.NoErrorf(t, errs[name],
+				"round %d %s: writer 1 pre-locked before the low tokens rows existed, so its "+
+					"delta UPDATE is the first acquisition of those locks and the order it took "+
+					"them in is not the order writer 2 did -- the union has to be guarded by "+
+					"something that exists whether or not the row does", round, name)
+		}
+	}
+
+	// Counters still agree with the stored rows, low half included: rows the
+	// creator made are seeded from the history already on disk, and any deltas
+	// that found no row are exactly what that seed picks up.
+	for _, addr := range all {
+		var cached, actual int64
+		require.NoError(t, d.pool.QueryRow(ctx,
+			`SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = $1`, addr).Scan(&cached))
+		require.NoError(t, d.pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, addr).Scan(&actual))
+		require.Equal(t, actual, cached, "counter drifted for %s", addr)
+	}
+}
