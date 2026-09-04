@@ -985,6 +985,10 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		}
 	}
 
+	// Addresses to mark as known, but only once their tokens row is committed --
+	// see the Add below the batch.
+	var discovered []string
+
 	if len(newTokenAddresses) > 0 {
 		// A token is only ever discovered from a Transfer event we just parsed,
 		// and that path already classifies ERC721 by its 4-topic signature (the
@@ -1018,7 +1022,7 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 					BlockNumber: blockNumber,
 					CreationTx:  &txHash,
 				})
-				i.tokenCache.Add(addr.Hex())
+				discovered = append(discovered, addr.Hex())
 			}
 		}
 	}
@@ -1039,6 +1043,22 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		return err
 	}
 	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
+
+	// Marked known only now, after the row is committed. Adding before the
+	// batch made the cache claim a token whose row was still uncommitted (or
+	// whose batch went on to fail), and another worker parsing a transfer of
+	// that token in the window would then omit it from its own data.Tokens --
+	// so it neither seeded the row nor was covered by the seed, and its delta
+	// UPDATE found no visible row and silently counted nothing.
+	//
+	// With the Add here, that worker still sees a cache miss, still queues the
+	// token, and blocks on the tokens primary key until the first worker
+	// commits. It then reads wasNew = false against a visible row and its own
+	// delta applies. The serialisation point is a lock the insert already
+	// takes; the cost is one duplicate metadata fetch in that window.
+	for _, addr := range discovered {
+		i.tokenCache.Add(addr)
+	}
 
 	// Refresh holder_count for each token touched in this block. transfer_count
 	// and total_supply are already maintained by the delta writes inside

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // MockDatabase is a mock of the Database interface
@@ -442,6 +444,91 @@ func TestIndexer_ProcessBlock(t *testing.T) {
 		mockDB.AssertExpectations(t)
 		mockRPC.AssertExpectations(t)
 	})
+}
+
+// TestIndexer_TokenCacheNotPoisonedByFailedBatch pins the ordering that keeps
+// the new-token counter seed correct.
+//
+// tokenCache.Add used to run as soon as metadata came back, before
+// InsertBlockDataBatch. Two things followed. A batch that then failed left the
+// cache claiming a token whose row was never written. And, worse, another
+// worker parsing a transfer of that token inside the window saw a cache hit,
+// omitted the token from its own data.Tokens, and so neither seeded the row nor
+// was covered by the seed -- its delta UPDATE found no visible row and silently
+// counted nothing, permanently short.
+//
+// The concurrent interleaving cannot be provoked on demand, but the ordering it
+// depends on can: after a failed batch the token must still be unknown, so the
+// next attempt re-queues it and blocks on the tokens primary key instead of
+// skipping it.
+func TestIndexer_TokenCacheNotPoisonedByFailedBatch(t *testing.T) {
+	ctx := context.Background()
+	mockDB := new(MockDatabase)
+	mockRPC := new(MockRPCClient)
+	idx := New(mockDB, mockRPC, time.Second, 0)
+
+	blockNum := uint64(4931)
+	blockNumber := hexutil.Big(*big.NewInt(int64(blockNum)))
+	txHash := common.HexToHash("0xfeed01")
+	tokenAddr := common.HexToAddress("0x00000000000000000000000000000000000c7ac1")
+	toAddr := common.HexToAddress("0x222")
+
+	rawBlock := &rpc.RawBlock{
+		Number:     &blockNumber,
+		Hash:       common.HexToHash("0xccc"),
+		ParentHash: common.HexToHash("0x000"),
+		Timestamp:  hexutil.Uint64(time.Now().Unix()),
+		GasUsed:    hexutil.Uint64(21000),
+		GasLimit:   hexutil.Uint64(8000000),
+		Miner:      common.HexToAddress("0x0"),
+		Transactions: []rpc.RawTransaction{{
+			Hash:             txHash,
+			BlockHash:        common.HexToHash("0xccc"),
+			BlockNumber:      &blockNumber,
+			TransactionIndex: hexutil.Uint64(0),
+			From:             common.HexToAddress("0x111"),
+			To:               &toAddr,
+			Value:            func() *hexutil.Big { v := hexutil.Big(*big.NewInt(0)); return &v }(),
+			Gas:              hexutil.Uint64(21000),
+			GasPrice:         func() *hexutil.Big { v := hexutil.Big(*big.NewInt(1)); return &v }(),
+			Input:            hexutil.Bytes{},
+			Nonce:            func() *hexutil.Uint64 { v := hexutil.Uint64(0); return &v }(),
+			Type:             hexutil.Uint64(0),
+		}},
+	}
+
+	// One ERC20 Transfer log, so the token is discovered.
+	holder := common.HexToHash("0x0000000000000000000000001111111111111111111111111111111111111111")
+	mockRPC.On("RawBlockByNumber", ctx, blockNum).Return(rawBlock, nil).Once()
+	mockRPC.On("FetchReceiptsBatch", ctx, []common.Hash{txHash}, mock.Anything, mock.Anything).
+		Return(map[common.Hash]*rpclient.Receipt{
+			txHash: {Status: 1, TxHash: txHash, Logs: []*rpclient.Log{{
+				Address: tokenAddr,
+				Topics:  []common.Hash{transferTopic, common.Hash{}, holder},
+				Data:    hexutil.Bytes(common.LeftPadBytes(big.NewInt(1000).Bytes(), 32)),
+				TxHash:  txHash,
+			}}},
+		}, nil).Once()
+
+	name := "Cache Token"
+	mockRPC.On("FetchTokenMetadataBatch", ctx, mock.Anything, mock.Anything, mock.Anything).
+		Return(map[common.Address]*rpc.TokenMetadataResult{
+			tokenAddr: {Address: tokenAddr, Symbol: "CT", Name: &name, Decimals: 18},
+		}, nil).Once()
+
+	// The batch fails, so nothing was committed.
+	mockDB.On("InsertBlockDataBatch", ctx, mock.Anything).
+		Return(errors.New("commit failed")).Once()
+
+	err := idx.processBlock(ctx, blockNum)
+	require.Error(t, err, "a failed batch must surface as an error")
+
+	assert.False(t, idx.tokenCache.Has(tokenAddr.Hex()),
+		"the cache must not claim a token whose row was never committed: another worker would "+
+			"then omit it from its own data.Tokens and its counter delta would find no row")
+
+	mockDB.AssertExpectations(t)
+	mockRPC.AssertExpectations(t)
 }
 
 func TestChainResetDetection(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/jackc/pgx/v5"
@@ -42,6 +43,27 @@ type BlockData struct {
 // from migration 005 onward, and every write path lowercases, so a plain
 // comparison is enough.
 const zeroAddress = "0x0000000000000000000000000000000000000000"
+
+// tokens.total_supply is NUMERIC(78, 0). Every individual transfer value fits
+// that, but a running mint-minus-burn total need not: two mints near the
+// uint256 ceiling already exceed 78 digits. The sum is computed in unconstrained
+// numeric and only the assignment to the column can raise "numeric field
+// overflow", so clamping the value before it is assigned removes the error
+// entirely.
+//
+// Saturating is deliberate, and it is a blast-radius decision rather than a
+// correctness one. These counters now move inside the ingest transaction, so an
+// overflow raised here would roll back the block's transfers, logs and address
+// stats, and the retry would fail on the same block forever -- one token with an
+// unrepresentable supply would stop the chain. A token whose net supply exceeds
+// what the column can hold is already outside what this schema can describe, so
+// the derived figure saturates and ingest continues.
+const numeric78Max = `(10::numeric^78 - 1)`
+
+// clampSupply bounds a total_supply expression to what the column can store.
+func clampSupply(expr string) string {
+	return `LEAST(GREATEST(` + expr + `, -` + numeric78Max + `), ` + numeric78Max + `)`
+}
 
 // tokenStatsFromTransfers derives a token's two history-scale counters from
 // token_transfers in one pass: the transfer row count, and the ERC20
@@ -162,8 +184,20 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	}
 
 	if len(data.Tokens) > 0 {
+		// Sorted by the stored (lowercased) key for the same reason the delta
+		// UPDATEs below are: this insert takes tokens row locks held to commit,
+		// and the caller built data.Tokens by ranging a map
+		// (indexer.go processBlock's tokenMetadata), so its order is randomised
+		// per block. The copy is because the caller reuses its slice, matching
+		// InsertBalancesBatch.
+		orderedTokens := make([]*types.Token, len(data.Tokens))
+		copy(orderedTokens, data.Tokens)
+		sort.SliceStable(orderedTokens, func(i, j int) bool {
+			return strings.ToLower(orderedTokens[i].Address) < strings.ToLower(orderedTokens[j].Address)
+		})
+
 		batch := &pgx.Batch{}
-		for _, t := range data.Tokens {
+		for _, t := range orderedTokens {
 			batch.Queue(`
 				INSERT INTO tokens (address, symbol, name, decimals, token_type, total_supply, block_number, creation_tx, l1_address)
 				VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9)
@@ -180,7 +214,10 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
 		}
 		br := tx.SendBatch(ctx, batch)
-		for _, t := range data.Tokens {
+		// Results come back in queue order, so this must range the same sorted
+		// slice the batch was built from. seedTokens inherits that order, which
+		// is what keeps the seed's locks in the one total order too.
+		for _, t := range orderedTokens {
 			var wasNew bool
 			if err := br.QueryRow().Scan(&wasNew); err != nil {
 				_ = br.Close()
@@ -212,7 +249,9 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			batch.Queue(`
 				UPDATE tokens SET
 					transfer_count = s.cnt,
-					total_supply = CASE WHEN tokens.token_type = 'ERC20' THEN s.supply ELSE tokens.total_supply END
+					total_supply = CASE WHEN tokens.token_type = 'ERC20'
+						THEN `+clampSupply(`s.supply`)+`
+						ELSE tokens.total_supply END
 				FROM (`+tokenStatsFromTransfers+`) AS s(cnt, supply)
 				WHERE tokens.address = $1`, addr)
 		}
@@ -325,18 +364,51 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	// RefreshTokenStats that used to own it; NULL means "never computed", so
 	// COALESCE is what turns the first delta into a real number.
 	if len(tokenDeltas) > 0 {
+		// Sorted, because each of these takes a tokens row lock held to commit
+		// and InsertBlockDataBatch runs concurrently -- catchup gives every
+		// worker its own block. Go randomises map iteration, so two workers
+		// touching the same two tokens would acquire them in opposite orders
+		// and deadlock. This is the discipline InsertBalancesBatch documents
+		// and sorts for; the tokens insert and its seed above are ordered the
+		// same way so one total order covers every tokens lock this
+		// transaction takes.
+		tokens := make([]string, 0, len(tokenDeltas))
+		for token := range tokenDeltas {
+			tokens = append(tokens, token)
+		}
+		sort.Strings(tokens)
+
 		batch := &pgx.Batch{}
-		for token, d := range tokenDeltas {
+		for _, token := range tokens {
+			d := tokenDeltas[token]
 			batch.Queue(`
 				UPDATE tokens SET
 					transfer_count = COALESCE(transfer_count, 0) + $2,
 					total_supply = CASE
-						WHEN token_type = 'ERC20' THEN COALESCE(total_supply, 0) + $3::NUMERIC
+						WHEN token_type = 'ERC20'
+						THEN `+clampSupply(`COALESCE(total_supply, 0) + $3::NUMERIC`)+`
 						ELSE total_supply
 					END
 				WHERE address = $1`, token, d.transferDelta, d.supplyDelta.String())
 		}
 		br := tx.SendBatch(ctx, batch)
+		for _, token := range tokens {
+			ct, err := br.Exec()
+			if err != nil {
+				_ = br.Close()
+				return err
+			}
+			// No tokens row to carry the delta. Benign and self-healing: the
+			// row does not exist yet because discovery's metadata fetch has not
+			// succeeded, and whichever batch finally creates it seeds it from
+			// the stored transfers -- these rows included. Logged rather than
+			// dropped silently, because the same zero would otherwise be the
+			// only trace of a genuine accounting loss.
+			if ct.RowsAffected() == 0 {
+				log.Debug("token counter delta found no tokens row; seed on creation will pick it up",
+					"token", token, "transfers", tokenDeltas[token].transferDelta)
+			}
+		}
 		if err := br.Close(); err != nil {
 			return err
 		}
