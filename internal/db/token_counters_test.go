@@ -42,6 +42,7 @@ const zeroAddr = "0x0000000000000000000000000000000000000000"
 // ctrFixture keys every row off a per-test id so these can share one database
 // with each other and with the other suites.
 type ctrFixture struct {
+	id    int64
 	token string
 	base  int64
 	seq   int
@@ -50,7 +51,7 @@ type ctrFixture struct {
 func newCtrFixture(t *testing.T, d *DB, id int64, baseBlock int64) (*ctrFixture, func()) {
 	t.Helper()
 	ctx := context.Background()
-	f := &ctrFixture{token: fmt.Sprintf("0xctr%038d", id), base: baseBlock}
+	f := &ctrFixture{id: id, token: fmt.Sprintf("0xctr%038d", id), base: baseBlock}
 
 	drop := func(when string) {
 		for _, q := range []string{
@@ -85,13 +86,13 @@ func (f *ctrFixture) transfer(t *testing.T, d *DB, from, to, value, tokenType st
 	ctx := context.Background()
 	f.seq++
 	block := f.base + int64(f.seq)
-	hash := fmt.Sprintf("0xctr%s-%d", f.token[5:12], f.seq)
+	hash := fmt.Sprintf("0xctr%d-%d", f.id, f.seq)
 	ts := uint64(time.Now().Unix())
 
 	_, err := d.pool.Exec(ctx,
 		`INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
 		 VALUES ($1, $2, '0xp', $3, 1, 1, 1) ON CONFLICT (number) DO NOTHING`,
-		block, fmt.Sprintf("0xblk%s-%d", f.token[5:12], f.seq), ts)
+		block, fmt.Sprintf("0xblk%d-%d", f.id, f.seq), ts)
 	require.NoError(t, err)
 	_, err = d.pool.Exec(ctx,
 		`INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value,
@@ -379,4 +380,250 @@ func TestTokenCounters_SingleRowWriterMaintainsThem(t *testing.T) {
 	// Re-inserting the same row is a no-op and must not double-count.
 	require.NoError(t, d.InsertTokenTransfer(ctx, burn))
 	f.requireAgrees(t, d, 2, "200")
+}
+
+// TestTokenCounters_ReorgRevertsThem covers the delete side of the delta
+// discipline.
+//
+// A reorg reverts blocks with DeleteBlock, and the cascade
+// (transactions.block_number -> blocks, token_transfers.tx_hash ->
+// transactions, both ON DELETE CASCADE) physically removes the block's
+// transfers. Before the counters were maintained by deltas, RefreshTokenStats
+// recomputed them absolutely on every block, so a reorg self-healed; with the
+// recompute gone, a delete that does not decrement leaves them permanently
+// high.
+func TestTokenCounters_ReorgRevertsThem(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	f, drop := newCtrFixture(t, d, 7, 4_700_000)
+	defer drop()
+	ctx := context.Background()
+
+	f.createToken(t, d, types.TokenTypeERC20)
+
+	// Three blocks, one transfer each: a mint, a plain move, a burn.
+	mint := f.transfer(t, d, zeroAddr, "0xholder1", "900", types.TokenTypeERC20)
+	plain := f.transfer(t, d, "0xholder1", "0xholder2", "100", types.TokenTypeERC20)
+	burn := f.transfer(t, d, "0xholder2", zeroAddr, "300", types.TokenTypeERC20)
+	for _, tr := range []*types.TokenTransfer{mint, plain, burn} {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{tr}}))
+	}
+	f.requireAgrees(t, d, 3, "600")
+
+	// Revert the burn's block. Its 300 must come back out of the subtraction.
+	require.NoError(t, d.DeleteBlock(ctx, burn.BlockNumber))
+	f.requireAgrees(t, d, 2, "900")
+
+	// Revert the mint's block too.
+	require.NoError(t, d.DeleteBlock(ctx, mint.BlockNumber))
+	f.requireAgrees(t, d, 1, "0")
+
+	// And the last one, back to empty.
+	require.NoError(t, d.DeleteBlock(ctx, plain.BlockNumber))
+	f.requireAgrees(t, d, 0, "0")
+}
+
+// TestTokenCounters_ReindexAfterReorgDoesNotDoubleCount is the failure the
+// reorg gap actually produced.
+//
+// Reverting a block removes the (tx_hash, log_index) rows, so the
+// ON CONFLICT DO NOTHING that suppresses a re-delivered block no longer fires
+// for the replacement blocks -- they insert fresh rows and count them again. An
+// uncompensated delete therefore does not merely lag, it doubles.
+func TestTokenCounters_ReindexAfterReorgDoesNotDoubleCount(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	f, drop := newCtrFixture(t, d, 8, 4_800_000)
+	defer drop()
+	ctx := context.Background()
+
+	f.createToken(t, d, types.TokenTypeERC20)
+
+	orphaned := []*types.TokenTransfer{
+		f.transfer(t, d, zeroAddr, "0xholder1", "5000", types.TokenTypeERC20),
+		f.transfer(t, d, "0xholder1", zeroAddr, "1000", types.TokenTypeERC20),
+	}
+	for _, tr := range orphaned {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{tr}}))
+	}
+	f.requireAgrees(t, d, 2, "4000")
+
+	// The reorg reverts both blocks.
+	for _, tr := range orphaned {
+		require.NoError(t, d.DeleteBlock(ctx, tr.BlockNumber))
+	}
+	f.requireAgrees(t, d, 0, "0")
+
+	// The canonical chain is re-indexed. New blocks, new tx hashes, same token
+	// and the same economic effect.
+	replacements := []*types.TokenTransfer{
+		f.transfer(t, d, zeroAddr, "0xholder1", "5000", types.TokenTypeERC20),
+		f.transfer(t, d, "0xholder1", zeroAddr, "1000", types.TokenTypeERC20),
+	}
+	for _, tr := range replacements {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{tr}}))
+	}
+
+	// Two transfers and 4000, not four and 8000.
+	f.requireAgrees(t, d, 2, "4000")
+}
+
+// TestTokenCounters_ReorgLeavesOtherTokensAlone pins that the compensation is
+// scoped to the reverted block: a token whose transfers live in blocks that
+// survive must not be decremented by another token's revert.
+func TestTokenCounters_ReorgLeavesOtherTokensAlone(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	keep, dropKeep := newCtrFixture(t, d, 9, 4_900_000)
+	defer dropKeep()
+	revert, dropRevert := newCtrFixture(t, d, 10, 5_000_000)
+	defer dropRevert()
+	ctx := context.Background()
+
+	keep.createToken(t, d, types.TokenTypeERC20)
+	revert.createToken(t, d, types.TokenTypeERC20)
+
+	keepMint := keep.transfer(t, d, zeroAddr, "0xholder1", "777", types.TokenTypeERC20)
+	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{keepMint}}))
+	revertMint := revert.transfer(t, d, zeroAddr, "0xholder1", "222", types.TokenTypeERC20)
+	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{revertMint}}))
+
+	require.NoError(t, d.DeleteBlock(ctx, revertMint.BlockNumber))
+
+	revert.requireAgrees(t, d, 0, "0")
+	keep.requireAgrees(t, d, 1, "777")
+}
+
+// TestTokenCounters_SupplySaturatesInsteadOfFailingTheBlock pins the blast
+// radius decision at batch.go's clampSupply.
+//
+// Individual values fit NUMERIC(78, 0); an accumulated mint total need not.
+// Because the counters now move inside the ingest transaction, an overflow
+// raised on assignment would roll back the block's transfers and every retry
+// would fail on the same block, so one token with an unrepresentable supply
+// would stop the chain. The figure saturates instead.
+func TestTokenCounters_SupplySaturatesInsteadOfFailingTheBlock(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	f, drop := newCtrFixture(t, d, 11, 5_100_000)
+	defer drop()
+	ctx := context.Background()
+
+	f.createToken(t, d, types.TokenTypeERC20)
+
+	// 78 nines: the largest value the column can hold. Two of these overflow it.
+	huge := strRepeat("9", 78)
+	for i := 0; i < 2; i++ {
+		tr := f.transfer(t, d, zeroAddr, "0xholder1", huge, types.TokenTypeERC20)
+		require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{tr}}),
+			"an over-range supply must not fail the block (mint %d)", i+1)
+	}
+
+	// Both transfers landed -- the rows are what matter, and they are unaffected
+	// by the derived figure saturating.
+	var stored int64
+	require.NoError(t, d.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, f.token).Scan(&stored))
+	require.Equal(t, int64(2), stored, "the transfers must be committed regardless of the supply clamp")
+
+	count, supply := f.stored(t, d)
+	require.Equal(t, int64(2), count)
+	require.Equal(t, huge, supply.String(), "supply should saturate at the column maximum")
+}
+
+// TestTokenCounters_TokenLocksAreTakenInSortedOrder pins the lock-ordering
+// discipline for the tokens row locks this change added.
+//
+// Every per-token UPDATE holds a tokens row lock to commit, and
+// InsertBlockDataBatch runs concurrently -- catchup gives each worker its own
+// block. The deltas are keyed by a Go map, whose iteration order is randomised
+// per call, so two workers touching the same two tokens would have acquired
+// them in opposite orders and deadlocked. This is the rule InsertBalancesBatch
+// documents and sorts for; a deadlock cannot be provoked on demand, so the
+// order the statements actually run in is observed directly instead.
+func TestTokenCounters_TokenLocksAreTakenInSortedOrder(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Several tokens sharing one fixture's blocks, created in an order that is
+	// not the sorted one so a missing sort is visible.
+	f, drop := newCtrFixture(t, d, 12, 5_200_000)
+	defer drop()
+
+	tokens := make([]string, 0, 5)
+	for _, n := range []int{4, 1, 3, 0, 2} {
+		addr := fmt.Sprintf("0xctrlock%034d", n)
+		tokens = append(tokens, addr)
+		_, err := d.pool.Exec(ctx,
+			`INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number)
+			 VALUES ($1, 'LCK', 'Lock Order', 18, 'ERC20', $2) ON CONFLICT (address) DO NOTHING`,
+			addr, f.base)
+		require.NoError(t, err)
+	}
+	defer func() {
+		for _, addr := range tokens {
+			if _, err := d.pool.Exec(ctx, `DELETE FROM token_transfers WHERE token_address = $1`, addr); err != nil {
+				t.Errorf("cleanup transfers %s: %v", addr, err)
+			}
+			if _, err := d.pool.Exec(ctx, `DELETE FROM tokens WHERE address = $1`, addr); err != nil {
+				t.Errorf("cleanup token %s: %v", addr, err)
+			}
+		}
+	}()
+
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS token_lock_audit (seq BIGSERIAL PRIMARY KEY, addr TEXT NOT NULL)`,
+		`CREATE OR REPLACE FUNCTION audit_token_lock_order() RETURNS TRIGGER AS $$
+		 BEGIN
+			IF NEW.address LIKE '0xctrlock%' THEN
+				INSERT INTO token_lock_audit (addr) VALUES (NEW.address);
+			END IF;
+			RETURN NULL;
+		 END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER trg_audit_token_lock AFTER INSERT OR UPDATE ON tokens
+			FOR EACH ROW EXECUTE FUNCTION audit_token_lock_order()`,
+	} {
+		_, err := d.pool.Exec(ctx, stmt)
+		require.NoError(t, err)
+	}
+	defer func() {
+		for _, stmt := range []string{
+			`DROP TRIGGER IF EXISTS trg_audit_token_lock ON tokens`,
+			`DROP FUNCTION IF EXISTS audit_token_lock_order()`,
+			`DROP TABLE IF EXISTS token_lock_audit`,
+		} {
+			if _, err := d.pool.Exec(ctx, stmt); err != nil {
+				t.Errorf("teardown %q: %v", stmt, err)
+			}
+		}
+	}()
+
+	// One batch touching every token, built in the unsorted order above.
+	var transfers []*types.TokenTransfer
+	for _, addr := range tokens {
+		tr := f.transfer(t, d, zeroAddr, "0xholder1", "10", types.TokenTypeERC20)
+		tr.TokenAddress = addr
+		transfers = append(transfers, tr)
+	}
+	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: transfers}))
+
+	rows, err := d.pool.Query(ctx, `SELECT addr FROM token_lock_audit ORDER BY seq`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var a string
+		require.NoError(t, rows.Scan(&a))
+		got = append(got, a)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, got, len(tokens), "every token should have been updated once")
+
+	for i := 1; i < len(got); i++ {
+		require.Greater(t, got[i], got[i-1],
+			"tokens row locks were taken out of order at index %d (%s after %s): the sort in "+
+				"InsertBlockDataBatch is gone, and two concurrent batches sharing these tokens can deadlock",
+			i, got[i], got[i-1])
+	}
 }

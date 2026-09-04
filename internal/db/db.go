@@ -105,7 +105,7 @@ func (d *DB) Migrate() error {
 	if _, err := d.pool.Exec(ctx, `
 		UPDATE tokens t SET
 			transfer_count = s.cnt,
-			total_supply = CASE WHEN t.token_type = 'ERC20' THEN s.supply ELSE t.total_supply END
+			total_supply = CASE WHEN t.token_type = 'ERC20' THEN `+clampSupply(`s.supply`)+` ELSE t.total_supply END
 		FROM (
 			SELECT token_address,
 			       COUNT(*) AS cnt,

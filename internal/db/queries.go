@@ -113,9 +113,114 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 	return blocks, rows.Err()
 }
 
+// DeleteBlock removes one block and everything that hangs off it. Used to
+// revert a reorg, one block at a time from the head down.
+//
+// The delete cascades: transactions.block_number REFERENCES blocks(number) ON
+// DELETE CASCADE, and token_transfers.tx_hash REFERENCES transactions(hash) ON
+// DELETE CASCADE, so the block's token_transfers rows physically go with it.
+// That makes this a writer of token_transfers, and every writer has to maintain
+// tokens.transfer_count and tokens.total_supply -- nothing recomputes them from
+// history per block any more.
+//
+// It used to not matter. RefreshTokenStats recomputed both counters absolutely
+// for every token in every block, so a reorg self-healed within a block or two.
+// With the counters maintained by deltas, an uncompensated delete leaves them
+// permanently high: the replacement blocks insert fresh transfer rows, and
+// because the unique key went with the delete the ON CONFLICT DO NOTHING that
+// would otherwise suppress a re-delivery does not fire, so the same transfers
+// are counted twice. Nothing but a process restart would repair it. See
+// PRST-4493.
 func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
-	_, err := d.pool.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number)
-	return err
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Aggregate exactly the set the cascade will remove: the transfers whose
+	// parent transaction belongs to this block. Filtering on
+	// token_transfers.block_number instead would be a second source of truth
+	// for the same fact, and a row disagreeing with its parent would decrement
+	// the wrong token.
+	rows, err := tx.Query(ctx, `
+		SELECT token_address, COUNT(*),
+		       COALESCE(
+		           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '`+zeroAddress+`' THEN value ELSE 0 END)
+		         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '`+zeroAddress+`' THEN value ELSE 0 END),
+		           0)::TEXT
+		FROM token_transfers
+		WHERE tx_hash IN (SELECT hash FROM transactions WHERE block_number = $1)
+		GROUP BY token_address
+		ORDER BY token_address`, number)
+	if err != nil {
+		return err
+	}
+	type reverted struct {
+		token  string
+		count  int64
+		supply string
+	}
+	var doomed []reverted
+	for rows.Next() {
+		var r reverted
+		if err := rows.Scan(&r.token, &r.count, &r.supply); err != nil {
+			rows.Close()
+			return err
+		}
+		doomed = append(doomed, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// One statement per token in sorted order (the ORDER BY above), not a
+	// single UPDATE ... FROM: this takes tokens row locks held to commit and a
+	// reorg can run while catchup workers are committing batches, so it has to
+	// join the same total lock order those use. UPDATE ... FROM would take them
+	// in whatever order the plan produced.
+	//
+	// transfer_count floors at zero. It cannot legitimately go negative, and a
+	// negative value would be served to consumers as authoritative; a floor
+	// turns an accounting error into a visibly wrong-but-sane number rather
+	// than a nonsensical one.
+	for _, r := range doomed {
+		if _, err := tx.Exec(ctx, `
+			UPDATE tokens SET
+				transfer_count = GREATEST(COALESCE(transfer_count, 0) - $2, 0),
+				total_supply = CASE
+					WHEN token_type = 'ERC20'
+					THEN `+clampSupply(`COALESCE(total_supply, 0) - $3::NUMERIC`)+`
+					ELSE total_supply
+				END
+			WHERE address = $1`, r.token, r.count, r.supply); err != nil {
+			return err
+		}
+	}
+
+	// transfers_total is maintained by the same delta discipline on the insert
+	// side, and had the same gap here. Reverting it in this transaction rather
+	// than leaving one counter uncompensated in the statement that compensates
+	// the others.
+	var revertedTransfers int64
+	for _, r := range doomed {
+		revertedTransfers += r.count
+	}
+	if revertedTransfers > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chain_counters (name, count, updated_at) VALUES ('transfers_total', $1, NOW())
+			ON CONFLICT (name) DO UPDATE
+				SET count = GREATEST(chain_counters.count + EXCLUDED.count, 0), updated_at = NOW()`,
+			-revertedTransfers); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // Transaction operations
@@ -742,7 +847,8 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) er
 		UPDATE tokens SET
 			transfer_count = COALESCE(transfer_count, 0) + 1,
 			total_supply = CASE
-				WHEN token_type = 'ERC20' THEN COALESCE(total_supply, 0) + $2::NUMERIC
+				WHEN token_type = 'ERC20'
+				THEN `+clampSupply(`COALESCE(total_supply, 0) + $2::NUMERIC`)+`
 				ELSE total_supply
 			END
 		WHERE address = LOWER($1)`, t.TokenAddress, supplyDelta.String()); err != nil {
