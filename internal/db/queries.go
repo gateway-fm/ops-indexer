@@ -2153,6 +2153,13 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"blocks",
 		"tokens",
 		"counters",
+		// The chain-wide totals are maintained by deltas from
+		// InsertBlockDataBatch, so nothing recomputes them once the rows the
+		// counts describe are gone. Left behind, a reset chain would serve the
+		// old chain's block, transaction, token, address and transfer totals
+		// and then add the new chain's on top -- the same failure nft_tokens
+		// had above.
+		"chain_counters",
 		"address_stats",
 		"indexer_progress",
 		"missing_block_ranges",

@@ -265,13 +265,13 @@ These matter because the two halves scale on **different axes**:
 - `RefreshTokenStats` scales with the history of the token being refreshed, and not at all
   with what the current block wrote.
 
-For an ERC-20 token, one call issues three history-proportional statements — a `COUNT(*)`
-over `token_transfers`, a `DISTINCT ON (address)` over `balances`, and a `SUM(...)` over
-`token_transfers` inside the `UPDATE`. None is bounded by the block being processed, so cost
-grows with the token's lifetime. A chain with one dominant token is the worst case, and is
-what these benchmarks seed.
+### What that cost before PRST-4493, measured
 
-### What this costs, measured
+`RefreshTokenStats` used to issue three history-proportional statements per ERC-20 token per
+block — a `COUNT(*)` over `token_transfers` for `transfer_count`, a `DISTINCT ON (address)`
+over `balances` for `holder_count`, and a `SUM(...)` over `token_transfers` for `total_supply`.
+None was bounded by the block being processed, so cost grew with the token's lifetime. A chain
+with one dominant token is the worst case, and is what these benchmarks seed.
 
 Same constrained server as above (PG 17, `shared_buffers = 2GB`, 3 CPU, gp3), 250 tx/block,
 one dominant ERC-20:
@@ -285,24 +285,74 @@ one dominant ERC-20:
 `BenchmarkRefreshTokenStats` runs immediately after the bulk seed, while autovacuum is still
 working through the freshly loaded table, so it reads slightly high. Timing the three
 statements individually on a settled server gives 2.44 s at 10M — 440 ms for the `COUNT(*)`,
-863 ms for the `DISTINCT ON` over `balances`, 1,140 ms for the `total_supply` `SUM`. Quote
-~2.5 s.
+863 ms for the `DISTINCT ON` over `balances`, 1,140 ms for the `total_supply` `SUM`.
 
-Two things follow, and both are structural rather than tuning problems.
+Two things followed, and both were structural rather than tuning problems.
 
-**It is linear in history.** Ten times the history costs ten times as much (10.2× then 10.2×
+**It was linear in history.** Ten times the history cost ten times as much (10.2× then 10.2×
 across these three scales), per block, forever. The per-block cycle therefore collapsed **28×**
-between 100k and 10M, and at 10M a single refresh costs around thirty-five times the insert it
-accompanies.
+between 100k and 10M, and at 10M a single refresh cost around thirty-five times the insert it
+accompanied.
 
-**It is CPU-bound, not I/O-bound.** At 10M only the `SUM` leaves `shared_buffers` at all, and
-its disk I/O is ~176 ms of a 1,107 ms statement — the other 84%, and effectively all of the
-other two statements, is CPU spent walking and aggregating rows that are already in memory.
-Raising `shared_buffers` or moving to faster disks will not fix this; not recomputing
-whole-history aggregates per block is the only thing that will.
+**It was CPU-bound, not I/O-bound.** At 10M only the `SUM` left `shared_buffers` at all, and
+its disk I/O was ~176 ms of a 1,107 ms statement — the other 84%, and effectively all of the
+other two statements, was CPU spent walking and aggregating rows that were already in memory.
+Raising `shared_buffers` or moving to faster disks would not have fixed this; not recomputing
+whole-history aggregates per block is what did.
 
-That is also why `BenchmarkInsertBlockDataBatch` cannot be the regression gate for ingest:
-at 10M it accounts for about 2.5% of the per-block cost that `BenchmarkBlockCycle` measures.
+### What PRST-4493 changed
+
+`transfer_count` and ERC20 `total_supply` are no longer recomputed. `InsertBlockDataBatch`
+derives both from the transfers it is already writing and applies them as deltas in the **same
+transaction**, so a reader that sees the transfers sees the counters — they are read-after-write
+correct, not eventually consistent. The two `token_transfers` statements are gone from
+`RefreshTokenStats` entirely; the whole-history aggregate survives only as a one-off seed for a
+`tokens` row created after some of its transfers were already stored, which is the case absolute
+recompute used to cover for free.
+
+`RefreshTokenStats` is now `holder_count` (plus the ERC721 `nft_tokens` count, which derives
+from a small table and is mutated by ownership changes rather than only appended to). That one
+statement is the remaining per-block history-scale cost, and it scales with **holders**, not
+with transfer history — so it does not shrink as the two removed statements did.
+
+### Measured live, before and after
+
+Two arms on dev Tickr against the same replayed GasStorm run (`erc20-transfer`, ~18,000 tx at
+~497 tps, ~300 blocks of backlog), pod restarted before each so both start with an empty
+balance-worker queue, `pg_stat_statements` diffed rather than reset. The chain's dominant token
+carries 2.5M transfers and 1.3M holders, and the load hits exactly it — `SELECT DISTINCT
+block_number, token_address` over the window returns **1.00 tokens per block**, so the
+synchronous per-block refresh is one call per block.
+
+| | before (`sha-9f3ee46`) | after |
+|---|---|---|
+| drain the same backlog | 990 s | **111 s** |
+| refresh DB time in that window | 10,662 s | **112 s** |
+| … as a multiple of wall clock | 10.77× | **1.01×** |
+| slowest refresh statement, mean | 2,959 ms | **47 ms** |
+| `holder_count` drift on the dominant token | −80 | **0** |
+
+The `10.77×` is the point of the before column: the refresh statements oversubscribed the drain
+window across parallel connections by an order of magnitude, and `pg_stat_activity` sampled
+during the drain showed 22 backends all sitting in them. After, refresh occupies about one
+connection-equivalent and the sample shows 2–3 active backends.
+
+Read from the indexer's own stage histogram rather than the database's, so it includes pool
+wait and round trips, `refresh_token_stats` is **120 ms mean per block** — median under 100 ms,
+71% of blocks inside 100 ms, nothing over 1 s. Against a budget of roughly 100 ms/block at
+500 tx/s that is marginal on the mean and comfortable on the median, and it is **no longer what
+decides throughput**: `block_total` is 449 ms/block, of which `db_commit` is 325 ms (72%) and
+the refresh is 120 ms (27%). The next thing worth attacking is the insert batch, not the refresh.
+
+The delta statements the change added cost nothing measurable: `UPDATE transfer+supply` over
+300 blocks totals under a millisecond, the tokens-row pre-lock 0.285 ms mean, and the advisory
+pass that guards the union 0.007 ms mean.
+
+That is also why `BenchmarkInsertBlockDataBatch` could not be the regression gate for ingest
+before: at 10M it accounted for about 2.5% of the per-block cost that `BenchmarkBlockCycle`
+measures. With the deltas folded into the insert it now carries their cost too, so it is the
+right gate for the counter path — and `BenchmarkBlockCycle` is now dominated by `holder_count`
+alone.
 
 `BenchmarkBlockCycle` writes its transfers against a different token from the one it
 refreshes, so a run cannot extend the history it is timing. That is not cosmetic: refresh cost

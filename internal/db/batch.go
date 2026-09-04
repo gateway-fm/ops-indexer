@@ -684,10 +684,10 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	// and holds it to commit, which the balances insert alone never did: its key
 	// carries block_number, so two workers at different blocks touched different
 	// rows and never contended. Balance workers each flush their own unordered
-	// batch -- 30 of them by default (indexer.go newDefaultConfig), 15 as the
-	// Tickr deployment sets BALANCE_WORKERS -- so on either count, without a
-	// discipline two of them can hold the row
-	// the other wants. flushBatch retries a 40P01 three times and then DROPS the
+	// batch -- 30 of them by default (config.go's balance_workers default, read
+	// by indexer.New), 15 as the Tickr deployment sets BALANCE_WORKERS -- so on
+	// either count, without a discipline two of them can hold the row the other
+	// wants. flushBatch retries a 40P01 three times and then DROPS the
 	// batch, so a deadlock costs balances outright, and a missing balance is a
 	// wrong holder_count.
 	//
