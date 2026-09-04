@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -626,4 +627,158 @@ func TestTokenCounters_TokenLocksAreTakenInSortedOrder(t *testing.T) {
 				"InsertBlockDataBatch is gone, and two concurrent batches sharing these tokens can deadlock",
 			i, got[i], got[i-1])
 	}
+}
+
+// TestTokenCounters_CrossPhaseLockingDoesNotDeadlock is the case sorting each
+// phase separately does not cover.
+//
+// A transaction takes tokens row locks in two runs: the upsert over the tokens
+// the block discovered, and the delta UPDATEs over the tokens its transfers
+// touched. sorted(A) then sorted(B) is a total order only when A and B are the
+// same set, and they differ whenever a token already in the database is absent
+// from this process's cache -- an ON CONFLICT DO UPDATE locks an existing row
+// just as much as it creates one. One worker then takes a high address
+// (discovered) before a low one (transfer) while a worker with a warm cache
+// takes the low one first, and the two cycle.
+//
+// The two shapes below are exactly that pair, run against each other. The
+// property is the absence of a 40P01, which is why this is a concurrency test
+// rather than an ordering one: the fix is a SELECT ... FOR UPDATE pass over the
+// union, and a lock taken without a write is invisible to the AFTER trigger the
+// within-phase test uses.
+func TestTokenCounters_CrossPhaseLockingDoesNotDeadlock(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newCtrFixture(t, d, 13, 5_300_000)
+	defer drop()
+
+	const keys = 8
+	addrs := make([]string, keys)
+	for i := range addrs {
+		addrs[i] = fmt.Sprintf("0xctrphase%031d", i)
+	}
+	// All of them exist: the asymmetry being tested is about cache state, not
+	// about whether the row is there.
+	for _, addr := range addrs {
+		_, err := d.pool.Exec(ctx, `DELETE FROM token_transfers WHERE token_address = $1`, addr)
+		require.NoError(t, err)
+		_, err = d.pool.Exec(ctx,
+			`INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number)
+			 VALUES ($1, 'PH', 'Phase', 18, 'ERC20', $2)
+			 ON CONFLICT (address) DO NOTHING`, addr, f.base)
+		require.NoError(t, err)
+	}
+	defer func() {
+		for _, addr := range addrs {
+			if _, err := d.pool.Exec(ctx, `DELETE FROM token_transfers WHERE token_address = $1`, addr); err != nil {
+				t.Errorf("cleanup transfers %s: %v", addr, err)
+			}
+			if _, err := d.pool.Exec(ctx, `DELETE FROM tokens WHERE address = $1`, addr); err != nil {
+				t.Errorf("cleanup token %s: %v", addr, err)
+			}
+		}
+	}()
+
+	// Worker 0: discovers the DESCENDING half (upsert phase) and transfers the
+	// ascending half (delta phase) -- so per-phase sorting gives it high before
+	// low. Worker 1: cache warm, discovers nothing, transfers everything in
+	// ascending order. Opposite acquisition orders over a shared set.
+	build := func(round, writer int) *BlockData {
+		bd := &BlockData{}
+		for i, addr := range addrs {
+			tr := f.transfer(t, d, zeroAddr, "0xholder1", "1", types.TokenTypeERC20)
+			tr.TokenAddress = addr
+			bd.Transfers = append(bd.Transfers, tr)
+			if writer == 0 && i >= keys/2 {
+				bd.Tokens = append(bd.Tokens, &types.Token{
+					Address:     addrs[keys-1-i+keys/2-1],
+					Symbol:      "PH",
+					Decimals:    18,
+					TokenType:   types.TokenTypeERC20,
+					BlockNumber: uint64(f.base),
+				})
+			}
+		}
+		return bd
+	}
+
+	const rounds = 12
+	for round := 0; round < rounds; round++ {
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		payloads := []*BlockData{build(round, 0), build(round, 1)}
+		for writer := 0; writer < 2; writer++ {
+			wg.Add(1)
+			go func(writer int) {
+				defer wg.Done()
+				errs[writer] = d.InsertBlockDataBatch(ctx, payloads[writer])
+			}(writer)
+		}
+		wg.Wait()
+		for writer, err := range errs {
+			require.NoErrorf(t, err,
+				"round %d writer %d: the upsert set and the transfer set differ between these two "+
+					"batches, so without one sorted pass over the union of every tokens row the "+
+					"transaction locks, they acquire them in opposite orders and deadlock",
+				round, writer)
+		}
+	}
+
+	// And the counters still agree with the stored rows for every token.
+	for _, addr := range addrs {
+		var cached, actual int64
+		require.NoError(t, d.pool.QueryRow(ctx,
+			`SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = $1`, addr).Scan(&cached))
+		require.NoError(t, d.pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, addr).Scan(&actual))
+		require.Equal(t, actual, cached, "counter drifted for %s under concurrent cross-phase batches", addr)
+	}
+}
+
+// TestTokenCounters_ReorgRevertsChainCounters covers the other counters the
+// reorg cascade invalidates.
+//
+// Compensating only transfers_total left blocks_total and transactions_total
+// drifting, which is the same fix-one-site mistake one level up from the
+// per-token counters. addresses_total is deliberately not reverted --
+// address_stats has no foreign key into transactions, so the cascade does not
+// reach it and an address seen in a reverted block has still been seen.
+func TestTokenCounters_ReorgRevertsChainCounters(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	f, drop := newCtrFixture(t, d, 14, 5_400_000)
+	defer drop()
+	ctx := context.Background()
+
+	f.createToken(t, d, types.TokenTypeERC20)
+	tr := f.transfer(t, d, zeroAddr, "0xholder1", "10", types.TokenTypeERC20)
+	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Transfers: []*types.TokenTransfer{tr}}))
+
+	// Seeded high so the GREATEST(..., 0) floor is not what the assertion
+	// measures -- the floor is a safety net, not the behaviour under test.
+	const seed = 1000
+	for _, name := range []string{"blocks_total", "transactions_total", "transfers_total", "addresses_total"} {
+		_, err := d.pool.Exec(ctx, `
+			INSERT INTO chain_counters (name, count, updated_at) VALUES ($1, $2, NOW())
+			ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`, name, seed)
+		require.NoError(t, err)
+	}
+
+	read := func(name string) int64 {
+		var n int64
+		require.NoError(t, d.pool.QueryRow(ctx,
+			`SELECT count FROM chain_counters WHERE name = $1`, name).Scan(&n))
+		return n
+	}
+
+	// The fixture wrote one block and one transaction for this transfer.
+	require.NoError(t, d.DeleteBlock(ctx, tr.BlockNumber))
+
+	require.Equal(t, int64(seed-1), read("blocks_total"), "blocks_total should lose the reverted block")
+	require.Equal(t, int64(seed-1), read("transactions_total"), "transactions_total should lose the reverted transaction")
+	require.Equal(t, int64(seed-1), read("transfers_total"), "transfers_total should lose the reverted transfer")
+	require.Equal(t, int64(seed), read("addresses_total"),
+		"addresses_total must not move: the cascade does not reach address_stats")
 }

@@ -183,13 +183,53 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		}
 	}
 
+	// Every tokens row this transaction will lock, taken in one ascending pass
+	// before any of them is touched individually.
+	//
+	// Sorting each phase separately is not enough, and that was the defect in
+	// the first attempt at this. Locks are acquired in two runs -- the upsert
+	// below, over the tokens the block discovered, and the delta UPDATEs at the
+	// end, over the tokens its transfers touched -- and sorted(A) followed by
+	// sorted(B) is a total order only when A and B are the same set. They are
+	// not: an ON CONFLICT DO UPDATE locks an existing row just as much as it
+	// creates one, so a token already in the database lands in the upsert set
+	// whenever this process's token cache has not recorded it yet. One worker
+	// then took a high address (discovered) before a low one (transfer), while
+	// another with a warm cache took the low one first.
+	//
+	// A row that does not exist yet is not locked here and is created by the
+	// upsert instead, which cannot cycle: a row absent now cannot be held by
+	// another transaction as an existing row, and two transactions creating the
+	// same row serialise on the primary key. New rows are created in sorted
+	// order for the same reason.
+	//
+	// One statement, so one round trip. ORDER BY makes the acquisition order
+	// explicit rather than leaving it to the plan, and on the primary-key btree
+	// it is the same order anyway.
+	lockTokens := make(map[string]struct{}, len(data.Tokens)+len(data.Transfers))
+	for _, t := range data.Tokens {
+		lockTokens[strings.ToLower(t.Address)] = struct{}{}
+	}
+	for _, t := range data.Transfers {
+		lockTokens[strings.ToLower(t.TokenAddress)] = struct{}{}
+	}
+	if len(lockTokens) > 0 {
+		ordered := make([]string, 0, len(lockTokens))
+		for addr := range lockTokens {
+			ordered = append(ordered, addr)
+		}
+		sort.Strings(ordered)
+		if _, err := tx.Exec(ctx,
+			`SELECT 1 FROM tokens WHERE address = ANY($1::text[]) ORDER BY address FOR UPDATE`,
+			ordered); err != nil {
+			return err
+		}
+	}
+
 	if len(data.Tokens) > 0 {
-		// Sorted by the stored (lowercased) key for the same reason the delta
-		// UPDATEs below are: this insert takes tokens row locks held to commit,
-		// and the caller built data.Tokens by ranging a map
-		// (indexer.go processBlock's tokenMetadata), so its order is randomised
-		// per block. The copy is because the caller reuses its slice, matching
-		// InsertBalancesBatch.
+		// Sorted so the rows this creates are created in ascending order; the
+		// rows that already exist are locked by the pass above. The copy is
+		// because the caller reuses its slice, matching InsertBalancesBatch.
 		orderedTokens := make([]*types.Token, len(data.Tokens))
 		copy(orderedTokens, data.Tokens)
 		sort.SliceStable(orderedTokens, func(i, j int) bool {
@@ -364,14 +404,12 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 	// RefreshTokenStats that used to own it; NULL means "never computed", so
 	// COALESCE is what turns the first delta into a real number.
 	if len(tokenDeltas) > 0 {
-		// Sorted, because each of these takes a tokens row lock held to commit
-		// and InsertBlockDataBatch runs concurrently -- catchup gives every
-		// worker its own block. Go randomises map iteration, so two workers
-		// touching the same two tokens would acquire them in opposite orders
-		// and deadlock. This is the discipline InsertBalancesBatch documents
-		// and sorts for; the tokens insert and its seed above are ordered the
-		// same way so one total order covers every tokens lock this
-		// transaction takes.
+		// Every row these touch was already locked by the pass at the top of
+		// this function, so this acquires nothing new and its order cannot
+		// contribute to a cycle. Sorted anyway, so the statements read in the
+		// same order the locks were taken and a reader is not invited to
+		// conclude the order here is what makes it safe -- it is not, and
+		// sorting these alone was exactly the incomplete fix.
 		tokens := make([]string, 0, len(tokenDeltas))
 		for token := range tokenDeltas {
 			tokens = append(tokens, token)

@@ -199,20 +199,51 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		}
 	}
 
-	// transfers_total is maintained by the same delta discipline on the insert
-	// side, and had the same gap here. Reverting it in this transaction rather
-	// than leaving one counter uncompensated in the statement that compensates
-	// the others.
+	// chain_counters is maintained by the same delta discipline on the insert
+	// side and had the same gap on this path. All three counters the cascade
+	// invalidates are reverted together: compensating only transfers_total left
+	// blocks_total and transactions_total drifting, which is the same
+	// fix-one-site mistake one level up.
+	//
+	// addresses_total is untouched because address_stats has no foreign key
+	// into transactions, so the cascade does not reach it -- an address seen in
+	// a reverted block has still been seen.
+	//
+	// tokens_total is deliberately not reverted here. tokens.creation_tx
+	// REFERENCES transactions(hash) ON DELETE CASCADE, so reverting a token's
+	// creating block deletes the token row itself, and a warm token cache then
+	// stops it ever being recreated. That is a separate defect on this path and
+	// decrementing the counter for it would encode the broken behaviour rather
+	// than repair it.
 	var revertedTransfers int64
 	for _, r := range doomed {
 		revertedTransfers += r.count
 	}
-	if revertedTransfers > 0 {
+
+	var revertedTxs int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM transactions WHERE block_number = $1`, number).Scan(&revertedTxs); err != nil {
+		return err
+	}
+	var blockExists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM blocks WHERE number = $1)`, number).Scan(&blockExists); err != nil {
+		return err
+	}
+	var revertedBlocks int64
+	if blockExists {
+		revertedBlocks = 1
+	}
+
+	if revertedBlocks|revertedTxs|revertedTransfers != 0 {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO chain_counters (name, count, updated_at) VALUES ('transfers_total', $1, NOW())
+			INSERT INTO chain_counters (name, count, updated_at) VALUES
+				('blocks_total',       $1, NOW()),
+				('transactions_total', $2, NOW()),
+				('transfers_total',    $3, NOW())
 			ON CONFLICT (name) DO UPDATE
 				SET count = GREATEST(chain_counters.count + EXCLUDED.count, 0), updated_at = NOW()`,
-			-revertedTransfers); err != nil {
+			-revertedBlocks, -revertedTxs, -revertedTransfers); err != nil {
 			return err
 		}
 	}
