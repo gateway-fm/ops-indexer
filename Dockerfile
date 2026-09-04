@@ -20,4 +20,6 @@ COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /licenses/
 
 USER nonroot:nonroot
 
+EXPOSE 50051 8080
+
 ENTRYPOINT ["/indexer"]

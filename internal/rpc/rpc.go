@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	explorerTypes "github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
@@ -221,6 +222,7 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 			for _, r := range receipts {
 				results[r.TxHash] = r
 			}
+			metrics.SetReceiptStrategy("batch")
 			log.Info("fetched receipts via eth_getBlockReceipts",
 				"block", blockNumber[0], "count", len(results))
 			return results, nil
@@ -238,10 +240,12 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 			} else {
 				logReceipts, lerr := c.fetchLogsAsReceipts(ctx, blockNumber[0])
 				if lerr == nil {
+					metrics.SetReceiptStrategy("logs")
 					log.Warn("eth_getBlockReceipts failed; recovered logs via eth_getLogs (status/gasUsed not available)",
 						"block", blockNumber[0], "receipts_err", err, "txs_with_logs", len(logReceipts), "total_txs", len(txHashes))
 					return logReceipts, nil
 				}
+				metrics.SetReceiptStrategy("none")
 				log.Warn("eth_getBlockReceipts failed and eth_getLogs fallback also failed; skipping receipts for block",
 					"block", blockNumber[0], "receipts_err", err, "logs_err", lerr, "txs", len(txHashes))
 				return make(map[common.Hash]*rpclient.Receipt), nil
@@ -250,6 +254,7 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 	}
 
 	// Fallback: fetch receipts individually per transaction (only when eth_getBlockReceipts is not supported)
+	metrics.SetReceiptStrategy("per_tx")
 	limiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit/10+1)
 
 	results := make(map[common.Hash]*rpclient.Receipt)

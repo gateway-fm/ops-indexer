@@ -8,6 +8,7 @@ import (
 
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
@@ -311,11 +312,14 @@ func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) err
 	// Detect chain reset: if we need to revert more than maxReorgDepth blocks,
 	// this is not a reorg, it is a chain reset.
 	if lastIndexed > fromBlock && lastIndexed-fromBlock > maxReorgDepth {
+		metrics.ChainResetDetected()
 		return fmt.Errorf(
 			"chain reset detected: need to revert %d blocks (max reorg depth: %d). "+
 				"Restart with FORCE_REINDEX=true to auto-wipe",
 			lastIndexed-fromBlock, maxReorgDepth)
 	}
+
+	metrics.ReorgDetected()
 
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
 		if err := r.db.DeleteBlock(ctx, blockNum); err != nil {

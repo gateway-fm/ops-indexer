@@ -11,6 +11,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
@@ -170,7 +171,95 @@ func (i *Indexer) IndexBlock(ctx context.Context, blockNumber uint64) error {
 	}
 }
 
+const (
+	progressMetricsInterval = 15 * time.Second
+
+	// GetBlockCount is a COUNT(*) over blocks, so it runs far less often than
+	// the cheap gauges. Backfill holes change slowly; lag does not.
+	missingBlocksInterval = 5 * time.Minute
+)
+
+// refreshProgress updates the cheap gauges and reports the chain head.
+func (i *Indexer) refreshProgress(ctx context.Context) (head uint64, ok bool) {
+	head, err := i.rpc.BlockNumber(ctx)
+	if err != nil {
+		log.Debug("progress metrics: chain head unavailable", "error", err)
+		return 0, false
+	}
+	metrics.SetChainHead(head)
+
+	if indexed, err := i.db.GetLatestBlockNumber(ctx); err == nil {
+		metrics.SetLastIndexed(indexed)
+	}
+	if i.balanceWorkers != nil {
+		metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
+	}
+	return head, true
+}
+
+// missingBlockCount is the number of blocks in [startBlock, head] absent from
+// the database. The range starts at startBlock, not genesis: assuming genesis
+// makes a fully caught-up database report startBlock missing forever.
+func missingBlockCount(startBlock, head uint64, count int64) int64 {
+	if head < startBlock {
+		return 0
+	}
+	missing := int64(head-startBlock+1) - count
+	if missing < 0 {
+		return 0
+	}
+	return missing
+}
+
+// refreshMissingBlocks counts real holes, which head-last_indexed cannot see:
+// that only measures the tip and reads zero while blocks behind it are absent.
+func (i *Indexer) refreshMissingBlocks(ctx context.Context, head uint64) {
+	if head < i.startBlock {
+		metrics.SetMissingBlocks(0)
+		return
+	}
+	count, err := i.db.GetBlockCountInRange(ctx, i.startBlock, head)
+	if err != nil {
+		return
+	}
+	metrics.SetMissingBlocks(missingBlockCount(i.startBlock, head, count))
+}
+
+func (i *Indexer) publishProgressMetrics(ctx context.Context) {
+	ticker := time.NewTicker(progressMetricsInterval)
+	defer ticker.Stop()
+	missingTicker := time.NewTicker(missingBlocksInterval)
+	defer missingTicker.Stop()
+
+	// Seed before the first tick. Gauges register at zero and a ticker does not
+	// fire immediately, so otherwise every restart reports no lag and no missing
+	// blocks for five minutes -- suppressing the alerts these exist to raise.
+	head, ok := i.refreshProgress(ctx)
+	if ok {
+		i.refreshMissingBlocks(ctx, head)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			if h, o := i.refreshProgress(ctx); o {
+				head, ok = h, true
+			}
+
+		case <-missingTicker.C:
+			if ok {
+				i.refreshMissingBlocks(ctx, head)
+			}
+		}
+	}
+}
+
 func (i *Indexer) Start(ctx context.Context) error {
+	go i.publishProgressMetrics(ctx)
+
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)
 	if err != nil {
 		log.Error("failed to get latest indexed block", "error", err)
@@ -231,6 +320,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 	// Detect chain reset: if the chain head is significantly behind our last
 	// indexed block, this is a chain reset (e.g. Anvil restart), not a reorg.
 	if lastIndexed > 0 && latestOnChain+maxReorgDepth < lastIndexed {
+		metrics.ChainResetDetected()
 		log.Error("CHAIN RESET DETECTED: chain head is far behind last indexed block",
 			"chain_head", latestOnChain,
 			"last_indexed", lastIndexed,
@@ -526,6 +616,7 @@ func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
 	if err != nil {
 		return err
 	}
+	metrics.ReorgDetected()
 
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
 		if err := i.db.DeleteBlock(ctx, blockNum); err != nil {
@@ -572,11 +663,16 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 		ReceiptsRoot:     rawBlock.ReceiptsRoot.Hex(),
 	}
 
-	return i.db.InsertBlock(ctx, b)
+	if err := i.db.InsertBlock(ctx, b); err != nil {
+		return err
+	}
+	metrics.BlockIndexed(0, uint64(rawBlock.GasUsed))
+	return nil
 }
 
 func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.RawBlock) error {
 	start := time.Now()
+	defer metrics.StageTimer(metrics.StageBlockTotal)()
 	blockNumber := rawBlock.NumberU64()
 	rawTxs := rawBlock.Transactions
 	blockTimestamp := uint64(rawBlock.Timestamp)
@@ -938,9 +1034,11 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		}
 	}
 
+	commitStart := time.Now()
 	if err := i.db.InsertBlockDataBatch(ctx, blockData); err != nil {
 		return err
 	}
+	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
 
 	// Refresh derived stats (transfer_count, total_supply, holder_count) for
 	// each token touched in this block. Cheap aggregate queries; runs
@@ -951,17 +1049,21 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			touched[strings.ToLower(t.TokenAddress)] = struct{}{}
 		}
 		for tokenAddr := range touched {
+			refreshStart := time.Now()
 			if err := i.db.RefreshTokenStats(ctx, tokenAddr); err != nil {
 				log.Warn("refresh token stats failed", "token", tokenAddr, "error", err)
 			}
+			metrics.ObserveStage(metrics.StageRefreshTokenStats, time.Since(refreshStart))
 		}
 	}
 
 	if i.balanceWorkers != nil && len(balanceWork) > 0 {
 		queued := i.balanceWorkers.QueueWorkBatch(balanceWork)
 		if queued < len(balanceWork) {
+			metrics.BalanceQueueDropped(len(balanceWork) - queued)
 			log.Warn("balance queue full, dropped items", "dropped", len(balanceWork)-queued)
 		}
+		metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
 	}
 
 	if i.eventBus != nil {
@@ -970,6 +1072,8 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			i.eventBus.PublishNewTransaction(tx)
 		}
 	}
+
+	metrics.BlockIndexed(len(rawTxs), uint64(rawBlock.GasUsed))
 
 	elapsed := time.Since(start)
 	if blockNumber%100 == 0 || elapsed > 2*time.Second {

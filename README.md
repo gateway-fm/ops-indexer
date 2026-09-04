@@ -14,6 +14,23 @@ docs/API.md                   API conventions and design rationale
 scripts/                      local dev helpers
 ```
 
+## Observability
+
+| Port | Env | Default | Purpose |
+| --- | --- | --- | --- |
+| 50051 | `GRPC_LISTEN_ADDR` | `:50051` | gRPC read API |
+| 8080 | `METRICS_LISTEN_ADDR` | `:8080` | Prometheus `/metrics` |
+| 6060 | `PPROF_LISTEN_ADDR` | `:6060` | `net/http/pprof`, off by default |
+
+`PPROF_ENABLED` (default `false`) must stay off outside active profiling, and the port
+must never be reachable through an ingress: heap dumps can contain secret material and
+the profile endpoints are a cheap denial of service.
+
+Metric names and meanings are self-describing in the `/metrics` output; see
+`internal/metrics` for the definitions. One thing that is not obvious from the names:
+chain head and last indexed block are exported as separate gauges rather than a
+pre-computed lag, so that when lag looks wrong you can see which of the two moved.
+
 ## Generated code
 
 Generated Go stubs are checked in under `gen/` so consumers don't need `buf` or `protoc` locally. Regenerate with `make proto-gen`.

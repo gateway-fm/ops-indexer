@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	explorerTypes "github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
@@ -216,9 +217,11 @@ func (c *Client) FetchTracesBatch(ctx context.Context, txHashes []common.Hash, b
 			}
 		}
 
+		metrics.SetTraceStrategy("batch")
 		return allInternalTxs, nil
 	}
 
+	metrics.SetTraceStrategy("per_tx")
 	log.Warn("block tracing failed, falling back to per-tx tracing", "block", blockNumber, "error", err)
 
 	limiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit/10+1)

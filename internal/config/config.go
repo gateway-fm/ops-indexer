@@ -35,7 +35,10 @@ type Config struct {
 	SolcPath            string `mapstructure:"solc_path"`
 	UseSourcifyFallback bool   `mapstructure:"use_sourcify_fallback"`
 
-	MetricsEnabled bool `mapstructure:"metrics_enabled"`
+	MetricsEnabled    bool   `mapstructure:"metrics_enabled"`
+	MetricsListenAddr string `mapstructure:"metrics_listen_addr"`
+	PprofEnabled      bool   `mapstructure:"pprof_enabled"`
+	PprofListenAddr   string `mapstructure:"pprof_listen_addr"`
 
 	CatchupEnabled   bool `mapstructure:"catchup_enabled"`
 	CatchupWorkers   int  `mapstructure:"catchup_workers"`
@@ -97,6 +100,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("use_sourcify_fallback", true)
 
 	v.SetDefault("metrics_enabled", true)
+	v.SetDefault("metrics_listen_addr", ":8080")
+	v.SetDefault("pprof_enabled", false)
+	v.SetDefault("pprof_listen_addr", ":6060")
 
 	v.SetDefault("catchup_enabled", true)
 	v.SetDefault("catchup_workers", 10)
@@ -161,6 +167,9 @@ func Load() (*Config, error) {
 	cfg.UseSourcifyFallback = v.GetBool("use_sourcify_fallback")
 
 	cfg.MetricsEnabled = v.GetBool("metrics_enabled")
+	cfg.MetricsListenAddr = v.GetString("metrics_listen_addr")
+	cfg.PprofEnabled = v.GetBool("pprof_enabled")
+	cfg.PprofListenAddr = v.GetString("pprof_listen_addr")
 
 	cfg.CatchupEnabled = v.GetBool("catchup_enabled")
 	cfg.CatchupWorkers = v.GetInt("catchup_workers")
@@ -249,6 +258,9 @@ func (c *Config) String() string {
     USE_SOURCIFY_FALLBACK: %t
   Metrics:
     METRICS_ENABLED: %t
+    METRICS_LISTEN_ADDR: %s
+    PPROF_ENABLED: %t
+    PPROF_LISTEN_ADDR: %s
   Catchup:
     CATCHUP_ENABLED: %t
     CATCHUP_WORKERS: %d
@@ -271,7 +283,7 @@ func (c *Config) String() string {
 		c.EnableTracing, c.TraceRateLimit, c.TraceWorkers,
 		c.WSMaxConnections, c.WSPingInterval,
 		c.SolcPath, c.UseSourcifyFallback,
-		c.MetricsEnabled,
+		c.MetricsEnabled, c.MetricsListenAddr, c.PprofEnabled, c.PprofListenAddr,
 		c.CatchupEnabled, c.CatchupWorkers, c.CatchupBatchSize, c.CatchupQueueSize,
 		c.PrivacyProxyURL, c.SSOClientID, c.SSORedirectURI,
 		c.EnableOPDeposits, c.L1RPCURL, c.OptimismPortalAddress, c.L1DepositPollInterval, c.L1DepositBatchSize, c.L1DepositStartBlock,
