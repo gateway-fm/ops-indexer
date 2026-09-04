@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -969,4 +971,48 @@ func TestTokenCounters_LockingCoversTokensNotYetCreated(t *testing.T) {
 			`SELECT COUNT(*) FROM token_transfers WHERE token_address = $1`, addr).Scan(&actual))
 		require.Equal(t, actual, cached, "counter drifted for %s", addr)
 	}
+}
+
+// TestChainCounters_WipedOnChainReset covers the FORCE_REINDEX path for the
+// chain-wide totals.
+//
+// They are maintained by deltas from InsertBlockDataBatch, so nothing
+// recomputes them once the rows they count are gone. Left behind by a wipe, a
+// reset chain would serve the old chain's totals and then add the new chain's
+// on top -- the same failure nft_tokens had before it was added to the list.
+//
+// Skipped against BENCH_DATABASE_URL for the reason
+// TestCurrentBalances_WipedWithBalancesOnChainReset gives: WipeAllData
+// truncates every indexed table, which is destructive on a reusable server.
+func TestChainCounters_WipedOnChainReset(t *testing.T) {
+	if url := strings.TrimSpace(os.Getenv("BENCH_DATABASE_URL")); url != "" {
+		t.Skip("skipping: this test truncates every table, and BENCH_DATABASE_URL points at a reusable database")
+	}
+
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	f, drop := newCtrFixture(t, d, 15, 5_500_000)
+	defer drop()
+
+	f.createToken(t, d, types.TokenTypeERC20)
+	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{
+		Transfers: []*types.TokenTransfer{
+			f.transfer(t, d, zeroAddr, "0xholder1", "1000", types.TokenTypeERC20),
+		},
+	}))
+
+	var before int64
+	require.NoError(t, d.pool.QueryRow(ctx,
+		`SELECT COALESCE(sum(count), 0) FROM chain_counters`).Scan(&before))
+	require.NotZero(t, before, "the fixture has to move a counter for the wipe to be worth checking")
+
+	require.NoError(t, d.WipeAllData(ctx))
+
+	var rows int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM chain_counters`).Scan(&rows))
+	require.Zero(t, rows,
+		"chain_counters must be truncated with the rows it counts, or the reset chain's totals "+
+			"are the old chain's plus the new one's")
 }
