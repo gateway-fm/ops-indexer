@@ -43,8 +43,8 @@ type Config struct {
 	CatchupBatchSize int
 	CatchupQueueSize int
 
-	SkipAddressStats    bool
-	SkipReceiptTxTypes  map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
+	SkipAddressStats   bool
+	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
 	// DailyStatsMinInterval is the minimum time between two recomputations of
 	// the current day's daily_stats row. Zero keeps the old behaviour (every
@@ -71,6 +71,7 @@ type Indexer struct {
 	contractCache *ContractCache
 
 	balanceWorkers *BalanceWorkerPool
+	statsRefresher *statsRefresher
 
 	tracingSupported bool
 	eventBus         *events.Bus
@@ -242,15 +243,13 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		// When balances actually land in the DB, refresh holder_count for the
 		// affected tokens so the cached count on the tokens row matches the
 		// new balance set without waiting for the next transfer.
-		idx.balanceWorkers.SetOnFlush(func(tokenAddresses []string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			for _, addr := range tokenAddresses {
-				if err := database.RefreshTokenStats(ctx, addr); err != nil {
-					log.Warn("refresh token stats after balance flush failed", "token", addr, "error", err)
-				}
-			}
-		})
+		//
+		// Coalesced: the flush only marks the token dirty; statsRefresher
+		// refreshes each dirty token once per tick instead of once per flush
+		// of each of the BalanceWorkers workers (PRST-4669; the measurement is
+		// in stats_refresher.go).
+		idx.statsRefresher = newStatsRefresher(database, time.Second)
+		idx.balanceWorkers.SetOnFlush(idx.statsRefresher.mark)
 	}
 
 	return idx
@@ -387,6 +386,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 	if i.balanceWorkers != nil {
 		i.balanceWorkers.Start()
+		if i.statsRefresher != nil {
+			go i.statsRefresher.run(ctx)
+		}
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)
