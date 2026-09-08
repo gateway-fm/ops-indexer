@@ -71,7 +71,6 @@ type Indexer struct {
 	contractCache *ContractCache
 
 	balanceWorkers *BalanceWorkerPool
-	statsRefresher *statsRefresher
 
 	tracingSupported bool
 	eventBus         *events.Bus
@@ -240,16 +239,10 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
 		idx.balanceWorkers = NewBalanceWorkerPool(database, rpcClient, cfg.BalanceWorkers, cfg.RPCRateLimit)
-		// When balances actually land in the DB, refresh holder_count for the
-		// affected tokens so the cached count on the tokens row matches the
-		// new balance set without waiting for the next transfer.
-		//
-		// Coalesced: the flush only marks the token dirty; statsRefresher
-		// refreshes each dirty token once per tick instead of once per flush
-		// of each of the BalanceWorkers workers (PRST-4669; the measurement is
-		// in stats_refresher.go).
-		idx.statsRefresher = newStatsRefresher(database, time.Second)
-		idx.balanceWorkers.SetOnFlush(idx.statsRefresher.mark)
+		// No post-flush stats refresh any more: holder_count is maintained by
+		// InsertBalancesBatch itself, in the transaction that writes the
+		// balances (PRST-4669). The callback used to trigger a COUNT(*) per
+		// token per flush of each worker -- ~7 per indexed block under load.
 	}
 
 	return idx
@@ -386,9 +379,6 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 	if i.balanceWorkers != nil {
 		i.balanceWorkers.Start()
-		if i.statsRefresher != nil {
-			go i.statsRefresher.run(ctx)
-		}
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)
@@ -1189,10 +1179,11 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		i.tokenCache.Add(addr)
 	}
 
-	// Refresh holder_count for each token touched in this block. transfer_count
-	// and total_supply are already maintained by the delta writes inside
-	// InsertBlockDataBatch above, in the same transaction as the transfers, so
-	// they need nothing here.
+	// Refresh the stats that are still recomputed for each token touched in
+	// this block -- only ERC721 total_supply is left. transfer_count and
+	// total_supply (ERC20) are maintained by the delta writes inside
+	// InsertBlockDataBatch above; holder_count by InsertBalancesBatch when the
+	// balances land (PRST-4669). For an ERC20 token this is one PK read.
 	//
 	// Runs synchronously so the new count is visible on the next read.
 	if len(blockData.Transfers) > 0 {

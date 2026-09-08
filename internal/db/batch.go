@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/big"
@@ -734,47 +735,125 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 
 	// token_balances_current caches the row that a DISTINCT ON (address) ...
 	// ORDER BY block_number DESC over balances would have returned, so the guard
-	// has to preserve exactly that: highest block_number wins. >= rather than >
-	// because the insert above is last-write-wins for an identical block_number,
-	// and the two must not disagree.
-	//
-	// The guard is also what keeps this correct across transactions: a second
-	// transaction touching the same row blocks on the row lock, then re-evaluates
-	// this WHERE against the updated row, so the highest block_number survives
-	// whatever order the writes arrive in. Plain last-write-wins would have been
-	// arrival-order dependent.
+	// in sql/tbc_upsert_delta.sql has to preserve exactly that: highest
+	// block_number wins, >= rather than > because the insert above is
+	// last-write-wins for an identical block_number, and the two must not
+	// disagree. See PRST-4508 for why block_number is the block that TRIGGERED
+	// the read rather than the block the balance was read at.
 	//
 	// One statement per distinct key rather than per row. The sort puts a key's
 	// rows in one ascending run, so its last element is the row the guard would
 	// have settled on anyway -- highest block, latest arrival on a tie -- and
 	// collapsing the run takes the key's lock once instead of once per row.
-	// Folding the run into a single multi-row INSERT instead is not available:
-	// a VALUES list that conflicts with itself fails with "ON CONFLICT DO UPDATE
-	// command cannot affect row a second time".
 	//
-	// block_number is the block that TRIGGERED the read, not the block the
-	// balance was read at -- the balance workers read at latest. balances
-	// carries the same defect, and this mirrors it rather than diverging from
-	// the query it replaces. See PRST-4508.
+	// tokens.holder_count moves here too, in this transaction (PRST-4669).
+	// Each key's upsert returns (new balance > 0) - (old balance > 0); the
+	// per-token sum is applied to the tokens row before commit. "old" is read
+	// under a per-key advisory lock taken as the FIRST thing this transaction
+	// does, so two flushes racing on a key not yet in the table cannot both
+	// read "absent" and both count +1. Lock phases, every writer in this order:
+	// advisory keys (sorted) -> balances rows (sorted) -> current rows (sorted)
+	// -> tokens rows (sorted). A transaction waiting in one phase holds locks
+	// only from earlier phases, and within a phase everyone agrees on the
+	// order, so no cycle is possible.
+	type currentKey struct {
+		token, address string
+		row            *types.Balance
+	}
+	keys := make([]currentKey, 0, len(ordered))
 	for i, b := range ordered {
 		if next := i + 1; next < len(ordered) &&
 			strings.EqualFold(ordered[next].TokenAddress, b.TokenAddress) &&
 			strings.EqualFold(ordered[next].Address, b.Address) {
 			continue
 		}
-		batch.Queue(`
-			INSERT INTO token_balances_current (token_address, address, balance, block_number)
-			VALUES (LOWER($1), LOWER($2), $3, $4)
-			ON CONFLICT (token_address, address) DO UPDATE
-				SET balance = EXCLUDED.balance,
-					block_number = EXCLUDED.block_number
-				WHERE EXCLUDED.block_number >= token_balances_current.block_number`,
-			b.TokenAddress, b.Address, b.Balance, b.BlockNumber)
+		keys = append(keys, currentKey{strings.ToLower(b.TokenAddress), strings.ToLower(b.Address), b})
+	}
+	keyTokens := make([]string, len(keys))
+	keyAddrs := make([]string, len(keys))
+	for i, k := range keys {
+		keyTokens[i], keyAddrs[i] = k.token, k.address
 	}
 
+	// Phase 0: advisory locks, then the pre-write state of every key.
+	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(keyTokens, keyAddrs)); err != nil {
+		return fmt.Errorf("lock balance keys: %w", err)
+	}
+	oldPos := make(map[currentKey]bool, len(keys))
+	rows, err := tx.Query(ctx, tbcOldPosSQL, keyTokens, keyAddrs)
+	if err != nil {
+		return fmt.Errorf("read current balances: %w", err)
+	}
+	for rows.Next() {
+		var k currentKey
+		var pos bool
+		if err := rows.Scan(&k.token, &k.address, &pos); err != nil {
+			rows.Close()
+			return err
+		}
+		oldPos[k] = pos
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Phases 1 and 2: the balances history rows, then the current rows.
+	for _, k := range keys {
+		old := 0
+		if oldPos[currentKey{token: k.token, address: k.address}] {
+			old = 1
+		}
+		batch.Queue(tbcUpsertDeltaSQL, k.row.TokenAddress, k.row.Address, k.row.Balance, k.row.BlockNumber, old)
+	}
 	br := tx.SendBatch(ctx, batch)
+	for range ordered {
+		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
+			return err
+		}
+	}
+	holderDelta := make(map[string]int, 4)
+	for _, k := range keys {
+		var delta int
+		err := br.QueryRow().Scan(&delta)
+		switch {
+		case err == nil:
+			holderDelta[k.token] += delta
+		case errors.Is(err, pgx.ErrNoRows):
+			// Block guard rejected the write: the row did not change.
+		default:
+			_ = br.Close()
+			return err
+		}
+	}
 	if err := br.Close(); err != nil {
 		return err
+	}
+
+	// Phase 3: tokens rows, sorted, one statement each.
+	tokensTouched := make([]string, 0, len(holderDelta))
+	for t, delta := range holderDelta {
+		if delta != 0 {
+			tokensTouched = append(tokensTouched, t)
+		}
+	}
+	if len(tokensTouched) > 0 {
+		sort.Strings(tokensTouched)
+		apply := &pgx.Batch{}
+		for _, t := range tokensTouched {
+			apply.Queue(holderCountApplySQL, t, holderDelta[t])
+		}
+		abr := tx.SendBatch(ctx, apply)
+		for range tokensTouched {
+			if _, err := abr.Exec(); err != nil {
+				_ = abr.Close()
+				return fmt.Errorf("apply holder_count delta: %w", err)
+			}
+		}
+		if err := abr.Close(); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit(ctx)

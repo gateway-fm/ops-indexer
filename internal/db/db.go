@@ -16,7 +16,7 @@ import (
 var migrations embed.FS
 
 type DB struct {
-	pool          *pgxpool.Pool
+	pool *pgxpool.Pool
 	// HiddenTxTypes are transaction type numbers excluded from default listings
 	// (e.g. 126 for OP deposit system transactions). Set via HIDDEN_TX_TYPES env var.
 	HiddenTxTypes []int
@@ -132,6 +132,14 @@ func (d *DB) Migrate() error {
 	log.Info("token transfer counters re-seeded from token_transfers")
 
 	if err := d.reconcileTokenBalancesCurrent(ctx); err != nil {
+		return err
+	}
+
+	// holder_count is delta-maintained by InsertBalancesBatch (PRST-4669) and
+	// re-seeded here for the same reason the counters above are: a build
+	// without the writer, or a crash between a current-row write and its
+	// counter, leaves it wrong until something absolute repairs it.
+	if err := d.ReseedHolderCounts(ctx); err != nil {
 		return err
 	}
 

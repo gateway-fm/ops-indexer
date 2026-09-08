@@ -730,53 +730,23 @@ func (d *DB) GetTokens(ctx context.Context, limit int, offset int, tokenType, se
 	return tokens, total, rows.Err()
 }
 
-// countTokenHolders returns the number of addresses whose current balance of
-// the token is greater than zero. The address must already be lowercased.
-//
-// This reads token_balances_current, which holds one row per (token, address)
-// carrying that address's current balance. The equivalent query over the
-// append-only balances table -- DISTINCT ON (address) ... ORDER BY address,
-// block_number DESC, then count the non-zero rows -- returns the same answer
-// but its cost grows with stored history rather than with the number of
-// holders, so at multi-million-row scale it runs for seconds per call while
-// this stays in the low hundreds of milliseconds for an identical count.
-//
-// That gap is not only about speed. Callers of this run under a context
-// deadline, and an operation that cannot finish inside it never updates the
-// counter at all. See PRST-4493.
-func (d *DB) countTokenHolders(ctx context.Context, lowercasedToken string) (int64, error) {
-	var holderCount int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM token_balances_current
-		WHERE token_address = $1 AND balance > 0`, lowercasedToken,
-	).Scan(&holderCount); err != nil {
-		return 0, fmt.Errorf("count holders: %w", err)
-	}
-	return holderCount, nil
-}
-
 // RefreshTokenStats recomputes the stats on a token row that cannot be
 // maintained incrementally, then writes them onto that row. Idempotent. The
 // token row must already exist; if not, the call is a no-op.
 //
-// holder_count counts addresses whose latest balance for this token is > 0. It
-// is the only counter left here, and it has to be recomputed because nothing
-// on the per-block ingest path writes `balances` -- balance rows arrive later,
-// from a worker pool, so there is no batch-local delta to derive it from. That
-// also makes it the one stat here that is only eventually consistent.
+// Only ERC721 total_supply is left here: it counts live token ids in
+// nft_tokens, a per-instance table small enough on these chains for the scan
+// not to matter, and unlike the transfer counters it is mutated by ownership
+// changes rather than only appended to. For every other token this is one
+// primary-key read and nothing else.
 //
-// transfer_count and total_supply used to be recomputed here too, each by a
-// query whose cost grew with the token's whole stored history -- a COUNT(*)
-// over token_transfers, and for ERC20 a mints-minus-burns SUM with no usable
-// index, which degenerated into a parallel sequential scan of the entire
-// table. Both are now derived incrementally in InsertBlockDataBatch, in the
-// same transaction as the transfer rows they describe, so they stay
-// read-after-write correct while costing nothing per block. See PRST-4493.
-//
-// ERC721 total_supply is still recomputed: it counts live token ids in
-// nft_tokens, which is a per-instance table small enough on these chains for
-// the scan not to matter, and unlike the transfer counters it is mutated by
-// ownership changes rather than only appended to.
+// transfer_count and total_supply were moved to per-batch deltas in
+// InsertBlockDataBatch under PRST-4493. holder_count followed under
+// PRST-4669: it is maintained by InsertBalancesBatch in the same transaction
+// as the token_balances_current rows it counts (see holder_count.go). Its
+// COUNT(*) used to be recomputed here once per touched token per block and once
+// per balance-worker flush, linear in the token's holder count -- 918 ms per
+// call at 826k holders, 96.9% of all database time in a 500 tx/s load test.
 func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 	addr := strings.ToLower(tokenAddress)
 
@@ -790,33 +760,22 @@ func (d *DB) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 		return fmt.Errorf("RefreshTokenStats: read token_type: %w", err)
 	}
 
-	holderCount, err := d.countTokenHolders(ctx, addr)
-	if err != nil {
-		return fmt.Errorf("RefreshTokenStats: %w", err)
-	}
-
-	if tokenType == types.TokenTypeERC721 {
-		// Supply for an NFT collection is the number of live (non-burned) token
-		// ids, tracked per-instance in nft_tokens.
-		if _, err := d.pool.Exec(ctx, `
-			UPDATE tokens
-			SET holder_count = $2,
-			    total_supply = (
-			        SELECT COUNT(*) FROM nft_tokens
-			        WHERE LOWER(token_address) = $1
-			          AND owner <> '0x0000000000000000000000000000000000000000'
-			    )
-			WHERE LOWER(address) = $1`,
-			addr, holderCount); err != nil {
-			return fmt.Errorf("RefreshTokenStats: update ERC721 stats: %w", err)
-		}
+	if tokenType != types.TokenTypeERC721 {
 		return nil
 	}
 
+	// Supply for an NFT collection is the number of live (non-burned) token
+	// ids, tracked per-instance in nft_tokens.
 	if _, err := d.pool.Exec(ctx, `
-		UPDATE tokens SET holder_count = $2 WHERE address = $1`,
-		addr, holderCount); err != nil {
-		return fmt.Errorf("RefreshTokenStats: update stats: %w", err)
+		UPDATE tokens
+		SET total_supply = (
+		        SELECT COUNT(*) FROM nft_tokens
+		        WHERE LOWER(token_address) = $1
+		          AND owner <> '0x0000000000000000000000000000000000000000'
+		    )
+		WHERE LOWER(address) = $1`,
+		addr); err != nil {
+		return fmt.Errorf("RefreshTokenStats: update ERC721 stats: %w", err)
 	}
 	return nil
 }
