@@ -4,14 +4,20 @@ name: Docker Publish
 #
 # Triggers:
 #   - Push to main         -> tag :sha-<7>
-#   - Push of v* tag       -> tags :<semver> (e.g. v1.2.3) and :sha-<7>
-#   - workflow_dispatch    -> tag :sha-<7> (same as main push)
+#   - Push of v* tag       -> tag :<semver> only (e.g. 1.2.3)
+#   - workflow_dispatch    -> :sha-<7> from a branch, :<semver> from a tag
 #
-# Only immutable tags are published: full semver and short-sha. Floating
-# tags (:latest, :main, :{{major}}, :{{major}}.{{minor}}) are deliberately
-# omitted because the Docker Hub repo (gatewayfm/chain-indexer) has tag
-# immutability enabled, which rejects any push that would overwrite an
-# existing tag. Operators should pin to a specific semver.
+# Only immutable tags are published: full semver, plus short-sha on branch
+# builds. Floating tags (:latest, :main, :{{major}}, :{{major}}.{{minor}}) are
+# deliberately omitted because the Docker Hub repo (gatewayfm/chain-indexer)
+# has tag immutability enabled, which rejects any push that would overwrite an
+# existing tag — and one rejected tag fails the whole buildx export, taking
+# the version tag down with it. Two settings enforce that and both are
+# load-bearing: `flavor: latest=false`, because metadata-action's default
+# latest=auto emits :latest for every semver tag, and the branch-only
+# condition on the sha tag, because a release promotes an RC by tagging the
+# same commit the RC already published :sha-<7> from.
+# Operators should pin to a specific semver.
 #
 # Why both registries: Open Privacy Suite and ops-explorer publish to Docker
 # Hub under the gatewayfm org; this repo was the odd one out at GHCR.
@@ -85,9 +91,12 @@ jobs:
           images: |
             ghcr.io/gateway-fm/chain-indexer
             gatewayfm/chain-indexer
+          # See the header: latest=false is load-bearing against Docker Hub tag
+          # immutability, not cosmetic.
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=sha,format=short,prefix=sha-
+            type=sha,format=short,prefix=sha-,enable=${{ github.ref_type == 'branch' }}
 
       - name: Build and push Indexer image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
