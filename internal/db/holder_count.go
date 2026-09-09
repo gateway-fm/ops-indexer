@@ -32,6 +32,8 @@ var (
 	tbcOldPosSQL string
 	//go:embed sql/tbc_upsert_delta.sql
 	tbcUpsertDeltaSQL string
+	//go:embed sql/balances_insert.sql
+	balancesInsertSQL string
 	//go:embed sql/holder_count_apply.sql
 	holderCountApplySQL string
 	//go:embed sql/holder_count_reseed.sql

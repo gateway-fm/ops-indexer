@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/big"
@@ -724,27 +723,21 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	}
 	defer tx.Rollback(ctx)
 
-	batch := &pgx.Batch{}
-	for _, b := range ordered {
-		batch.Queue(`
-			INSERT INTO balances (address, token_address, block_number, balance)
-			VALUES (LOWER($1), LOWER($2), $3, $4)
-			ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance`,
-			b.Address, b.TokenAddress, b.BlockNumber, b.Balance)
-	}
-
+	// One statement per phase instead of one per row (PRST-4669): the
+	// history rows go in one multi-row INSERT, the current rows in one multi-row
+	// upsert that returns each key's holder_count delta. ON CONFLICT DO UPDATE
+	// cannot touch the same row twice in a statement, so duplicates are
+	// collapsed client-side first, keeping the last arrival -- which is what
+	// the per-row form's last-write-wins produced. Row locks are taken in
+	// unnest order = this sort order, the same total order every writer uses.
+	//
 	// token_balances_current caches the row that a DISTINCT ON (address) ...
 	// ORDER BY block_number DESC over balances would have returned, so the guard
 	// in sql/tbc_upsert_delta.sql has to preserve exactly that: highest
-	// block_number wins, >= rather than > because the insert above is
+	// block_number wins, >= rather than > because the history insert is
 	// last-write-wins for an identical block_number, and the two must not
 	// disagree. See PRST-4508 for why block_number is the block that TRIGGERED
 	// the read rather than the block the balance was read at.
-	//
-	// One statement per distinct key rather than per row. The sort puts a key's
-	// rows in one ascending run, so its last element is the row the guard would
-	// have settled on anyway -- highest block, latest arrival on a tie -- and
-	// collapsing the run takes the key's lock once instead of once per row.
 	//
 	// tokens.holder_count moves here too, in this transaction (PRST-4669).
 	// Each key's upsert returns (new balance > 0) - (old balance > 0); the
@@ -756,31 +749,48 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	// -> tokens rows (sorted). A transaction waiting in one phase holds locks
 	// only from earlier phases, and within a phase everyone agrees on the
 	// order, so no cycle is possible.
+	histAddr := make([]string, 0, len(ordered))
+	histTok := make([]string, 0, len(ordered))
+	histBlk := make([]int64, 0, len(ordered))
+	histBal := make([]string, 0, len(ordered))
+	for i, b := range ordered {
+		if next := i + 1; next < len(ordered) &&
+			strings.EqualFold(ordered[next].TokenAddress, b.TokenAddress) &&
+			strings.EqualFold(ordered[next].Address, b.Address) &&
+			ordered[next].BlockNumber == b.BlockNumber {
+			continue // same (address, token, block) again: the later arrival wins
+		}
+		histAddr = append(histAddr, strings.ToLower(b.Address))
+		histTok = append(histTok, strings.ToLower(b.TokenAddress))
+		histBlk = append(histBlk, int64(b.BlockNumber))
+		histBal = append(histBal, string(b.Balance))
+	}
+
 	type currentKey struct {
 		token, address string
-		row            *types.Balance
 	}
-	keys := make([]currentKey, 0, len(ordered))
+	curTok := make([]string, 0, len(ordered))
+	curAddr := make([]string, 0, len(ordered))
+	curBal := make([]string, 0, len(ordered))
+	curBlk := make([]int64, 0, len(ordered))
 	for i, b := range ordered {
 		if next := i + 1; next < len(ordered) &&
 			strings.EqualFold(ordered[next].TokenAddress, b.TokenAddress) &&
 			strings.EqualFold(ordered[next].Address, b.Address) {
-			continue
+			continue // a key's run collapses to its last (highest block) row
 		}
-		keys = append(keys, currentKey{strings.ToLower(b.TokenAddress), strings.ToLower(b.Address), b})
-	}
-	keyTokens := make([]string, len(keys))
-	keyAddrs := make([]string, len(keys))
-	for i, k := range keys {
-		keyTokens[i], keyAddrs[i] = k.token, k.address
+		curTok = append(curTok, strings.ToLower(b.TokenAddress))
+		curAddr = append(curAddr, strings.ToLower(b.Address))
+		curBal = append(curBal, string(b.Balance))
+		curBlk = append(curBlk, int64(b.BlockNumber))
 	}
 
 	// Phase 0: advisory locks, then the pre-write state of every key.
-	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(keyTokens, keyAddrs)); err != nil {
+	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(curTok, curAddr)); err != nil {
 		return fmt.Errorf("lock balance keys: %w", err)
 	}
-	oldPos := make(map[currentKey]bool, len(keys))
-	rows, err := tx.Query(ctx, tbcOldPosSQL, keyTokens, keyAddrs)
+	oldPos := make(map[currentKey]bool, len(curTok))
+	rows, err := tx.Query(ctx, tbcOldPosSQL, curTok, curAddr)
 	if err != nil {
 		return fmt.Errorf("read current balances: %w", err)
 	}
@@ -797,37 +807,35 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	curOld := make([]int32, len(curTok))
+	for i := range curTok {
+		if oldPos[currentKey{token: curTok[i], address: curAddr[i]}] {
+			curOld[i] = 1
+		}
+	}
 
-	// Phases 1 and 2: the balances history rows, then the current rows.
-	for _, k := range keys {
-		old := 0
-		if oldPos[currentKey{token: k.token, address: k.address}] {
-			old = 1
-		}
-		batch.Queue(tbcUpsertDeltaSQL, k.row.TokenAddress, k.row.Address, k.row.Balance, k.row.BlockNumber, old)
+	// Phase 1: the history rows.
+	if _, err := tx.Exec(ctx, balancesInsertSQL, histAddr, histTok, histBlk, histBal); err != nil {
+		return fmt.Errorf("insert balances: %w", err)
 	}
-	br := tx.SendBatch(ctx, batch)
-	for range ordered {
-		if _, err := br.Exec(); err != nil {
-			_ = br.Close()
-			return err
-		}
-	}
+
+	// Phase 2: the current rows, returning (token, delta) for every key written.
 	holderDelta := make(map[string]int, 4)
-	for _, k := range keys {
+	drows, err := tx.Query(ctx, tbcUpsertDeltaSQL, curTok, curAddr, curBal, curBlk, curOld)
+	if err != nil {
+		return fmt.Errorf("upsert current balances: %w", err)
+	}
+	for drows.Next() {
+		var token string
 		var delta int
-		err := br.QueryRow().Scan(&delta)
-		switch {
-		case err == nil:
-			holderDelta[k.token] += delta
-		case errors.Is(err, pgx.ErrNoRows):
-			// Block guard rejected the write: the row did not change.
-		default:
-			_ = br.Close()
+		if err := drows.Scan(&token, &delta); err != nil {
+			drows.Close()
 			return err
 		}
+		holderDelta[token] += delta
 	}
-	if err := br.Close(); err != nil {
+	drows.Close()
+	if err := drows.Err(); err != nil {
 		return err
 	}
 
