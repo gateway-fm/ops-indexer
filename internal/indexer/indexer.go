@@ -18,6 +18,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 // maxReorgDepth is the maximum number of blocks we expect a legitimate reorg
@@ -651,26 +652,7 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 				}
 			}
 
-			for blockNum := lastIndexed + 1; blockNum <= latestOnChain; blockNum++ {
-				select {
-				case req := <-i.indexRequests:
-					err := i.processBlock(ctx, req.blockNumber)
-					req.done <- err
-				default:
-				}
-
-				if err := i.processBlock(ctx, blockNum); err != nil {
-					log.Error("failed to process block", "block", blockNum, "error", err)
-					if !receipts.skip(ctx, i.db, blockNum, err) {
-						break
-					}
-				}
-				lastIndexed = blockNum
-
-				if blockNum%10 == 0 {
-					i.db.UpdateSyncStatus(ctx, lastIndexed, true)
-				}
-			}
+			lastIndexed = i.indexPrefetched(ctx, lastIndexed, latestOnChain, &receipts)
 		}
 	}
 }
@@ -759,7 +741,10 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 	if len(rawBlock.Transactions) > 0 {
 		return i.processBlockParallelRaw(ctx, rawBlock)
 	}
+	return i.insertEmptyBlock(ctx, rawBlock)
+}
 
+func (i *Indexer) insertEmptyBlock(ctx context.Context, rawBlock *rpc.RawBlock) error {
 	b := &types.Block{
 		Number:           rawBlock.NumberU64(),
 		Hash:             rawBlock.Hash.Hex(),
@@ -789,27 +774,36 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 	return nil
 }
 
-func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.RawBlock) error {
-	start := time.Now()
-	defer metrics.StageTimer(metrics.StageBlockTotal)()
-	blockNumber := rawBlock.NumberU64()
-	rawTxs := rawBlock.Transactions
-	blockTimestamp := uint64(rawBlock.Timestamp)
-
-	// Build receipt fetch list, skipping tx types that are known to fail
-	// (e.g. type 126 OP deposit system transactions on op-reth devnets)
-	txHashes := make([]common.Hash, 0, len(rawTxs))
-	for _, tx := range rawTxs {
+// receiptTxHashes lists the transactions whose receipts are fetched, skipping tx types that are
+// known to fail (e.g. type 126 OP deposit system transactions on op-reth devnets).
+func (i *Indexer) receiptTxHashes(rawBlock *rpc.RawBlock) []common.Hash {
+	txHashes := make([]common.Hash, 0, len(rawBlock.Transactions))
+	for _, tx := range rawBlock.Transactions {
 		if i.config.SkipReceiptTxTypes != nil && i.config.SkipReceiptTxTypes[int(tx.Type)] {
 			continue
 		}
 		txHashes = append(txHashes, tx.Hash)
 	}
+	return txHashes
+}
 
-	receipts, err := i.rpc.FetchReceiptsBatch(ctx, txHashes, i.config.RPCWorkers, i.config.RPCRateLimit, blockNumber)
+func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.RawBlock) error {
+	receipts, err := i.rpc.FetchReceiptsBatch(ctx, i.receiptTxHashes(rawBlock), i.config.RPCWorkers, i.config.RPCRateLimit, rawBlock.NumberU64())
 	if err != nil {
 		return fmt.Errorf("%w: %w", errReceiptsUnavailable, err)
 	}
+	return i.processBlockWithReceipts(ctx, rawBlock, receipts)
+}
+
+// processBlockWithReceipts is everything after the two chain reads: it builds the block's rows and
+// commits them. The standard loop prefetches the reads (prefetch.go) and calls this in block order.
+func (i *Indexer) processBlockWithReceipts(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) error {
+	start := time.Now()
+	defer metrics.StageTimer(metrics.StageBlockTotal)()
+	blockNumber := rawBlock.NumberU64()
+	rawTxs := rawBlock.Transactions
+	blockTimestamp := uint64(rawBlock.Timestamp)
+	txHashes := i.receiptTxHashes(rawBlock)
 
 	blockData := &db.BlockData{
 		Block: &types.Block{
