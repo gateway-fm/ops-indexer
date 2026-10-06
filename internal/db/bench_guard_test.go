@@ -99,38 +99,50 @@ func TestBenchmarkHarnessMeasuresRealWork(t *testing.T) {
 		}
 	})
 
-	t.Run("RefreshTokenStats has history to walk and writes a result", func(t *testing.T) {
+	t.Run("RefreshTokenStats has history to walk and leaves ERC20 counters to the incremental path", func(t *testing.T) {
 		token := benchSeedTokenHistory(t, d)
+
+		holders, err := d.countTokenHolders(ctx, token)
+		if err != nil {
+			t.Fatalf("count seeded holders: %v", err)
+		}
+		if holders == 0 {
+			t.Fatal("seeded token has no holders in token_balances_current; the refresh would have no history to walk")
+		}
+
+		type tokenCounters struct {
+			holderCount, transferCount int64
+			totalSupply                string
+		}
+		readCounters := func() tokenCounters {
+			var c tokenCounters
+			if err := d.pool.QueryRow(ctx, `
+				SELECT COALESCE(holder_count, 0), COALESCE(transfer_count, 0), COALESCE(total_supply, 0)::text
+				FROM tokens WHERE address = $1`, token).Scan(&c.holderCount, &c.transferCount, &c.totalSupply); err != nil {
+				t.Fatalf("read token counters: %v", err)
+			}
+			return c
+		}
+
+		before := readCounters()
+		if before.transferCount == 0 {
+			t.Errorf("seeded token has transfer_count=0; the bench seeder's COPY into token_transfers " +
+				"bypasses the delta path, so it must reseed the counter itself")
+		}
+
 		if err := d.RefreshTokenStats(ctx, token); err != nil {
 			t.Fatalf("RefreshTokenStats: %v", err)
 		}
-		var holderCount int64
-		if err := d.pool.QueryRow(ctx,
-			`SELECT COALESCE(holder_count, 0) FROM tokens WHERE address = $1`,
-			token).Scan(&holderCount); err != nil {
-			t.Fatalf("read refreshed token: %v", err)
-		}
-		// holder_count is all RefreshTokenStats writes now, so it is the only
-		// signal that the call did anything. RefreshTokenStats returns nil
-		// early when the token row is absent, so zero is what a skipped
-		// refresh looks like.
-		if holderCount == 0 {
-			t.Errorf("refreshed token has holder_count=%d; expected the seeded holders", holderCount)
+		if after := readCounters(); after != before {
+			t.Errorf("RefreshTokenStats changed ERC20 counters %+v -> %+v; holder_count, "+
+				"transfer_count and total_supply are maintained by the insert path, not by the refresh", before, after)
 		}
 
-		// transfer_count no longer comes from the refresh, so the seeder owns
-		// it. A zero here means the seeder's counter reseed stopped matching
-		// the rows it COPYs, which would make the benchmarks time a token the
-		// derived counters disagree with.
-		var transferCount int64
-		if err := d.pool.QueryRow(ctx,
-			`SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = $1`,
-			token).Scan(&transferCount); err != nil {
-			t.Fatalf("read seeded transfer_count: %v", err)
+		if err := d.ReseedHolderCounts(ctx); err != nil {
+			t.Fatalf("ReseedHolderCounts: %v", err)
 		}
-		if transferCount == 0 {
-			t.Errorf("seeded token has transfer_count=0; the bench seeder's COPY into token_transfers " +
-				"bypasses the delta path, so it must reseed the counter itself")
+		if got := readCounters().holderCount; got != holders {
+			t.Errorf("holder_count after re-seed = %d; want %d, the positive balances in token_balances_current", got, holders)
 		}
 	})
 
