@@ -55,6 +55,9 @@ type Config struct {
 	// DailyStatsLegacy recomputes the current day from base tables on each run instead of advancing the
 	// incremental aggregate (migration 012).
 	DailyStatsLegacy bool
+	// CommitPipelineDepth is how many blocks the standard loop writes at once (the pipelined
+	// commit). 1 is the sequential committer. See indexPipelined.
+	CommitPipelineDepth int
 
 	EnableOPDeposits bool
 }
@@ -656,7 +659,11 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 				}
 			}
 
-			lastIndexed = i.indexPrefetched(ctx, lastIndexed, latestOnChain, &receipts)
+			if i.config.CommitPipelineDepth > 1 {
+				lastIndexed = i.indexPipelined(ctx, lastIndexed, latestOnChain, i.config.CommitPipelineDepth, &receipts)
+			} else {
+				lastIndexed = i.indexPrefetched(ctx, lastIndexed, latestOnChain, &receipts)
+			}
 		}
 	}
 }
@@ -802,8 +809,30 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 // processBlockWithReceipts is everything after the two chain reads: it builds the block's rows and
 // commits them. The standard loop prefetches the reads (prefetch.go) and calls this in block order.
 func (i *Indexer) processBlockWithReceipts(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) error {
-	start := time.Now()
 	defer metrics.StageTimer(metrics.StageBlockTotal)()
+	b := i.buildBlock(ctx, rawBlock, receipts)
+	commitStart := time.Now()
+	if err := i.db.InsertBlockDataBatch(ctx, b.data); err != nil {
+		return err
+	}
+	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
+	i.afterCommit(ctx, b)
+	return nil
+}
+
+// builtBlock is a block turned into rows, with what has to happen once those rows are committed.
+type builtBlock struct {
+	raw            *rpc.RawBlock
+	data           *db.BlockData
+	balanceWork    []BalanceWork
+	discovered     []string
+	start          time.Time
+	blockNumber    uint64
+	blockTimestamp uint64
+}
+
+func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) *builtBlock {
+	start := time.Now()
 	blockNumber := rawBlock.NumberU64()
 	rawTxs := rawBlock.Transactions
 	blockTimestamp := uint64(rawBlock.Timestamp)
@@ -1155,11 +1184,13 @@ func (i *Indexer) processBlockWithReceipts(ctx context.Context, rawBlock *rpc.Ra
 		}
 	}
 
-	commitStart := time.Now()
-	if err := i.db.InsertBlockDataBatch(ctx, blockData); err != nil {
-		return err
-	}
-	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
+	return &builtBlock{raw: rawBlock, data: blockData, balanceWork: balanceWork, discovered: discovered,
+		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp}
+}
+
+func (i *Indexer) afterCommit(ctx context.Context, b *builtBlock) {
+	rawBlock, blockData, balanceWork, discovered := b.raw, b.data, b.balanceWork, b.discovered
+	start, blockNumber, blockTimestamp, rawTxs := b.start, b.blockNumber, b.blockTimestamp, b.raw.Transactions
 
 	// Marked known only now, after the row is committed. Adding before the
 	// batch made the cache claim a token whose row was still uncommitted (or
@@ -1240,8 +1271,6 @@ func (i *Indexer) processBlockWithReceipts(ctx context.Context, rawBlock *rpc.Ra
 	// maintains is a dashboard aggregate: a day's row may lag its blocks by up to
 	// one interval plus one run. Same queries, fewer runs.
 	i.scheduleDailyStats(ctx, blockNumber, blockDay(blockTimestamp))
-
-	return nil
 }
 
 func blockDay(timestamp uint64) time.Time {

@@ -111,3 +111,30 @@ func TestIndexPrefetchedSkipsABlockWhoseReceiptsNeverCome(t *testing.T) {
 	}
 	mockDB.AssertExpectations(t)
 }
+
+// The pipelined loop moves past such a block too, after committing the blocks before it.
+func TestIndexPipelinedSkipsABlockWhoseReceiptsNeverCome(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	blocks := chainOfEmptyBlocks(1, 6)
+	blocks[3].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{3})}}
+	for n, b := range blocks {
+		mockRPC.On("RawBlockByNumber", mock.Anything, n).Return(b, nil).Maybe()
+	}
+	mockRPC.On("FetchReceiptsBatch", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(map[common.Hash]*rpclient.Receipt(nil), errors.New("receipts not found"))
+	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil)
+	mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockDB.On("RequeueMissingBlock", mock.Anything, uint64(3)).Return(nil).Once()
+	idx := newPrefetchIndexer(mockDB, mockRPC)
+
+	var skip receiptSkip
+	for attempt := 1; attempt < maxReceiptAttempts; attempt++ {
+		if last := idx.indexPipelined(context.Background(), 2, 6, 4, &skip); last != 2 {
+			t.Fatalf("attempt %d: last indexed %d, want 2", attempt, last)
+		}
+	}
+	if last := idx.indexPipelined(context.Background(), 2, 6, 4, &skip); last != 6 {
+		t.Fatalf("after %d attempts: last indexed %d, want 6", maxReceiptAttempts, last)
+	}
+	mockDB.AssertExpectations(t)
+}

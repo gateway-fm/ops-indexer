@@ -21,6 +21,7 @@ type Database interface {
 	DeleteBlock(ctx context.Context, number uint64) error
 	InsertBlock(ctx context.Context, b *types.Block) error
 	InsertBlockDataBatch(ctx context.Context, b *db.BlockData) error
+	BeginBlockData(ctx context.Context, b *db.BlockData) (*db.BlockWrite, error)
 	UpdateSyncStatus(ctx context.Context, lastIndexed uint64, isSyncing bool) error
 	HasBlock(ctx context.Context, number uint64) (bool, error)
 	DeleteMissingRangeByBlock(ctx context.Context, blockNum uint64) error

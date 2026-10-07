@@ -96,6 +96,8 @@ var (
 const (
 	StageBlockTotal        = "block_total"
 	StageDBCommit          = "db_commit"
+	StageDBBegin           = "db_begin"
+	StageDBFinish          = "db_finish"
 	StageBalanceQueueWait  = "balance_queue_wait"
 	StageRefreshTokenStats = "refresh_token_stats"
 

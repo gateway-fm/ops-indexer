@@ -124,21 +124,49 @@ type AddressStatsDelta struct {
 	BlockNumber          uint64
 }
 
+// BlockWrite is one block's ingest transaction, split so that the rows a block owns can be written
+// while an earlier block's transaction is still open (the pipelined commit).
+//
+// BeginBlockData writes the rows that belong to this block alone -- blocks, transactions, contracts,
+// logs, token_transfers, internal_transactions -- and takes no row lock another block's write can
+// want: every key is this block's own. Finish writes the rows blocks share -- tokens, nft_tokens,
+// address_stats, chain_counters -- and commits. Several BeginBlockData may run at once; Finish must
+// run in block order, each after the previous block's Finish returned. That keeps the committed
+// blocks a prefix of the chain, and it is what rules out a deadlock Postgres cannot see: a later
+// block never holds a shared row while it waits for an earlier block to commit.
+type BlockWrite struct {
+	tx                                    pgx.Tx
+	data                                  *BlockData
+	deltaBlocks, deltaTxs, deltaTransfers int64
+	tokenDeltas                           map[string]*tokenStatsDelta
+}
+
 func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
-	tx, err := d.pool.Begin(ctx)
+	w, err := d.BeginBlockData(ctx, data)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	return w.Finish(ctx)
+}
 
-	var deltaBlocks, deltaTxs, deltaTokens, deltaAddresses, deltaTransfers int64
+// Rollback abandons a write that will not be finished.
+func (w *BlockWrite) Rollback(ctx context.Context) {
+	_ = w.tx.Rollback(ctx)
+}
 
-	// Per-token counters, maintained here rather than recomputed per block.
-	// tokenDeltas accumulates this batch's movement; seedTokens lists rows
-	// that this batch created and therefore have to be reconciled against
-	// whatever history already exists.
+func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite, err error) {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var deltaBlocks, deltaTxs, deltaTransfers int64
 	tokenDeltas := map[string]*tokenStatsDelta{}
-	var seedTokens []string
 
 	if data.Block != nil {
 		ct, err := tx.Exec(ctx, `
@@ -151,7 +179,7 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			data.Block.Size, data.Block.Difficulty, data.Block.TotalDifficulty, data.Block.Nonce,
 			data.Block.Miner, data.Block.ExtraData, data.Block.StateRoot, data.Block.TransactionsRoot, data.Block.ReceiptsRoot)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		deltaBlocks += ct.RowsAffected()
 	}
@@ -182,12 +210,12 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 			ct, err := br.Exec()
 			if err != nil {
 				_ = br.Close()
-				return err
+				return nil, err
 			}
 			deltaTxs += ct.RowsAffected()
 		}
 		if err := br.Close(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -204,9 +232,111 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		}
 		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {
-			return err
+			return nil, err
 		}
 	}
+
+	if len(data.Logs) > 0 {
+		batch := &pgx.Batch{}
+		for _, l := range data.Logs {
+			batch.Queue(`
+				INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
+				VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(data.Transfers) > 0 {
+		batch := &pgx.Batch{}
+		for _, t := range data.Transfers {
+			batch.Queue(`
+				INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
+					block_number, timestamp, transfer_type, token_type, token_id, is_internal)
+				VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
+				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
+				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
+		}
+		br := tx.SendBatch(ctx, batch)
+		// Results come back in queue order, so the i-th result belongs to the
+		// i-th transfer -- which is what lets a row be attributed to its token.
+		for _, t := range data.Transfers {
+			ct, err := br.Exec()
+			if err != nil {
+				_ = br.Close()
+				return nil, err
+			}
+			// ON CONFLICT DO NOTHING ⇒ only genuinely new rows count toward the total.
+			if ct.RowsAffected() == 0 {
+				continue
+			}
+			deltaTransfers += ct.RowsAffected()
+
+			token := strings.ToLower(t.TokenAddress)
+			d := tokenDeltas[token]
+			if d == nil {
+				d = &tokenStatsDelta{supplyDelta: new(big.Int)}
+				tokenDeltas[token] = d
+			}
+			d.transferDelta++
+
+			// Mirror the supply definition exactly: ERC20 rows only, mints add
+			// and burns subtract, and a 0x0 -> 0x0 row does both and so nets
+			// to zero rather than being treated as one or the other.
+			if t.TokenType != types.TokenTypeERC20 {
+				continue
+			}
+			v, ok := new(big.Int).SetString(string(t.Value), 10)
+			if !ok {
+				// NUMERIC(78,0) NOT NULL upstream; an unparseable value would
+				// silently skew supply, so refuse the batch instead.
+				_ = br.Close()
+				return nil, fmt.Errorf("transfer %s/%d: invalid value %q", t.TxHash, t.LogIndex, string(t.Value))
+			}
+			if strings.ToLower(t.From) == zeroAddress {
+				d.supplyDelta.Add(d.supplyDelta, v)
+			}
+			if strings.ToLower(t.To) == zeroAddress {
+				d.supplyDelta.Sub(d.supplyDelta, v)
+			}
+		}
+		if err := br.Close(); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(data.InternalTransactions) > 0 {
+		batch := &pgx.Batch{}
+		for _, it := range data.InternalTransactions {
+			batch.Queue(`
+				INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
+					gas, gas_used, input, output, call_type, error, timestamp)
+				VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
+				ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
+				it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
+				it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return nil, err
+		}
+	}
+
+	return &BlockWrite{tx: tx, data: data, deltaBlocks: deltaBlocks, deltaTxs: deltaTxs,
+		deltaTransfers: deltaTransfers, tokenDeltas: tokenDeltas}, nil
+}
+
+func (w *BlockWrite) Finish(ctx context.Context) error {
+	tx, data, tokenDeltas := w.tx, w.data, w.tokenDeltas
+	defer tx.Rollback(ctx)
+	deltaBlocks, deltaTxs, deltaTransfers := w.deltaBlocks, w.deltaTxs, w.deltaTransfers
+	var deltaTokens, deltaAddresses int64
+	var seedTokens []string
 
 	// Every tokens row this transaction will lock, taken in one ascending pass
 	// before any of them is touched individually.
@@ -375,78 +505,11 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 		}
 	}
 
-	if len(data.Logs) > 0 {
-		batch := &pgx.Batch{}
-		for _, l := range data.Logs {
-			batch.Queue(`
-				INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
-				VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
-				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
-				l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
-		}
-		br := tx.SendBatch(ctx, batch)
-		if err := br.Close(); err != nil {
-			return err
-		}
-	}
-
-	if len(data.Transfers) > 0 {
-		batch := &pgx.Batch{}
-		for _, t := range data.Transfers {
-			batch.Queue(`
-				INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
-					block_number, timestamp, transfer_type, token_type, token_id, is_internal)
-				VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
-				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
-				t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
-				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
-		}
-		br := tx.SendBatch(ctx, batch)
-		// Results come back in queue order, so the i-th result belongs to the
-		// i-th transfer -- which is what lets a row be attributed to its token.
-		for _, t := range data.Transfers {
-			ct, err := br.Exec()
-			if err != nil {
-				_ = br.Close()
-				return err
-			}
-			// ON CONFLICT DO NOTHING ⇒ only genuinely new rows count toward the total.
-			if ct.RowsAffected() == 0 {
-				continue
-			}
-			deltaTransfers += ct.RowsAffected()
-
-			token := strings.ToLower(t.TokenAddress)
-			d := tokenDeltas[token]
-			if d == nil {
-				d = &tokenStatsDelta{supplyDelta: new(big.Int)}
-				tokenDeltas[token] = d
-			}
-			d.transferDelta++
-
-			// Mirror the supply definition exactly: ERC20 rows only, mints add
-			// and burns subtract, and a 0x0 -> 0x0 row does both and so nets
-			// to zero rather than being treated as one or the other.
-			if t.TokenType != types.TokenTypeERC20 {
-				continue
-			}
-			v, ok := new(big.Int).SetString(string(t.Value), 10)
-			if !ok {
-				// NUMERIC(78,0) NOT NULL upstream; an unparseable value would
-				// silently skew supply, so refuse the batch instead.
-				_ = br.Close()
-				return fmt.Errorf("transfer %s/%d: invalid value %q", t.TxHash, t.LogIndex, string(t.Value))
-			}
-			if strings.ToLower(t.From) == zeroAddress {
-				d.supplyDelta.Add(d.supplyDelta, v)
-			}
-			if strings.ToLower(t.To) == zeroAddress {
-				d.supplyDelta.Sub(d.supplyDelta, v)
-			}
-		}
-		if err := br.Close(); err != nil {
-			return err
-		}
+	// The seed above aggregated token_transfers after this block's own rows were inserted, so for a
+	// token it seeded those rows are already counted; adding the block's delta on top would count
+	// them twice.
+	for _, addr := range seedTokens {
+		delete(tokenDeltas, addr)
 	}
 
 	// Apply the per-token counters. Same transaction as the transfer rows they
@@ -501,23 +564,6 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 					"token", token, "transfers", tokenDeltas[token].transferDelta)
 			}
 		}
-		if err := br.Close(); err != nil {
-			return err
-		}
-	}
-
-	if len(data.InternalTransactions) > 0 {
-		batch := &pgx.Batch{}
-		for _, it := range data.InternalTransactions {
-			batch.Queue(`
-				INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
-					gas, gas_used, input, output, call_type, error, timestamp)
-				VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
-				ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
-				it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
-				it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
-		}
-		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {
 			return err
 		}

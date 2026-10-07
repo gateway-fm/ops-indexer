@@ -26,7 +26,7 @@ func newMockSubscription() *mockSubscription {
 	return &mockSubscription{errCh: make(chan error, 1)}
 }
 
-func (s *mockSubscription) Unsubscribe() {}
+func (s *mockSubscription) Unsubscribe()      {}
 func (s *mockSubscription) Err() <-chan error { return s.errCh }
 
 func newTestCatchupIndexer(mockDB *MockDatabase, mockRPC *MockRPCClient) *CatchupIndexer {

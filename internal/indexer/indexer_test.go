@@ -70,6 +70,12 @@ func (m *MockDatabase) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	return uint64(args.Int(0)), args.Error(1)
 }
 
+func (m *MockDatabase) BeginBlockData(ctx context.Context, b *db.BlockData) (*db.BlockWrite, error) {
+	args := m.Called(ctx, b)
+	w, _ := args.Get(0).(*db.BlockWrite)
+	return w, args.Error(1)
+}
+
 func (m *MockDatabase) UpdateSyncStatus(ctx context.Context, lastIndexed uint64, isSyncing bool) error {
 	args := m.Called(ctx, lastIndexed, isSyncing)
 	return args.Error(0)
@@ -405,13 +411,13 @@ func TestIndexer_ProcessBlock(t *testing.T) {
 		blockNumber := hexutil.Big(*big.NewInt(int64(blockNum)))
 
 		rawBlock := &rpc.RawBlock{
-			Number:     &blockNumber,
-			Hash:       common.HexToHash("0xaaa"),
-			ParentHash: common.HexToHash("0x123"),
-			Timestamp:  hexutil.Uint64(time.Now().Unix()),
-			GasUsed:    hexutil.Uint64(0),
-			GasLimit:   hexutil.Uint64(8000000),
-			Miner:      common.HexToAddress("0x0"),
+			Number:       &blockNumber,
+			Hash:         common.HexToHash("0xaaa"),
+			ParentHash:   common.HexToHash("0x123"),
+			Timestamp:    hexutil.Uint64(time.Now().Unix()),
+			GasUsed:      hexutil.Uint64(0),
+			GasLimit:     hexutil.Uint64(8000000),
+			Miner:        common.HexToAddress("0x0"),
 			Transactions: []rpc.RawTransaction{},
 		}
 

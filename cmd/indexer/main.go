@@ -103,6 +103,7 @@ func main() {
 		SkipReceiptTxTypes:    skipReceipts,
 		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
 		DailyStatsLegacy:      cfg.DailyStatsLegacy,
+		CommitPipelineDepth:   cfg.CommitPipelineDepth,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
