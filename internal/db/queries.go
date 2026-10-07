@@ -143,11 +143,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		return err
 	}
 
-	// Aggregate exactly the set the cascade will remove: the transfers whose
-	// parent transaction belongs to this block. Filtering on
-	// token_transfers.block_number instead would be a second source of truth
-	// for the same fact, and a row disagreeing with its parent would decrement
-	// the wrong token.
+	// Aggregate exactly the set this function removes below: the block's
+	// transfers by block_number (migration 012 dropped the tx_hash foreign key
+	// whose cascade used to remove them).
 	rows, err := tx.Query(ctx, `
 		SELECT token_address, COUNT(*),
 		       COALESCE(
@@ -155,7 +153,7 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '`+zeroAddress+`' THEN value ELSE 0 END),
 		           0)::TEXT
 		FROM token_transfers
-		WHERE tx_hash IN (SELECT hash FROM transactions WHERE block_number = $1)
+		WHERE block_number = $1
 		GROUP BY token_address
 		ORDER BY token_address`, number)
 	if err != nil {
@@ -253,6 +251,12 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		}
 	}
 
+	if _, err := tx.Exec(ctx, "DELETE FROM token_transfers WHERE block_number = $1", number); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM logs WHERE block_number = $1", number); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number); err != nil {
 		return err
 	}
@@ -814,7 +818,7 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, t *types.TokenTransfer) er
 		INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 			block_number, timestamp, transfer_type, token_type, token_id, is_internal)
 		VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+		ON CONFLICT (block_number, log_index) DO NOTHING`,
 		t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 		t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 	if err != nil {
@@ -907,7 +911,7 @@ func (d *DB) GetTransfersByTransaction(ctx context.Context, txHash string) ([]ty
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
 			timestamp, transfer_type, token_type, token_id, is_internal
-		FROM token_transfers WHERE tx_hash = $1
+		FROM token_transfers WHERE block_number = (SELECT block_number FROM transactions WHERE hash = $1) AND tx_hash = $1
 		ORDER BY log_index`, txHash)
 	if err != nil {
 		return nil, err
@@ -1410,7 +1414,7 @@ func (d *DB) InsertLog(ctx context.Context, l *types.Log) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
 		VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+		ON CONFLICT (block_number, log_index) DO NOTHING`,
 		l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
 	return err
 }
@@ -1418,7 +1422,7 @@ func (d *DB) InsertLog(ctx context.Context, l *types.Log) error {
 func (d *DB) GetLogsByTransaction(ctx context.Context, txHash string) ([]types.Log, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed
-		FROM logs WHERE tx_hash = $1
+		FROM logs WHERE block_number = (SELECT block_number FROM transactions WHERE hash = $1) AND tx_hash = $1
 		ORDER BY log_index`, txHash)
 	if err != nil {
 		return nil, err

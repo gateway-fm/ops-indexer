@@ -242,7 +242,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			batch.Queue(`
 				INSERT INTO logs (tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed)
 				VALUES ($1, $2, LOWER($3), $4, $5, $6, $7, $8, $9, $10, $11)
-				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				ON CONFLICT (block_number, log_index) DO NOTHING`,
 				l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
 		}
 		br := tx.SendBatch(ctx, batch)
@@ -258,7 +258,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
 					block_number, timestamp, transfer_type, token_type, token_id, is_internal)
 				VALUES ($1, $2, LOWER($3), LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12)
-				ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+				ON CONFLICT (block_number, log_index) DO NOTHING`,
 				t.TxHash, t.LogIndex, t.TokenAddress, t.From, t.To, t.Value,
 				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 		}
