@@ -52,6 +52,10 @@ type Config struct {
 	// 100th block). See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
 
+	// DailyStatsLegacy recomputes the current day from base tables on each run instead of advancing the
+	// incremental aggregate (migration 011).
+	DailyStatsLegacy bool
+
 	EnableOPDeposits bool
 }
 
@@ -1292,6 +1296,13 @@ func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta
 }
 
 func (i *Indexer) updateDailyStatsForDate(ctx context.Context, date time.Time) bool {
+	if !i.config.DailyStatsLegacy {
+		if _, err := i.db.AdvanceDailyStats(ctx); err != nil {
+			log.Warn("failed to advance daily stats; will retry", "error", err)
+			return false
+		}
+		return true
+	}
 	stats, err := i.db.ComputeDailyStats(ctx, date)
 	if err != nil {
 		log.Warn("failed to compute daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)

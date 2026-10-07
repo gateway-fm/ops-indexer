@@ -51,6 +51,7 @@ type Database interface {
 	RefreshTokenStats(ctx context.Context, tokenAddress string) error
 
 	ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error)
+	AdvanceDailyStats(ctx context.Context) (uint64, error)
 	UpsertDailyStats(ctx context.Context, stats *types.DailyStats) error
 	BackfillDailyStats(ctx context.Context) error
 

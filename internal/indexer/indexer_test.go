@@ -65,6 +65,11 @@ func (m *MockDatabase) InsertBlockDataBatch(ctx context.Context, b *db.BlockData
 	return args.Error(0)
 }
 
+func (m *MockDatabase) AdvanceDailyStats(ctx context.Context) (uint64, error) {
+	args := m.Called(ctx)
+	return uint64(args.Int(0)), args.Error(1)
+}
+
 func (m *MockDatabase) UpdateSyncStatus(ctx context.Context, lastIndexed uint64, isSyncing bool) error {
 	args := m.Called(ctx, lastIndexed, isSyncing)
 	return args.Error(0)

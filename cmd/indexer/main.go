@@ -102,6 +102,7 @@ func main() {
 		CatchupQueueSize:      cfg.CatchupQueueSize,
 		SkipReceiptTxTypes:    skipReceipts,
 		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
+		DailyStatsLegacy:      cfg.DailyStatsLegacy,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

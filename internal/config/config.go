@@ -19,7 +19,8 @@ type Config struct {
 	// Minimum interval between recomputations of the current day's daily_stats
 	// row (PRST-4669). 0 = every 100 blocks (legacy).
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
-	StartBlock      uint64        `mapstructure:"start_block"`
+	DailyStatsLegacy      bool          `mapstructure:"daily_stats_legacy"`
+	StartBlock            uint64        `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -152,6 +153,7 @@ func Load() (*Config, error) {
 	cfg.APIPort = v.GetInt("api_port")
 	cfg.PollInterval = v.GetDuration("poll_interval")
 	cfg.DailyStatsMinInterval = v.GetDuration("daily_stats_min_interval")
+	cfg.DailyStatsLegacy = v.GetBool("daily_stats_legacy")
 	cfg.StartBlock = v.GetUint64("start_block")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")

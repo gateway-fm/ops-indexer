@@ -138,6 +138,11 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	}
 	defer tx.Rollback(ctx)
 
+	// The block's day is re-aggregated from its first block on the next advance (migration 011).
+	if _, err := tx.Exec(ctx, `SELECT daily_stats_invalidate($1)`, number); err != nil {
+		return err
+	}
+
 	// Aggregate exactly the set the cascade will remove: the transfers whose
 	// parent transaction belongs to this block. Filtering on
 	// token_transfers.block_number instead would be a second source of truth
@@ -1905,6 +1910,19 @@ func (d *DB) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) erro
 		stats.AvgBlockSize, stats.NewContracts, stats.TokenTransferCount, stats.CumulativeTransactions,
 		stats.CumulativeAddresses, stats.CumulativeContracts)
 	return err
+}
+
+// AdvanceDailyStats folds the blocks indexed since the last call into daily_stats (migration 011) and
+// returns the block it aggregated through.
+func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
+	var upto *int64
+	if err := d.pool.QueryRow(ctx, `SELECT daily_stats_advance()`).Scan(&upto); err != nil {
+		return 0, err
+	}
+	if upto == nil {
+		return 0, nil
+	}
+	return uint64(*upto), nil
 }
 
 func (d *DB) GetDailyStats(ctx context.Context, from, to time.Time) ([]types.DailyStats, error) {
