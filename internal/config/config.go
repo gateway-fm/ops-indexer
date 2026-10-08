@@ -22,6 +22,8 @@ type Config struct {
 	DailyStatsLegacy      bool          `mapstructure:"daily_stats_legacy"`
 	CommitPipelineDepth   int           `mapstructure:"commit_pipeline"`
 	BalanceDedupWindow    time.Duration `mapstructure:"balance_dedup_window"`
+	BalanceReaderBatch    int           `mapstructure:"balance_reader_batch"`
+	BalanceSkipL1         bool          `mapstructure:"balance_skip_l1"`
 	StartBlock            uint64        `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
@@ -89,6 +91,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("daily_stats_min_interval", "60s")
 	v.SetDefault("commit_pipeline", 1)
 	v.SetDefault("balance_dedup_window", "0s")
+	v.SetDefault("balance_reader_batch", 0)
+	v.SetDefault("balance_skip_l1", false)
 	v.SetDefault("start_block", 0)
 
 	v.SetDefault("rpc_workers", 50)
@@ -160,6 +164,8 @@ func Load() (*Config, error) {
 	cfg.DailyStatsLegacy = v.GetBool("daily_stats_legacy")
 	cfg.CommitPipelineDepth = v.GetInt("commit_pipeline")
 	cfg.BalanceDedupWindow = v.GetDuration("balance_dedup_window")
+	cfg.BalanceReaderBatch = v.GetInt("balance_reader_batch")
+	cfg.BalanceSkipL1 = v.GetBool("balance_skip_l1")
 	cfg.StartBlock = v.GetUint64("start_block")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")

@@ -62,6 +62,11 @@ type Config struct {
 	// BalanceDedupWindow holds balance work per (address, token) for this long before one fetch.
 	BalanceDedupWindow time.Duration
 
+	// BalanceReaderBatch > 1 reads up to that many balances per eth_call through BalanceReader;
+	// BalanceSkipL1 sends skipL1Charging with those calls.
+	BalanceReaderBatch int
+	BalanceSkipL1      bool
+
 	EnableOPDeposits bool
 }
 
@@ -251,6 +256,7 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
 		idx.balanceWorkers = NewBalanceWorkerPool(database, rpcClient, cfg.BalanceWorkers, cfg.RPCRateLimit)
 		idx.balanceWorkers.SetDedupWindow(cfg.BalanceDedupWindow)
+		idx.balanceWorkers.SetReaderBatch(cfg.BalanceReaderBatch, cfg.BalanceSkipL1)
 		// No post-flush stats refresh any more: holder_count is maintained by
 		// InsertBalancesBatch itself, in the transaction that writes the
 		// balances (PRST-4669). The callback used to trigger a COUNT(*) per

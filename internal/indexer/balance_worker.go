@@ -42,6 +42,12 @@ type BalanceWorkerPool struct {
 	fetchChan   chan BalanceWork
 	held        atomic.Int64
 
+	// readerBatch > 1 makes a worker drain up to that many items and read them with one BalanceReader eth_call
+	// per token, when the RPC client supports it.
+	readerBatch    int
+	readerSkipL1   bool
+	balancesReader balancesReader
+
 	// onFlush is invoked (if set) after each successful batch write with the
 	// distinct token addresses present in that batch. Used by the indexer to
 	// refresh derived stats (holder count) when balances actually land.
@@ -66,13 +72,27 @@ func NewBalanceWorkerPool(database Database, rpcClient RPCClient, numWorkers, ra
 	}
 }
 
+// balancesReader is implemented by the RPC client that can read many balances of one token in one eth_call.
+type balancesReader interface {
+	BalancesOf(ctx context.Context, token common.Address, holders []common.Address, skipL1Charging bool) ([]*big.Int, []bool, error)
+}
+
+// SetReaderBatch enables batched balance reads. Must be called before Start.
+func (p *BalanceWorkerPool) SetReaderBatch(n int, skipL1Charging bool) {
+	r, ok := p.rpc.(balancesReader)
+	if n <= 1 || !ok {
+		return
+	}
+	p.readerBatch, p.readerSkipL1, p.balancesReader = n, skipL1Charging, r
+}
+
 // SetDedupWindow enables the dedup window. Must be called before Start.
 func (p *BalanceWorkerPool) SetDedupWindow(d time.Duration) {
 	p.dedupWindow = d
 }
 
 func (p *BalanceWorkerPool) Start() {
-	log.Info("starting balance workers", "count", p.numWorkers, "dedup_window", p.dedupWindow)
+	log.Info("starting balance workers", "count", p.numWorkers, "dedup_window", p.dedupWindow, "reader_batch", p.readerBatch, "skip_l1", p.readerSkipL1)
 	if p.dedupWindow > 0 {
 		p.fetchChan = make(chan BalanceWork, cap(p.workChan))
 		p.wg.Add(1)
@@ -304,6 +324,14 @@ func (p *BalanceWorkerPool) worker(id int) {
 				continue
 			}
 
+			if p.readerBatch > 1 {
+				batch = append(batch, p.fetchReader(work, in)...)
+				if len(batch) >= 100 {
+					flush()
+				}
+				continue
+			}
+
 			balance, err := p.fetchBalance(work)
 			if err != nil || balance == nil {
 				continue // Skip on error, or a token whose balanceOf returned no uint256
@@ -387,4 +415,69 @@ func (p *BalanceWorkerPool) flushBatch(batch []*types.Balance) {
 		// Exponential backoff: 10ms, 20ms, 40ms
 		time.Sleep(time.Duration(10<<attempt) * time.Millisecond)
 	}
+}
+
+// fetchReader drains up to readerBatch-1 more items after first without waiting, keeps one per (address, token) at
+// its highest block (reads are at latest), and reads each token's holders with one BalanceReader call. Items whose
+// balanceOf failed, or whose call failed, are counted and not written.
+func (p *BalanceWorkerPool) fetchReader(first BalanceWork, in <-chan BalanceWork) []*types.Balance {
+	works := map[balanceKey]BalanceWork{{first.Address, first.TokenAddress}: first}
+	var tokens []common.Address
+	holders := map[common.Address][]common.Address{first.TokenAddress: {first.Address}}
+	tokens = append(tokens, first.TokenAddress)
+	taken := 1
+drain:
+	for taken < p.readerBatch {
+		select {
+		case w, ok := <-in:
+			if !ok {
+				break drain
+			}
+			taken++
+			if w.Address == (common.Address{}) {
+				continue
+			}
+			k := balanceKey{w.Address, w.TokenAddress}
+			if prev, seen := works[k]; seen {
+				if w.BlockNumber > prev.BlockNumber {
+					works[k] = w
+				}
+				metrics.BalanceDeduped(1)
+				continue
+			}
+			works[k] = w
+			if _, ok := holders[w.TokenAddress]; !ok {
+				tokens = append(tokens, w.TokenAddress)
+			}
+			holders[w.TokenAddress] = append(holders[w.TokenAddress], w.Address)
+		default:
+			break drain
+		}
+	}
+	out := make([]*types.Balance, 0, len(works))
+	failed := 0
+	for _, token := range tokens {
+		hs := holders[token]
+		values, ok, err := p.balancesReader.BalancesOf(p.ctx, token, hs, p.readerSkipL1)
+		if err != nil {
+			failed += len(hs)
+			continue
+		}
+		for i, h := range hs {
+			if !ok[i] {
+				failed++
+				continue
+			}
+			w := works[balanceKey{h, token}]
+			out = append(out, &types.Balance{
+				Address:      w.Address.Hex(),
+				TokenAddress: w.TokenAddress.Hex(),
+				BlockNumber:  w.BlockNumber,
+				Balance:      types.JSONString(values[i].String()),
+			})
+		}
+	}
+	metrics.BalanceReads(len(works))
+	metrics.BalanceFetchFailed(failed)
+	return out
 }

@@ -181,6 +181,29 @@ var balanceDeduped = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Balance work items folded into a held item for the same (address, token) before fetching.",
 })
 
+var (
+	balanceFetchFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_balance_fetch_failed_total",
+		Help: "Balance reads that failed and were not written.",
+	})
+	balanceReads = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_balance_reads_total",
+		Help: "Balances requested through batched reads (one eth_call reads many).",
+	})
+)
+
+func BalanceFetchFailed(n int) {
+	if n > 0 {
+		balanceFetchFailed.Add(float64(n))
+	}
+}
+
+func BalanceReads(n int) {
+	if n > 0 {
+		balanceReads.Add(float64(n))
+	}
+}
+
 func BalanceDeduped(n int) {
 	if n > 0 {
 		balanceDeduped.Add(float64(n))

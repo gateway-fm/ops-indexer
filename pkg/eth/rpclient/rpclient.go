@@ -326,6 +326,21 @@ func (c *Client) CallContract(ctx context.Context, msg CallMsg, block *big.Int) 
 	return []byte(result), nil
 }
 
+// CallWithCodeOverride runs eth_call at latest against code injected at to with a state override (the balance
+// reader). skipL1Charging asks nitro to skip the per-call L1 poster-cost estimate, which a view call does not need.
+func (c *Client) CallWithCodeOverride(ctx context.Context, to common.Address, data []byte, code string, skipL1Charging bool) ([]byte, error) {
+	callObj := map[string]any{"to": to.Hex(), "data": "0x" + common.Bytes2Hex(data)}
+	if skipL1Charging {
+		callObj["skipL1Charging"] = true
+	}
+	override := map[string]map[string]string{to.Hex(): {"code": code}}
+	var result hexutil.Bytes
+	if err := c.CallContext(ctx, &result, "eth_call", callObj, "latest", override); err != nil {
+		return nil, err
+	}
+	return []byte(result), nil
+}
+
 var ErrReceiptNotFound = errors.New("receipt not found")
 
 func (c *Client) TransactionReceipt(ctx context.Context, txHash common.Hash) (*Receipt, error) {
