@@ -104,6 +104,7 @@ func main() {
 		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
 		DailyStatsLegacy:      cfg.DailyStatsLegacy,
 		CommitPipelineDepth:   cfg.CommitPipelineDepth,
+		BalanceDedupWindow:    cfg.BalanceDedupWindow,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

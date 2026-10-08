@@ -176,6 +176,17 @@ func StageTimer(stage string) func() {
 
 func SetQueueDepth(queue string, depth int) { queueDepth.WithLabelValues(queue).Set(float64(depth)) }
 
+var balanceDeduped = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_balance_deduped_total",
+	Help: "Balance work items folded into a held item for the same (address, token) before fetching.",
+})
+
+func BalanceDeduped(n int) {
+	if n > 0 {
+		balanceDeduped.Add(float64(n))
+	}
+}
+
 func BalanceQueueDropped(n int) {
 	if n > 0 {
 		balanceQueueDropped.Add(float64(n))

@@ -5,9 +5,11 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
@@ -34,6 +36,12 @@ type BalanceWorkerPool struct {
 	closed   bool
 	stopOnce sync.Once
 
+	// dedupWindow > 0 holds each (address, token) key for that long before one fetch at latest.
+	// Items for a held key fold into it; fetchChan feeds the workers, held counts keys not yet forwarded.
+	dedupWindow time.Duration
+	fetchChan   chan BalanceWork
+	held        atomic.Int64
+
 	// onFlush is invoked (if set) after each successful batch write with the
 	// distinct token addresses present in that batch. Used by the indexer to
 	// refresh derived stats (holder count) when balances actually land.
@@ -58,8 +66,18 @@ func NewBalanceWorkerPool(database Database, rpcClient RPCClient, numWorkers, ra
 	}
 }
 
+// SetDedupWindow enables the dedup window. Must be called before Start.
+func (p *BalanceWorkerPool) SetDedupWindow(d time.Duration) {
+	p.dedupWindow = d
+}
+
 func (p *BalanceWorkerPool) Start() {
-	log.Info("starting balance workers", "count", p.numWorkers)
+	log.Info("starting balance workers", "count", p.numWorkers, "dedup_window", p.dedupWindow)
+	if p.dedupWindow > 0 {
+		p.fetchChan = make(chan BalanceWork, cap(p.workChan))
+		p.wg.Add(1)
+		go p.coalesce()
+	}
 	for i := 0; i < p.numWorkers; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
@@ -157,7 +175,92 @@ func (p *BalanceWorkerPool) QueueCommittedWork(ctx context.Context, works []Bala
 }
 
 func (p *BalanceWorkerPool) QueueSize() int {
-	return len(p.workChan)
+	if p.fetchChan == nil {
+		return len(p.workChan)
+	}
+	return len(p.workChan) + int(p.held.Load()) + len(p.fetchChan)
+}
+
+type balanceKey struct {
+	address common.Address
+	token   common.Address
+}
+
+type heldKey struct {
+	key balanceKey
+	due time.Time
+}
+
+// maxHeldKeys bounds the window's memory; past it the oldest key is forwarded early.
+const maxHeldKeys = 100000
+
+// coalesce holds each key for dedupWindow, folding repeats into it at the highest block, then forwards it once.
+// The fetch reads at latest after the window, so it sees every transfer folded into the key. A key that changes
+// again after it was forwarded opens a new window. Forwarding blocks while the workers are busy, which stops
+// reads from workChan and so reaches the committer's backpressure.
+func (p *BalanceWorkerPool) coalesce() {
+	defer p.wg.Done()
+	defer close(p.fetchChan)
+
+	held := make(map[balanceKey]*BalanceWork)
+	var order []heldKey
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	forwardOldest := func() bool {
+		h := order[0]
+		order = order[1:]
+		w := held[h.key]
+		delete(held, h.key)
+		select {
+		case p.fetchChan <- *w:
+			p.held.Add(-1)
+			return true
+		case <-p.ctx.Done():
+			return false
+		}
+	}
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			for len(order) > 0 && !order[0].due.After(now) {
+				if !forwardOldest() {
+					return
+				}
+			}
+		case work, ok := <-p.workChan:
+			if !ok {
+				for len(order) > 0 {
+					if !forwardOldest() {
+						return
+					}
+				}
+				return
+			}
+			if work.Address == (common.Address{}) {
+				continue
+			}
+			k := balanceKey{address: work.Address, token: work.TokenAddress}
+			if h, ok := held[k]; ok {
+				if work.BlockNumber > h.BlockNumber {
+					h.BlockNumber = work.BlockNumber
+				}
+				metrics.BalanceDeduped(1)
+				continue
+			}
+			if len(held) >= maxHeldKeys && !forwardOldest() {
+				return
+			}
+			w := work
+			held[k] = &w
+			order = append(order, heldKey{key: k, due: time.Now().Add(p.dedupWindow)})
+			p.held.Add(1)
+		}
+	}
 }
 
 func (p *BalanceWorkerPool) worker(id int) {
@@ -179,6 +282,11 @@ func (p *BalanceWorkerPool) worker(id int) {
 		}
 	}
 
+	in := p.workChan
+	if p.fetchChan != nil {
+		in = p.fetchChan
+	}
+
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -186,7 +294,7 @@ func (p *BalanceWorkerPool) worker(id int) {
 			return
 		case <-ticker.C:
 			flush()
-		case work, ok := <-p.workChan:
+		case work, ok := <-in:
 			if !ok {
 				flush()
 				return

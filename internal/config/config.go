@@ -21,6 +21,7 @@ type Config struct {
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
 	DailyStatsLegacy      bool          `mapstructure:"daily_stats_legacy"`
 	CommitPipelineDepth   int           `mapstructure:"commit_pipeline"`
+	BalanceDedupWindow    time.Duration `mapstructure:"balance_dedup_window"`
 	StartBlock            uint64        `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
@@ -87,6 +88,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("poll_interval", "2s")
 	v.SetDefault("daily_stats_min_interval", "60s")
 	v.SetDefault("commit_pipeline", 1)
+	v.SetDefault("balance_dedup_window", "0s")
 	v.SetDefault("start_block", 0)
 
 	v.SetDefault("rpc_workers", 50)
@@ -157,6 +159,7 @@ func Load() (*Config, error) {
 	cfg.DailyStatsMinInterval = v.GetDuration("daily_stats_min_interval")
 	cfg.DailyStatsLegacy = v.GetBool("daily_stats_legacy")
 	cfg.CommitPipelineDepth = v.GetInt("commit_pipeline")
+	cfg.BalanceDedupWindow = v.GetDuration("balance_dedup_window")
 	cfg.StartBlock = v.GetUint64("start_block")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")

@@ -59,6 +59,9 @@ type Config struct {
 	// commit). 1 is the sequential committer. See indexPipelined.
 	CommitPipelineDepth int
 
+	// BalanceDedupWindow holds balance work per (address, token) for this long before one fetch.
+	BalanceDedupWindow time.Duration
+
 	EnableOPDeposits bool
 }
 
@@ -247,6 +250,7 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
 		idx.balanceWorkers = NewBalanceWorkerPool(database, rpcClient, cfg.BalanceWorkers, cfg.RPCRateLimit)
+		idx.balanceWorkers.SetDedupWindow(cfg.BalanceDedupWindow)
 		// No post-flush stats refresh any more: holder_count is maintained by
 		// InsertBalancesBatch itself, in the transaction that writes the
 		// balances (PRST-4669). The callback used to trigger a COUNT(*) per
