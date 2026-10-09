@@ -834,6 +834,12 @@ func waitForLockWaiters(t *testing.T, d *DB, n int) {
 // The property is the absence of a 40P01. Guarding the union with advisory keys
 // is what supplies it: a key exists whether or not its row does, so the creator
 // and writer 2 both queue behind writer 1 instead of interleaving into a cycle.
+//
+// Since the pipelined commit split InsertBlockDataBatch into BeginBlockData (the block's own rows) and
+// Finish (the token lock pass and deltas), a writer inserts before it locks. The stall now parks writer 1
+// inside its inserts with no token lock held, so the creator and writer 2 complete past it, and writer 1
+// takes its locks afterwards, against rows that now exist. The test keeps the properties that still apply:
+// no writer fails, and the counters equal the stored rows, the low tokens created mid-flight included.
 func TestTokenCounters_LockingCoversTokensNotYetCreated(t *testing.T) {
 	d, cleanup := setupBenchDB(t)
 	defer cleanup()
@@ -945,8 +951,13 @@ func TestTokenCounters_LockingCoversTokensNotYetCreated(t *testing.T) {
 		case <-time.After(2 * time.Second):
 		}
 
-		run("writer 2", second)
-		waitForLockWaiters(t, d, 2) // writer 1, plus whoever queued behind it
+		// Since the Begin/Finish split, writer 1 is parked in its transfers insert and holds no token lock yet,
+		// so writer 2 (whose parent rows are not stalled) runs to completion past it. Bounded, so a regression
+		// that makes it wait on writer 1 shows as a failure below rather than a hang.
+		select {
+		case <-run("writer 2", second):
+		case <-time.After(10 * time.Second):
+		}
 
 		require.NoError(t, stall.Rollback(ctx))
 		wg.Wait()
