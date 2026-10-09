@@ -911,14 +911,17 @@ func TestTokenCounters_LockingCoversTokensNotYetCreated(t *testing.T) {
 			})
 		}
 
-		// token_transfers.tx_hash references transactions(hash), so inserting a
-		// transfer takes FOR KEY SHARE on the parent row. Holding FOR UPDATE on
-		// it parks writer 1 in its transfers insert -- past the pre-lock, short
-		// of the deltas.
+		// Migration 013 keys token_transfers by (block_number, log_index) and drops the tx_hash foreign key,
+		// so the parent row no longer parks anyone. An uncommitted row on writer 1's first key does: its
+		// ON CONFLICT insert waits for this transaction, in its transfers insert, before any token lock.
 		stall, err := d.pool.Begin(ctx)
 		require.NoError(t, err)
+		tr0 := first.Transfers[0]
 		_, err = stall.Exec(ctx,
-			`SELECT 1 FROM transactions WHERE hash = $1 FOR UPDATE`, first.Transfers[0].TxHash)
+			`INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value,
+			                              block_number, timestamp, transfer_type, token_type)
+			 VALUES ('0xstall', $1, $2, $3, $4, 0, $5, $6, 'transfer', 'ERC20')`,
+			tr0.LogIndex, tr0.TokenAddress, tr0.From, tr0.To, tr0.BlockNumber, *tr0.Timestamp)
 		require.NoError(t, err)
 
 		var wg sync.WaitGroup
