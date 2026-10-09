@@ -138,3 +138,42 @@ func TestIndexPipelinedSkipsABlockWhoseReceiptsNeverCome(t *testing.T) {
 	}
 	mockDB.AssertExpectations(t)
 }
+
+// A block request that arrives while the pipelined loop runs is answered, not left waiting until the loop ends.
+func TestIndexPipelinedServesBlockRequests(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	blocks := chainOfEmptyBlocks(1, 5)
+	blocks[99] = chainOfEmptyBlocks(99, 99)[99]
+	for n, b := range blocks {
+		mockRPC.On("RawBlockByNumber", mock.Anything, n).Return(b, nil).Maybe()
+	}
+	var inserted []uint64
+	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		inserted = append(inserted, args.Get(1).(*types.Block).Number)
+	}).Return(nil)
+	mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	idx := newPrefetchIndexer(mockDB, mockRPC)
+
+	done := make(chan error, 1)
+	idx.indexRequests <- indexRequest{blockNumber: 99, done: done}
+	last := idx.indexPipelined(context.Background(), 0, 5, 2, &receiptSkip{})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("request for block 99 failed: %v", err)
+		}
+	default:
+		t.Fatal("the request for block 99 was never answered")
+	}
+	if last != 5 {
+		t.Fatalf("last indexed %d, want 5", last)
+	}
+	saw99 := false
+	for _, n := range inserted {
+		saw99 = saw99 || n == 99
+	}
+	if !saw99 {
+		t.Fatalf("inserted %v, want block 99 among them", inserted)
+	}
+}

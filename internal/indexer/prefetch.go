@@ -185,6 +185,18 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 
 	var prevHash common.Hash
 	for slot := range i.prefetchBlocks(fetchCtx, lastIndexed+1, latest, blockPrefetchDepth+depth) {
+		// Serve a block request (as indexPrefetched does) between blocks. Finish what is in flight first, so the
+		// requested block never runs beside a pipelined one and committed blocks stay a prefix.
+		select {
+		case req := <-i.indexRequests:
+			if !drain() {
+				req.done <- fmt.Errorf("block %d not processed: the commit pipeline aborted", req.blockNumber)
+				return lastIndexed
+			}
+			req.done <- i.processBlock(ctx, req.blockNumber)
+		default:
+		}
+
 		b := <-slot
 		if b.err != nil {
 			log.Error("failed to process block", "block", b.number, "error", b.err)

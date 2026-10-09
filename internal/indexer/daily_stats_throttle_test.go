@@ -134,7 +134,7 @@ func TestDailyStatsRecomputedAfterQuietPeriod(t *testing.T) {
 		Run(func(args mock.Arguments) { computed <- args.Get(1).(time.Time) }).
 		Return(&types.DailyStats{}, nil)
 	db.On("UpsertDailyStats", mock.Anything, mock.Anything).Return(nil)
-	idx := NewWithConfig(db, nil, time.Second, 0, &Config{DailyStatsMinInterval: 50 * time.Millisecond})
+	idx := NewWithConfig(db, nil, time.Second, 0, &Config{DailyStatsMinInterval: 50 * time.Millisecond, DailyStatsLegacy: true})
 
 	idx.scheduleDailyStats(t.Context(), 1, day1)
 	if d := <-computed; !d.Equal(day1) {
