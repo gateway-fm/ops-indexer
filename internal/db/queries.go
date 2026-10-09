@@ -144,7 +144,7 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	}
 
 	// Aggregate exactly the set this function removes below: the block's
-	// transfers by block_number (migration 012 dropped the tx_hash foreign key
+	// transfers by block_number (migration 013 dropped the tx_hash foreign key
 	// whose cascade used to remove them).
 	rows, err := tx.Query(ctx, `
 		SELECT token_address, COUNT(*),
