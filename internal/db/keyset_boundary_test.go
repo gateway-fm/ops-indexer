@@ -204,8 +204,8 @@ func TestGetTransactionsByAddress_TransferOnlyKeysetBoundary(t *testing.T) {
 		require.NoError(t, err)
 		_, err = d.pool.Exec(ctx, `
 			INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value, block_number, timestamp, transfer_type, token_type)
-			VALUES ($1, 0, $2, $3, $4, 1, $5, $6, 'transfer', 'ERC20')`,
-			hash, tok, oth, A, block, 1_700_000_000+int64(block))
+			VALUES ($1, $7, $2, $3, $4, 1, $5, $6, 'transfer', 'ERC20')`,
+			hash, tok, oth, A, block, 1_700_000_000+int64(block), txIndex) // logIndex is block-scoped
 		require.NoError(t, err)
 		return hash
 	}

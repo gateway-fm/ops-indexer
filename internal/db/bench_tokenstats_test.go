@@ -168,7 +168,7 @@ func benchSeedTokenHistory(tb testing.TB, d *DB) string {
 			}
 			return []any{
 				fmt.Sprintf("0xtx%062d", i), // seeded transaction hash
-				0,
+				i % 125, // block-scoped, as a receipt's logIndex is: unique within the block below
 				token,
 				from, to,
 				"1000000000000000",
