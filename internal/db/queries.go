@@ -138,7 +138,7 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	}
 	defer tx.Rollback(ctx)
 
-	// The block's day is re-aggregated from its first block on the next advance (migration 011).
+	// The block's day is re-aggregated from its first block on the next advance (migration 012).
 	if _, err := tx.Exec(ctx, `SELECT daily_stats_invalidate($1)`, number); err != nil {
 		return err
 	}
@@ -1912,7 +1912,7 @@ func (d *DB) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) erro
 	return err
 }
 
-// AdvanceDailyStats folds the blocks indexed since the last call into daily_stats (migration 011) and
+// AdvanceDailyStats folds the blocks indexed since the last call into daily_stats (migration 012) and
 // returns the block it aggregated through.
 func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	var upto *int64

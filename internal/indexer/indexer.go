@@ -53,7 +53,7 @@ type Config struct {
 	DailyStatsMinInterval time.Duration
 
 	// DailyStatsLegacy recomputes the current day from base tables on each run instead of advancing the
-	// incremental aggregate (migration 011).
+	// incremental aggregate (migration 012).
 	DailyStatsLegacy bool
 
 	EnableOPDeposits bool
