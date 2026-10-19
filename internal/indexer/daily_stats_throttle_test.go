@@ -5,74 +5,119 @@ import (
 	"time"
 )
 
+var (
+	day1 = time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	day2 = day1.Add(24 * time.Hour)
+)
+
 // TestDailyStatsThrottle pins the two properties the throttle exists for: at
 // most one recomputation in flight, and at most one start per interval. With
 // interval 0 it reproduces the pre-PRST-4669 every-100th-block trigger.
 func TestDailyStatsThrottle(t *testing.T) {
 	var th dailyStatsThrottle
 
-	// interval > 0: first call starts; while running nothing else starts,
-	// even on a 100th block; after done, not before the interval elapses.
-	if !th.due(1, time.Hour) {
+	if days := th.due(1, day1, time.Hour); days == nil {
 		t.Fatal("first call must be due")
 	}
-	if th.due(100, time.Hour) {
+	if days := th.due(100, day1, time.Hour); days != nil {
 		t.Fatal("must not start while a run is in flight")
 	}
 	th.done()
-	if th.due(200, time.Hour) {
+	if days := th.due(200, day1, time.Hour); days != nil {
 		t.Fatal("must not start again before the interval elapsed")
 	}
 	th.last = time.Now().Add(-2 * time.Hour)
-	if !th.due(201, time.Hour) {
+	if days := th.due(201, day1, time.Hour); days == nil {
 		t.Fatal("must start once the interval elapsed")
 	}
 	th.done()
 
-	// interval 0: legacy behaviour, every 100th block, still single-flight.
 	var legacy dailyStatsThrottle
-	if legacy.due(99, 0) {
+	if days := legacy.due(99, day1, 0); days != nil {
 		t.Fatal("legacy: block 99 must not trigger")
 	}
-	if !legacy.due(100, 0) {
+	if days := legacy.due(100, day1, 0); days == nil {
 		t.Fatal("legacy: block 100 must trigger")
 	}
-	if legacy.due(200, 0) {
+	if days := legacy.due(200, day1, 0); days != nil {
 		t.Fatal("legacy: must not overlap an in-flight run")
 	}
 	legacy.done()
-	if !legacy.due(200, 0) {
+	if days := legacy.due(200, day1, 0); days == nil {
 		t.Fatal("legacy: block 200 must trigger once the previous run is done")
 	}
 }
 
-// TestCatchupSharesDailyStatsThrottle pins the fix for the catchup regression:
-// the CatchupIndexer must hand the SAME throttle to the per-block Indexer values
-// it constructs, otherwise every block starts with a fresh, never-run throttle
-// and the day aggregate fires on every block (measured: 104 runs for 105 blocks).
-func TestCatchupSharesDailyStatsThrottle(t *testing.T) {
-	th := &dailyStatsThrottle{}
-	c := &CatchupIndexer{idxCfg: &Config{DailyStatsMinInterval: time.Minute}}
-	c.SetDailyStatsThrottle(th)
-	if c.dailyStats != th {
-		t.Fatal("SetDailyStatsThrottle must store the shared pointer")
+// Every block marks its day dirty and a run recomputes all dirty days, so a day
+// is recomputed after its last block even when catch-up commits older days
+// after newer ones and the slot is taken by the head.
+func TestDailyStatsThrottleRecomputesEveryDirtyDay(t *testing.T) {
+	var th dailyStatsThrottle
+	if days := th.due(1, day2, time.Hour); len(days) != 1 || !days[0].Equal(day2) {
+		t.Fatalf("first block: got %v, want [day2]", days)
 	}
-	// Simulate two per-block Indexer values the way processBlockRaw builds them.
-	a := &Indexer{config: c.idxCfg, dailyStats: c.dailyStats}
-	b := &Indexer{config: c.idxCfg, dailyStats: c.dailyStats}
-	if !a.dailyStats.due(1, a.config.DailyStatsMinInterval) {
-		t.Fatal("first block must be due")
+	th.done()
+	if days := th.due(2, day1, time.Hour); days != nil {
+		t.Fatalf("within the interval: got %v, want no run", days)
 	}
-	if b.dailyStats.due(2, b.config.DailyStatsMinInterval) {
-		t.Fatal("second block must see the first run in flight through the shared throttle")
+	if days := th.due(3, day2, time.Hour); days != nil {
+		t.Fatalf("within the interval: got %v, want no run", days)
 	}
-	a.dailyStats.done()
-	if b.dailyStats.due(3, b.config.DailyStatsMinInterval) {
-		t.Fatal("second block must respect the interval through the shared throttle")
+	th.last = time.Now().Add(-2 * time.Hour)
+	days := th.due(4, day2, time.Hour)
+	if len(days) != 2 || !days[0].Equal(day1) || !days[1].Equal(day2) {
+		t.Fatalf("after the interval: got %v, want [day1 day2]", days)
 	}
-	// The main indexer's constructor must create the pointer.
-	idx := NewWithConfig(nil, nil, time.Second, 0, &Config{})
+	th.done()
+	th.last = time.Now().Add(-2 * time.Hour)
+	if days := th.due(5, day2, time.Hour); len(days) != 1 || !days[0].Equal(day2) {
+		t.Fatalf("dirty days are cleared by a run: got %v, want [day2]", days)
+	}
+}
+
+// A block committed while a run is in flight marks its day for the next run.
+func TestDailyStatsThrottleKeepsDaysMarkedWhileRunning(t *testing.T) {
+	var th dailyStatsThrottle
+	th.due(1, day1, time.Hour)
+	if days := th.due(2, day1, time.Hour); days != nil {
+		t.Fatal("must not start while a run is in flight")
+	}
+	th.done()
+	th.last = time.Now().Add(-2 * time.Hour)
+	if days := th.due(3, day2, time.Hour); len(days) != 2 || !days[0].Equal(day1) {
+		t.Fatalf("got %v, want day1 (marked while running) and day2", days)
+	}
+}
+
+// The per-block Indexer values built by the catch-up and realtime indexers must
+// share the main indexer's throttle. A fresh throttle per block fires the day
+// aggregate on every block (measured: 104 runs for 105 blocks); none at all
+// stops daily_stats at the head.
+func TestSubIndexersShareDailyStatsThrottle(t *testing.T) {
+	idx := NewWithConfig(nil, nil, time.Second, 0, &Config{DailyStatsMinInterval: time.Minute})
 	if idx.dailyStats == nil {
 		t.Fatal("NewWithConfig must create the shared throttle")
+	}
+	catchup := idx.newCatchupIndexer(&CatchupConfig{Workers: 1, BatchSize: 1, QueueSize: 1})
+	realtime := idx.newRealtimeIndexer(&RealtimeConfig{ConfirmationBlocks: 1, PollInterval: time.Second})
+	for name, blockIndexer := range map[string]*Indexer{
+		"catchup":  catchup.blockIndexer(),
+		"realtime": realtime.blockIndexer(),
+	} {
+		if blockIndexer.dailyStats != idx.dailyStats {
+			t.Errorf("%s per-block Indexer does not share the main indexer's throttle", name)
+		}
+	}
+}
+
+// A day whose recomputation failed goes back into the dirty set for the next run.
+func TestDailyStatsThrottleRetriesAFailedDay(t *testing.T) {
+	var th dailyStatsThrottle
+	th.due(1, day1, time.Hour)
+	th.markDirty(day1)
+	th.done()
+	th.last = time.Now().Add(-2 * time.Hour)
+	if days := th.due(2, day2, time.Hour); len(days) != 2 || !days[0].Equal(day1) {
+		t.Fatalf("got %v, want the failed day1 retried with day2", days)
 	}
 }

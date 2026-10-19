@@ -343,6 +343,15 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 		return err
 	}
 
+	idx := c.blockIndexer()
+	if len(rawBlock.Transactions) > 0 {
+		return idx.processBlockParallelRaw(c.ctx, rawBlock)
+	}
+
+	return idx.processBlockRaw(c.ctx, number)
+}
+
+func (c *CatchupIndexer) blockIndexer() *Indexer {
 	catchupConfig := *c.idxCfg
 	// Catchup never writes address_stats incrementally — the realtime indexer is
 	// the primary path that keeps it current. Trade-off: a block processed by
@@ -351,7 +360,7 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 	// restart. Acceptable, since post-sync catchup only handles rare gaps.
 	catchupConfig.SkipAddressStats = true
 
-	idx := &Indexer{
+	return &Indexer{
 		db:               c.db,
 		rpc:              c.rpc,
 		config:           &catchupConfig,
@@ -362,10 +371,4 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 		eventBus:         c.eventBus,
 		dailyStats:       c.dailyStats,
 	}
-
-	if len(rawBlock.Transactions) > 0 {
-		return idx.processBlockParallelRaw(c.ctx, rawBlock)
-	}
-
-	return idx.processBlockRaw(c.ctx, number)
 }
