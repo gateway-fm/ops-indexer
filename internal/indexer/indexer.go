@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -44,6 +45,11 @@ type Config struct {
 	SkipAddressStats    bool
 	SkipReceiptTxTypes  map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
+	// DailyStatsMinInterval is the minimum time between two recomputations of
+	// the current day's daily_stats row. Zero keeps the old behaviour (every
+	// 100th block). See dailyStatsThrottle.
+	DailyStatsMinInterval time.Duration
+
 	EnableOPDeposits bool
 }
 
@@ -74,6 +80,41 @@ type Indexer struct {
 	realtimeIndexer *RealtimeIndexer
 
 	catchupRunning bool
+
+	dailyStats dailyStatsThrottle
+}
+
+// dailyStatsThrottle gates the day-aggregate recomputation: at most one run in
+// flight, and at most one start per minInterval (or per 100 blocks when
+// minInterval is zero, the pre-PRST-4669 behaviour).
+type dailyStatsThrottle struct {
+	mu      sync.Mutex
+	last    time.Time
+	running bool
+}
+
+func (t *dailyStatsThrottle) due(blockNumber uint64, minInterval time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.running {
+		return false
+	}
+	if minInterval <= 0 {
+		if blockNumber%100 != 0 {
+			return false
+		}
+	} else if !t.last.IsZero() && time.Since(t.last) < minInterval {
+		return false
+	}
+	t.last = time.Now()
+	t.running = true
+	return true
+}
+
+func (t *dailyStatsThrottle) done() {
+	t.mu.Lock()
+	t.running = false
+	t.mu.Unlock()
 }
 
 func (i *Indexer) SetEventBus(bus *events.Bus) {
@@ -1090,9 +1131,22 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			"elapsed", elapsed)
 	}
 
-	// Update daily stats every 100 blocks
-	if blockNumber%100 == 0 {
-		go i.updateDailyStatsForDate(ctx, blockTimestamp)
+	// Recompute the day's daily_stats row, throttled.
+	//
+	// ComputeDailyStats re-aggregates the WHOLE day from base tables: six
+	// queries, the largest a COUNT(DISTINCT from/to address) over every
+	// transaction of the day. That cost grows with the day's volume: 1.9 s
+	// per call at 2.1M transactions on the PRST-4669 rig, ~2.7 s for the six
+	// together, and it was fired every 100 blocks -- every 10-14 s at 500 tx/s
+	// -- so it was 21.5% of all database time once holder_count stopped
+	// dominating, and on course to saturate a core by mid-day. The row it
+	// maintains is a dashboard aggregate; a minute of staleness is invisible,
+	// a core is not. Same queries, same semantics, fewer runs.
+	if i.dailyStats.due(blockNumber, i.config.DailyStatsMinInterval) {
+		go func() {
+			defer i.dailyStats.done()
+			i.updateDailyStatsForDate(ctx, blockTimestamp)
+		}()
 	}
 
 	return nil
