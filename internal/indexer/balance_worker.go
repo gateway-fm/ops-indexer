@@ -29,6 +29,11 @@ type BalanceWorkerPool struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 
+	// sendMu guards workChan's close against concurrent sends; closed is set under its write lock by Stop.
+	sendMu   sync.RWMutex
+	closed   bool
+	stopOnce sync.Once
+
 	// onFlush is invoked (if set) after each successful batch write with the
 	// distinct token addresses present in that batch. Used by the indexer to
 	// refresh derived stats (holder count) when balances actually land.
@@ -61,16 +66,47 @@ func (p *BalanceWorkerPool) Start() {
 	}
 }
 
+// balanceDrainTimeout bounds how long Stop lets the workers finish queued work, and balanceEnqueueGrace how long
+// a committed block's producer keeps waiting for queue room once shutdown has begun. Together they stay below
+// Kubernetes' default 30 s termination grace period.
+var (
+	balanceDrainTimeout = 20 * time.Second
+	balanceEnqueueGrace = 5 * time.Second
+)
+
+// Stop drains instead of discarding: it closes the queue and lets the workers fetch and flush everything queued,
+// under a live context. Only after balanceDrainTimeout does it cancel and drop what is left (logged with the
+// count). A Queue call after Stop is refused (counted as dropped) instead of panicking on the closed channel.
 func (p *BalanceWorkerPool) Stop() {
-	log.Info("stopping balance workers")
-	p.cancel()
-	close(p.workChan)
-	p.wg.Wait()
-	log.Info("balance workers stopped")
+	p.stopOnce.Do(func() {
+		left := p.QueueSize()
+		log.Info("stopping balance workers: draining", "items", left)
+		p.sendMu.Lock()
+		p.closed = true
+		close(p.workChan)
+		p.sendMu.Unlock()
+
+		done := make(chan struct{})
+		go func() { p.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+			log.Info("balance workers stopped: drained", "items", left)
+		case <-time.After(balanceDrainTimeout):
+			log.Warn("balance drain timed out; remaining balance work dropped", "left", p.QueueSize())
+			p.cancel()
+			<-done
+		}
+		p.cancel()
+	})
 }
 
 // QueueWork returns false if the queue is full (non-blocking).
 func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+	if p.closed {
+		return false
+	}
 	select {
 	case p.workChan <- work:
 		return true
@@ -92,6 +128,11 @@ func (p *BalanceWorkerPool) QueueWorkBatch(works []BalanceWork) int {
 // QueueWorkBatchWait queues every item, waiting for room instead of dropping (spike: backpressure). A full
 // queue then slows the committer to what the balance workers absorb, instead of losing balance updates.
 func (p *BalanceWorkerPool) QueueWorkBatchWait(ctx context.Context, works []BalanceWork) int {
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+	if p.closed {
+		return 0
+	}
 	queued := 0
 	for _, work := range works {
 		select {
@@ -102,6 +143,17 @@ func (p *BalanceWorkerPool) QueueWorkBatchWait(ctx context.Context, works []Bala
 		}
 	}
 	return queued
+}
+
+// QueueCommittedWork queues the balance work of a block that is already committed. It keeps waiting for room
+// after ctx is cancelled, so shutdown does not drop it, but only for balanceEnqueueGrace: with the node hung the
+// queue never drains, and an unbounded wait would hold shutdown until the pod is killed.
+func (p *BalanceWorkerPool) QueueCommittedWork(ctx context.Context, works []BalanceWork) int {
+	qctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() { time.AfterFunc(balanceEnqueueGrace, cancel) })
+	defer stop()
+	return p.QueueWorkBatchWait(qctx, works)
 }
 
 func (p *BalanceWorkerPool) QueueSize() int {
