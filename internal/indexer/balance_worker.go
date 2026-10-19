@@ -145,8 +145,8 @@ func (p *BalanceWorkerPool) worker(id int) {
 			}
 
 			balance, err := p.fetchBalance(work)
-			if err != nil {
-				continue // Skip on error
+			if err != nil || balance == nil {
+				continue // Skip on error, or a token whose balanceOf returned no uint256
 			}
 
 			batch = append(batch, balance)
