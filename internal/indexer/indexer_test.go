@@ -348,9 +348,39 @@ func TestIndexer_DetectReorg(t *testing.T) {
 		chainHash99 := "0x1111111111111111111111111111111111111111111111111111111111111111"
 		mockRPC.On("RawBlockHash", ctx, uint64(99)).Return(chainHash99, nil).Once()
 
+		// The detector scans the whole window (PRST-4669): the deeper blocks match.
+		deepHash := "0x2222222222222222222222222222222222222222222222222222222222222222"
+		mockDB.On("GetBlock", ctx, mock.Anything).Return(&types.Block{Hash: deepHash}, nil)
+		mockRPC.On("RawBlockHash", ctx, mock.Anything).Return(deepHash, nil)
+
 		reorgAt, err := idx.detectReorg(ctx, blockNum)
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(2), reorgAt) // depth 1 (parent) + 1
+		mockDB.AssertExpectations(t)
+		mockRPC.AssertExpectations(t)
+	})
+
+	// PRST-4669: a reorg deeper than one block used to be reported as depth 1
+	// (the detector returned at the first mismatch), so only the head block was
+	// reverted and the stale blocks beneath it stayed. Three mismatching blocks
+	// under the head must be reported as depth 3.
+	t.Run("deep reorg reports the deepest mismatch", func(t *testing.T) {
+		mockDB := new(MockDatabase)
+		mockRPC := new(MockRPCClient)
+		idx := New(mockDB, mockRPC, time.Second, 0)
+
+		stale := "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		good := "0x3333333333333333333333333333333333333333333333333333333333333333"
+		for _, n := range []uint64{100, 99, 98} {
+			mockDB.On("GetBlock", ctx, n).Return(&types.Block{Hash: stale}, nil).Once()
+			mockRPC.On("RawBlockHash", ctx, n).Return(good, nil).Once()
+		}
+		mockDB.On("GetBlock", ctx, mock.Anything).Return(&types.Block{Hash: good}, nil)
+		mockRPC.On("RawBlockHash", ctx, mock.Anything).Return(good, nil)
+
+		reorgAt, err := idx.detectReorg(ctx, uint64(100))
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(3), reorgAt)
 		mockDB.AssertExpectations(t)
 		mockRPC.AssertExpectations(t)
 	})

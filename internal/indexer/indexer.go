@@ -683,8 +683,21 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 	}
 }
 
+// detectReorg walks down from blockNumber comparing stored and chain hashes and
+// returns how many blocks, counted from blockNumber, no longer match the chain.
+//
+// It used to return at the FIRST mismatch, i.e. always depth 1 when the head
+// block differed, so a reorg deeper than one block reverted only the head and
+// left the stale blocks beneath it in place forever (a test that corrupted three
+// stored hashes saw one reverted, two kept). It now scans the whole
+// window and returns the DEEPEST mismatch: a real reorg mismatches from the
+// head down to the fork point, and a stored block that disagrees with the
+// chain beneath a matching head (a corrupted or partially reverted database)
+// is reverted too rather than kept. The window was always scanned in full in
+// the no-reorg case, so the cost per poll tick is unchanged.
 func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, error) {
 	maxReorgCheck := uint64(10)
+	var deepest uint64
 	for depth := uint64(0); depth < maxReorgCheck && blockNumber > depth; depth++ {
 		checkBlock := blockNumber - depth
 
@@ -698,21 +711,25 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 			return 0, err
 		}
 
-		if storedBlock.Hash != chainHash {
-			storedHash := storedBlock.Hash
-			chainHashLog := chainHash
-			if len(storedHash) > 16 {
-				storedHash = storedHash[:16]
-			}
-			if len(chainHashLog) > 16 {
-				chainHashLog = chainHashLog[:16]
-			}
-			log.Warn("reorg detected",
-				"block", checkBlock,
-				"stored_hash", storedHash,
-				"chain_hash", chainHashLog)
-			return depth + 1, nil
+		if storedBlock.Hash == chainHash {
+			continue
 		}
+		storedHash := storedBlock.Hash
+		chainHashLog := chainHash
+		if len(storedHash) > 16 {
+			storedHash = storedHash[:16]
+		}
+		if len(chainHashLog) > 16 {
+			chainHashLog = chainHashLog[:16]
+		}
+		log.Warn("reorg detected",
+			"block", checkBlock,
+			"stored_hash", storedHash,
+			"chain_hash", chainHashLog)
+		deepest = depth + 1
+	}
+	if deepest > 0 {
+		return deepest, nil
 	}
 	return 0, nil
 }

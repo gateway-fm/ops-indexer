@@ -292,8 +292,12 @@ func (r *RealtimeIndexer) blockIndexer() *Indexer {
 	}
 }
 
+// detectReorg: see Indexer.detectReorg. Same walk, same fix (PRST-4669): the
+// depth returned is the number of consecutive mismatching blocks from the
+// top, not 1 as soon as the top mismatches.
 func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, error) {
 	maxReorgCheck := uint64(10)
+	var deepest uint64
 	for depth := uint64(0); depth < maxReorgCheck && blockNumber > depth; depth++ {
 		checkBlock := blockNumber - depth
 
@@ -307,15 +311,23 @@ func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (
 			return 0, err
 		}
 
-		if storedBlock.Hash != chainHash {
-			log.Warn("realtime: reorg detected",
-				"block", checkBlock,
-				"stored_hash", storedBlock.Hash[:16],
-				"chain_hash", chainHash[:16])
-			return depth + 1, nil
+		if storedBlock.Hash == chainHash {
+			continue
 		}
+		storedHash, chainHashLog := storedBlock.Hash, chainHash
+		if len(storedHash) > 16 {
+			storedHash = storedHash[:16]
+		}
+		if len(chainHashLog) > 16 {
+			chainHashLog = chainHashLog[:16]
+		}
+		log.Warn("realtime: reorg detected",
+			"block", checkBlock,
+			"stored_hash", storedHash,
+			"chain_hash", chainHashLog)
+		deepest = depth + 1
 	}
-	return 0, nil
+	return deepest, nil
 }
 
 func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) error {
