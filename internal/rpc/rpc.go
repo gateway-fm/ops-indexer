@@ -40,9 +40,24 @@ type Client struct {
 	raw *rpclient.Client
 }
 
+// newTransport is the HTTP transport for every JSON-RPC call the indexer makes. It used to be
+// http.DefaultTransport, whose MaxIdleConnsPerHost is 2: with 50 RPC workers, 30 balance workers and the
+// catch-up workers against one node, nearly every request opened and closed a TCP connection, and at
+// ~1,000 requests/s the pod ran out of ephemeral ports ("connect: cannot assign requested address").
+// Up to 256 idle connections are now kept per host, more than twice the default worker total. A larger
+// pool costs nothing: a connection only sits idle if that many requests ran at once, and it is closed after
+// the default 90 s. There is no per-host cap, as before: with no response timeout on RPCs, a cap would let
+// requests stuck on a dead node block every other call. Same requests, fewer sockets.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 256
+	t.MaxIdleConnsPerHost = 256
+	return t
+}
+
 func New(url string) (*Client, error) {
 	httpClient := &http.Client{
-		Transport: &authTransport{underlying: http.DefaultTransport},
+		Transport: &authTransport{underlying: newTransport()},
 	}
 
 	raw := rpclient.New(url, httpClient)
