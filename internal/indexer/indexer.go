@@ -81,7 +81,11 @@ type Indexer struct {
 
 	catchupRunning bool
 
-	dailyStats dailyStatsThrottle
+	// dailyStats is shared with the catchup path: CatchupIndexer builds a fresh
+	// Indexer value for every block it processes, so a value field here would
+	// be a fresh, never-run throttle per block and fire the day aggregate on
+	// every one of them (measured: 104 runs for 105 blocks, 22 s each).
+	dailyStats *dailyStatsThrottle
 }
 
 // dailyStatsThrottle gates the day-aggregate recomputation: at most one run in
@@ -175,6 +179,7 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		config:        cfg,
 		tokenCache:    NewTokenCache(),
 		contractCache: NewContractCache(),
+		dailyStats:    &dailyStatsThrottle{},
 	}
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
@@ -427,6 +432,7 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 		i.tracingSupported,
 	)
 	i.catchupIndexer.SetEventBus(i.eventBus)
+	i.catchupIndexer.SetDailyStatsThrottle(i.dailyStats)
 
 	realtimeCfg := &RealtimeConfig{
 		ConfirmationBlocks: 1,
@@ -503,6 +509,7 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 		i.tracingSupported,
 	)
 	i.catchupIndexer.SetEventBus(i.eventBus)
+	i.catchupIndexer.SetDailyStatsThrottle(i.dailyStats)
 	i.catchupIndexer.SetCollector(i.missingRangeCollector)
 
 	realtimeCfg := &RealtimeConfig{
@@ -1142,7 +1149,7 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	// dominating, and on course to saturate a core by mid-day. The row it
 	// maintains is a dashboard aggregate; a minute of staleness is invisible,
 	// a core is not. Same queries, same semantics, fewer runs.
-	if i.dailyStats.due(blockNumber, i.config.DailyStatsMinInterval) {
+	if i.dailyStats != nil && i.dailyStats.due(blockNumber, i.config.DailyStatsMinInterval) {
 		go func() {
 			defer i.dailyStats.done()
 			i.updateDailyStatsForDate(ctx, blockTimestamp)

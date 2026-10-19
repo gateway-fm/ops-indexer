@@ -38,6 +38,11 @@ type CatchupIndexer struct {
 	// Tracing support
 	tracingSupported bool
 
+	// Shared with the main indexer (see Indexer.dailyStats); nil = no daily
+	// stats from the catchup path, which is what a stale aggregate during a
+	// backfill deserves anyway.
+	dailyStats *dailyStatsThrottle
+
 	// Work queue
 	workQueue chan uint64
 
@@ -83,6 +88,12 @@ func NewCatchupIndexer(
 		lastLogTime:      time.Now(),
 		pollInterval:     5 * time.Second,
 	}
+}
+
+// SetDailyStatsThrottle shares the main indexer's day-aggregate throttle with
+// the per-block Indexer values this catchup builds. Must be called before Start.
+func (c *CatchupIndexer) SetDailyStatsThrottle(t *dailyStatsThrottle) {
+	c.dailyStats = t
 }
 
 func (c *CatchupIndexer) SetEventBus(bus *events.Bus) {
@@ -349,6 +360,7 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 		balanceWorkers:   c.balanceWorkers,
 		tracingSupported: c.tracingSupported,
 		eventBus:         c.eventBus,
+		dailyStats:       c.dailyStats,
 	}
 
 	if len(rawBlock.Transactions) > 0 {
