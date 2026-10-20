@@ -91,13 +91,16 @@ type Indexer struct {
 
 // dailyStatsThrottle gates the day-aggregate recomputation: at most one run in
 // flight, and at most one start per minInterval (or per 100 blocks when
-// minInterval is zero, the pre-PRST-4669 behaviour). Every block marks its day
-// dirty and every run recomputes all dirty days, so a day is recomputed after
-// its last block whatever order its blocks are committed in.
+// minInterval is zero, the pre-PRST-4669 behaviour). Every block, empty or not,
+// marks its day dirty and every run recomputes all dirty days, so a day is
+// recomputed after its last block whatever order its blocks are committed in.
+// Days left dirty when no later block arrives (the last burst before a quiet
+// period) are recomputed by a timer once the interval has passed.
 type dailyStatsThrottle struct {
 	mu      sync.Mutex
 	last    time.Time
 	running bool
+	armed   bool
 	dirty   map[time.Time]struct{}
 }
 
@@ -110,8 +113,10 @@ func (t *dailyStatsThrottle) due(blockNumber uint64, day time.Time, minInterval 
 	if t.dirty == nil {
 		t.dirty = make(map[time.Time]struct{})
 	}
-	t.dirty[day] = struct{}{}
-	if t.running {
+	if !day.IsZero() {
+		t.dirty[day] = struct{}{}
+	}
+	if t.running || len(t.dirty) == 0 {
 		return nil
 	}
 	if minInterval <= 0 {
@@ -133,6 +138,9 @@ func (t *dailyStatsThrottle) due(blockNumber uint64, day time.Time, minInterval 
 }
 
 func (t *dailyStatsThrottle) markDirty(day time.Time) {
+	if t == nil {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.dirty == nil {
@@ -144,6 +152,27 @@ func (t *dailyStatsThrottle) markDirty(day time.Time) {
 func (t *dailyStatsThrottle) done() {
 	t.mu.Lock()
 	t.running = false
+	t.mu.Unlock()
+}
+
+// arm reports whether a deferred run must be scheduled, and when: dirty days are
+// waiting, no run is in flight to pick them up afterwards, and none is scheduled.
+func (t *dailyStatsThrottle) arm(minInterval time.Duration) (time.Duration, bool) {
+	if t == nil || minInterval <= 0 {
+		return 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.running || t.armed || len(t.dirty) == 0 {
+		return 0, false
+	}
+	t.armed = true
+	return max(minInterval-time.Since(t.last), time.Millisecond), true
+}
+
+func (t *dailyStatsThrottle) disarm() {
+	t.mu.Lock()
+	t.armed = false
 	t.mu.Unlock()
 }
 
@@ -746,6 +775,8 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 		return err
 	}
 	metrics.BlockIndexed(0, uint64(rawBlock.GasUsed))
+	i.dailyStats.markDirty(blockDay(b.Timestamp))
+	i.scheduleDeferredDailyStats(ctx)
 	return nil
 }
 
@@ -1176,20 +1207,43 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	// -- so it was 21.5% of all database time once holder_count stopped
 	// dominating, and on course to saturate a core by mid-day. The row it
 	// maintains is a dashboard aggregate: a day's row may lag its blocks by up to
-	// one interval. Same queries, fewer runs.
-	day := time.Unix(int64(blockTimestamp), 0).UTC().Truncate(24 * time.Hour)
-	if days := i.dailyStats.due(blockNumber, day, i.config.DailyStatsMinInterval); days != nil {
-		go func() {
-			defer i.dailyStats.done()
-			for _, d := range days {
-				if !i.updateDailyStatsForDate(ctx, d) {
-					i.dailyStats.markDirty(d)
-				}
-			}
-		}()
-	}
+	// one interval plus one run. Same queries, fewer runs.
+	i.scheduleDailyStats(ctx, blockNumber, blockDay(blockTimestamp))
 
 	return nil
+}
+
+func blockDay(timestamp uint64) time.Time {
+	return time.Unix(int64(timestamp), 0).UTC().Truncate(24 * time.Hour)
+}
+
+func (i *Indexer) scheduleDailyStats(ctx context.Context, blockNumber uint64, day time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	days := i.dailyStats.due(blockNumber, day, i.config.DailyStatsMinInterval)
+	if days == nil {
+		i.scheduleDeferredDailyStats(ctx)
+		return
+	}
+	go func() {
+		defer i.scheduleDeferredDailyStats(ctx)
+		defer i.dailyStats.done()
+		for _, d := range days {
+			if !i.updateDailyStatsForDate(ctx, d) {
+				i.dailyStats.markDirty(d)
+			}
+		}
+	}()
+}
+
+func (i *Indexer) scheduleDeferredDailyStats(ctx context.Context) {
+	if wait, ok := i.dailyStats.arm(i.config.DailyStatsMinInterval); ok {
+		time.AfterFunc(wait, func() {
+			i.dailyStats.disarm()
+			i.scheduleDailyStats(ctx, 0, time.Time{})
+		})
+	}
 }
 
 func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64, isContract bool) {
