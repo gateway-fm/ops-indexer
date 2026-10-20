@@ -86,3 +86,41 @@ func TestQueueCommittedWorkWaitsOnlyAGraceAfterShutdown(t *testing.T) {
 		t.Fatal("still waiting long after the grace period; shutdown would hang")
 	}
 }
+
+// With a dedup window every key is held in memory when the pod is told to stop; Stop must forward and write the
+// held keys too, not only what is still in the queue.
+func TestStopDrainsHeldBalanceWork(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	mockRPC.On("CallContract", mock.Anything, mock.Anything, mock.Anything).Return(make([]byte, 32), nil)
+	var mu sync.Mutex
+	written := map[string]bool{}
+	mockDB.On("InsertBalancesBatch", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, b := range args.Get(1).([]*types.Balance) {
+			written[b.Address] = true
+		}
+	}).Return(nil)
+
+	p := NewBalanceWorkerPool(mockDB, mockRPC, 2, 0)
+	p.SetDedupWindow(10 * time.Second) // longer than the test: every key is still held at Stop
+	p.Start()
+	const n = 50
+	works := make([]BalanceWork, n)
+	for i := range works {
+		works[i] = BalanceWork{Address: common.HexToAddress(fmt.Sprintf("0x%040x", i+1)), TokenAddress: common.HexToAddress("0x01"), BlockNumber: 1}
+	}
+	if got := p.QueueWorkBatchWait(t.Context(), works); got != n {
+		t.Fatalf("queued %d of %d", got, n)
+	}
+
+	p.Stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, w := range works {
+		if !written[w.Address.Hex()] {
+			t.Fatalf("held balance of %s dropped at Stop (%d of %d written)", w.Address.Hex(), len(written), n)
+		}
+	}
+}

@@ -112,8 +112,8 @@ var (
 	balanceEnqueueGrace = 5 * time.Second
 )
 
-// Stop drains instead of discarding: it closes the queue and lets the workers fetch and flush everything queued,
-// under a live context. Only after balanceDrainTimeout does it cancel and drop what is left (logged with the
+// Stop drains instead of discarding: it closes the queue, so the coalescer forwards every key held by the dedup
+// window, and lets the workers fetch and flush everything queued and held, under a live context. Only after balanceDrainTimeout does it cancel and drop what is left (logged with the
 // count). A Queue call after Stop is refused (counted as dropped) instead of panicking on the closed channel.
 func (p *BalanceWorkerPool) Stop() {
 	p.stopOnce.Do(func() {
