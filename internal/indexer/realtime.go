@@ -38,6 +38,7 @@ type RealtimeIndexer struct {
 	// State tracking
 	lastProcessedBlock uint64
 	mu                 sync.RWMutex
+	receipts           receiptSkip
 
 	// Coordination
 	ctx    context.Context
@@ -179,7 +180,9 @@ func (r *RealtimeIndexer) runSubscriptionMode(ctx context.Context, headers <-cha
 
 				if err := r.processBlock(ctx, blockNum); err != nil {
 					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					break
+					if !r.receipts.skip(ctx, r.db, blockNum, err) {
+						break
+					}
 				}
 
 				r.SetLastProcessedBlock(blockNum)
@@ -243,7 +246,9 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 
 				if err := r.processBlock(ctx, blockNum); err != nil {
 					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					break
+					if !r.receipts.skip(ctx, r.db, blockNum, err) {
+						break
+					}
 				}
 
 				r.SetLastProcessedBlock(blockNum)

@@ -518,6 +518,7 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 
 	ticker := time.NewTicker(i.pollInterval)
 	defer ticker.Stop()
+	var receipts receiptSkip
 
 	for {
 		select {
@@ -563,7 +564,9 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 
 				if err := i.processBlock(ctx, blockNum); err != nil {
 					log.Error("failed to process block", "block", blockNum, "error", err)
-					break
+					if !receipts.skip(ctx, i.db, blockNum, err) {
+						break
+					}
 				}
 				lastIndexed = blockNum
 
@@ -689,7 +692,7 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 
 	receipts, err := i.rpc.FetchReceiptsBatch(ctx, txHashes, i.config.RPCWorkers, i.config.RPCRateLimit, blockNumber)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errReceiptsUnavailable, err)
 	}
 
 	blockData := &db.BlockData{
