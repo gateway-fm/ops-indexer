@@ -47,6 +47,11 @@ var (
 		Buckets: latencyBuckets,
 	})
 
+	statsBackfillThrough = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_stats_backfill_through",
+		Help: "Every block at or below this is counted by the stats backfill.",
+	})
+
 	verifyChecked = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "indexer_verify_ranges_checked_total",
 		Help: "Ledger checks run, by check (recount: one retained span; running: chain, tokens and one address bucket; node: one pruned span).",
@@ -227,6 +232,8 @@ func VerifyCheckedN(check string, checked, drifted int) {
 	verifyDrift.WithLabelValues(check).Set(float64(drifted))
 	verifyDrifted.WithLabelValues(check).Add(float64(drifted))
 }
+
+func SetStatsBackfillThrough(block uint64) { statsBackfillThrough.Set(float64(block)) }
 
 func SetVerifyQuarantined(n int64) { verifyQuarantined.Set(float64(n)) }
 

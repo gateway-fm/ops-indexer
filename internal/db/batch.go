@@ -108,6 +108,8 @@ type AddressStatsDelta struct {
 	TokenTransferDelta   int
 	SentDelta            int
 	IsContract           bool
+	// LastBlock, when above BlockNumber, is the newest block of a delta merged over several (the stats backfill).
+	LastBlock uint64
 	BlockNumber          uint64
 }
 
@@ -501,7 +503,10 @@ func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
 	// sorted them. ORDER BY on the row pass makes its acquisition order
 	// explicit rather than leaving it to the plan, and on the primary-key btree
 	// it is the same order anyway.
-	lockTokens := make(map[string]struct{}, len(data.Tokens)+len(data.Transfers))
+	lockTokens := make(map[string]struct{}, len(data.Tokens)+len(data.Transfers)+len(tokenDeltas))
+	for token := range tokenDeltas {
+		lockTokens[token] = struct{}{}
+	}
 	for _, t := range data.Tokens {
 		lockTokens[strings.ToLower(t.Address)] = struct{}{}
 	}
@@ -552,7 +557,9 @@ func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
 					-- seen before this fix, stored as the ERC20 default) when a
 					-- more specific type is observed, but never downgrade.
 					token_type = CASE WHEN EXCLUDED.token_type <> 'ERC20' THEN EXCLUDED.token_type ELSE tokens.token_type END,
-					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)
+					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply),
+					creation_tx = CASE WHEN EXCLUDED.block_number < tokens.block_number THEN EXCLUDED.creation_tx ELSE tokens.creation_tx END,
+					block_number = LEAST(tokens.block_number, EXCLUDED.block_number)
 				RETURNING (xmax = 0)`,
 				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
 		}
@@ -723,7 +730,7 @@ func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
 			s := data.AddressStats[addr]
 			batch.Queue(`
 				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
-				VALUES (LOWER($1), $2, $3, $4, $7, $5, $5, $6, NOW())
+				VALUES (LOWER($1), $2, $3, $4, $7, $5::BIGINT, GREATEST($5::BIGINT, $8::BIGINT), $6, NOW())
 				ON CONFLICT (address) DO UPDATE SET
 					tx_count = address_stats.tx_count + $2,
 					internal_tx_count = address_stats.internal_tx_count + $3,
@@ -734,7 +741,7 @@ func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
 					is_contract = COALESCE(address_stats.is_contract, false) OR EXCLUDED.is_contract,
 					updated_at = NOW()
 				RETURNING (xmax = 0)`,
-				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract, s.SentDelta)
+				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract, s.SentDelta, s.LastBlock)
 		}
 		br := tx.SendBatch(ctx, batch)
 		for range data.AddressStats {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -27,18 +28,39 @@ type fakeChain struct {
 	head, busy uint64
 	calls      int
 	balances   map[string]*big.Int
+	failOnce   map[uint64]bool
+	mu         sync.Mutex
+}
+
+func (f *fakeChain) count() {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+}
+
+func (f *fakeChain) failsNow(n uint64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failOnce[n] {
+		f.failOnce[n] = false
+		return true
+	}
+	return false
 }
 
 func blockTime(n uint64) hexutil.Uint64 { return hexutil.Uint64(1_700_000_000 + n) }
 
 func (f *fakeChain) txHash(n uint64) common.Hash { return common.BytesToHash(new(big.Int).SetUint64(n + 1).Bytes()) }
 
-func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { f.calls++; return f.head, nil }
+func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { f.count(); return f.head, nil }
 
 func (f *fakeChain) RawBlockByNumber(_ context.Context, n uint64) (*rpc.RawBlock, error) {
-	f.calls++
+	f.count()
 	if n > f.head {
 		return nil, fmt.Errorf("block %d above head %d", n, f.head)
+	}
+	if f.failsNow(n) {
+		return nil, fmt.Errorf("block %d: node unavailable", n)
 	}
 	num := hexutil.Big(*new(big.Int).SetUint64(n))
 	b := &rpc.RawBlock{Number: &num, Hash: common.BytesToHash(new(big.Int).SetUint64(1_000_000 + n).Bytes()),
@@ -58,7 +80,7 @@ func (f *fakeChain) RawBlockByNumber(_ context.Context, n uint64) (*rpc.RawBlock
 }
 
 func (f *fakeChain) FetchReceiptsBatch(_ context.Context, hashes []common.Hash, _ int, _ int, blockNumber ...uint64) (map[common.Hash]*rpclient.Receipt, error) {
-	f.calls++
+	f.count()
 	out := map[common.Hash]*rpclient.Receipt{}
 	for _, h := range hashes {
 		n := h.Big().Uint64() - 1
@@ -81,7 +103,7 @@ func transferEvent(from, to common.Address, value int64, index uint) *rpclient.L
 }
 
 func (f *fakeChain) FetchTokenMetadataBatch(_ context.Context, addrs []common.Address, _ int, _ int) (map[common.Address]*rpc.TokenMetadataResult, error) {
-	f.calls++
+	f.count()
 	name := "Chain Token"
 	out := map[common.Address]*rpc.TokenMetadataResult{}
 	for _, a := range addrs {
@@ -91,7 +113,7 @@ func (f *fakeChain) FetchTokenMetadataBatch(_ context.Context, addrs []common.Ad
 }
 
 func (f *fakeChain) FetchTracesBatch(context.Context, []common.Hash, uint64, uint64, int, int) ([]*types.InternalTransaction, error) {
-	f.calls++
+	f.count()
 	return nil, nil
 }
 
@@ -99,7 +121,7 @@ func (f *fakeChain) txsThrough(block uint64) uint64 { return min(block+1, f.busy
 
 // CallContractAt answers totalSupply() with the minted supply and balanceOf() from balances (default 0).
 func (f *fakeChain) CallContractAt(_ context.Context, _ common.Address, data []byte, block uint64) ([]byte, error) {
-	f.calls++
+	f.count()
 	var v *big.Int
 	switch {
 	case len(data) == 4:
@@ -114,7 +136,7 @@ func (f *fakeChain) CallContractAt(_ context.Context, _ common.Address, data []b
 }
 
 func (f *fakeChain) TransactionCountAt(_ context.Context, a common.Address, block uint64) (uint64, error) {
-	f.calls++
+	f.count()
 	if a != chainSender {
 		return 0, nil
 	}
@@ -122,7 +144,7 @@ func (f *fakeChain) TransactionCountAt(_ context.Context, a common.Address, bloc
 }
 
 func (f *fakeChain) BlockTransactionCounts(_ context.Context, from, to uint64, _ int) (uint64, error) {
-	f.calls++
+	f.count()
 	if from >= f.busy {
 		return 0, nil
 	}
