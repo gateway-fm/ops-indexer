@@ -790,16 +790,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	} else if wm > 0 {
 		return ErrHistoryPruned
 	}
-	// All address keys are lowercased so duplicate-case rows from past
-	// writes (some checksum-cased, some lowercase) collapse to one row per
-	// address. Ongoing delta writes already lowercase the key, so this
-	// stays consistent going forward.
-	//
-	// tx_count is the count of distinct tx hashes involving the address
-	// either as the EVM from/to OR as a Transfer-event participant in that
-	// tx's logs. This matches the inclusive list returned by
-	// GetTransactionsByAddress — a recipient who never sent a tx of their
-	// own still gets credit for the mint/transfer txs that gave them tokens.
+	// Each address's counters are what the writer counts for it, from the same per-row definition as the ledger.
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -814,79 +805,10 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 		TRUNCATE address_stats;
 
 		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
-		SELECT
-			addr,
-			COALESCE(tx_count, 0),
-			COALESCE(internal_tx_count, 0),
-			COALESCE(token_transfer_count, 0),
-			COALESCE(sent_count, 0),
-			first_seen,
-			last_seen,
-			COALESCE(is_contract, false),
-			NOW()
-		FROM (
-			SELECT
-				a.address as addr,
-				tx.tx_count,
-				it.internal_tx_count,
-				tt.token_transfer_count,
-				sent.sent_count,
-				LEAST(tx.first_seen, it.first_seen, tt.first_seen) as first_seen,
-				GREATEST(tx.last_seen, it.last_seen, tt.last_seen) as last_seen,
-				c.is_contract
-			FROM (
-				SELECT LOWER(from_address) as address FROM transactions
-				UNION
-				SELECT LOWER(to_address) as address FROM transactions WHERE to_address IS NOT NULL
-				UNION
-				SELECT LOWER(from_address) as address FROM internal_transactions
-				UNION
-				SELECT LOWER(to_address) as address FROM internal_transactions WHERE to_address IS NOT NULL
-				UNION
-				SELECT LOWER(from_address) as address FROM token_transfers
-				UNION
-				SELECT LOWER(to_address) as address FROM token_transfers
-			) a
-			LEFT JOIN (
-				SELECT address, COUNT(DISTINCT tx_hash) as tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
-				FROM (
-					SELECT LOWER(from_address) as address, hash as tx_hash, block_number FROM transactions
-					UNION ALL
-					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
-					UNION ALL
-					SELECT LOWER(tt.from_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
-					UNION ALL
-					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt WHERE tt.to_address IS DISTINCT FROM tt.from_address
-				) t
-				GROUP BY address
-			) tx ON a.address = tx.address
-			LEFT JOIN (
-				SELECT address, COUNT(*) as internal_tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
-				FROM (
-					SELECT LOWER(from_address) as address, block_number FROM internal_transactions
-					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
-				) t
-				GROUP BY address
-			) it ON a.address = it.address
-			LEFT JOIN (
-				SELECT address, COUNT(*) as token_transfer_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
-				FROM (
-					SELECT LOWER(from_address) as address, block_number FROM token_transfers
-					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM token_transfers WHERE to_address IS DISTINCT FROM from_address
-				) t
-				GROUP BY address
-			) tt ON a.address = tt.address
-			LEFT JOIN (
-				SELECT LOWER(from_address) as address, COUNT(*) as sent_count FROM transactions
-				WHERE tx_type BETWEEN 0 AND 4 GROUP BY 1
-			) sent ON a.address = sent.address
-			LEFT JOIN (
-				SELECT LOWER(address) as address, true as is_contract FROM contracts
-			) c ON a.address = c.address
-		) stats
-		WHERE addr IS NOT NULL
+		SELECT x.address, count(DISTINCT x.tx), sum(x.internal), sum(x.transfers), sum(x.sent), min(x.block), max(x.block),
+		       EXISTS (SELECT 1 FROM contracts c WHERE c.address = x.address), NOW()
+		FROM ledger_address_contributions(0, 9223372036854775807) x
+		GROUP BY x.address
 	`); err != nil {
 		return err
 	}

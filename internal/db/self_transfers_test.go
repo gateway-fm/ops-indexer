@@ -127,3 +127,17 @@ func TestMigration017RefusesOncePruned(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(16), v, "the refused migration is not recorded as applied")
 }
+
+// The rebuild counts what the writer counts: the zero address keeps no transfer count (mints and burns).
+func TestRebuildAddressStatsGivesTheZeroAddressNoTransferCount(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 99, 1)
+	require.NoError(t, d.RebuildAddressStats(ctx))
+	var zero int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM address_stats WHERE address = $1`, zeroAddress).Scan(&zero))
+	require.Zero(t, zero)
+	txs, transfers, internal := addressCounters(t, d, "0xb")
+	require.Equal(t, [3]int64{100, 100, 100}, [3]int64{txs, transfers, internal}, "one transaction, mint and call per block")
+}
