@@ -1,5 +1,5 @@
 -- Totals as a ledger: what each closed span of blocks contributed to
--- the chain and token counters, one row per span and key. A span is final and complete when it closes, and closes
+-- the chain, token and address counters, one row per span and key. A span is final and complete when it closes, and closes
 -- in block order, so the closed spans are a prefix of the chain. Pruned history is the spans at or below the
 -- watermark; prune_offsets becomes their sum, so every recount stays "retained rows + offsets".
 -- Replaces the folded prune_offsets and prune_pending: refuses a database that holds folded offsets.
@@ -32,6 +32,21 @@ CREATE TABLE ledger_token (
     transfers BIGINT NOT NULL,
     supply NUMERIC NOT NULL,
     PRIMARY KEY (lo, token)
+);
+
+-- An address's row counts what the writer counts for it in the span: distinct transactions it sent, received or
+-- took part in through a Transfer event (the zero address takes no part), the nonce-bumping ones it sent, each
+-- transfer and internal call once, and the blocks it was first and last seen in (a created contract included).
+CREATE TABLE ledger_address (
+    lo BIGINT NOT NULL REFERENCES ledger_spans (lo) ON DELETE CASCADE,
+    address TEXT NOT NULL,
+    txs BIGINT NOT NULL,
+    sent BIGINT NOT NULL,
+    internal BIGINT NOT NULL,
+    transfers BIGINT NOT NULL,
+    first_seen BIGINT NOT NULL,
+    last_seen BIGINT NOT NULL,
+    PRIMARY KEY (lo, address)
 );
 
 DROP FUNCTION prune_prepare(TEXT);
@@ -92,6 +107,35 @@ BEGIN
                   - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END), 0)
     FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
     GROUP BY token_address;
+    INSERT INTO ledger_address (lo, address, txs, sent, internal, transfers, first_seen, last_seen)
+    SELECT p_lo, address, count(DISTINCT tx), sum(sent), sum(internal), sum(transfers), min(block), max(block)
+    FROM (
+        SELECT from_address AS address, hash AS tx, block_number AS block,
+               CASE WHEN tx_type BETWEEN 0 AND 4 THEN 1 ELSE 0 END AS sent, 0 AS internal, 0 AS transfers
+        FROM transactions WHERE block_number >= p_lo AND block_number < p_hi
+        UNION ALL
+        SELECT to_address, hash, block_number, 0, 0, 0
+        FROM transactions WHERE block_number >= p_lo AND block_number < p_hi AND to_address IS NOT NULL
+        UNION ALL
+        SELECT from_address, tx_hash, block_number, 0, 0, 1
+        FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
+          AND from_address <> '0x0000000000000000000000000000000000000000'
+        UNION ALL
+        SELECT to_address, tx_hash, block_number, 0, 0, 1
+        FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
+          AND to_address <> '0x0000000000000000000000000000000000000000' AND to_address <> from_address
+        UNION ALL
+        SELECT from_address, NULL, block_number, 0, 1, 0
+        FROM internal_transactions WHERE block_number >= p_lo AND block_number < p_hi
+        UNION ALL
+        SELECT to_address, NULL, block_number, 0, 1, 0
+        FROM internal_transactions WHERE block_number >= p_lo AND block_number < p_hi
+          AND to_address IS NOT NULL AND to_address <> from_address
+        UNION ALL
+        SELECT address, NULL, block_number, 0, 0, 0
+        FROM contracts WHERE block_number >= p_lo AND block_number < p_hi
+    ) x
+    GROUP BY address;
     RETURN true;
 END
 $f$;
@@ -151,6 +195,7 @@ $m$;
 DROP FUNCTION ledger_close_span(BIGINT, BIGINT);
 DROP FUNCTION ledger_next_span(BIGINT, BIGINT);
 DROP VIEW prune_offsets;
+DROP TABLE ledger_address;
 DROP TABLE ledger_token;
 DROP TABLE ledger_chain;
 DROP TABLE ledger_spans;
