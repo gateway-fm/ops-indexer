@@ -264,6 +264,10 @@ func (c *Config) Validate() error {
 	if err := c.CheckCommitPipeline(); err != nil {
 		return err
 	}
+	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
+		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+
+			"every total would leave those blocks out. Set START_BLOCK=0, or PRUNE_RETAIN_BLOCKS=0 to keep totals from START_BLOCK", c.StartBlock, c.PruneRetainBlocks)
+	}
 	if c.EnableOPDeposits {
 		if c.L1RPCURL == "" {
 			return fmt.Errorf("L1_RPC_URL is required when ENABLE_OP_DEPOSITS is true")
