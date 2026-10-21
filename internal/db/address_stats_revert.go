@@ -7,7 +7,7 @@ import (
 )
 
 // revertAddressStats takes a reverted block's rows off address_stats, before they are deleted: each address loses
-// what ledgerAddressRowsSQL counts for it in the block, one address at a time in address order like the writer.
+// what the ledger counts for it in the block (ledger_address_contributions, sent transactions included), one address at a time in address order like the writer.
 // first_seen and last_seen that point into the block move to the address's remaining rows (the closed ledger when
 // only pruned history remains), is_contract follows the remaining contract creations, and an address no remaining
 // block has seen loses its row. It returns the number of rows removed.
@@ -20,21 +20,24 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 		return 0, err
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT c.address, c.txs, c.internal, c.transfers,
+		SELECT c.address, c.txs, c.sent, c.internal, c.transfers,
 		       EXISTS (SELECT 1 FROM contracts k WHERE k.address = c.address AND k.block_number = $1)
-		FROM (`+ledgerAddressRowsSQL+`) c
+		FROM (
+			SELECT address, count(DISTINCT tx) AS txs, sum(sent) AS sent, sum(internal) AS internal, sum(transfers) AS transfers
+			FROM ledger_address_contributions($1::BIGINT, $2::BIGINT) GROUP BY address
+		) c
 		ORDER BY c.address`, int64(number), int64(number)+1)
 	if err != nil {
 		return 0, err
 	}
 	type contribution struct {
-		address                  string
-		txs, internal, transfers int64
-		created                  bool
+		address                        string
+		txs, sent, internal, transfers int64
+		created                        bool
 	}
 	all, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (contribution, error) {
 		var c contribution
-		return c, r.Scan(&c.address, &c.txs, &c.internal, &c.transfers, &c.created)
+		return c, r.Scan(&c.address, &c.txs, &c.sent, &c.internal, &c.transfers, &c.created)
 	})
 	if err != nil {
 		return 0, err
@@ -84,6 +87,7 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 		if _, err := tx.Exec(ctx, `
 			UPDATE address_stats SET
 				tx_count = GREATEST(tx_count - $3, 0),
+				sent_count = GREATEST(sent_count - $9, 0),
 				internal_tx_count = GREATEST(internal_tx_count - $4, 0),
 				token_transfer_count = GREATEST(token_transfer_count - $5, 0),
 				first_seen = CASE WHEN first_seen >= $2 AND $6::BIGINT IS NOT NULL THEN $6 ELSE first_seen END,
@@ -91,7 +95,7 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 				is_contract = CASE WHEN $8 THEN EXISTS (SELECT 1 FROM contracts WHERE address = $1 AND block_number <> $2) ELSE is_contract END,
 				updated_at = NOW()
 			WHERE address = $1`,
-			c.address, int64(number), c.txs, c.internal, c.transfers, first, last, c.created); err != nil {
+			c.address, int64(number), c.txs, c.internal, c.transfers, first, last, c.created, c.sent); err != nil {
 			return 0, err
 		}
 	}
