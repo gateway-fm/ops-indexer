@@ -14,6 +14,11 @@ func notFound(kind, identifier string) error {
 	return status.Errorf(codes.NotFound, "%s not found: %s", kind, identifier)
 }
 
+// pruned returns OutOfRange for an explicit block target the retention window already removed.
+func pruned(block, watermark uint64) error {
+	return status.Errorf(codes.OutOfRange, "pruned: block %d is at or below the retention watermark %d", block, watermark)
+}
+
 // invalidArgument returns InvalidArgument with a short, non-PII message.
 func invalidArgument(format string, args ...any) error {
 	return status.Errorf(codes.InvalidArgument, format, args...)

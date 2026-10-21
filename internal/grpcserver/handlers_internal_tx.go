@@ -33,14 +33,22 @@ func (s *Server) ListInternalTransactions(ctx context.Context, req *indexerv1.Li
 	case hasBlock:
 		switch b := req.GetByBlock().GetSelector().(type) {
 		case *indexerv1.ListInternalTransactionsRequest_BlockFilter_Number:
+			if cerr := s.checkRetained(ctx, b.Number); cerr != nil {
+				return nil, cerr
+			}
 			rows, err = s.db.GetInternalTransactionsByBlock(ctx, b.Number)
+			if err == nil && len(rows) == 0 {
+				if cerr := s.recheckRetained(ctx, b.Number); cerr != nil {
+					return nil, cerr
+				}
+			}
 		case *indexerv1.ListInternalTransactionsRequest_BlockFilter_Hash:
 			blk, berr := s.db.GetBlockByHash(ctx, b.Hash)
 			if berr != nil {
 				return nil, internalErr(berr, "ListInternalTransactions")
 			}
 			if blk == nil {
-				return nil, notFound("block", b.Hash)
+				return nil, s.notFoundByHash(ctx, "block", b.Hash)
 			}
 			rows, err = s.db.GetInternalTransactionsByBlock(ctx, blk.Number)
 		default:

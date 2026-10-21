@@ -578,9 +578,19 @@ func (d *DB) GetTransactionsWithCategories(ctx context.Context, limit int, befor
 	return scanTransactionsWithCategories(rows)
 }
 
+// GetTransactionsPaginatedWithCategories returns a feed page and its total. Without hidden tx types the total is
+// the transactions_total counter, which counts pruned history; with them it is a COUNT(*) of the retained rows.
 func (d *DB) GetTransactionsPaginatedWithCategories(ctx context.Context, page, pageSize int) ([]types.Transaction, int64, error) {
 	var total int64
-	err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE NOT (tx_type = ANY($1::int[]))`, d.HiddenTxTypes).Scan(&total)
+	var err error
+	if len(d.HiddenTxTypes) == 0 {
+		err = d.pool.QueryRow(ctx, `
+			SELECT COALESCE(
+				(SELECT count FROM chain_counters WHERE name = 'transactions_total'),
+				(SELECT COUNT(*) FROM transactions))`).Scan(&total)
+	} else {
+		err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE NOT (tx_type = ANY($1::int[]))`, d.HiddenTxTypes).Scan(&total)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -923,14 +933,13 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 	return scanTokenTransfers(rows)
 }
 
-// CountTransfersByAddress returns the total number of transfers where the
-// address is sender or receiver, ignoring pagination. Mirrors the WHERE clause
-// of GetTransfersByAddress so consumers can show a true "of N" total.
+// CountTransfersByAddress returns address_stats.token_transfer_count: every transfer the address sent or received,
+// pruned history included. A self-transfer counts twice, once per side.
 func (d *DB) CountTransfersByAddress(ctx context.Context, address string) (int64, error) {
 	var total int64
-	addr := strings.ToLower(address)
-	err := d.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM token_transfers WHERE from_address = $1 OR to_address = $1`, addr).Scan(&total)
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT token_transfer_count FROM address_stats WHERE address = $1), 0)`,
+		strings.ToLower(address)).Scan(&total)
 	return total, err
 }
 
@@ -947,9 +956,16 @@ func (d *DB) GetTransfersByTransaction(ctx context.Context, txHash string) ([]ty
 	return scanTokenTransfers(rows)
 }
 
+// GetTransfersByToken's total is tokens.transfer_count, which counts pruned history. A token without a tokens row
+// yet (metadata discovery pending) falls back to counting its retained transfers.
 func (d *DB) GetTransfersByToken(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenTransfer, int64, error) {
 	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM token_transfers WHERE token_address = LOWER($1)", tokenAddress).Scan(&total)
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(
+			(SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = LOWER($1)),
+			(SELECT COUNT(*) FROM token_transfers WHERE token_address = LOWER($1)))`, tokenAddress).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
@@ -1602,11 +1618,14 @@ func (d *DB) GetInternalTransactionsByBlock(ctx context.Context, blockNumber uin
 	return scanInternalTransactions(rows)
 }
 
+// GetInternalTransactionsByAddress's total is address_stats.internal_tx_count, which counts pruned history; a
+// self-call counts twice, once per side.
 func (d *DB) GetInternalTransactionsByAddress(ctx context.Context, address string, limit int, offset int) ([]types.InternalTransaction, int64, error) {
 	var total int64
-	d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM internal_transactions
-		WHERE from_address = LOWER($1) OR to_address = LOWER($1)`, address).Scan(&total)
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT internal_tx_count FROM address_stats WHERE address = LOWER($1)), 0)`, address).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, block_number, trace_address, from_address, to_address, value::text,

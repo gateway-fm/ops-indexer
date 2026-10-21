@@ -71,8 +71,9 @@ func (c Config) withDefaults() Config {
 type Server struct {
 	indexerv1.UnimplementedIndexerServiceServer
 
-	cfg Config
-	db  *db.DB
+	cfg       Config
+	db        *db.DB
+	watermark watermark
 }
 
 // New constructs a Server. The db must already be connected and migrated.

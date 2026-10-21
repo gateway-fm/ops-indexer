@@ -59,7 +59,18 @@ func (s *Server) ListLogs(ctx context.Context, req *indexerv1.ListLogsRequest) (
 				to = &t
 			}
 		}
+		// GetLogs treats to_block as inclusive.
+		if to != nil {
+			if cerr := s.checkRetained(ctx, *to); cerr != nil {
+				return nil, cerr
+			}
+		}
 		rows, err = s.db.GetLogs(ctx, addr, topic, from, to, limit)
+		if err == nil && to != nil && len(rows) == 0 {
+			if cerr := s.recheckRetained(ctx, *to); cerr != nil {
+				return nil, cerr
+			}
+		}
 		if err == nil {
 			total, err = s.db.CountLogs(ctx, addr, topic, from, to)
 		}

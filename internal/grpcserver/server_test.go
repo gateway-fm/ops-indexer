@@ -27,6 +27,8 @@ import (
 type testHarness struct {
 	t       *testing.T
 	db      *db.DB
+	pool    *pgxpool.Pool
+	srv     *Server
 	client  indexerv1.IndexerServiceClient
 	conn    *grpc.ClientConn
 	cleanup func()
@@ -117,6 +119,8 @@ func newTestHarness(t *testing.T) *testHarness {
 	return &testHarness{
 		t:       t,
 		db:      database,
+		pool:    pool,
+		srv:     srv,
 		client:  indexerv1.NewIndexerServiceClient(conn),
 		conn:    conn,
 		cleanup: cleanup,
@@ -152,8 +156,14 @@ func seedChain(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("seed tx %d: %v", i, err)
 		}
 	}
-	// sync_status row so GetSyncStatus returns something
+	// The writer keeps the chain totals; this seed bypasses it.
 	_, err := pool.Exec(ctx, `
+		UPDATE chain_counters SET count = 5 WHERE name IN ('blocks_total', 'transactions_total')`)
+	if err != nil {
+		t.Fatalf("seed chain_counters: %v", err)
+	}
+	// sync_status row so GetSyncStatus returns something
+	_, err = pool.Exec(ctx, `
 		INSERT INTO sync_status (id, last_indexed_block, is_syncing, updated_at)
 		VALUES (1, 5, false, NOW())
 		ON CONFLICT (id) DO UPDATE SET last_indexed_block = 5, is_syncing = false

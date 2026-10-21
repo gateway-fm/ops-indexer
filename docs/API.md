@@ -125,6 +125,57 @@ proto3 semantics by default — unset primitive fields default to zero / empty. 
 - When the proto uses `oneof` for mutually exclusive filters (e.g., `ListTransactionsRequest.filter`), exactly one option is allowed.
 - Filters that require at least one criterion (e.g., `ListLogsRequest`) return `InvalidArgument` if none is provided. This prevents accidental full-table scans.
 
+## History retention
+
+With `PRUNE_RETAIN_BLOCKS` set (0 = off, the default), the indexer keeps only that many blocks of history (blocks,
+transactions, logs, token transfers, internal transactions, balance history) below its head and drops older ranges.
+Current state (addresses, tokens, holders, balances, NFT inventory, contracts, daily stats) is never pruned.
+
+`GetChainStats` reports the watermark: `pruned_through_block` is the newest pruned block (every block at or below it
+is gone; 0 = nothing pruned) and `pruned_through_timestamp` its timestamp (unset when nothing is pruned). With nothing
+pruned, every call behaves as before.
+
+**`OutOfRange`** answers explicit block targets at or below the watermark:
+
+- `GetBlock` by number.
+- `ListTransactions` and `ListInternalTransactions` `by_block` by number.
+- `BatchGetBlockTransactionCounts` when any requested block is at or below it.
+- `ListBlocks` when its upper bound (`before_number` or the cursor, exclusive) is at most watermark + 1.
+- `ListTransactions` and `ListTokenTransfers` `by_address` with `block_range.to_block` (exclusive) at most
+  watermark + 1 and no cursor.
+- `ListLogs` with `by_address` + `topic0` and `block_range.to_block` at or below the watermark: this path treats
+  `to_block` as **inclusive**. `ListLogs` honours `block_range` on that path only.
+
+**Hash lookups stay `NotFound`.** `GetBlock` by hash, `GetTransaction`, and `by_block` by hash cannot tell a pruned
+entity from one that never existed; while anything is pruned, the message ends with
+`(history at or below block W is pruned)`. `by_tx_hash` lists of a pruned transaction return empty.
+
+Lists that run into the watermark while paging (the feeds, `by_address` lists, deep offset pages) just end: no error.
+
+**Totals count pruned history**, from counters the writer keeps (never a `COUNT(*)` over retained rows):
+
+- `GetChainStats` totals, `GetAddress`, `BatchGetAddressTransactionCounts`, `GetToken`.
+- `ListTransactionsPaginated` `total_items` (`transactions_total`), when no hidden tx types are configured.
+- `ListAllTokenTransfers` `total_items` without a `token_type` filter (`transfers_total`).
+- `ListTokenTransfers` `by_token` `total_count` (`tokens.transfer_count`).
+- `ListTokenTransfers` `by_address` `total_count` (`address_stats.token_transfer_count`) and
+  `ListInternalTransactions` `by_address` `total_count` (`address_stats.internal_tx_count`). Both count a self-transfer
+  or self-call twice, once per side, and the zero address has no transfer count.
+- `ListTokenHolders` (`tokens.holder_count`), `ListTokens`, `ListAddresses`, `ListTokenInventory`, `GetDailyStats`:
+  current state, unaffected by pruning.
+
+**Within retention** (counts or rows limited to retained history):
+
+- `ListLogs` `total_count` by address, by topic0, by address + topic0, and by range.
+- `ListAllTokenTransfers` `total_items` when filtered by `token_type`.
+- `ListTransactionsPaginated` `total_items` when hidden tx types are configured.
+- `GetTransactionHistory` `HOUR` buckets when the retention window is shorter than 168 h.
+- `Search` block and transaction suggestions.
+- `by_tx_hash` lists (`ListLogs`, `ListTokenTransfers`, `ListInternalTransactions`): their `total_count` is the row
+  count, 0 for a pruned transaction.
+- `GetGasPrices` samples the latest 10,000 transactions; a window holding fewer samples fewer.
+- The rows of every list: they end at the watermark.
+
 ## Error model
 
 Standard gRPC status codes:
@@ -134,6 +185,7 @@ Standard gRPC status codes:
 | `OK` | Success. |
 | `NotFound` | Entity does not exist in the index (e.g., `GetBlock` on an unseen number). |
 | `InvalidArgument` | Malformed address / hash / cursor, missing required filter, page size out of range. |
+| `OutOfRange` | An explicit block target is at or below the retention watermark: that history was pruned on purpose (see [History retention](#history-retention)). |
 | `Unavailable` | Feature gated off for this indexer's chain (e.g., OP-Stack RPCs on a non-OP chain), or indexer is still syncing through startup. |
 | `FailedPrecondition` | Indexer is not yet ready to serve (e.g., migration not applied, DB unreachable). |
 | `ResourceExhausted` | Server-side cap hit (rare; typically a symptom of a client not using pagination). |

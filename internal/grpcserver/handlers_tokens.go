@@ -81,17 +81,26 @@ func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListToke
 		// (full (block, log_index) keyset — RD-1148), else block_range.to_block as an
 		// EXCLUSIVE whole-block upper bound (proto: half-open, 0 = unbounded).
 		var before *db.AddressFeedBound
+		var toBlock uint64
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur transferFeedCursor
 			if derr := decodeCursor(c, &cur); derr != nil {
 				return nil, derr
 			}
 			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.LogIndex}
-		} else if tb := req.GetBlockRange().GetToBlock(); tb > 0 {
-			before = &db.AddressFeedBound{Block: tb}
+		} else if toBlock = req.GetBlockRange().GetToBlock(); toBlock > 0 {
+			before = &db.AddressFeedBound{Block: toBlock}
+			if cerr := s.checkRetained(ctx, lastBlockBelow(toBlock)); cerr != nil {
+				return nil, cerr
+			}
 		}
 		addr := strings.ToLower(req.GetByAddress())
 		rows, err = s.db.GetTransfersByAddress(ctx, addr, limit+1, before)
+		if err == nil && toBlock > 0 && len(rows) == 0 {
+			if cerr := s.recheckRetained(ctx, lastBlockBelow(toBlock)); cerr != nil {
+				return nil, cerr
+			}
+		}
 		if err == nil {
 			total, err = s.db.CountTransfersByAddress(ctx, addr)
 		}

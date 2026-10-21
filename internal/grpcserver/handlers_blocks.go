@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"log/slog"
+	"slices"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 )
@@ -10,12 +11,18 @@ import (
 func (s *Server) GetBlock(ctx context.Context, req *indexerv1.GetBlockRequest) (*indexerv1.Block, error) {
 	switch sel := req.GetSelector().(type) {
 	case *indexerv1.GetBlockRequest_Number:
+		if err := s.checkRetained(ctx, sel.Number); err != nil {
+			return nil, err
+		}
 		b, err := s.db.GetBlock(ctx, sel.Number)
 		if err != nil {
 			slog.Error("GetBlock by number", "error", err)
 			return nil, internalErr(err, "GetBlock")
 		}
 		if b == nil {
+			if err := s.recheckRetained(ctx, sel.Number); err != nil {
+				return nil, err
+			}
 			return nil, notFound("block", "")
 		}
 		return mapBlock(b), nil
@@ -29,7 +36,7 @@ func (s *Server) GetBlock(ctx context.Context, req *indexerv1.GetBlockRequest) (
 			return nil, internalErr(err, "GetBlock")
 		}
 		if b == nil {
-			return nil, notFound("block", sel.Hash)
+			return nil, s.notFoundByHash(ctx, "block", sel.Hash)
 		}
 		return mapBlock(b), nil
 	default:
@@ -51,12 +58,22 @@ func (s *Server) ListBlocks(ctx context.Context, req *indexerv1.ListBlocksReques
 		b := req.GetBeforeNumber()
 		beforeBlock = &b
 	}
+	if beforeBlock != nil {
+		if err := s.checkRetained(ctx, lastBlockBelow(*beforeBlock)); err != nil {
+			return nil, err
+		}
+	}
 
 	// limit+1 trick to detect more pages.
 	rows, err := s.db.GetBlocks(ctx, int(limit)+1, beforeBlock)
 	if err != nil {
 		slog.Error("ListBlocks", "error", err)
 		return nil, internalErr(err, "ListBlocks")
+	}
+	if beforeBlock != nil && len(rows) == 0 {
+		if err := s.recheckRetained(ctx, lastBlockBelow(*beforeBlock)); err != nil {
+			return nil, err
+		}
 	}
 
 	nextCursor := ""
@@ -92,10 +109,19 @@ func (s *Server) BatchGetBlockTransactionCounts(
 	if len(nums) == 0 {
 		return &indexerv1.BatchGetBlockTransactionCountsResponse{Counts: map[uint64]uint32{}}, nil
 	}
+	oldest := slices.Min(nums)
+	if err := s.checkRetained(ctx, oldest); err != nil {
+		return nil, err
+	}
 	counts, err := s.db.BatchGetBlockTransactionCounts(ctx, nums)
 	if err != nil {
 		slog.Error("BatchGetBlockTransactionCounts", "error", err)
 		return nil, internalErr(err, "BatchGetBlockTransactionCounts")
+	}
+	if _, ok := counts[oldest]; !ok {
+		if err := s.recheckRetained(ctx, oldest); err != nil {
+			return nil, err
+		}
 	}
 	// Missing blocks: return 0 so clients get a full map.
 	for _, n := range nums {

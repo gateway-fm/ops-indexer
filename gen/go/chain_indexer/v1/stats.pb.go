@@ -85,8 +85,12 @@ type ChainStats struct {
 	// Moving average over the last N blocks (N is indexer config).
 	AvgBlockTimeSeconds float32 `protobuf:"fixed32,7,opt,name=avg_block_time_seconds,json=avgBlockTimeSeconds,proto3" json:"avg_block_time_seconds,omitempty"`
 	AvgTxPerBlock       float32 `protobuf:"fixed32,8,opt,name=avg_tx_per_block,json=avgTxPerBlock,proto3" json:"avg_tx_per_block,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Every block at or below it was pruned by the retention window (0: nothing pruned); history reads at or below it answer OUT_OF_RANGE; totals still count it.
+	PrunedThroughBlock uint64 `protobuf:"varint,9,opt,name=pruned_through_block,json=prunedThroughBlock,proto3" json:"pruned_through_block,omitempty"`
+	// Timestamp of pruned_through_block (unset: nothing pruned).
+	PrunedThroughTimestamp *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=pruned_through_timestamp,json=prunedThroughTimestamp,proto3" json:"pruned_through_timestamp,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *ChainStats) Reset() {
@@ -173,6 +177,20 @@ func (x *ChainStats) GetAvgTxPerBlock() float32 {
 		return x.AvgTxPerBlock
 	}
 	return 0
+}
+
+func (x *ChainStats) GetPrunedThroughBlock() uint64 {
+	if x != nil {
+		return x.PrunedThroughBlock
+	}
+	return 0
+}
+
+func (x *ChainStats) GetPrunedThroughTimestamp() *timestamppb.Timestamp {
+	if x != nil {
+		return x.PrunedThroughTimestamp
+	}
+	return nil
 }
 
 // TransactionHistoryBucket is one bin in a tx-count-over-time histogram.
@@ -803,7 +821,7 @@ var File_chain_indexer_v1_stats_proto protoreflect.FileDescriptor
 
 const file_chain_indexer_v1_stats_proto_rawDesc = "" +
 	"\n" +
-	"\x1cchain_indexer/v1/stats.proto\x12\x10chain_indexer.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dchain_indexer/v1/common.proto\"\x90\x03\n" +
+	"\x1cchain_indexer/v1/stats.proto\x12\x10chain_indexer.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dchain_indexer/v1/common.proto\"\x98\x04\n" +
 	"\n" +
 	"ChainStats\x12.\n" +
 	"\x13latest_block_number\x18\x01 \x01(\x04R\x11latestBlockNumber\x12P\n" +
@@ -813,7 +831,10 @@ const file_chain_indexer_v1_stats_proto_rawDesc = "" +
 	"\x0ftotal_addresses\x18\x05 \x01(\x04R\x0etotalAddresses\x12'\n" +
 	"\x0ftotal_contracts\x18\x06 \x01(\x04R\x0etotalContracts\x123\n" +
 	"\x16avg_block_time_seconds\x18\a \x01(\x02R\x13avgBlockTimeSeconds\x12'\n" +
-	"\x10avg_tx_per_block\x18\b \x01(\x02R\ravgTxPerBlock\"\xc1\x01\n" +
+	"\x10avg_tx_per_block\x18\b \x01(\x02R\ravgTxPerBlock\x120\n" +
+	"\x14pruned_through_block\x18\t \x01(\x04R\x12prunedThroughBlock\x12T\n" +
+	"\x18pruned_through_timestamp\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\x16prunedThroughTimestamp\"\xc1\x01\n" +
 	"\x18TransactionHistoryBucket\x12=\n" +
 	"\fbucket_start\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\vbucketStart\x129\n" +
 	"\n" +
@@ -904,23 +925,24 @@ var file_chain_indexer_v1_stats_proto_goTypes = []any{
 }
 var file_chain_indexer_v1_stats_proto_depIdxs = []int32{
 	11, // 0: chain_indexer.v1.ChainStats.latest_block_timestamp:type_name -> google.protobuf.Timestamp
-	11, // 1: chain_indexer.v1.TransactionHistoryBucket.bucket_start:type_name -> google.protobuf.Timestamp
-	11, // 2: chain_indexer.v1.TransactionHistoryBucket.bucket_end:type_name -> google.protobuf.Timestamp
-	12, // 3: chain_indexer.v1.GetTransactionHistoryRequest.range:type_name -> chain_indexer.v1.TimeRange
-	0,  // 4: chain_indexer.v1.GetTransactionHistoryRequest.bucket:type_name -> chain_indexer.v1.TimeBucket
-	2,  // 5: chain_indexer.v1.TransactionHistory.buckets:type_name -> chain_indexer.v1.TransactionHistoryBucket
-	13, // 6: chain_indexer.v1.GasPrices.slow:type_name -> chain_indexer.v1.BigInt
-	13, // 7: chain_indexer.v1.GasPrices.normal:type_name -> chain_indexer.v1.BigInt
-	13, // 8: chain_indexer.v1.GasPrices.fast:type_name -> chain_indexer.v1.BigInt
-	13, // 9: chain_indexer.v1.GasPrices.base_fee:type_name -> chain_indexer.v1.BigInt
-	13, // 10: chain_indexer.v1.DailyStats.total_fees:type_name -> chain_indexer.v1.BigInt
-	7,  // 11: chain_indexer.v1.GetDailyStatsResponse.days:type_name -> chain_indexer.v1.DailyStats
-	11, // 12: chain_indexer.v1.SyncStatus.last_updated_at:type_name -> google.protobuf.Timestamp
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	11, // 1: chain_indexer.v1.ChainStats.pruned_through_timestamp:type_name -> google.protobuf.Timestamp
+	11, // 2: chain_indexer.v1.TransactionHistoryBucket.bucket_start:type_name -> google.protobuf.Timestamp
+	11, // 3: chain_indexer.v1.TransactionHistoryBucket.bucket_end:type_name -> google.protobuf.Timestamp
+	12, // 4: chain_indexer.v1.GetTransactionHistoryRequest.range:type_name -> chain_indexer.v1.TimeRange
+	0,  // 5: chain_indexer.v1.GetTransactionHistoryRequest.bucket:type_name -> chain_indexer.v1.TimeBucket
+	2,  // 6: chain_indexer.v1.TransactionHistory.buckets:type_name -> chain_indexer.v1.TransactionHistoryBucket
+	13, // 7: chain_indexer.v1.GasPrices.slow:type_name -> chain_indexer.v1.BigInt
+	13, // 8: chain_indexer.v1.GasPrices.normal:type_name -> chain_indexer.v1.BigInt
+	13, // 9: chain_indexer.v1.GasPrices.fast:type_name -> chain_indexer.v1.BigInt
+	13, // 10: chain_indexer.v1.GasPrices.base_fee:type_name -> chain_indexer.v1.BigInt
+	13, // 11: chain_indexer.v1.DailyStats.total_fees:type_name -> chain_indexer.v1.BigInt
+	7,  // 12: chain_indexer.v1.GetDailyStatsResponse.days:type_name -> chain_indexer.v1.DailyStats
+	11, // 13: chain_indexer.v1.SyncStatus.last_updated_at:type_name -> google.protobuf.Timestamp
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_chain_indexer_v1_stats_proto_init() }
