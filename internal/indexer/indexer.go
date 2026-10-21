@@ -60,6 +60,9 @@ type Config struct {
 	NodeRecountRPS int
 	VerifyRepair   bool
 
+	// ChainCheck bounds the chain checks against the node; RPS 0 turns them off.
+	ChainCheck ChainCheckConfig
+
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
@@ -431,6 +434,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 	if store, ok := i.db.(prunedSpanStore); ok && i.config.NodeRecountRPS > 0 {
 		go i.RunNodeRecount(ctx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
+	}
+	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
+		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)

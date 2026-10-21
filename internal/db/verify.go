@@ -226,6 +226,9 @@ func (d *DB) RunVerify(ctx context.Context, cfg VerifyConfig) {
 			if bucket = (bucket + 1) % addressBuckets; bucket == 0 {
 				metrics.VerifyCycle("running", time.Since(runningCycle))
 				runningCycle = time.Now()
+				if err := d.countRunningCycle(ctx); err != nil {
+					log.Warn("ledger: recording a running cycle failed", "error", err)
+				}
 			}
 		}
 		if n, err := d.QuarantinedCount(ctx); err == nil {

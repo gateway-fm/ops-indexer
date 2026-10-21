@@ -218,6 +218,16 @@ func VerifyChecked(check string, drifted int, state string) {
 	}
 }
 
+// VerifyCheckedN records a sampled check: checked items, of which drifted differ.
+func VerifyCheckedN(check string, checked, drifted int) {
+	if checked == 0 {
+		return
+	}
+	verifyChecked.WithLabelValues(check).Add(float64(checked))
+	verifyDrift.WithLabelValues(check).Set(float64(drifted))
+	verifyDrifted.WithLabelValues(check).Add(float64(drifted))
+}
+
 func SetVerifyQuarantined(n int64) { verifyQuarantined.Set(float64(n)) }
 
 func VerifyCycle(check string, d time.Duration) {

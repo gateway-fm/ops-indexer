@@ -302,6 +302,24 @@ func (m *MockRPCClient) ChainID(ctx context.Context) (*big.Int, error) {
 	return args.Get(0).(*big.Int), args.Error(1)
 }
 
+func (m *MockRPCClient) CallContractAt(ctx context.Context, to common.Address, data []byte, block uint64) ([]byte, error) {
+	args := m.Called(ctx, to, data, block)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]byte), args.Error(1)
+}
+
+func (m *MockRPCClient) TransactionCountAt(ctx context.Context, address common.Address, block uint64) (uint64, error) {
+	args := m.Called(ctx, address, block)
+	return args.Get(0).(uint64), args.Error(1)
+}
+
+func (m *MockRPCClient) BlockTransactionCounts(ctx context.Context, from, to uint64, batchSize int) (uint64, error) {
+	args := m.Called(ctx, from, to, batchSize)
+	return args.Get(0).(uint64), args.Error(1)
+}
+
 func (m *MockRPCClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*rpclient.Receipt, error) {
 	args := m.Called(ctx, txHash)
 	if args.Get(0) == nil {

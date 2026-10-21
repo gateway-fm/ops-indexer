@@ -143,6 +143,9 @@ func main() {
 		BalanceSkipL1:         cfg.BalanceSkipL1,
 		NodeRecountRPS:        cfg.VerifyNodeRecountRPS,
 		VerifyRepair:          cfg.VerifyRepair,
+		ChainCheck: indexer.ChainCheckConfig{
+			RPS: cfg.VerifyChainRPS, Sample: cfg.VerifyChainSample, Interval: cfg.VerifyChainInterval,
+		},
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

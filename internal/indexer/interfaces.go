@@ -74,4 +74,8 @@ type RPCClient interface {
 	FetchTokenURIsBatch(ctx context.Context, reqs []rpc.NFTURIRequest, workers int, rateLimit int) map[int]string
 	ChainID(ctx context.Context) (*big.Int, error)
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*rpclient.Receipt, error)
+
+	CallContractAt(ctx context.Context, to common.Address, data []byte, block uint64) ([]byte, error)
+	TransactionCountAt(ctx context.Context, address common.Address, block uint64) (uint64, error)
+	BlockTransactionCounts(ctx context.Context, from, to uint64, batchSize int) (uint64, error)
 }

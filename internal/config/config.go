@@ -50,6 +50,9 @@ type Config struct {
 	VerifyRecountInterval   time.Duration `mapstructure:"verify_recount_interval"`
 	VerifyRepair            bool          `mapstructure:"verify_repair"`
 	VerifyNodeRecountRPS    int           `mapstructure:"verify_node_recount_rps"`
+	VerifyChainRPS          int           `mapstructure:"verify_chain_rps"`
+	VerifyChainSample       int           `mapstructure:"verify_chain_sample"`
+	VerifyChainInterval     time.Duration `mapstructure:"verify_chain_interval"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -140,6 +143,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("verify_recount_interval", "1m")
 	v.SetDefault("verify_repair", true)
 	v.SetDefault("verify_node_recount_rps", 50)
+	v.SetDefault("verify_chain_rps", 20)
+	v.SetDefault("verify_chain_sample", 20)
+	v.SetDefault("verify_chain_interval", "1m")
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -234,6 +240,9 @@ func Load() (*Config, error) {
 	cfg.VerifyRecountInterval = v.GetDuration("verify_recount_interval")
 	cfg.VerifyRepair = v.GetBool("verify_repair")
 	cfg.VerifyNodeRecountRPS = v.GetInt("verify_node_recount_rps")
+	cfg.VerifyChainRPS = v.GetInt("verify_chain_rps")
+	cfg.VerifyChainSample = v.GetInt("verify_chain_sample")
+	cfg.VerifyChainInterval = v.GetDuration("verify_chain_interval")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")
@@ -368,8 +377,8 @@ func (c *Config) Validate() error {
 			"this small let a chain of up to %d blocks/s outrun them; set PARTITION_BLOCKS to at least %d",
 			c.PartitionBlocks, partitionKeeperInterval, MaxChainBlocksPerSecond, MinPartitionBlocks)
 	}
-	if c.VerifyRecountInterval <= 0 {
-		return fmt.Errorf("VERIFY_RECOUNT_INTERVAL must be greater than 0")
+	if c.VerifyRecountInterval <= 0 || (c.VerifyChainRPS > 0 && c.VerifyChainInterval <= 0) {
+		return fmt.Errorf("VERIFY_RECOUNT_INTERVAL and (with VERIFY_CHAIN_RPS) VERIFY_CHAIN_INTERVAL must be greater than 0")
 	}
 	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
 		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+

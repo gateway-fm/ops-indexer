@@ -26,6 +26,7 @@ type fakeChain struct {
 	*MockRPCClient
 	head, busy uint64
 	calls      int
+	balances   map[string]*big.Int
 }
 
 func blockTime(n uint64) hexutil.Uint64 { return hexutil.Uint64(1_700_000_000 + n) }
@@ -92,4 +93,38 @@ func (f *fakeChain) FetchTokenMetadataBatch(_ context.Context, addrs []common.Ad
 func (f *fakeChain) FetchTracesBatch(context.Context, []common.Hash, uint64, uint64, int, int) ([]*types.InternalTransaction, error) {
 	f.calls++
 	return nil, nil
+}
+
+func (f *fakeChain) txsThrough(block uint64) uint64 { return min(block+1, f.busy) }
+
+// CallContractAt answers totalSupply() with the minted supply and balanceOf() from balances (default 0).
+func (f *fakeChain) CallContractAt(_ context.Context, _ common.Address, data []byte, block uint64) ([]byte, error) {
+	f.calls++
+	var v *big.Int
+	switch {
+	case len(data) == 4:
+		v = big.NewInt(7 * int64((f.txsThrough(block)+1)/2))
+	default:
+		v = f.balances[common.BytesToAddress(data[4:]).Hex()]
+		if v == nil {
+			v = new(big.Int)
+		}
+	}
+	return common.LeftPadBytes(v.Bytes(), 32), nil
+}
+
+func (f *fakeChain) TransactionCountAt(_ context.Context, a common.Address, block uint64) (uint64, error) {
+	f.calls++
+	if a != chainSender {
+		return 0, nil
+	}
+	return f.txsThrough(block), nil
+}
+
+func (f *fakeChain) BlockTransactionCounts(_ context.Context, from, to uint64, _ int) (uint64, error) {
+	f.calls++
+	if from >= f.busy {
+		return 0, nil
+	}
+	return min(to, f.busy) - from, nil
 }
