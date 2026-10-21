@@ -887,6 +887,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 
 	newTokenAddresses := make([]common.Address, 0)
 	newTokenTxHashes := make(map[common.Address]string)
+	addressTxs := make(map[string]map[int]struct{})
 	balanceWork := make([]BalanceWork, 0)
 
 	// NFT instances touched this block, and (for mints) the tokenURI fetches to
@@ -972,11 +973,11 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			Error:                txError,
 		})
 
-		i.updateAddressStatsDelta(blockData.AddressStats, from, blockNumber, false)
+		touchAddressTx(blockData.AddressStats, addressTxs, from, idx, blockNumber)
 
 		if to != nil {
-			isContract := i.contractCache.Has(*to)
-			i.updateAddressStatsDelta(blockData.AddressStats, *to, blockNumber, isContract)
+			toDelta := touchAddressTx(blockData.AddressStats, addressTxs, *to, idx, blockNumber)
+			toDelta.IsContract = toDelta.IsContract || i.contractCache.Has(*to)
 		}
 
 		if receipt != nil && rawTx.To == nil && receipt.ContractAddress != (common.Address{}) {
@@ -996,7 +997,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 					IsVerified:   false,
 				})
 				i.contractCache.Add(contractAddr)
-				i.updateAddressStatsDelta(blockData.AddressStats, contractAddr, blockNumber, true)
+				addressDelta(blockData.AddressStats, contractAddr, blockNumber).IsContract = true
 			}
 		}
 
@@ -1125,10 +1126,16 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 				// Pre-bug, we incremented the txn's from/to here, which both
 				// over-counted the contract address and missed every transfer
 				// recipient who never sent a tx themselves.
-				i.bumpTokenTransferDelta(blockData.AddressStats, fromAddr, blockNumber)
-				i.bumpTokenTransferDelta(blockData.AddressStats, toAddr, blockNumber)
+				countTransferParticipant(blockData.AddressStats, addressTxs, fromAddr, idx, blockNumber)
+				if toAddr != fromAddr {
+					countTransferParticipant(blockData.AddressStats, addressTxs, toAddr, idx, blockNumber)
+				}
 			}
 		}
+	}
+
+	for addr, txs := range addressTxs {
+		blockData.AddressStats[addr].TxCountDelta += len(txs)
 	}
 
 	if i.tracingSupported && len(txHashes) > 0 {
@@ -1140,9 +1147,9 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			blockData.InternalTransactions = internalTxs
 
 			for _, it := range internalTxs {
-				i.updateAddressStatsDeltaInternal(blockData.AddressStats, it.From, blockNumber)
-				if it.To != nil {
-					i.updateAddressStatsDeltaInternal(blockData.AddressStats, *it.To, blockNumber)
+				addressDelta(blockData.AddressStats, it.From, blockNumber).InternalTxCountDelta++
+				if it.To != nil && !strings.EqualFold(*it.To, it.From) {
+					addressDelta(blockData.AddressStats, *it.To, blockNumber).InternalTxCountDelta++
 				}
 			}
 		}
@@ -1314,22 +1321,32 @@ func (i *Indexer) scheduleDeferredDailyStats(ctx context.Context) {
 	}
 }
 
-func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64, isContract bool) {
+func addressDelta(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64) *db.AddressStatsDelta {
 	key := strings.ToLower(address)
-	if delta, ok := stats[key]; ok {
-		delta.TxCountDelta++
-		if isContract {
-			delta.IsContract = true
-		}
-	} else {
-		// Store lowercased so the row PK matches `WHERE address = LOWER($1)` reads.
-		stats[key] = &db.AddressStatsDelta{
-			Address:      key,
-			TxCountDelta: 1,
-			IsContract:   isContract,
-			BlockNumber:  blockNumber,
-		}
+	delta, ok := stats[key]
+	if !ok {
+		delta = &db.AddressStatsDelta{Address: key, BlockNumber: blockNumber}
+		stats[key] = delta
 	}
+	return delta
+}
+
+func touchAddressTx(stats map[string]*db.AddressStatsDelta, addressTxs map[string]map[int]struct{}, address string, txIndex int, blockNumber uint64) *db.AddressStatsDelta {
+	delta := addressDelta(stats, address, blockNumber)
+	txs := addressTxs[delta.Address]
+	if txs == nil {
+		txs = make(map[int]struct{})
+		addressTxs[delta.Address] = txs
+	}
+	txs[txIndex] = struct{}{}
+	return delta
+}
+
+func countTransferParticipant(stats map[string]*db.AddressStatsDelta, addressTxs map[string]map[int]struct{}, addr common.Address, txIndex int, blockNumber uint64) {
+	if addr == zeroAddress {
+		return
+	}
+	touchAddressTx(stats, addressTxs, addr.Hex(), txIndex, blockNumber).TokenTransferDelta++
 }
 
 func (i *Indexer) advanceDailyStats(ctx context.Context) bool {
@@ -1340,19 +1357,6 @@ func (i *Indexer) advanceDailyStats(ctx context.Context) bool {
 	return true
 }
 
-// bumpTokenTransferDelta records this address as a participant in a Transfer
-// event. Creates the address_stats entry if absent so transfer-only
-// recipients (who never sent a tx of their own) are still indexed. Skips
-// the zero address (mint source / burn sink isn't a holder).
-//
-// When creating a new entry, we also seed TxCountDelta=1: this transfer's
-// underlying tx genuinely touches the address (it shows up in their
-// Transactions list via the same log-join we do in GetTransactionsByAddress).
-// If the entry already exists, the address was already credited as tx-from
-// or tx-to and we mustn't double-count. This is approximate when the same
-// address appears in transfers across multiple txs in one block (the rebuild
-// SQL is authoritative for those edge cases), but it eliminates the common
-// pure-recipient drift of badge=0 vs list=N.
 // classifyNewToken decides the stored token_type and decimals for a freshly
 // discovered contract. ERC721 is inferred from the transfer topology already
 // parsed for this block (a 4-topic Transfer carries the tokenId as an indexed
@@ -1363,36 +1367,6 @@ func classifyNewToken(isERC721 bool, metaDecimals int) (tokenType string, decima
 		return types.TokenTypeERC721, 0
 	}
 	return types.TokenTypeERC20, metaDecimals
-}
-
-func (i *Indexer) bumpTokenTransferDelta(stats map[string]*db.AddressStatsDelta, addr common.Address, blockNumber uint64) {
-	if addr == zeroAddress {
-		return
-	}
-	key := strings.ToLower(addr.Hex())
-	delta, ok := stats[key]
-	if !ok {
-		delta = &db.AddressStatsDelta{
-			Address:      key,
-			TxCountDelta: 1,
-			BlockNumber:  blockNumber,
-		}
-		stats[key] = delta
-	}
-	delta.TokenTransferDelta++
-}
-
-func (i *Indexer) updateAddressStatsDeltaInternal(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64) {
-	key := strings.ToLower(address)
-	if delta, ok := stats[key]; ok {
-		delta.InternalTxCountDelta++
-	} else {
-		stats[key] = &db.AddressStatsDelta{
-			Address:              key,
-			InternalTxCountDelta: 1,
-			BlockNumber:          blockNumber,
-		}
-	}
 }
 
 func (i *Indexer) trackBalance(ctx context.Context, addr common.Address, tokenAddress common.Address, blockNumber uint64) {

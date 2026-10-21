@@ -159,8 +159,17 @@ Lists that run into the watermark while paging (the feeds, `by_address` lists, d
 - `ListAllTokenTransfers` `total_items` without a `token_type` filter (`transfers_total`).
 - `ListTokenTransfers` `by_token` `total_count` (`tokens.transfer_count`).
 - `ListTokenTransfers` `by_address` `total_count` (`address_stats.token_transfer_count`) and
-  `ListInternalTransactions` `by_address` `total_count` (`address_stats.internal_tx_count`). Both count a self-transfer
-  or self-call twice, once per side, and the zero address has no transfer count.
+  `ListInternalTransactions` `by_address` `total_count` (`address_stats.internal_tx_count`). Each counts a transfer or
+  internal call once per address, whichever sides it is on, so `total_count` equals the rows the list returns.
+  **Correction:** before migration 017 a self-transfer or self-call counted twice, here and in `GetAddress`; 017 subtracts
+  the extra side from existing rows (it refuses on a pruned database).
+- `GetAddress` and `BatchGetAddressTransactionCounts` transaction counts (`address_stats.tx_count`): one per
+  transaction the address sent, received or took part in through a Transfer event, as `ListTransactions` `by_address`
+  returns them. **Correction:** a self-send used to count twice, and an address in Transfer events of several
+  transactions of one block once; rows written before this build keep the old count until they are recounted.
+- The zero address keeps no transfer count (mints and burns): `ListTokenTransfers` `by_address` `total_count` and
+  `GetAddress` `token_count` are 0 for it, and its `GetAddress` transaction count leaves out mint and burn transactions
+  it is not the sender or recipient of.
 - `ListTokenHolders` (`tokens.holder_count`), `ListTokens`, `ListAddresses`, `ListTokenInventory`, `GetDailyStats`:
   current state, unaffected by pruning.
 

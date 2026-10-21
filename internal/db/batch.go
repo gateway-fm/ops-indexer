@@ -782,11 +782,11 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				FROM (
 					SELECT LOWER(from_address) as address, hash as tx_hash, block_number FROM transactions
 					UNION ALL
-					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS NOT NULL
+					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
 					UNION ALL
 					SELECT LOWER(tt.from_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
 					UNION ALL
-					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
+					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt WHERE tt.to_address IS DISTINCT FROM tt.from_address
 				) t
 				GROUP BY address
 			) tx ON a.address = tx.address
@@ -795,7 +795,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				FROM (
 					SELECT LOWER(from_address) as address, block_number FROM internal_transactions
 					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS NOT NULL
+					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
 				) t
 				GROUP BY address
 			) it ON a.address = it.address
@@ -804,7 +804,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				FROM (
 					SELECT LOWER(from_address) as address, block_number FROM token_transfers
 					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM token_transfers
+					SELECT LOWER(to_address) as address, block_number FROM token_transfers WHERE to_address IS DISTINCT FROM from_address
 				) t
 				GROUP BY address
 			) tt ON a.address = tt.address
