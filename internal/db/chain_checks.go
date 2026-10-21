@@ -7,11 +7,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// BlocksCheck is blocks_total against the stored head: they agree when every block from the first indexed one up
-// to the head is counted. Applicable only with no missing range open.
+// BlocksCheck is blocks_total against the stored head: they agree when every block from the first counted one up
+// to the head is counted. Applicable only with no missing range open and no stats backfill still counting;
+// FromGenesis once a stats backfill has counted every block below START_BLOCK.
 type BlocksCheck struct {
-	Total, Head int64
-	Applicable  bool
+	Total, Head             int64
+	Applicable, FromGenesis bool
 }
 
 func (d *DB) CheckBlocksTotal(ctx context.Context) (BlocksCheck, error) {
@@ -19,7 +20,8 @@ func (d *DB) CheckBlocksTotal(ctx context.Context) (BlocksCheck, error) {
 	err := d.pool.QueryRow(ctx, `
 		SELECT (SELECT count FROM chain_counters WHERE name = 'blocks_total'),
 		       COALESCE((SELECT max(number) FROM blocks), -1),
-		       NOT EXISTS (SELECT 1 FROM missing_block_ranges)`).Scan(&c.Total, &c.Head, &c.Applicable)
+		       NOT EXISTS (SELECT 1 FROM missing_block_ranges) AND NOT EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NULL),
+		       EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NOT NULL)`).Scan(&c.Total, &c.Head, &c.Applicable, &c.FromGenesis)
 	return c, err
 }
 

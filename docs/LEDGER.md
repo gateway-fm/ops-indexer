@@ -49,12 +49,23 @@ on any drift. The ledger and the checks run with retention on or off.
 | `VERIFY_CHAIN_SAMPLE` | 20 | Balances and senders sampled per pass. |
 | `VERIFY_CHAIN_INTERVAL` | 1m | One chain-check pass per interval. |
 
+With `START_BLOCK` > 0 and retention on, the stats backfill (docs/API.md "Stats backfill") counts `[0, START_BLOCK)`
+from the node into the counters and into ledger spans of source `node`, which the `node` check recounts like any
+pruned span:
+
+| variable | default | bounds |
+|---|---|---|
+| `STATS_BACKFILL_RPS` | 100 | Node calls per second of the backfill: about two per block (block, receipts), plus traces with internal transactions indexed, `eth_getCode` per contract creation, token metadata per new token, `tokenURI` per NFT mint. The head path's `RPC_RATE_LIMIT` is separate. |
+| `STATS_BACKFILL_WORKERS` | 4 | Fetch parallelism under that budget. |
+| `STATS_BACKFILL_BATCH_BLOCKS` | 1000 | Blocks per transaction; a restart resumes after the last committed batch. |
+
 ## Metrics
 
 | metric | meaning |
 |---|---|
 | `indexer_ledger_closed_through` | Every block at or below this is in a closed span. |
 | `indexer_ledger_close_seconds` | Time to close one span from its rows. |
+| `indexer_stats_backfill_through` | Every block at or below this is counted by the stats backfill. |
 | `indexer_verify_ranges_checked_total{check}` | Spans, buckets or samples checked. |
 | `indexer_verify_ranges_drifted_total{check}` | Checks that found a difference. |
 | `indexer_verify_drift{check}` | Differences found by the last check. |

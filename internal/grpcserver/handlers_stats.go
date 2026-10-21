@@ -32,6 +32,14 @@ func (s *Server) GetChainStats(ctx context.Context, _ *indexerv1.Empty) (*indexe
 		resp.PrunedThroughBlock = through
 		resp.PrunedThroughTimestamp = unixToProto(uint64(ts))
 	}
+	backfill, err := s.db.StatsBackfillState(ctx)
+	if err != nil {
+		return nil, internalErr(err, "StatsBackfillState")
+	}
+	if backfill.Exists {
+		resp.StatsIncomplete = !backfill.Complete
+		resp.StatsBackfilledThroughBlock = uint64(max(backfill.Through, 0))
+	}
 	return resp, nil
 }
 

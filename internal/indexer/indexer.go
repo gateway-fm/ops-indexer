@@ -63,6 +63,9 @@ type Config struct {
 	// ChainCheck bounds the chain checks against the node; RPS 0 turns them off.
 	ChainCheck ChainCheckConfig
 
+	// StatsBackfill bounds the stats backfill of [0, START_BLOCK), when one was prepared.
+	StatsBackfill StatsBackfillConfig
+
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
@@ -437,6 +440,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 	}
 	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
 		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
+	}
+	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
+		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)

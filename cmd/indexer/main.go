@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/config"
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -146,6 +147,15 @@ func main() {
 		ChainCheck: indexer.ChainCheckConfig{
 			RPS: cfg.VerifyChainRPS, Sample: cfg.VerifyChainSample, Interval: cfg.VerifyChainInterval,
 		},
+		StatsBackfill: indexer.StatsBackfillConfig{
+			RPS: cfg.StatsBackfillRPS, Workers: cfg.StatsBackfillWorkers, BatchBlocks: cfg.StatsBackfillBatchBlocks,
+			SpanBlocks: cfg.LedgerSpanBlocks, Retry: 10 * time.Second,
+		},
+	}
+	if cfg.StartBlock > 0 && cfg.PruneRetainBlocks > 0 {
+		if err := indexer.PrepareStatsBackfill(context.Background(), database, rpcClient, cfg.StartBlock); err != nil {
+			log.Fatal("failed to prepare the stats backfill", "error", err)
+		}
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

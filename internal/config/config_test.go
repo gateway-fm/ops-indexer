@@ -13,10 +13,12 @@ func validConfig() *Config {
 		VerifyRecountInterval: time.Minute}
 }
 
-func TestValidateRefusesStartBlockWithRetentionUntilTheStatsBackfill(t *testing.T) {
+func TestValidateNeedsABackfillBudgetForStartBlockWithRetention(t *testing.T) {
 	c := validConfig()
 	c.StartBlock, c.PruneRetainBlocks = 1_000_000, 100_000
 	require.ErrorContains(t, c.Validate(), "stats backfill")
+	c.StatsBackfillRPS, c.StatsBackfillBatchBlocks = 100, 1000
+	require.NoError(t, c.Validate())
 }
 
 func TestValidateKeepsStartBlockWithoutRetention(t *testing.T) {

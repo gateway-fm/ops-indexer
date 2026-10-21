@@ -50,7 +50,9 @@ func (f *fakeChain) failsNow(n uint64) bool {
 
 func blockTime(n uint64) hexutil.Uint64 { return hexutil.Uint64(1_700_000_000 + n) }
 
-func (f *fakeChain) txHash(n uint64) common.Hash { return common.BytesToHash(new(big.Int).SetUint64(n + 1).Bytes()) }
+func (f *fakeChain) txHash(n uint64) common.Hash {
+	return common.BytesToHash(new(big.Int).SetUint64(n + 1).Bytes())
+}
 
 func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { f.count(); return f.head, nil }
 

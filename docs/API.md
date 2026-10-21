@@ -213,6 +213,25 @@ described.
 - `GetGasPrices` samples the latest 10,000 transactions; a window holding fewer samples fewer.
 - The rows of every list: they end at the watermark.
 
+## Stats backfill
+
+A deployment that starts at `START_BLOCK` > 0 with `PRUNE_RETAIN_BLOCKS` > 0 has no history below `START_BLOCK`:
+everything below it is pruned from day one (`GetChainStats` `pruned_through_block` = `START_BLOCK` − 1). Its totals
+still cover the whole chain. A stats backfill walks `[0, START_BLOCK)` on the node and adds what those blocks
+contributed to every counter, current balance and current state, without storing their history rows. Startup
+refuses a `START_BLOCK` whose day is not entirely below the reorg floor (12,800 blocks below the node head).
+
+While it runs, `GetChainStats` reports `stats_incomplete` = true and `stats_backfilled_through_block`. These are
+partial until it completes:
+
+- `GetChainStats` totals; `GetAddress` and `BatchGetAddressTransactionCounts` counts and first/last seen blocks.
+- `GetToken` (transfer count, supply, holder count, creation block and transaction).
+- `ListTokenTransfers` `by_token` / `by_address` and `ListInternalTransactions` `by_address` `total_count`;
+  `ListTransactionsPaginated` and `ListAllTokenTransfers` `total_items`.
+- `ListTokenHolders`, `ListTokens`, `ListAddresses` (ordered by transaction count), `ListTokenInventory` (owners).
+- `GetDailyStats` for the days up to and including the day of `START_BLOCK`.
+- `Search` address suggestions (ordered by transaction count).
+
 ## Error model
 
 Standard gRPC status codes:

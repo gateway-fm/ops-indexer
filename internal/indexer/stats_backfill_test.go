@@ -140,6 +140,13 @@ func TestStatsBackfillEqualsAFullSyncFromGenesis(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, "ok", c.State, "the node recount of a backfilled span agrees with it: [%d, %d)", c.Lo, c.Hi)
 	}
+	_, err = sql.Exec(ctx, `UPDATE ledger_verify_state SET value = 1 WHERE name = 'running_cycles'`)
+	require.NoError(t, err)
+	checks, err := newTestIndexer(store, chain).newChainChecker(store, ChainCheckConfig{RPS: 1_000_000, Sample: 50}).pass(ctx)
+	require.NoError(t, err)
+	require.Equal(t, ChainCheckResult{BlocksApplicable: true, SupplyChecked: 1, NoncesChecked: 1, SpanChecked: true}, checks,
+		"blocks counted from genesis = head + 1, supply and the sender's nonce agree with the node")
+
 	var keys int64
 	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM stats_backfill_balance_keys`).Scan(&keys))
 	require.Equal(t, int64(2), keys, "one balance key per (token, address) touched below START_BLOCK, not one per transfer")
@@ -176,4 +183,23 @@ func TestStatsBackfillRefusesABatchTwice(t *testing.T) {
 	}
 	require.NoError(t, store.CommitBackfillBatch(ctx, batch()))
 	require.ErrorIs(t, store.CommitBackfillBatch(ctx, batch()), db.ErrBackfillNotNext, "a batch applied twice would count twice")
+}
+
+// Block n is stamped 1_700_000_000 + n: blocks 0..6,399 are on 2023-11-14, 6,400..92,799 on 2023-11-15.
+func TestPrepareStatsBackfillNeedsTheRangeAndItsDayFinal(t *testing.T) {
+	store, _ := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
+
+	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 10_000), "within the reorg floor")
+	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 7_000), "whole day is final",
+		"the floor (block 7,200) is on 2023-11-15 too")
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 6_000))
+	s, err := store.StatsBackfillState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, db.BackfillState{Exists: true, Target: 5_999, Through: -1}, s)
+	wm, ts, err := store.PrunedThrough(ctx)
+	require.NoError(t, err)
+	require.Equal(t, [2]int64{5_999, 1_700_005_999}, [2]int64{int64(wm), ts}, "pruned from day one")
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 6_000), "a prepared backfill is resumed, not restarted")
 }

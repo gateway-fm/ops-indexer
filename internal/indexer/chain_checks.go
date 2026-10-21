@@ -69,8 +69,11 @@ func (c *chainChecker) pass(ctx context.Context) (ChainCheckResult, error) {
 		return r, err
 	}
 	r.BlocksApplicable = blocks.Applicable
+	first := int64(c.idx.startBlock)
+	if blocks.FromGenesis {
+		first = 0
+	}
 	if blocks.Applicable && blocks.Head >= 0 {
-		first := int64(c.idx.startBlock)
 		r.BlocksDrift = blocks.Total - (blocks.Head + 1 - first)
 	}
 	if err := c.checkSupply(ctx, &r); err != nil {
@@ -79,8 +82,10 @@ func (c *chainChecker) pass(ctx context.Context) (ChainCheckResult, error) {
 	if err := c.checkBalances(ctx, &r); err != nil {
 		return r, err
 	}
-	if err := c.checkNonces(ctx, &r); err != nil {
-		return r, err
+	if first == 0 && blocks.Applicable {
+		if err := c.checkNonces(ctx, &r); err != nil {
+			return r, err
+		}
 	}
 	return r, c.checkSpanTxCount(ctx, &r)
 }

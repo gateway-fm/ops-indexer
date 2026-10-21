@@ -24,7 +24,11 @@ message ChainStats {
   uint64 pruned_through_block = 9;
   // Timestamp of pruned_through_block (unset: nothing pruned).
   google.protobuf.Timestamp pruned_through_timestamp = 10;
-  // 11 and 12 are left free for the stats backfill's fields.
+  // True while the stats backfill of a deployment started at START_BLOCK > 0 is still counting the blocks below it:
+  // totals are partial until it completes (docs/API.md "Stats backfill").
+  bool stats_incomplete = 11;
+  // Every block at or below this is counted by the stats backfill (0 with no backfill).
+  uint64 stats_backfilled_through_block = 12;
   // Tokens the indexer has discovered (chain_counters tokens_total).
   uint64 total_tokens = 13;
 }

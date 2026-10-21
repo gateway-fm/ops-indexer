@@ -185,3 +185,47 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 		}
 	}
 }
+
+type backfillInitStore interface {
+	StatsBackfillState(ctx context.Context) (db.BackfillState, error)
+	InitStatsBackfill(ctx context.Context, target, targetTimestamp uint64) error
+}
+
+// PrepareStatsBackfill starts the stats backfill of [0, startBlock) unless one exists. The whole range, and the whole
+// day holding startBlock, must be below the node's reorg floor: a reorg there could not be reverted (the day's first
+// blocks are pruned from day one).
+func PrepareStatsBackfill(ctx context.Context, store backfillInitStore, node RPCClient, startBlock uint64) error {
+	if startBlock == 0 {
+		return nil
+	}
+	s, err := store.StatsBackfillState(ctx)
+	if err != nil || s.Exists {
+		return err
+	}
+	head, err := node.BlockNumber(ctx)
+	if err != nil {
+		return err
+	}
+	if startBlock+db.PruneFloorGap > head {
+		return fmt.Errorf("START_BLOCK %d is within the reorg floor (%d blocks) of the node head %d: the stats backfill range must be final",
+			startBlock, db.PruneFloorGap, head)
+	}
+	first, err := node.RawBlockByNumber(ctx, startBlock)
+	if err != nil {
+		return err
+	}
+	floor, err := node.RawBlockByNumber(ctx, head-db.PruneFloorGap)
+	if err != nil {
+		return err
+	}
+	if day, floorDay := blockDay(uint64(first.Timestamp)), blockDay(uint64(floor.Timestamp)); !day.Before(floorDay) {
+		return fmt.Errorf("START_BLOCK %d is on %s, the day of the reorg floor (block %d): choose a START_BLOCK whose whole day is final",
+			startBlock, day.Format("2006-01-02"), head-db.PruneFloorGap)
+	}
+	prev, err := node.RawBlockByNumber(ctx, startBlock-1)
+	if err != nil {
+		return err
+	}
+	log.Info("stats backfill: counting the blocks below START_BLOCK", "start_block", startBlock, "head", head)
+	return store.InitStatsBackfill(ctx, startBlock-1, uint64(prev.Timestamp))
+}
