@@ -56,6 +56,7 @@ type Config struct {
 	StatsBackfillRPS         int           `mapstructure:"stats_backfill_rps"`
 	StatsBackfillWorkers     int           `mapstructure:"stats_backfill_workers"`
 	StatsBackfillBatchBlocks uint64        `mapstructure:"stats_backfill_batch_blocks"`
+	LedgerCompactSpans       int           `mapstructure:"ledger_compact_spans"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -143,6 +144,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pruned_lookup_timeout", "5s")
 	v.SetDefault("pruned_lookup_concurrency", 4)
 	v.SetDefault("ledger_max_head_lag_blocks", 0)
+	v.SetDefault("ledger_compact_spans", 0)
 	v.SetDefault("verify_recount_interval", "1m")
 	v.SetDefault("verify_repair", true)
 	v.SetDefault("verify_node_recount_rps", 50)
@@ -243,6 +245,7 @@ func Load() (*Config, error) {
 	cfg.PrunedLookupTimeout = v.GetDuration("pruned_lookup_timeout")
 	cfg.PrunedLookupConcurrency = v.GetInt("pruned_lookup_concurrency")
 	cfg.LedgerMaxHeadLag = v.GetUint64("ledger_max_head_lag_blocks")
+	cfg.LedgerCompactSpans = v.GetInt("ledger_compact_spans")
 	cfg.VerifyRecountInterval = v.GetDuration("verify_recount_interval")
 	cfg.VerifyRepair = v.GetBool("verify_repair")
 	cfg.VerifyNodeRecountRPS = v.GetInt("verify_node_recount_rps")

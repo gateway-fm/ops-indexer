@@ -228,7 +228,8 @@ func main() {
 				}
 				return node - ingested, nil
 			},
-			MaxHeadLag: cfg.LedgerMaxHeadLag,
+			MaxHeadLag:   cfg.LedgerMaxHeadLag,
+			CompactSpans: cfg.LedgerCompactSpans,
 		})
 	}()
 
