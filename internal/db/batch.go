@@ -92,22 +92,6 @@ func clampSupply(expr string) string {
 	return `LEAST(GREATEST(` + expr + `, -` + numeric78Max + `), ` + numeric78Max + `)`
 }
 
-// tokenStatsFromTransfers derives a token's two history-scale counters from
-// token_transfers in one pass: the transfer row count, and the ERC20
-// mint-minus-burn supply. $1 is the lowercased token address.
-//
-// The token_type filter sits inside the CASE rather than in the WHERE so that
-// COUNT(*) still spans every transfer of the token while the sums stay
-// ERC20-only -- the same split the two separate queries in RefreshTokenStats
-// used to make, at one scan instead of two.
-const tokenStatsFromTransfers = `
-	SELECT COUNT(*),
-	       COALESCE(
-	           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '` + zeroAddress + `' THEN value ELSE 0 END)
-	         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '` + zeroAddress + `' THEN value ELSE 0 END),
-	           0)
-	FROM token_transfers WHERE token_address = $1`
-
 // tokenStatsDelta is one token's counter movement contributed by a single
 // batch: the transfer rows that genuinely landed, and the ERC20 supply change
 // those rows imply. Both are applied in the batch's own transaction, so a read
@@ -410,9 +394,34 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	if w.stored {
 		return nil
 	}
-	tx, data, tokenDeltas := w.tx, w.data, w.tokenDeltas
-	defer tx.Rollback(ctx)
-	deltaBlocks, deltaTxs, deltaTransfers := w.deltaBlocks, w.deltaTxs, w.deltaTransfers
+	defer w.tx.Rollback(ctx)
+	if err := writeSharedRows(ctx, w.tx, sharedRows{data: w.data, blocks: w.deltaBlocks, txs: w.deltaTxs,
+		transfers: w.deltaTransfers, tokenDeltas: w.tokenDeltas, seedCountsOwnRows: true}); err != nil {
+		return err
+	}
+	if err := w.tx.Commit(ctx); err != nil {
+		return err
+	}
+	if w.data.Block != nil && (w.deltaBlocks > 0 || w.deltaTxs > 0 || w.deltaTransfers > 0) {
+		w.lateDays.noteBlock(w.data.Block.Number, w.data.Block.Timestamp)
+	}
+	return nil
+}
+
+// sharedRows is what a write adds to the rows blocks share. tokenDeltas are the transfer and supply counts per
+// token; seedCountsOwnRows says a token created here is seeded from rows that include this write's own transfers
+// (ingest stores them first), so their delta must not be added on top.
+type sharedRows struct {
+	data                   *BlockData
+	blocks, txs, transfers int64
+	tokenDeltas            map[string]*tokenStatsDelta
+	seedCountsOwnRows      bool
+}
+
+// writeSharedRows writes tokens, nft_tokens, address_stats and chain_counters for ingest and the stats backfill.
+func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
+	data, tokenDeltas := w.data, w.tokenDeltas
+	deltaBlocks, deltaTxs, deltaTransfers := w.blocks, w.txs, w.transfers
 	var deltaTokens, deltaAddresses int64
 	var seedTokens []string
 
@@ -595,7 +604,7 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 						ELSE tokens.total_supply END,
 					holder_count = (SELECT COUNT(*) FROM token_balances_current
 						WHERE token_address = $1 AND balance > 0)
-				FROM (`+tokenStatsFromTransfers+`) AS s(cnt, supply)
+				FROM token_counted($1) AS s(cnt, supply)
 				WHERE tokens.address = $1`, addr)
 		}
 		br := tx.SendBatch(ctx, batch)
@@ -640,8 +649,10 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	// The seed above aggregated token_transfers after this block's own rows were inserted, so for a
 	// token it seeded those rows are already counted; adding the block's delta on top would count
 	// them twice.
-	for _, addr := range seedTokens {
-		delete(tokenDeltas, addr)
+	if w.seedCountsOwnRows {
+		for _, addr := range seedTokens {
+			delete(tokenDeltas, addr)
+		}
 	}
 
 	// Apply the per-token counters. Same transaction as the transfer rows they
@@ -756,13 +767,6 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	if data.Block != nil && (deltaBlocks > 0 || deltaTxs > 0 || deltaTransfers > 0) {
-		w.lateDays.noteBlock(data.Block.Number, data.Block.Timestamp)
 	}
 	return nil
 }
