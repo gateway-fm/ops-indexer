@@ -121,6 +121,7 @@ func TestRetentionCutsPrunesAndKeepsTotals(t *testing.T) {
 
 	ensurePartitions(t, d, 80_001, cfg)
 	seedHistory(t, d, 40_002, 80_001, 1)
+	closeLedger(t, d)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 
 	wm, _, err := d.PrunedThrough(ctx)
@@ -164,6 +165,7 @@ func TestRetentionWaitsForDailyStats(t *testing.T) {
 	seedHistory(t, d, 40_002, 80_001, 1)
 	_, err := d.pool.Exec(ctx, `UPDATE daily_stats_watermark SET last_block = 10000`)
 	require.NoError(t, err)
+	closeLedger(t, d)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 
 	wm, _, err := d.PrunedThrough(ctx)
@@ -190,6 +192,15 @@ func TestReorgDeletesAcrossPartitions(t *testing.T) {
 		require.NoError(t, d.pool.QueryRow(ctx, q).Scan(&n))
 		require.Zero(t, n, q)
 	}
+}
+
+var testLedger = LedgerConfig{SpanBlocks: 1000}
+
+// closeLedger closes every span that is final and complete, as the ledger closer would over time.
+func closeLedger(t *testing.T, d *DB) {
+	t.Helper()
+	_, err := d.CloseLedgerSpans(context.Background(), testLedger, 1_000_000)
+	require.NoError(t, err)
 }
 
 // ensurePartitions creates what the retention pass keeps ahead of a head that ingest is about to reach.
@@ -239,9 +250,8 @@ func TestRetentionResumesAfterCrashBeforeDetach(t *testing.T) {
 	ensurePartitions(t, d, 80_001, cfg)
 	seedHistory(t, d, 40_002, 80_001, 1)
 
-	_, err := d.pool.Exec(ctx, `SELECT prune_prepare('legacy')`)
-	require.NoError(t, err)
-	_, err = d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
+	closeLedger(t, d)
+	_, err := d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
 	require.NoError(t, err)
 	require.Equal(t, before.blocks+40_000, totalsAfterReseed(t, d).blocks, "attached rows below the watermark are not counted twice")
 
@@ -264,9 +274,8 @@ func TestRetentionFinalizesPendingDetach(t *testing.T) {
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	ensurePartitions(t, d, 80_001, cfg)
 	seedHistory(t, d, 40_002, 80_001, 1)
-	_, err := d.pool.Exec(ctx, `SELECT prune_prepare('legacy')`)
-	require.NoError(t, err)
-	_, err = d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
+	closeLedger(t, d)
+	_, err := d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
 	require.NoError(t, err)
 
 	holder, err := d.pool.Begin(ctx)
@@ -310,6 +319,7 @@ func TestRetentionDropsOnlyArchivedRanges(t *testing.T) {
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	ensurePartitions(t, d, 80_001, cfg)
 	seedHistory(t, d, 40_002, 80_001, 1)
+	closeLedger(t, d)
 	require.Error(t, d.retentionPass(ctx, cfg), "the archive directory is a file")
 
 	var state string

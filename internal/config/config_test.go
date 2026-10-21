@@ -7,7 +7,7 @@ import (
 )
 
 func validConfig() *Config {
-	return &Config{RPCURL: "http://node", DatabaseURL: "postgres://db", APIPort: 8080, RPCWorkers: 1, RPCRateLimit: 1}
+	return &Config{RPCURL: "http://node", DatabaseURL: "postgres://db", APIPort: 8080, RPCWorkers: 1, RPCRateLimit: 1, LedgerSpanBlocks: 100_000}
 }
 
 func TestValidateRefusesStartBlockWithRetentionUntilTheStatsBackfill(t *testing.T) {

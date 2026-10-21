@@ -65,6 +65,7 @@ func TestRetentionNeverPrunesARangeWithMissingBlocks(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(106_001), dailyStatsWatermark(t, d))
 
+	closeLedger(t, d)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	wm, _, err := d.PrunedThrough(ctx)
 	require.NoError(t, err)
@@ -82,6 +83,7 @@ func TestRetentionNeverPrunesARangeWithMissingBlocks(t *testing.T) {
 	_, err = d.pool.Exec(ctx, `DELETE FROM missing_block_ranges`)
 	require.NoError(t, err)
 	unpruned := totalsAfterReseed(t, d)
+	closeLedger(t, d)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	wm, _, err = d.PrunedThrough(ctx)
 	require.NoError(t, err)

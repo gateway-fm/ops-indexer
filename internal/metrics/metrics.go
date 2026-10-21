@@ -35,9 +35,20 @@ var (
 		Help: "Every block at or below this was pruned on purpose (0: nothing pruned).",
 	})
 
+	ledgerClosedThrough = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_ledger_closed_through",
+		Help: "Every block at or below this is in a closed ledger span.",
+	})
+
+	ledgerCloseSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "indexer_ledger_close_seconds",
+		Help:    "Duration of closing one ledger span from its rows.",
+		Buckets: latencyBuckets,
+	})
+
 	retentionStepSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "indexer_retention_step_seconds",
-		Help:    "Duration of one retention step: cut_constrain, cut_validate, cut_finish, ensure, prepare, advance, detach, archive, drop.",
+		Help:    "Duration of one retention step: cut_constrain, cut_validate, cut_finish, ensure, advance, detach, archive, drop.",
 		Buckets: latencyBuckets,
 	}, []string{"step"})
 
@@ -150,6 +161,10 @@ func SetMissingBlocks(n int64) { missingBlocks.Set(float64(n)) }
 func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
 
 func SetPruneWatermark(block uint64) { pruneWatermark.Set(float64(block)) }
+
+func SetLedgerClosedThrough(block uint64) { ledgerClosedThrough.Set(float64(block)) }
+
+func ObserveLedgerClose(d time.Duration) { ledgerCloseSeconds.Observe(d.Seconds()) }
 
 func ObserveRetentionStep(step string, d time.Duration) {
 	retentionStepSeconds.WithLabelValues(step).Observe(d.Seconds())

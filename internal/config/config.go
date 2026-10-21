@@ -30,10 +30,12 @@ type Config struct {
 	StartBlock    uint64 `mapstructure:"start_block"`
 	// PruneRetainBlocks keeps this many blocks below the stored head and drops older history by whole partitions;
 	// 0 (the default) keeps everything. PartitionBlocks 0 is PruneRetainBlocks / 10.
-	PruneRetainBlocks uint64        `mapstructure:"prune_retain_blocks"`
-	PartitionBlocks   uint64        `mapstructure:"partition_blocks"`
-	PruneInterval     time.Duration `mapstructure:"prune_interval"`
-	PruneArchiveDir   string        `mapstructure:"prune_archive_dir"`
+	PruneRetainBlocks   uint64        `mapstructure:"prune_retain_blocks"`
+	PartitionBlocks     uint64        `mapstructure:"partition_blocks"`
+	PruneInterval       time.Duration `mapstructure:"prune_interval"`
+	PruneArchiveDir     string        `mapstructure:"prune_archive_dir"`
+	LedgerSpanBlocks    uint64        `mapstructure:"ledger_span_blocks"`
+	LedgerCloseInterval time.Duration `mapstructure:"ledger_close_interval"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -108,6 +110,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("partition_blocks", 0)
 	v.SetDefault("prune_interval", "1m")
 	v.SetDefault("prune_archive_dir", "")
+	v.SetDefault("ledger_span_blocks", 100000)
+	v.SetDefault("ledger_close_interval", "10s")
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -188,6 +192,8 @@ func Load() (*Config, error) {
 	}
 	cfg.PruneInterval = v.GetDuration("prune_interval")
 	cfg.PruneArchiveDir = v.GetString("prune_archive_dir")
+	cfg.LedgerSpanBlocks = v.GetUint64("ledger_span_blocks")
+	cfg.LedgerCloseInterval = v.GetDuration("ledger_close_interval")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")
@@ -263,6 +269,9 @@ func (c *Config) Validate() error {
 	}
 	if err := c.CheckCommitPipeline(); err != nil {
 		return err
+	}
+	if c.LedgerSpanBlocks == 0 {
+		return fmt.Errorf("LEDGER_SPAN_BLOCKS must be greater than 0")
 	}
 	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
 		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+

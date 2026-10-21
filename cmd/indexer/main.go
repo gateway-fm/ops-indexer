@@ -150,7 +150,16 @@ func main() {
 	}()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		database.RunLedger(ctx, db.LedgerConfig{
+			SpanBlocks: cfg.LedgerSpanBlocks,
+			FirstBlock: cfg.StartBlock,
+			Interval:   cfg.LedgerCloseInterval,
+		})
+	}()
 
 	go func() {
 		defer wg.Done()

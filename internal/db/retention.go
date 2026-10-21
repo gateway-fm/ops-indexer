@@ -228,14 +228,16 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 		log.Info("retention: oldest range is missing blocks; not pruned", "range", suffix, "below", *hi)
 		return false, nil
 	}
+	var closed bool
+	if err := d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ledger_spans WHERE hi = $1)`, *hi).Scan(&closed); err != nil {
+		return false, err
+	}
+	if !closed {
+		log.Info("retention: oldest range is not closed in the ledger yet; not pruned", "range", suffix, "below", *hi)
+		return false, nil
+	}
 
 	start := time.Now()
-	if _, err := d.pool.Exec(ctx, `SELECT prune_prepare($1)`, suffix); err != nil {
-		return false, fmt.Errorf("prepare %s: %w", suffix, err)
-	}
-	metrics.ObserveRetentionStep("prepare", time.Since(start))
-
-	start = time.Now()
 	var wm int64
 	if err := d.pool.QueryRow(ctx, `SELECT prune_advance($1)`, suffix).Scan(&wm); err != nil {
 		return false, fmt.Errorf("advance %s: %w", suffix, err)
