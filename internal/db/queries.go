@@ -2110,7 +2110,7 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 			FROM transactions t
 			JOIN blocks b ON t.block_number = b.number
 			WHERE b.timestamp < extract(epoch from ($1::date + interval '1 day'))::bigint
-			  AND t.block_number >= history_from()
+			  AND t.block_number >= (SELECT history_from())
 		) sub`, dateStr).Scan(&s.CumulativeTransactions)
 	if err != nil {
 		return nil, fmt.Errorf("compute cumulative transactions: %w", err)

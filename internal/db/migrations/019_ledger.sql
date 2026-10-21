@@ -41,12 +41,12 @@ DROP TABLE prune_offsets;
 CREATE VIEW prune_offsets AS
 SELECT 'chain'::TEXT AS kind, c.name AS key, sum(c.value)::BIGINT AS count, 0::NUMERIC AS supply
 FROM ledger_chain c JOIN ledger_spans s USING (lo)
-WHERE s.hi <= history_from()
+WHERE s.hi <= (SELECT history_from())
 GROUP BY c.name
 UNION ALL
 SELECT 'token', t.token, sum(t.transfers)::BIGINT, sum(t.supply)
 FROM ledger_token t JOIN ledger_spans s USING (lo)
-WHERE s.hi <= history_from()
+WHERE s.hi <= (SELECT history_from())
 GROUP BY t.token;
 
 -- The span after the closed prefix: from the prefix's end (or first_block) to the next grid point or partition bound.
