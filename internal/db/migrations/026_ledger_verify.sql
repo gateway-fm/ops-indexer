@@ -119,8 +119,8 @@ BEGIN
     IF EXISTS (SELECT 1 FROM missing_block_ranges WHERE from_number < p_hi AND to_number >= p_lo) THEN
         RETURN false;
     END IF;
-    SELECT count(*) INTO stored FROM blocks WHERE number >= p_lo AND number < p_hi;
-    IF stored <> p_hi - p_lo THEN
+    SELECT count(*) INTO stored FROM blocks WHERE number >= GREATEST(p_lo, 1) AND number < p_hi;
+    IF stored <> p_hi - GREATEST(p_lo, 1) THEN
         RETURN false;
     END IF;
     INSERT INTO ledger_spans (lo, hi, source) VALUES (p_lo, p_hi, 'rows');
@@ -290,14 +290,14 @@ BEGIN
     IF EXISTS (SELECT 1 FROM missing_block_ranges WHERE from_number < p_hi AND to_number >= p_lo) THEN
         RETURN false;
     END IF;
-    SELECT count(*) INTO stored FROM blocks WHERE number >= p_lo AND number < p_hi;
-    IF stored <> p_hi - p_lo THEN
+    SELECT count(*) INTO stored FROM blocks WHERE number >= GREATEST(p_lo, 1) AND number < p_hi;
+    IF stored <> p_hi - GREATEST(p_lo, 1) THEN
         RETURN false;
     END IF;
 
     INSERT INTO ledger_spans (lo, hi, source) VALUES (p_lo, p_hi, 'rows');
     INSERT INTO ledger_chain (lo, name, value)
-    VALUES (p_lo, 'blocks_total', stored),
+    VALUES (p_lo, 'blocks_total', (SELECT count(*) FROM blocks WHERE number >= p_lo AND number < p_hi)),
            (p_lo, 'transactions_total', (SELECT count(*) FROM transactions WHERE block_number >= p_lo AND block_number < p_hi)),
            (p_lo, 'transfers_total', (SELECT count(*) FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi));
     INSERT INTO ledger_token (lo, token, transfers, supply)

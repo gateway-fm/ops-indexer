@@ -34,6 +34,12 @@ func TestChainChecksPassOnKnownGoodAndFailOnEachSabotage(t *testing.T) {
 		_, err := sql.Exec(ctx, q, args...)
 		require.NoError(t, err)
 	}
+	exec(`DELETE FROM blocks WHERE number = 0`)
+	exec(`UPDATE chain_counters SET count = count - 1 WHERE name = 'blocks_total'`)
+	r, err = checker.pass(ctx)
+	require.NoError(t, err)
+	require.Zero(t, r.BlocksDrift, "a database without block 0 (ingest never stores it) counts from block 1")
+	require.Equal(t, 1, r.NoncesChecked, "and still counts every sent transaction from genesis")
 	exec(`UPDATE chain_counters SET count = count + 1 WHERE name = 'blocks_total'`)
 	exec(`UPDATE tokens SET total_supply = total_supply + 1`)
 	exec(`UPDATE token_balances_current SET balance = balance - 1`)

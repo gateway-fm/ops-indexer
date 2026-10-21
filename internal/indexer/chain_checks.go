@@ -73,6 +73,10 @@ func (c *chainChecker) pass(ctx context.Context) (ChainCheckResult, error) {
 	if blocks.FromGenesis {
 		first = 0
 	}
+	fromGenesis := first == 0
+	if first == 0 && !blocks.Genesis {
+		first = 1
+	}
 	if blocks.Applicable && blocks.Head >= 0 {
 		r.BlocksDrift = blocks.Total - (blocks.Head + 1 - first)
 	}
@@ -82,7 +86,7 @@ func (c *chainChecker) pass(ctx context.Context) (ChainCheckResult, error) {
 	if err := c.checkBalances(ctx, &r); err != nil {
 		return r, err
 	}
-	if first == 0 && blocks.Applicable {
+	if fromGenesis && blocks.Applicable {
 		if err := c.checkNonces(ctx, &r); err != nil {
 			return r, err
 		}

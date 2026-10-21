@@ -56,7 +56,7 @@ DROP FUNCTION ledger_compact(INT);
 DO $m$
 BEGIN
     IF EXISTS (SELECT 1 FROM ledger_spans WHERE source = 'merged') THEN
-        RAISE EXCEPTION 'migration 028 cannot be reverted: the ledger holds merged spans';
+        RAISE EXCEPTION 'migration 029 cannot be reverted: the ledger holds merged spans';
     END IF;
 END
 $m$;

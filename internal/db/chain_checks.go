@@ -9,10 +9,11 @@ import (
 
 // BlocksCheck is blocks_total against the stored head: they agree when every block from the first counted one up
 // to the head is counted. Applicable only with no missing range open and no stats backfill still counting;
-// FromGenesis once a stats backfill has counted every block below START_BLOCK.
+// FromGenesis once a stats backfill has counted every block below START_BLOCK; Genesis when block 0 is counted
+// (ingest never stores it: it starts after the stored head, 0 on an empty database).
 type BlocksCheck struct {
-	Total, Head             int64
-	Applicable, FromGenesis bool
+	Total, Head                      int64
+	Applicable, FromGenesis, Genesis bool
 }
 
 func (d *DB) CheckBlocksTotal(ctx context.Context) (BlocksCheck, error) {
@@ -21,7 +22,9 @@ func (d *DB) CheckBlocksTotal(ctx context.Context) (BlocksCheck, error) {
 		SELECT (SELECT count FROM chain_counters WHERE name = 'blocks_total'),
 		       COALESCE((SELECT max(number) FROM blocks), -1),
 		       NOT EXISTS (SELECT 1 FROM missing_block_ranges) AND NOT EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NULL),
-		       EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NOT NULL)`).Scan(&c.Total, &c.Head, &c.Applicable, &c.FromGenesis)
+		       EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NOT NULL),
+		       EXISTS (SELECT 1 FROM blocks WHERE number = 0) OR EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NOT NULL)`).
+		Scan(&c.Total, &c.Head, &c.Applicable, &c.FromGenesis, &c.Genesis)
 	return c, err
 }
 
