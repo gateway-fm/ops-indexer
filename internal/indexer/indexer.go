@@ -47,6 +47,10 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
+	// RetentionEnabled: history below a window is (or will be) pruned. Catch-up then writes address_stats per
+	// block instead of rebuilding the table from history afterwards, which would drop the pruned counts.
+	RetentionEnabled bool
+
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
@@ -365,6 +369,15 @@ func (i *Indexer) publishProgressMetrics(ctx context.Context) {
 }
 
 func (i *Indexer) Start(ctx context.Context) error {
+	// Blocks at or below the prune watermark are gone on purpose: gap counting, the missing-range collector
+	// and catch-up all start above it, or they would fetch the pruned history back.
+	if wm, _, err := i.db.PrunedThrough(ctx); err != nil {
+		return fmt.Errorf("read prune watermark: %w", err)
+	} else if wm > 0 && wm >= i.startBlock {
+		log.Info("starting above the prune watermark", "start_block", i.startBlock, "pruned_through", wm)
+		i.startBlock = wm + 1
+	}
+
 	go i.publishProgressMetrics(ctx)
 
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)

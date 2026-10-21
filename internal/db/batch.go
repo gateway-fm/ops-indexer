@@ -258,7 +258,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
 				VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-				ON CONFLICT (hash) DO NOTHING`,
+				ON CONFLICT DO NOTHING`,
 				t.Hash, t.BlockNumber, blockTimestamp, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
 				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason, categories)
 		}
@@ -393,7 +393,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 					gas, gas_used, input, output, call_type, error, timestamp)
 				VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
-				ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
+				ON CONFLICT DO NOTHING`,
 				it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 				it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
 		}
@@ -712,8 +712,16 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	return nil
 }
 
-// RebuildAddressStats rebuilds address_stats after catchup completes.
+// ErrHistoryPruned refuses a recount of history that pruning has made partial.
+var ErrHistoryPruned = errors.New("history is pruned: a recount from the retained rows would drop the pruned counts")
+
+// RebuildAddressStats rebuilds address_stats after catchup completes. It refuses once anything was pruned.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
+	if wm, _, err := d.PrunedThrough(ctx); err != nil {
+		return err
+	} else if wm > 0 {
+		return ErrHistoryPruned
+	}
 	// All address keys are lowercased so duplicate-case rows from past
 	// writes (some checksum-cased, some lowercase) collapse to one row per
 	// address. Ongoing delta writes already lowercase the key, so this

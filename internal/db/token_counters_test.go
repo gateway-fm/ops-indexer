@@ -100,7 +100,7 @@ func (f *ctrFixture) transfer(t *testing.T, d *DB, from, to, value, tokenType st
 	_, err = d.pool.Exec(ctx,
 		`INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value,
 			gas_used, gas_price, input_data, status, tx_type)
-		 VALUES ($1, $2, 0, $3, $4, '0', 0, 0, '0x', 1, 0) ON CONFLICT (hash) DO NOTHING`,
+		 VALUES ($1, $2, 0, $3, $4, '0', 0, 0, '0x', 1, 0) ON CONFLICT DO NOTHING`,
 		hash, block, zeroAddr, zeroAddr)
 	require.NoError(t, err)
 

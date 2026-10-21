@@ -75,8 +75,9 @@ func (d *DB) SaveMissingRanges(ctx context.Context, ranges []BlockRange) error {
 // Returns ranges ordered by from_number descending (process newest first)
 func (d *DB) GetMissingRangesBatch(ctx context.Context, batchSize int) ([]BlockRange, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT id, from_number, to_number, created_at
+		SELECT id, GREATEST(from_number, history_from()), to_number, created_at
 		FROM missing_block_ranges
+		WHERE to_number >= history_from()
 		ORDER BY from_number DESC
 		LIMIT $1`, batchSize)
 	if err != nil {
@@ -160,10 +161,12 @@ func (d *DB) GetTotalMissingBlocks(ctx context.Context) (int64, error) {
 	return *total, err
 }
 
+// FindMissingBlocksInRange never reports a block below history_from(): those were pruned on purpose, and a gap
+// there would make catch-up fetch them back.
 func (d *DB) FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]BlockRange, error) {
 	rows, err := d.pool.Query(ctx, `
 		WITH block_series AS (
-			SELECT generate_series($1::bigint, $2::bigint) AS block_num
+			SELECT generate_series(GREATEST($1::bigint, history_from()), $2::bigint) AS block_num
 		),
 		existing_blocks AS (
 			SELECT number FROM blocks WHERE number >= $1 AND number <= $2

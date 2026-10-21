@@ -185,12 +185,13 @@ func (c *CatchupIndexer) blockProducerFromRanges() {
 					log.Info("catchup: initial sync complete, continuing to monitor for new gaps",
 						"processed", processed)
 
-					// Rebuild address stats after initial catchup
-					log.Info("catchup: rebuilding address_stats table")
-					if err := c.db.RebuildAddressStats(context.Background()); err != nil {
-						log.Error("catchup: failed to rebuild address_stats", "error", err)
-					} else {
-						log.Info("catchup: address_stats rebuild complete")
+					if !c.idxCfg.RetentionEnabled {
+						log.Info("catchup: rebuilding address_stats table")
+						if err := c.db.RebuildAddressStats(context.Background()); err != nil {
+							log.Error("catchup: failed to rebuild address_stats", "error", err)
+						} else {
+							log.Info("catchup: address_stats rebuild complete")
+						}
 					}
 
 					if c.onComplete != nil {
@@ -358,7 +359,9 @@ func (c *CatchupIndexer) blockIndexer() *Indexer {
 	// catchup after the initial-sync rebuild (e.g. one realtime missed via an RPC
 	// blip and requeued) stays stale in address_stats until the next process
 	// restart. Acceptable, since post-sync catchup only handles rare gaps.
-	catchupConfig.SkipAddressStats = true
+	// With retention it writes them per block instead: a rebuild from the retained
+	// history would drop every pruned block's counts.
+	catchupConfig.SkipAddressStats = !c.idxCfg.RetentionEnabled
 
 	return &Indexer{
 		db:               c.db,

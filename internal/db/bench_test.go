@@ -271,7 +271,8 @@ func restoreSeededState(tb testing.TB, d *DB, head uint64) {
 	ctx := context.Background()
 	// Logs and transfers are keyed by (block_number, log_index) with no foreign key to transactions since
 	// migration 013, so the block delete no longer cascades to them: delete them by block, as DeleteBlock does.
-	for _, table := range []string{"logs", "token_transfers"} {
+	// Since migration 014 (partitioned history) no foreign key cascades from blocks either.
+	for _, table := range []string{"logs", "token_transfers", "internal_transactions", "transactions"} {
 		if _, err := d.pool.Exec(ctx, `DELETE FROM `+table+` WHERE block_number > $1`, head); err != nil {
 			tb.Errorf("restore seeded state: delete %s above %d: %v", table, head, err)
 			return

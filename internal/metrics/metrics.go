@@ -30,6 +30,17 @@ var (
 		Help: "Highest block number written to the database.",
 	})
 
+	pruneWatermark = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_prune_watermark",
+		Help: "Every block at or below this was pruned on purpose (0: nothing pruned).",
+	})
+
+	retentionStepSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "indexer_retention_step_seconds",
+		Help:    "Duration of one retention step: cut_constrain, cut_validate, cut_finish, ensure, prepare, advance, detach, archive, drop.",
+		Buckets: latencyBuckets,
+	}, []string{"step"})
+
 	missingBlocks = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "indexer_missing_blocks",
 		Help: "Blocks below the chain head absent from the database.",
@@ -137,6 +148,12 @@ func SetLastIndexed(block uint64) { lastIndexedBlock.Set(float64(block)) }
 func SetMissingBlocks(n int64) { missingBlocks.Set(float64(n)) }
 
 func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
+
+func SetPruneWatermark(block uint64) { pruneWatermark.Set(float64(block)) }
+
+func ObserveRetentionStep(step string, d time.Duration) {
+	retentionStepSeconds.WithLabelValues(step).Observe(d.Seconds())
+}
 
 func BlockIndexed(txCount int, gasUsed uint64) {
 	blocksIndexed.Inc()

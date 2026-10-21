@@ -86,6 +86,20 @@ func main() {
 		}
 	}
 
+	if cfg.PruneRetainBlocks > 0 && cfg.PruneRetainBlocks < db.PruneFloorGap {
+		log.Fatal("PRUNE_RETAIN_BLOCKS is inside the reorg floor", "retain_blocks", cfg.PruneRetainBlocks, "floor", db.PruneFloorGap)
+	}
+	prunedThrough, _, err := database.PrunedThrough(context.Background())
+	if err != nil {
+		log.Fatal("failed to read the prune watermark", "error", err)
+	}
+	// Once the history is cut a block above the newest partition cannot be stored: create them before ingest.
+	if head, err := database.GetLatestBlockNumber(context.Background()); err != nil {
+		log.Fatal("failed to read the stored head", "error", err)
+	} else if _, err := database.EnsureHistoryPartitions(context.Background(), head+2*cfg.PartitionBlocks, cfg.PartitionBlocks); err != nil {
+		log.Fatal("failed to create history partitions", "error", err)
+	}
+
 	rpcClient, err := rpc.New(cfg.RPCURL)
 	if err != nil {
 		log.Fatal("failed to create rpc client", "error", err)
@@ -112,6 +126,7 @@ func main() {
 		BalanceDedupWindow:    cfg.BalanceDedupWindow,
 		BalanceReaderBatch:    cfg.BalanceReaderBatch,
 		BalanceSkipL1:         cfg.BalanceSkipL1,
+		RetentionEnabled:      cfg.PruneRetainBlocks > 0 || prunedThrough > 0,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
@@ -135,7 +150,17 @@ func main() {
 	}()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		database.RunRetention(ctx, db.RetentionConfig{
+			RetainBlocks:    cfg.PruneRetainBlocks,
+			PartitionBlocks: cfg.PartitionBlocks,
+			Interval:        cfg.PruneInterval,
+			ArchiveDir:      cfg.PruneArchiveDir,
+		})
+	}()
 
 	go func() {
 		defer wg.Done()

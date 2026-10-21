@@ -28,6 +28,12 @@ type Config struct {
 	// transaction hash (0.4.0 had one); false spares ingest its random writes.
 	TxHashIndexes bool   `mapstructure:"tx_hash_indexes"`
 	StartBlock    uint64 `mapstructure:"start_block"`
+	// PruneRetainBlocks keeps this many blocks below the stored head and drops older history by whole partitions;
+	// 0 (the default) keeps everything. PartitionBlocks 0 is PruneRetainBlocks / 10.
+	PruneRetainBlocks uint64        `mapstructure:"prune_retain_blocks"`
+	PartitionBlocks   uint64        `mapstructure:"partition_blocks"`
+	PruneInterval     time.Duration `mapstructure:"prune_interval"`
+	PruneArchiveDir   string        `mapstructure:"prune_archive_dir"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -98,6 +104,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("balance_skip_l1", false)
 	v.SetDefault("tx_hash_indexes", true)
 	v.SetDefault("start_block", 0)
+	v.SetDefault("prune_retain_blocks", 0)
+	v.SetDefault("partition_blocks", 0)
+	v.SetDefault("prune_interval", "1m")
+	v.SetDefault("prune_archive_dir", "")
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -171,6 +181,13 @@ func Load() (*Config, error) {
 	cfg.BalanceSkipL1 = v.GetBool("balance_skip_l1")
 	cfg.TxHashIndexes = v.GetBool("tx_hash_indexes")
 	cfg.StartBlock = v.GetUint64("start_block")
+	cfg.PruneRetainBlocks = v.GetUint64("prune_retain_blocks")
+	cfg.PartitionBlocks = v.GetUint64("partition_blocks")
+	if cfg.PartitionBlocks == 0 {
+		cfg.PartitionBlocks = cfg.PruneRetainBlocks / 10
+	}
+	cfg.PruneInterval = v.GetDuration("prune_interval")
+	cfg.PruneArchiveDir = v.GetString("prune_archive_dir")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")

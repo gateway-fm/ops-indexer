@@ -137,10 +137,8 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 // DeleteBlock removes one block and everything that hangs off it. Used to
 // revert a reorg, one block at a time from the head down.
 //
-// The block's token_transfers and logs are deleted here by block_number:
-// migration 013 dropped their foreign keys to transactions, so no cascade
-// reaches them. Its transactions go with the block, through
-// transactions.block_number REFERENCES blocks(number) ON DELETE CASCADE.
+// It deletes the block's rows from every history table itself (no foreign keys
+// cascade since migration 014), the block's token_transfers rows included.
 // That makes this a writer of token_transfers, and every writer has to maintain
 // tokens.transfer_count and tokens.total_supply -- nothing recomputes them from
 // history per block any more.
@@ -234,12 +232,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	// into transactions, so the cascade does not reach it -- an address seen in
 	// a reverted block has still been seen.
 	//
-	// tokens_total is deliberately not reverted here. tokens.creation_tx
-	// REFERENCES transactions(hash) ON DELETE CASCADE, so reverting a token's
-	// creating block deletes the token row itself, and a warm token cache then
-	// stops it ever being recreated. That is a separate defect on this path and
-	// decrementing the counter for it would encode the broken behaviour rather
-	// than repair it.
+	// tokens_total is not reverted: the tokens row outlives its creating
+	// block (migration 014 dropped tokens.creation_tx's cascade), so a token
+	// seen in a reverted block stays counted, like an address.
 	var revertedTransfers int64
 	for _, r := range doomed {
 		revertedTransfers += r.count
@@ -279,6 +274,16 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	if _, err := tx.Exec(ctx, "DELETE FROM logs WHERE block_number = $1", number); err != nil {
 		return err
 	}
+	// The history tables are partitioned (migration 014) and carry no foreign keys, so nothing cascades.
+	if _, err := tx.Exec(ctx, `DELETE FROM op_deposits WHERE l2_tx_hash IN (SELECT hash FROM transactions WHERE block_number = $1)`, number); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM internal_transactions WHERE block_number = $1", number); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM transactions WHERE block_number = $1", number); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number); err != nil {
 		return err
 	}
@@ -297,7 +302,7 @@ func (d *DB) InsertTransaction(ctx context.Context, tx *types.Transaction) error
 		INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
 		VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-		ON CONFLICT (hash) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		tx.Hash, tx.BlockNumber, tx.BlockTimestamp, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
 		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason, categories)
 	return err
@@ -1576,7 +1581,7 @@ func (d *DB) InsertInternalTransaction(ctx context.Context, it *types.InternalTr
 		INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 			gas, gas_used, input, output, call_type, error, timestamp)
 		VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
-		ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 		it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
 	return err
@@ -1993,6 +1998,13 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 	dateStr := date.Format("2006-01-02")
 	s := &types.DailyStats{Date: dateStr}
 
+	// A day whose first blocks are pruned would come out partial and overwrite a correct row.
+	if _, prunedTS, err := d.PrunedThrough(ctx); err != nil {
+		return nil, err
+	} else if prunedTS > 0 && date.Unix() <= prunedTS {
+		return nil, fmt.Errorf("%w: %s", ErrDayPruned, dateStr)
+	}
+
 	// total_blocks, total_gas_used, avg_block_size
 	err := d.pool.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(gas_used)::bigint, 0), COALESCE(AVG(size)::bigint, 0)
@@ -2085,11 +2097,12 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 
 	// cumulative_transactions: sum of all total_transactions up to and including this date
 	err = d.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(cnt), 0) FROM (
+		SELECT COALESCE(SUM(cnt), 0) + prune_offset('chain', 'transactions_total') FROM (
 			SELECT COUNT(*) as cnt
 			FROM transactions t
 			JOIN blocks b ON t.block_number = b.number
 			WHERE b.timestamp < extract(epoch from ($1::date + interval '1 day'))::bigint
+			  AND t.block_number >= history_from()
 		) sub`, dateStr).Scan(&s.CumulativeTransactions)
 	if err != nil {
 		return nil, fmt.Errorf("compute cumulative transactions: %w", err)

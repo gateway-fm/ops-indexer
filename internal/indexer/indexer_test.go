@@ -114,6 +114,10 @@ func (m *MockDatabase) RebuildAddressStats(ctx context.Context) error {
 	return args.Error(0)
 }
 
+func (m *MockDatabase) PrunedThrough(ctx context.Context) (uint64, int64, error) {
+	return 0, 0, nil
+}
+
 func (m *MockDatabase) InsertTransaction(ctx context.Context, tx *types.Transaction) error {
 	args := m.Called(ctx, tx)
 	return args.Error(0)

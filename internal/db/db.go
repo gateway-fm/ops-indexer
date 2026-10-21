@@ -83,13 +83,15 @@ func (d *DB) Migrate() error {
 
 	// Reconciles counters against actual row counts in case earlier writes
 	// bypassed the live-increment path (e.g. pre-existing rows on first deploy).
+	// Pruned history counts through prune_offsets (migration 014): the retained
+	// rows alone would decrement every counter.
 	if _, err := d.pool.Exec(ctx, `
 		INSERT INTO chain_counters (name, count, updated_at) VALUES
-			('blocks_total',       (SELECT COUNT(*) FROM blocks),          NOW()),
-			('transactions_total', (SELECT COUNT(*) FROM transactions),    NOW()),
-			('addresses_total',    (SELECT COUNT(*) FROM address_stats),   NOW()),
-			('tokens_total',       (SELECT COUNT(*) FROM tokens),          NOW()),
-			('transfers_total',    (SELECT COUNT(*) FROM token_transfers), NOW())
+			('blocks_total',       (SELECT COUNT(*) FROM blocks WHERE number >= history_from())                + prune_offset('chain', 'blocks_total'),       NOW()),
+			('transactions_total', (SELECT COUNT(*) FROM transactions WHERE block_number >= history_from())    + prune_offset('chain', 'transactions_total'), NOW()),
+			('addresses_total',    (SELECT COUNT(*) FROM address_stats),                                                                                   NOW()),
+			('tokens_total',       (SELECT COUNT(*) FROM tokens),                                                                                          NOW()),
+			('transfers_total',    (SELECT COUNT(*) FROM token_transfers WHERE block_number >= history_from()) + prune_offset('chain', 'transfers_total'),    NOW())
 		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`); err != nil {
 		return fmt.Errorf("failed to re-seed chain_counters: %w", err)
 	}
@@ -100,7 +102,7 @@ func (d *DB) Migrate() error {
 	// every row written before that existed still holds a value computed the
 	// old way -- and rows written by a build without the delta would keep
 	// drifting. One absolute pass at startup makes them agree with the stored
-	// transfers.
+	// transfers plus the pruned ones' offsets.
 	//
 	// ERC721 total_supply is left alone: it derives from nft_tokens rather than
 	// from token_transfers and RefreshTokenStats still recomputes it per block.
@@ -109,13 +111,17 @@ func (d *DB) Migrate() error {
 			transfer_count = s.cnt,
 			total_supply = CASE WHEN t.token_type = 'ERC20' THEN `+clampSupply(`s.supply`)+` ELSE t.total_supply END
 		FROM (
-			SELECT token_address,
-			       COUNT(*) AS cnt,
-			       COALESCE(
-			           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
-			         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
-			           0) AS supply
-			FROM token_transfers GROUP BY token_address
+			SELECT token_address, SUM(cnt) AS cnt, SUM(supply) AS supply FROM (
+				SELECT token_address,
+				       COUNT(*) AS cnt,
+				       COALESCE(
+				           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+				         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
+				           0) AS supply
+				FROM token_transfers WHERE block_number >= history_from() GROUP BY token_address
+				UNION ALL
+				SELECT key, count, supply FROM prune_offsets WHERE kind = 'token'
+			) u GROUP BY token_address
 		) s
 		WHERE t.address = s.token_address
 		  AND (t.transfer_count IS DISTINCT FROM s.cnt
@@ -128,7 +134,8 @@ func (d *DB) Migrate() error {
 	if _, err := d.pool.Exec(ctx, `
 		UPDATE tokens SET transfer_count = 0
 		WHERE transfer_count <> 0
-		  AND NOT EXISTS (SELECT 1 FROM token_transfers WHERE token_address = tokens.address)`); err != nil {
+		  AND NOT EXISTS (SELECT 1 FROM token_transfers WHERE token_address = tokens.address AND block_number >= history_from())
+		  AND NOT EXISTS (SELECT 1 FROM prune_offsets WHERE kind = 'token' AND key = tokens.address)`); err != nil {
 		return fmt.Errorf("failed to zero token transfer counters: %w", err)
 	}
 	log.Info("token transfer counters re-seeded from token_transfers")
