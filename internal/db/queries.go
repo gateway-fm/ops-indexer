@@ -1381,9 +1381,9 @@ func (d *DB) UpdateAddressStatsCounters(ctx context.Context, address string, int
 func (d *DB) GetAddressStats(ctx context.Context, address string) (*types.AddressStats, error) {
 	var s types.AddressStats
 	err := d.pool.QueryRow(ctx, `
-		SELECT address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at
+		SELECT address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at
 		FROM address_stats WHERE address = LOWER($1)`, address).Scan(
-		&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt)
+		&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.SentCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return &types.AddressStats{Address: address}, nil
 	}
@@ -1399,7 +1399,7 @@ func (d *DB) GetAccountsPaginated(ctx context.Context, page, pageSize int) ([]ty
 
 	offset := (page - 1) * pageSize
 	rows, err := d.pool.Query(ctx, `
-		SELECT address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at
+		SELECT address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at
 		FROM address_stats
 		ORDER BY tx_count DESC, address ASC
 		LIMIT $1 OFFSET $2`, pageSize, offset)
@@ -1411,7 +1411,7 @@ func (d *DB) GetAccountsPaginated(ctx context.Context, page, pageSize int) ([]ty
 	var accounts []types.AddressStats
 	for rows.Next() {
 		var s types.AddressStats
-		if err := rows.Scan(&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.SentCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		accounts = append(accounts, s)

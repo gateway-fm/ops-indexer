@@ -122,6 +122,7 @@ type AddressStatsDelta struct {
 	TxCountDelta         int
 	InternalTxCountDelta int
 	TokenTransferDelta   int
+	SentDelta            int
 	IsContract           bool
 	BlockNumber          uint64
 }
@@ -710,18 +711,19 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 		for _, addr := range addresses {
 			s := data.AddressStats[addr]
 			batch.Queue(`
-				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
-				VALUES (LOWER($1), $2, $3, $4, $5, $5, $6, NOW())
+				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
+				VALUES (LOWER($1), $2, $3, $4, $7, $5, $5, $6, NOW())
 				ON CONFLICT (address) DO UPDATE SET
 					tx_count = address_stats.tx_count + $2,
 					internal_tx_count = address_stats.internal_tx_count + $3,
 					token_transfer_count = address_stats.token_transfer_count + $4,
+					sent_count = address_stats.sent_count + $7,
 					first_seen = LEAST(address_stats.first_seen, EXCLUDED.first_seen),
 					last_seen = GREATEST(address_stats.last_seen, EXCLUDED.last_seen),
 					is_contract = COALESCE(address_stats.is_contract, false) OR EXCLUDED.is_contract,
 					updated_at = NOW()
 				RETURNING (xmax = 0)`,
-				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract)
+				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract, s.SentDelta)
 		}
 		br := tx.SendBatch(ctx, batch)
 		for range data.AddressStats {
@@ -800,12 +802,13 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, `
 		TRUNCATE address_stats;
 
-		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
 		SELECT
 			addr,
 			COALESCE(tx_count, 0),
 			COALESCE(internal_tx_count, 0),
 			COALESCE(token_transfer_count, 0),
+			COALESCE(sent_count, 0),
 			first_seen,
 			last_seen,
 			COALESCE(is_contract, false),
@@ -816,6 +819,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				tx.tx_count,
 				it.internal_tx_count,
 				tt.token_transfer_count,
+				sent.sent_count,
 				LEAST(tx.first_seen, it.first_seen, tt.first_seen) as first_seen,
 				GREATEST(tx.last_seen, it.last_seen, tt.last_seen) as last_seen,
 				c.is_contract
@@ -863,6 +867,10 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				) t
 				GROUP BY address
 			) tt ON a.address = tt.address
+			LEFT JOIN (
+				SELECT LOWER(from_address) as address, COUNT(*) as sent_count FROM transactions
+				WHERE tx_type BETWEEN 0 AND 4 GROUP BY 1
+			) sent ON a.address = sent.address
 			LEFT JOIN (
 				SELECT LOWER(address) as address, true as is_contract FROM contracts
 			) c ON a.address = c.address

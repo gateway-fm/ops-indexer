@@ -1196,7 +1196,10 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			Error:                txError,
 		})
 
-		touchAddressTx(blockData.AddressStats, addressTxs, from, idx, blockNumber)
+		sender := touchAddressTx(blockData.AddressStats, addressTxs, from, idx, blockNumber)
+		if bumpsNonce(txType) {
+			sender.SentDelta++
+		}
 
 		if to != nil {
 			toDelta := touchAddressTx(blockData.AddressStats, addressTxs, *to, idx, blockNumber)
@@ -1561,6 +1564,10 @@ func addressDelta(stats map[string]*db.AddressStatsDelta, address string, blockN
 		stats[key] = delta
 	}
 	return delta
+}
+
+func bumpsNonce(txType int) bool {
+	return txType >= 0 && txType <= 4
 }
 
 func touchAddressTx(stats map[string]*db.AddressStatsDelta, addressTxs map[string]map[int]struct{}, address string, txIndex int, blockNumber uint64) *db.AddressStatsDelta {

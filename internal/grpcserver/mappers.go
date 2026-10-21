@@ -359,7 +359,7 @@ func mapAddressStats(a *types.AddressStats) *indexerv1.Address {
 		Address:          a.Address,
 		IsContract:       a.IsContract,
 		TxCountIn:        uint64(a.TxCount), // schema doesn't split in/out; full total stored as TxCount
-		TxCountOut:       0,
+		TxCountOut:       uint64(a.SentCount),
 		TokenCount:       uint64(a.TokenTransferCount), // closest available proxy
 		FirstSeenAt:      unixPtrToProto(a.FirstSeen),
 		LastSeenAt:       unixPtrToProto(a.LastSeen),

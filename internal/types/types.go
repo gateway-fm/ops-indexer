@@ -161,6 +161,7 @@ type AddressStats struct {
 	TxCount            int       `json:"txCount"`
 	InternalTxCount    int       `json:"internalTxCount"`
 	TokenTransferCount int       `json:"tokenTransferCount"`
+	SentCount          int64     `json:"sentCount"`
 	FirstSeen          *uint64   `json:"firstSeen"`
 	LastSeen           *uint64   `json:"lastSeen"`
 	IsContract         bool      `json:"isContract"`

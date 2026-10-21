@@ -80,6 +80,9 @@ func TestRebuildAddressStatsTotalsMatchTheRowsTheListsReturn(t *testing.T) {
 	}
 	_, transfers, internal := addressCounters(t, d, selfA)
 	require.Equal(t, int64(2), transfers, "A: the self-transfer once plus C->A")
+	a, err := d.GetAddressStats(ctx, selfA)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), a.SentCount, "A sent both transactions")
 	require.Equal(t, int64(2), internal, "A: the self-call once plus A->B")
 }
 
