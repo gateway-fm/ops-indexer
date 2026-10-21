@@ -1169,7 +1169,7 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 
 	if i.balanceWorkers != nil && len(balanceWork) > 0 {
 		queueStart := time.Now()
-		queued := i.balanceWorkers.QueueWorkBatchWait(ctx, balanceWork)
+		queued := i.balanceWorkers.QueueCommittedWork(ctx, balanceWork)
 		metrics.ObserveStage(metrics.StageBalanceQueueWait, time.Since(queueStart))
 		if queued < len(balanceWork) {
 			metrics.BalanceQueueDropped(len(balanceWork) - queued)
