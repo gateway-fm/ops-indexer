@@ -22,6 +22,7 @@ import (
 type backfillStore interface {
 	StatsBackfillState(ctx context.Context) (db.BackfillState, error)
 	CommitBackfillBatch(ctx context.Context, b *db.BackfillBatch) error
+	CompleteStatsBackfill(ctx context.Context) error
 	NextBackfillBalanceKeys(ctx context.Context, n int) ([]db.BalanceKey, error)
 	SettleBackfillBalances(ctx context.Context, keys []db.BalanceKey, balances []*types.Balance) error
 }
@@ -67,8 +68,8 @@ type fetched struct {
 	receipts map[common.Hash]*rpclient.Receipt
 }
 
-// batch fetches and builds blocks [from, to) and merges them into one batch.
-func (b *backfiller) batch(ctx context.Context, from, to, target uint64) (*db.BackfillBatch, []string, error) {
+// batch fetches and builds blocks [from, to) and merges them into one batch; prevTs is block from - 1's timestamp.
+func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs *int64) (*db.BackfillBatch, []string, error) {
 	blocks := make([]fetched, to-from)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(max(b.cfg.Workers, 1))
@@ -97,7 +98,8 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64) (*db.Ba
 	}
 
 	out := &db.BackfillBatch{From: from, To: to, Spans: map[uint64]*db.SpanTotals{}, SpanHi: map[uint64]uint64{},
-		Shared: &db.BlockData{AddressStats: map[string]*db.AddressStatsDelta{}}, TokenFirstSeen: map[string]db.TokenSeen{}}
+		Shared: &db.BlockData{AddressStats: map[string]*db.AddressStatsDelta{}}, TokenFirstSeen: map[string]db.TokenSeen{},
+		Days: map[string]*db.DayParts{}, Active: map[string]map[string]struct{}{}}
 	var discovered []string
 	for _, f := range blocks {
 		built := b.idx.buildBlock(ctx, f.raw, f.receipts)
@@ -114,9 +116,48 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64) (*db.Ba
 			return nil, nil, err
 		}
 		mergeShared(out, built)
+		addDay(out, built, prevTs)
+		ts := int64(built.blockTimestamp)
+		prevTs = &ts
 		discovered = append(discovered, built.discovered...)
 	}
 	return out, discovered, nil
+}
+
+// addDay adds a block to its day's daily_stats parts, as daily_stats_advance aggregates stored blocks.
+func addDay(out *db.BackfillBatch, built *builtBlock, prevTs *int64) {
+	data := built.data
+	date := blockDay(built.blockTimestamp).Format("2006-01-02")
+	p := out.Days[date]
+	if p == nil {
+		p = db.NewDayParts(built.blockNumber)
+		out.Days[date], out.Active[date] = p, map[string]struct{}{}
+	}
+	p.FirstBlock = min(p.FirstBlock, built.blockNumber)
+	p.Blocks++
+	p.GasUsed.Add(p.GasUsed, new(big.Int).SetUint64(data.Block.GasUsed))
+	p.SizeSum.Add(p.SizeSum, new(big.Int).SetUint64(data.Block.Size))
+	p.SizeN++
+	if prevTs != nil && built.blockNumber > 0 {
+		p.BlockTimeSum.Add(p.BlockTimeSum, big.NewInt(int64(built.blockTimestamp)-*prevTs))
+		p.BlockTimeN++
+	}
+	for _, t := range data.Transactions {
+		p.Txs++
+		p.GasPriceSum.Add(p.GasPriceSum, new(big.Int).SetUint64(t.GasPrice))
+		switch t.Status {
+		case 1:
+			p.Successful++
+		case 0:
+			p.Failed++
+		}
+		out.Active[date][strings.ToLower(t.From)] = struct{}{}
+		if t.To != nil {
+			out.Active[date][strings.ToLower(*t.To)] = struct{}{}
+		}
+	}
+	p.TokenTransfers += int64(len(data.Transfers))
+	out.LastTs = int64(built.blockTimestamp)
 }
 
 func mergeShared(out *db.BackfillBatch, built *builtBlock) {
@@ -156,9 +197,16 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 	if err != nil || !s.Exists || s.Complete {
 		return err == nil, err
 	}
+	if s.Through == s.Target {
+		if err := b.store.CompleteStatsBackfill(ctx); err != nil {
+			return false, err
+		}
+		log.Info("stats backfill: every block counted and daily_stats written", "through", s.Target)
+		return true, nil
+	}
 	from := uint64(s.Through + 1)
 	to := min(from+b.cfg.BatchBlocks, uint64(s.Target)+1)
-	batch, discovered, err := b.batch(ctx, from, to, uint64(s.Target))
+	batch, discovered, err := b.batch(ctx, from, to, uint64(s.Target), s.LastTs)
 	if err != nil {
 		return false, err
 	}
@@ -169,7 +217,7 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 		b.idx.tokenCache.Add(addr)
 	}
 	metrics.SetStatsBackfillThrough(to - 1)
-	return to-1 == uint64(s.Target), nil
+	return false, nil
 }
 
 // readBalances reads, at latest, the balance of up to n keys the backfill touched, once each; a key whose

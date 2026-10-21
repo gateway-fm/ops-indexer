@@ -52,12 +52,49 @@ func indexBlocks(t *testing.T, idx *Indexer, from, to uint64) {
 	}
 }
 
-func fullSync(t *testing.T, head uint64) []string {
+func fullSync(t *testing.T, head uint64) (counters, days []string) {
 	t.Helper()
 	store, sql := setupPostgres(t)
 	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: head, busy: head + 1}
 	indexBlocks(t, newTestIndexer(store, chain), 0, head)
-	return counterRows(t, sql)
+	advanceDailyStats(t, store, sql, -1)
+	return counterRows(t, sql), backfillDailyRows(t, sql)
+}
+
+// advanceDailyStats starts the incremental aggregate after block from (if it has not started) and advances it to
+// the stored head.
+func advanceDailyStats(t *testing.T, store *db.DB, sql *pgxpool.Pool, from int64) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := sql.Exec(ctx, `INSERT INTO daily_stats_watermark (id, last_block) VALUES (1, $1) ON CONFLICT (id) DO NOTHING`, from)
+	require.NoError(t, err)
+	for {
+		before, err := store.AdvanceDailyStats(ctx)
+		require.NoError(t, err)
+		after, err := store.AdvanceDailyStats(ctx)
+		require.NoError(t, err)
+		if after == before {
+			return
+		}
+	}
+}
+
+func backfillDailyRows(t *testing.T, sql *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := sql.Query(context.Background(), `
+		SELECT concat_ws(' ', date, total_blocks, total_transactions, total_gas_used, avg_gas_price, successful_txs, failed_txs,
+		       active_addresses, new_addresses, avg_block_time, avg_block_size, new_contracts, token_transfer_count,
+		       cumulative_transactions, cumulative_addresses, cumulative_contracts)
+		FROM daily_stats ORDER BY date`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		require.NoError(t, rows.Scan(&s))
+		out = append(out, s)
+	}
+	return out
 }
 
 // backfilled indexes [backfillStart, head] with the head path while the backfill counts [0, backfillStart),
@@ -83,6 +120,7 @@ func backfilled(t *testing.T, head uint64, sabotage func(*db.BackfillBatch)) (*d
 		steps++
 	}
 	indexBlocks(t, head1, backfillStart+301, head-100)
+	advanceDailyStats(t, store, sql, 1_546)
 
 	fresh := newTestIndexer(store, chain).newBackfiller(sabotaged{store, sabotage}, testBackfill)
 	for {
@@ -93,6 +131,7 @@ func backfilled(t *testing.T, head uint64, sabotage func(*db.BackfillBatch)) (*d
 		}
 	}
 	indexBlocks(t, newTestIndexer(store, chain), head-99, head)
+	advanceDailyStats(t, store, sql, 1_546)
 	return store, sql, chain
 }
 
@@ -110,13 +149,17 @@ func (s sabotaged) CommitBackfillBatch(ctx context.Context, b *db.BackfillBatch)
 
 func TestStatsBackfillEqualsAFullSyncFromGenesis(t *testing.T) {
 	const head = 2_000
-	want := fullSync(t, head)
+	want, wantDays := fullSync(t, head)
 	store, sql, chain := backfilled(t, head, nil)
 	ctx := context.Background()
 
 	require.Equal(t, want, counterRows(t, sql), "every counter-backed row equals a full sync from genesis")
+	require.Len(t, wantDays, 3)
+	require.Equal(t, wantDays, backfillDailyRows(t, sql),
+		"daily_stats too: a day before START_BLOCK's, START_BLOCK's day from both sides, and a day after it")
 	s, err := store.StatsBackfillState(ctx)
 	require.NoError(t, err)
+	s.LastTs = nil
 	require.Equal(t, db.BackfillState{Exists: true, Complete: true, Target: backfillStart - 1, Through: backfillStart - 1}, s)
 
 	var spans []string
@@ -156,7 +199,7 @@ func TestStatsBackfillEqualsAFullSyncFromGenesis(t *testing.T) {
 
 func TestStatsBackfillThatDropsABlocksAddressDeltasFails(t *testing.T) {
 	const head = 2_000
-	want := fullSync(t, head)
+	want, _ := fullSync(t, head)
 	dropped := false
 	store, sql, _ := backfilled(t, head, func(b *db.BackfillBatch) {
 		if b.From <= 700 && 700 < b.To && !dropped {
@@ -187,23 +230,23 @@ func TestStatsBackfillRefusesABatchTwice(t *testing.T) {
 	require.ErrorIs(t, store.CommitBackfillBatch(ctx, batch()), db.ErrBackfillNotNext, "a batch applied twice would count twice")
 }
 
-// Block n is stamped 1_700_000_000 + n: blocks 0..6,399 are on 2023-11-14, 6,400..92,799 on 2023-11-15.
+// With one block a minute, blocks 5,867..7,306 share a day with the floor block 7,200 (head 20,000 − 12,800); block
+// 5,000 is on the day before.
 func TestPrepareStatsBackfillNeedsTheRangeAndItsDayFinal(t *testing.T) {
 	store, _ := setupPostgres(t)
 	ctx := context.Background()
 	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
 
 	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 10_000), "within the reorg floor")
-	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 7_000), "whole day is final",
-		"the floor (block 7,200) is on 2023-11-15 too")
-	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 6_000))
+	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 7_000), "whole day is final")
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000))
 	s, err := store.StatsBackfillState(ctx)
 	require.NoError(t, err)
-	require.Equal(t, db.BackfillState{Exists: true, Target: 5_999, Through: -1}, s)
+	require.Equal(t, db.BackfillState{Exists: true, Target: 4_999, Through: -1}, s)
 	wm, ts, err := store.PrunedThrough(ctx)
 	require.NoError(t, err)
-	require.Equal(t, [2]int64{5_999, 1_700_005_999}, [2]int64{int64(wm), ts}, "pruned from day one")
-	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 6_000), "a prepared backfill is resumed, not restarted")
+	require.Equal(t, [2]int64{4_999, int64(blockTime(4_999))}, [2]int64{int64(wm), ts}, "pruned from day one")
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000), "a prepared backfill is resumed, not restarted")
 }
 
 func TestStatsBackfillReadsEachTouchedBalanceOnce(t *testing.T) {

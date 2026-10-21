@@ -16,15 +16,18 @@ import (
 // count its blocks twice.
 var ErrBackfillNotNext = errors.New("stats backfill: batch does not continue the recorded progress")
 
+// BackfillState: Complete once every block is counted and daily_stats written; LastTs is the timestamp of block
+// Through, for the next batch's first block time.
 type BackfillState struct {
 	Exists, Complete bool
 	Target, Through  int64
+	LastTs           *int64
 }
 
 func (d *DB) StatsBackfillState(ctx context.Context) (BackfillState, error) {
 	var s BackfillState
-	err := d.pool.QueryRow(ctx, `SELECT target, through, completed_at IS NOT NULL FROM stats_backfill WHERE id = 1`).
-		Scan(&s.Target, &s.Through, &s.Complete)
+	err := d.pool.QueryRow(ctx, `SELECT target, through, completed_at IS NOT NULL, last_ts FROM stats_backfill WHERE id = 1`).
+		Scan(&s.Target, &s.Through, &s.Complete, &s.LastTs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return s, nil
 	}
@@ -64,6 +67,22 @@ type BackfillBatch struct {
 	BalanceKeys []BalanceKey
 	// TokenFirstSeen is each token's first transfer in the batch: a token row created by a later block takes it.
 	TokenFirstSeen map[string]TokenSeen
+	// Days are the batch's daily_stats parts, Active each day's active addresses, LastTs the last block's timestamp.
+	Days   map[string]*DayParts
+	Active map[string]map[string]struct{}
+	LastTs int64
+}
+
+// DayParts is what blocks add to one day's daily_stats, summed as daily_stats_advance sums them.
+type DayParts struct {
+	FirstBlock                                  uint64
+	Blocks, SizeN, BlockTimeN                   int64
+	GasUsed, SizeSum, BlockTimeSum, GasPriceSum *big.Int
+	Txs, Successful, Failed, TokenTransfers     int64
+}
+
+func NewDayParts(firstBlock uint64) *DayParts {
+	return &DayParts{FirstBlock: firstBlock, GasUsed: new(big.Int), SizeSum: new(big.Int), BlockTimeSum: new(big.Int), GasPriceSum: new(big.Int)}
 }
 
 type TokenSeen struct {
@@ -156,10 +175,64 @@ func (d *DB) CommitBackfillBatch(ctx context.Context, b *BackfillBatch) error {
 			}
 		}
 
-		_, err := tx.Exec(ctx, `
-			UPDATE stats_backfill SET through = $1, span_lo = $2,
-			       completed_at = CASE WHEN $1 = target THEN now() END
-			WHERE id = 1`, int64(b.To)-1, openSpan)
+		if err := addDailyParts(ctx, tx, b); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE stats_backfill SET through = $1, span_lo = $2, last_ts = $3 WHERE id = 1`,
+			int64(b.To)-1, openSpan, b.LastTs)
+		return err
+	})
+}
+
+func addDailyParts(ctx context.Context, tx pgx.Tx, b *BackfillBatch) error {
+	dates := make([]string, 0, len(b.Days))
+	for date := range b.Days {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+	for _, date := range dates {
+		p := b.Days[date]
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO daily_stats_base AS d (date, first_block, blocks, gas_used, size_sum, size_n, block_time_sum,
+				block_time_n, txs, gas_price_sum, successful_txs, failed_txs, token_transfers)
+			VALUES ($1::DATE, $2, $3, $4::NUMERIC, $5::NUMERIC, $6, $7::NUMERIC, $8, $9, $10::NUMERIC, $11, $12, $13)
+			ON CONFLICT (date) DO UPDATE SET
+				first_block = LEAST(d.first_block, EXCLUDED.first_block), blocks = d.blocks + EXCLUDED.blocks,
+				gas_used = d.gas_used + EXCLUDED.gas_used, size_sum = d.size_sum + EXCLUDED.size_sum,
+				size_n = d.size_n + EXCLUDED.size_n, block_time_sum = d.block_time_sum + EXCLUDED.block_time_sum,
+				block_time_n = d.block_time_n + EXCLUDED.block_time_n, txs = d.txs + EXCLUDED.txs,
+				gas_price_sum = d.gas_price_sum + EXCLUDED.gas_price_sum,
+				successful_txs = d.successful_txs + EXCLUDED.successful_txs, failed_txs = d.failed_txs + EXCLUDED.failed_txs,
+				token_transfers = d.token_transfers + EXCLUDED.token_transfers`,
+			date, int64(p.FirstBlock), p.Blocks, p.GasUsed.String(), p.SizeSum.String(), p.SizeN, p.BlockTimeSum.String(),
+			p.BlockTimeN, p.Txs, p.GasPriceSum.String(), p.Successful, p.Failed, p.TokenTransfers); err != nil {
+			return err
+		}
+		addrs := make([]string, 0, len(b.Active[date]))
+		for a := range b.Active[date] {
+			addrs = append(addrs, a)
+		}
+		if _, err := tx.Exec(ctx, `
+			WITH fresh AS (
+				INSERT INTO daily_active_base (date, address) SELECT $1::DATE, unnest($2::TEXT[])
+				ON CONFLICT DO NOTHING RETURNING 1
+			)
+			UPDATE daily_stats_base SET active_addresses = active_addresses + (SELECT count(*) FROM fresh) WHERE date = $1::DATE`,
+			date, addrs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CompleteStatsBackfill writes daily_stats for the days the backfill counted and marks it complete: from here the
+// totals are whole. It needs START_BLOCK stored.
+func (d *DB) CompleteStatsBackfill(ctx context.Context) error {
+	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT daily_stats_backfill_complete()`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE stats_backfill SET completed_at = now() WHERE id = 1 AND through = target`)
 		return err
 	})
 }

@@ -50,7 +50,9 @@ func (f *fakeChain) failsNow(n uint64) bool {
 	return false
 }
 
-func blockTime(n uint64) hexutil.Uint64 { return hexutil.Uint64(1_700_000_000 + n) }
+// blockTime is about one block a minute from 1_700_000_000, the gaps uneven (54 or 61 s) so an average block time
+// notices a missing gap: blocks 0..106 are on 2023-11-14, 107..1,546 on 2023-11-15, 1,547..2,986 on 2023-11-16.
+func blockTime(n uint64) hexutil.Uint64 { return hexutil.Uint64(1_700_000_000 + 60*n + n%7) }
 
 func (f *fakeChain) txHash(n uint64) common.Hash {
 	return common.BytesToHash(new(big.Int).SetUint64(n + 1).Bytes())

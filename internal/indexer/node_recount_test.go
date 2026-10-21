@@ -11,11 +11,14 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/db"
 )
 
+// newTestIndexer runs no daily_stats advance of its own: tests advance it where production would.
 func newTestIndexer(store Database, chain RPCClient) *Indexer {
-	return NewWithConfig(store, chain, time.Second, 0, &Config{
+	idx := NewWithConfig(store, chain, time.Second, 0, &Config{
 		RPCWorkers: 4, RPCRateLimit: 1000, TokenMetadataWorkers: 2, TraceWorkers: 2, TraceRateLimit: 1000,
 		DailyStatsMinInterval: time.Hour,
 	})
+	idx.dailyStats = nil
+	return idx
 }
 
 // ingestChain writes [0, busy) through the head path and the empty blocks up to head directly, then closes every
@@ -28,7 +31,7 @@ func ingestChain(t *testing.T, idx *Indexer, store *db.DB, sql *pgxpool.Pool, ch
 	}
 	_, err := sql.Exec(ctx, `
 		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
-		SELECT b, 'filler' || b, 'filler' || (b - 1), 1700000000 + b, 0, 30000000, 0 FROM generate_series($1::bigint, $2::bigint) b`,
+		SELECT b, 'filler' || b, 'filler' || (b - 1), 1700000000 + 60 * b + b % 7, 0, 30000000, 0 FROM generate_series($1::bigint, $2::bigint) b`,
 		chain.busy, chain.head)
 	require.NoError(t, err)
 	_, err = store.CloseLedgerSpans(ctx, db.LedgerConfig{SpanBlocks: 1000}, 1_000)
