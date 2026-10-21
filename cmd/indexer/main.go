@@ -87,20 +87,21 @@ func main() {
 	}
 
 	idxCfg := &indexer.Config{
-		RPCWorkers:           cfg.RPCWorkers,
-		RPCRateLimit:         cfg.RPCRateLimit,
-		DBBatchSize:          cfg.DBBatchSize,
-		TokenMetadataWorkers: cfg.TokenMetadataWorkers,
-		BalanceWorkers:       cfg.BalanceWorkers,
-		EnableAsyncBalance:   cfg.EnableAsyncBalance,
-		EnableTracing:        cfg.EnableTracing,
-		TraceRateLimit:       cfg.TraceRateLimit,
-		TraceWorkers:         cfg.TraceWorkers,
-		CatchupEnabled:       cfg.CatchupEnabled,
-		CatchupWorkers:       cfg.CatchupWorkers,
-		CatchupBatchSize:     cfg.CatchupBatchSize,
-		CatchupQueueSize:     cfg.CatchupQueueSize,
-		SkipReceiptTxTypes:   skipReceipts,
+		RPCWorkers:            cfg.RPCWorkers,
+		RPCRateLimit:          cfg.RPCRateLimit,
+		DBBatchSize:           cfg.DBBatchSize,
+		TokenMetadataWorkers:  cfg.TokenMetadataWorkers,
+		BalanceWorkers:        cfg.BalanceWorkers,
+		EnableAsyncBalance:    cfg.EnableAsyncBalance,
+		EnableTracing:         cfg.EnableTracing,
+		TraceRateLimit:        cfg.TraceRateLimit,
+		TraceWorkers:          cfg.TraceWorkers,
+		CatchupEnabled:        cfg.CatchupEnabled,
+		CatchupWorkers:        cfg.CatchupWorkers,
+		CatchupBatchSize:      cfg.CatchupBatchSize,
+		CatchupQueueSize:      cfg.CatchupQueueSize,
+		SkipReceiptTxTypes:    skipReceipts,
+		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

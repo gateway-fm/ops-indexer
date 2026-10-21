@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -325,12 +326,17 @@ func (c *Client) CallContract(ctx context.Context, msg CallMsg, block *big.Int) 
 	return []byte(result), nil
 }
 
+var ErrReceiptNotFound = errors.New("receipt not found")
+
 func (c *Client) TransactionReceipt(ctx context.Context, txHash common.Hash) (*Receipt, error) {
-	var receipt Receipt
+	var receipt *Receipt
 	if err := c.CallContext(ctx, &receipt, "eth_getTransactionReceipt", txHash.Hex()); err != nil {
 		return nil, err
 	}
-	return &receipt, nil
+	if receipt == nil {
+		return nil, fmt.Errorf("%w: %s", ErrReceiptNotFound, txHash.Hex())
+	}
+	return receipt, nil
 }
 
 func (c *Client) TransactionByHash(ctx context.Context, txHash common.Hash) (*Transaction, bool, error) {

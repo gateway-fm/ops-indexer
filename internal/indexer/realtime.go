@@ -32,12 +32,16 @@ type RealtimeIndexer struct {
 	// Balance workers (shared with main indexer)
 	balanceWorkers *BalanceWorkerPool
 
+	// Shared with the main indexer (see Indexer.dailyStats).
+	dailyStats *dailyStatsThrottle
+
 	// Tracing support
 	tracingSupported bool
 
 	// State tracking
 	lastProcessedBlock uint64
 	mu                 sync.RWMutex
+	receipts           receiptSkip
 
 	// Coordination
 	ctx    context.Context
@@ -71,6 +75,12 @@ func NewRealtimeIndexer(
 		ctx:              ctx,
 		cancel:           cancel,
 	}
+}
+
+// SetDailyStatsThrottle shares the main indexer's day-aggregate throttle with
+// the per-block Indexer values this realtime indexer builds.
+func (r *RealtimeIndexer) SetDailyStatsThrottle(t *dailyStatsThrottle) {
+	r.dailyStats = t
 }
 
 func (r *RealtimeIndexer) SetEventBus(bus *events.Bus) {
@@ -179,7 +189,9 @@ func (r *RealtimeIndexer) runSubscriptionMode(ctx context.Context, headers <-cha
 
 				if err := r.processBlock(ctx, blockNum); err != nil {
 					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					break
+					if !r.receipts.skip(ctx, r.db, blockNum, err) {
+						break
+					}
 				}
 
 				r.SetLastProcessedBlock(blockNum)
@@ -243,7 +255,9 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 
 				if err := r.processBlock(ctx, blockNum); err != nil {
 					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					break
+					if !r.receipts.skip(ctx, r.db, blockNum, err) {
+						break
+					}
 				}
 
 				r.SetLastProcessedBlock(blockNum)
@@ -261,7 +275,11 @@ func (r *RealtimeIndexer) processBlock(ctx context.Context, number uint64) error
 }
 
 func (r *RealtimeIndexer) processBlockRaw(ctx context.Context, number uint64) error {
-	idx := &Indexer{
+	return r.blockIndexer().processBlockRaw(ctx, number)
+}
+
+func (r *RealtimeIndexer) blockIndexer() *Indexer {
+	return &Indexer{
 		db:               r.db,
 		rpc:              r.rpc,
 		config:           r.idxCfg,
@@ -270,9 +288,8 @@ func (r *RealtimeIndexer) processBlockRaw(ctx context.Context, number uint64) er
 		balanceWorkers:   r.balanceWorkers,
 		tracingSupported: r.tracingSupported,
 		eventBus:         r.eventBus,
+		dailyStats:       r.dailyStats,
 	}
-
-	return idx.processBlockRaw(ctx, number)
 }
 
 func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, error) {

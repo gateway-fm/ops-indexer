@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"net/http"
 	"strings"
@@ -39,9 +40,24 @@ type Client struct {
 	raw *rpclient.Client
 }
 
+// newTransport is the HTTP transport for every JSON-RPC call the indexer makes. It used to be
+// http.DefaultTransport, whose MaxIdleConnsPerHost is 2: with 50 RPC workers, 30 balance workers and the
+// catch-up workers against one node, nearly every request opened and closed a TCP connection, and at
+// ~1,000 requests/s the pod ran out of ephemeral ports ("connect: cannot assign requested address").
+// Up to 256 idle connections are now kept per host, more than twice the default worker total. A larger
+// pool costs nothing: a connection only sits idle if that many requests ran at once, and it is closed after
+// the default 90 s. There is no per-host cap, as before: with no response timeout on RPCs, a cap would let
+// requests stuck on a dead node block every other call. Same requests, fewer sockets.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 256
+	t.MaxIdleConnsPerHost = 256
+	return t
+}
+
 func New(url string) (*Client, error) {
 	httpClient := &http.Client{
-		Transport: &authTransport{underlying: http.DefaultTransport},
+		Transport: &authTransport{underlying: newTransport()},
 	}
 
 	raw := rpclient.New(url, httpClient)
@@ -159,7 +175,8 @@ type ReceiptResult struct {
 }
 
 // FetchBlockReceipts fetches all receipts for a block in a single RPC call
-// using eth_getBlockReceipts. Returns nil if the method is not supported.
+// using eth_getBlockReceipts. Returns nil receipts and no error when the node
+// answers null, which geth-derived nodes do for a block they do not have yet.
 func (c *Client) FetchBlockReceipts(ctx context.Context, blockNumber uint64) ([]*rpclient.Receipt, error) {
 	var receipts []*rpclient.Receipt
 	err := c.raw.CallContext(ctx, &receipts, "eth_getBlockReceipts", toHex(blockNumber))
@@ -222,44 +239,55 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 			for _, r := range receipts {
 				results[r.TxHash] = r
 			}
+			for _, h := range txHashes {
+				if _, ok := results[h]; !ok {
+					metrics.SetReceiptStrategy("none")
+					return nil, fmt.Errorf("receipts for block %d incomplete: eth_getBlockReceipts has no receipt for tx %s", blockNumber[0], h.Hex())
+				}
+			}
 			metrics.SetReceiptStrategy("batch")
 			log.Info("fetched receipts via eth_getBlockReceipts",
 				"block", blockNumber[0], "count", len(results))
 			return results, nil
 		}
-		if err != nil {
-			// If the error indicates the method doesn't exist, fall through to per-TX.
-			// For any other error (data errors, node issues), try eth_getLogs as a
-			// last resort so we can at least index events/token transfers — op-reth
-			// in OP-Stack mode refuses receipts on blocks whose tx[0] isn't the L1
-			// info system tx, but eth_getLogs still works on those same blocks.
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "method not found") || strings.Contains(errMsg, "not supported") || strings.Contains(errMsg, "does not exist") {
-				log.Warn("eth_getBlockReceipts not supported, falling back to per-TX fetch",
-					"block", blockNumber[0], "error", err)
-			} else {
-				logReceipts, lerr := c.fetchLogsAsReceipts(ctx, blockNumber[0])
-				if lerr == nil {
-					metrics.SetReceiptStrategy("logs")
-					log.Warn("eth_getBlockReceipts failed; recovered logs via eth_getLogs (status/gasUsed not available)",
-						"block", blockNumber[0], "receipts_err", err, "txs_with_logs", len(logReceipts), "total_txs", len(txHashes))
-					return logReceipts, nil
-				}
-				metrics.SetReceiptStrategy("none")
-				log.Warn("eth_getBlockReceipts failed and eth_getLogs fallback also failed; skipping receipts for block",
-					"block", blockNumber[0], "receipts_err", err, "logs_err", lerr, "txs", len(txHashes))
-				return make(map[common.Hash]*rpclient.Receipt), nil
+		if err == nil {
+			metrics.SetReceiptStrategy("none")
+			return nil, fmt.Errorf("receipts for block %d unavailable: eth_getBlockReceipts returned null", blockNumber[0])
+		}
+		// If the error indicates the method doesn't exist, fall through to per-TX.
+		// For any other error (data errors, node issues), try eth_getLogs as a
+		// last resort so we can at least index events/token transfers — op-reth
+		// in OP-Stack mode refuses receipts on blocks whose tx[0] isn't the L1
+		// info system tx, but eth_getLogs still works on those same blocks.
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "method not found") || strings.Contains(errMsg, "not supported") || strings.Contains(errMsg, "does not exist") {
+			log.Warn("eth_getBlockReceipts not supported, falling back to per-TX fetch",
+				"block", blockNumber[0], "error", err)
+		} else {
+			logReceipts, lerr := c.fetchLogsAsReceipts(ctx, blockNumber[0])
+			if lerr == nil {
+				metrics.SetReceiptStrategy("logs")
+				log.Warn("eth_getBlockReceipts failed; recovered logs via eth_getLogs (status/gasUsed not available)",
+					"block", blockNumber[0], "receipts_err", err, "txs_with_logs", len(logReceipts), "total_txs", len(txHashes))
+				return logReceipts, nil
 			}
+			// Both receipt paths failed. Storing the block anyway would write it with zero logs and zero
+			// token transfers while its transactions are marked successful, and no counter check would
+			// see it (the counters agree with the missing rows). Fail the block; the loop retries it.
+			metrics.SetReceiptStrategy("none")
+			log.Error("eth_getBlockReceipts failed and eth_getLogs fallback also failed; block will be retried",
+				"block", blockNumber[0], "receipts_err", err, "logs_err", lerr, "txs", len(txHashes))
+			return nil, fmt.Errorf("receipts for block %d unavailable: %w (logs fallback: %v)", blockNumber[0], err, lerr)
 		}
 	}
 
-	// Fallback: fetch receipts individually per transaction (only when eth_getBlockReceipts is not supported)
+	// Fallback: fetch receipts individually per transaction, when eth_getBlockReceipts is not supported or no
+	// block number was given. One missing receipt fails the block, for the same reason as above.
 	metrics.SetReceiptStrategy("per_tx")
 	limiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit/10+1)
 
 	results := make(map[common.Hash]*rpclient.Receipt)
 	var mu sync.Mutex
-	var failCount int
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(workers)
@@ -273,12 +301,7 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 
 			receipt, err := c.raw.TransactionReceipt(ctx, hash)
 			if err != nil {
-				mu.Lock()
-				failCount++
-				mu.Unlock()
-				log.Warn("failed to fetch receipt",
-					"tx", hash.Hex(), "error", err)
-				return nil
+				return fmt.Errorf("receipt for tx %s: %w", hash.Hex(), err)
 			}
 
 			mu.Lock()
@@ -289,12 +312,8 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 	}
 
 	if err := g.Wait(); err != nil {
+		log.Error("per-tx receipt fetch failed; block will be retried", "txs", len(txHashes), "error", err)
 		return nil, err
-	}
-
-	if failCount > 0 {
-		log.Warn("some receipts could not be fetched",
-			"failed", failCount, "total", len(txHashes))
 	}
 
 	return results, nil

@@ -16,6 +16,9 @@ type Config struct {
 	GRPCListenAddr  string        `mapstructure:"grpc_listen_addr"`
 	APIPort         int           `mapstructure:"api_port"`
 	PollInterval    time.Duration `mapstructure:"poll_interval"`
+	// Minimum interval between recomputations of the current day's daily_stats
+	// row (PRST-4669). 0 = every 100 blocks (legacy).
+	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
 	StartBlock      uint64        `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
@@ -80,6 +83,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("grpc_listen_addr", ":50051")
 	v.SetDefault("api_port", 8080)
 	v.SetDefault("poll_interval", "2s")
+	v.SetDefault("daily_stats_min_interval", "60s")
 	v.SetDefault("start_block", 0)
 
 	v.SetDefault("rpc_workers", 50)
@@ -147,6 +151,7 @@ func Load() (*Config, error) {
 	cfg.GRPCListenAddr = v.GetString("grpc_listen_addr")
 	cfg.APIPort = v.GetInt("api_port")
 	cfg.PollInterval = v.GetDuration("poll_interval")
+	cfg.DailyStatsMinInterval = v.GetDuration("daily_stats_min_interval")
 	cfg.StartBlock = v.GetUint64("start_block")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
