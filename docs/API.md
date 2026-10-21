@@ -172,6 +172,11 @@ Lists that run into the watermark while paging (the feeds, `by_address` lists, d
   it is not the sender or recipient of.
 - `ListTokenHolders` (`tokens.holder_count`), `ListTokens`, `ListAddresses`, `ListTokenInventory`, `GetDailyStats`:
   current state, unaffected by pruning.
+- `GetDailyStats` `new_addresses`, `new_contracts`, `cumulative_addresses`, `cumulative_contracts` count an address on
+  the day of the block it was first seen in. **Correction (migration 021):** they compared that block number with epoch
+  seconds, so `new_addresses` and `new_contracts` were 0 on every day and the cumulative columns counted every address
+  known when the row was written. 021 rewrites every stored day (it refuses on a pruned database); values can rise or
+  fall per day, and the cumulative columns now grow day by day to the totals in `GetChainStats`.
 
 **Within retention** (counts or rows limited to retained history):
 

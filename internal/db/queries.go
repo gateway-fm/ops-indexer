@@ -2056,16 +2056,6 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 		return nil, fmt.Errorf("compute active addresses: %w", err)
 	}
 
-	// new_addresses
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE first_seen >= extract(epoch from $1::date)::bigint
-		  AND first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.NewAddresses)
-	if err != nil {
-		return nil, fmt.Errorf("compute new addresses: %w", err)
-	}
-
 	// avg_block_time
 	err = d.pool.QueryRow(ctx, `
 		SELECT COALESCE(
@@ -2079,17 +2069,6 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 		Scan(&s.AvgBlockTime)
 	if err != nil {
 		return nil, fmt.Errorf("compute avg block time: %w", err)
-	}
-
-	// new_contracts
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE is_contract = true
-		  AND first_seen >= extract(epoch from $1::date)::bigint
-		  AND first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.NewContracts)
-	if err != nil {
-		return nil, fmt.Errorf("compute new contracts: %w", err)
 	}
 
 	// token_transfer_count
@@ -2116,23 +2095,23 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 		return nil, fmt.Errorf("compute cumulative transactions: %w", err)
 	}
 
-	// cumulative_addresses
+	// Addresses by the day of their first block: from the day's first block to the next day's.
 	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.CumulativeAddresses)
+		WITH span AS (
+			SELECT min(number) AS lo,
+			       COALESCE(max(number) + 1,
+			                (SELECT min(number) FROM blocks WHERE timestamp >= extract(epoch from ($1::date + interval '1 day'))::bigint)) AS hi
+			FROM blocks
+			WHERE timestamp >= extract(epoch from $1::date)::bigint
+			  AND timestamp < extract(epoch from ($1::date + interval '1 day'))::bigint)
+		SELECT count(*) FILTER (WHERE first_seen >= span.lo AND first_seen < span.hi),
+		       count(*) FILTER (WHERE is_contract AND first_seen >= span.lo AND first_seen < span.hi),
+		       count(*) FILTER (WHERE first_seen < span.hi),
+		       count(*) FILTER (WHERE is_contract AND first_seen < span.hi)
+		FROM address_stats, span`, dateStr).
+		Scan(&s.NewAddresses, &s.NewContracts, &s.CumulativeAddresses, &s.CumulativeContracts)
 	if err != nil {
-		return nil, fmt.Errorf("compute cumulative addresses: %w", err)
-	}
-
-	// cumulative_contracts
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE is_contract = true
-		  AND first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.CumulativeContracts)
-	if err != nil {
-		return nil, fmt.Errorf("compute cumulative contracts: %w", err)
+		return nil, fmt.Errorf("compute address columns: %w", err)
 	}
 
 	return s, nil
