@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -44,6 +46,11 @@ type Config struct {
 	SkipAddressStats    bool
 	SkipReceiptTxTypes  map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
+	// DailyStatsMinInterval is the minimum time between two recomputations of
+	// the current day's daily_stats row. Zero keeps the old behaviour (every
+	// 100th block). See dailyStatsThrottle.
+	DailyStatsMinInterval time.Duration
+
 	EnableOPDeposits bool
 }
 
@@ -74,6 +81,99 @@ type Indexer struct {
 	realtimeIndexer *RealtimeIndexer
 
 	catchupRunning bool
+
+	// dailyStats is shared with the catchup path: CatchupIndexer builds a fresh
+	// Indexer value for every block it processes, so a value field here would
+	// be a fresh, never-run throttle per block and fire the day aggregate on
+	// every one of them (measured: 104 runs for 105 blocks, 22 s each).
+	dailyStats *dailyStatsThrottle
+}
+
+// dailyStatsThrottle gates the day-aggregate recomputation: at most one run in
+// flight, and at most one start per minInterval (or per 100 blocks when
+// minInterval is zero, the pre-PRST-4669 behaviour). Every block, empty or not,
+// marks its day dirty and every run recomputes all dirty days, so a day is
+// recomputed after its last block whatever order its blocks are committed in.
+// Days left dirty when no later block arrives (the last burst before a quiet
+// period) are recomputed by a timer once the interval has passed.
+type dailyStatsThrottle struct {
+	mu      sync.Mutex
+	last    time.Time
+	running bool
+	armed   bool
+	dirty   map[time.Time]struct{}
+}
+
+func (t *dailyStatsThrottle) due(blockNumber uint64, day time.Time, minInterval time.Duration) []time.Time {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.dirty == nil {
+		t.dirty = make(map[time.Time]struct{})
+	}
+	if !day.IsZero() {
+		t.dirty[day] = struct{}{}
+	}
+	if t.running || len(t.dirty) == 0 {
+		return nil
+	}
+	if minInterval <= 0 {
+		if blockNumber%100 != 0 {
+			return nil
+		}
+	} else if !t.last.IsZero() && time.Since(t.last) < minInterval {
+		return nil
+	}
+	days := make([]time.Time, 0, len(t.dirty))
+	for d := range t.dirty {
+		days = append(days, d)
+	}
+	sort.Slice(days, func(a, b int) bool { return days[a].Before(days[b]) })
+	clear(t.dirty)
+	t.last = time.Now()
+	t.running = true
+	return days
+}
+
+func (t *dailyStatsThrottle) markDirty(day time.Time) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.dirty == nil {
+		t.dirty = make(map[time.Time]struct{})
+	}
+	t.dirty[day] = struct{}{}
+}
+
+func (t *dailyStatsThrottle) done() {
+	t.mu.Lock()
+	t.running = false
+	t.mu.Unlock()
+}
+
+// arm reports whether a deferred run must be scheduled, and when: dirty days are
+// waiting, no run is in flight to pick them up afterwards, and none is scheduled.
+func (t *dailyStatsThrottle) arm(minInterval time.Duration) (time.Duration, bool) {
+	if t == nil || minInterval <= 0 {
+		return 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.running || t.armed || len(t.dirty) == 0 {
+		return 0, false
+	}
+	t.armed = true
+	return max(minInterval-time.Since(t.last), time.Millisecond), true
+}
+
+func (t *dailyStatsThrottle) disarm() {
+	t.mu.Lock()
+	t.armed = false
+	t.mu.Unlock()
 }
 
 func (i *Indexer) SetEventBus(bus *events.Bus) {
@@ -134,6 +234,7 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		config:        cfg,
 		tokenCache:    NewTokenCache(),
 		contractCache: NewContractCache(),
+		dailyStats:    &dailyStatsThrottle{},
 	}
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
@@ -368,6 +469,30 @@ func (i *Indexer) Start(ctx context.Context) error {
 	return i.startStandardMode(ctx, lastIndexed)
 }
 
+// newCatchupIndexer and newRealtimeIndexer build the sub-indexers with the
+// state they share with this one, including the daily-stats throttle.
+func (i *Indexer) newCatchupIndexer(cfg *CatchupConfig) *CatchupIndexer {
+	c := NewCatchupIndexer(
+		i.db, i.rpc, cfg, i.config,
+		i.tokenCache, i.contractCache, i.balanceWorkers,
+		i.tracingSupported,
+	)
+	c.SetEventBus(i.eventBus)
+	c.SetDailyStatsThrottle(i.dailyStats)
+	return c
+}
+
+func (i *Indexer) newRealtimeIndexer(cfg *RealtimeConfig) *RealtimeIndexer {
+	r := NewRealtimeIndexer(
+		i.db, i.rpc, cfg, i.config,
+		i.tokenCache, i.contractCache, i.balanceWorkers,
+		i.tracingSupported,
+	)
+	r.SetEventBus(i.eventBus)
+	r.SetDailyStatsThrottle(i.dailyStats)
+	return r
+}
+
 func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnChain uint64) error {
 	log.Info("starting catchup mode",
 		"from_block", lastIndexed+1,
@@ -380,24 +505,14 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 		QueueSize: i.config.CatchupQueueSize,
 	}
 
-	i.catchupIndexer = NewCatchupIndexer(
-		i.db, i.rpc, catchupCfg, i.config,
-		i.tokenCache, i.contractCache, i.balanceWorkers,
-		i.tracingSupported,
-	)
-	i.catchupIndexer.SetEventBus(i.eventBus)
+	i.catchupIndexer = i.newCatchupIndexer(catchupCfg)
 
 	realtimeCfg := &RealtimeConfig{
 		ConfirmationBlocks: 1,
 		PollInterval:       i.pollInterval,
 	}
 
-	i.realtimeIndexer = NewRealtimeIndexer(
-		i.db, i.rpc, realtimeCfg, i.config,
-		i.tokenCache, i.contractCache, i.balanceWorkers,
-		i.tracingSupported,
-	)
-	i.realtimeIndexer.SetEventBus(i.eventBus)
+	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {
@@ -456,12 +571,7 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 		QueueSize: i.config.CatchupQueueSize,
 	}
 
-	i.catchupIndexer = NewCatchupIndexer(
-		i.db, i.rpc, catchupCfg, i.config,
-		i.tokenCache, i.contractCache, i.balanceWorkers,
-		i.tracingSupported,
-	)
-	i.catchupIndexer.SetEventBus(i.eventBus)
+	i.catchupIndexer = i.newCatchupIndexer(catchupCfg)
 	i.catchupIndexer.SetCollector(i.missingRangeCollector)
 
 	realtimeCfg := &RealtimeConfig{
@@ -469,12 +579,7 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 		PollInterval:       i.pollInterval,
 	}
 
-	i.realtimeIndexer = NewRealtimeIndexer(
-		i.db, i.rpc, realtimeCfg, i.config,
-		i.tokenCache, i.contractCache, i.balanceWorkers,
-		i.tracingSupported,
-	)
-	i.realtimeIndexer.SetEventBus(i.eventBus)
+	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {
@@ -670,6 +775,8 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 		return err
 	}
 	metrics.BlockIndexed(0, uint64(rawBlock.GasUsed))
+	i.dailyStats.markDirty(blockDay(b.Timestamp))
+	i.scheduleDeferredDailyStats(ctx)
 	return nil
 }
 
@@ -1090,12 +1197,53 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			"elapsed", elapsed)
 	}
 
-	// Update daily stats every 100 blocks
-	if blockNumber%100 == 0 {
-		go i.updateDailyStatsForDate(ctx, blockTimestamp)
-	}
+	// Recompute the day's daily_stats row, throttled.
+	//
+	// ComputeDailyStats re-aggregates the WHOLE day from base tables: six
+	// queries, the largest a COUNT(DISTINCT from/to address) over every
+	// transaction of the day. That cost grows with the day's volume: 1.9 s
+	// per call at 2.1M transactions on the PRST-4669 rig, ~2.7 s for the six
+	// together, and it was fired every 100 blocks -- every 10-14 s at 500 tx/s
+	// -- so it was 21.5% of all database time once holder_count stopped
+	// dominating, and on course to saturate a core by mid-day. The row it
+	// maintains is a dashboard aggregate: a day's row may lag its blocks by up to
+	// one interval plus one run. Same queries, fewer runs.
+	i.scheduleDailyStats(ctx, blockNumber, blockDay(blockTimestamp))
 
 	return nil
+}
+
+func blockDay(timestamp uint64) time.Time {
+	return time.Unix(int64(timestamp), 0).UTC().Truncate(24 * time.Hour)
+}
+
+func (i *Indexer) scheduleDailyStats(ctx context.Context, blockNumber uint64, day time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	days := i.dailyStats.due(blockNumber, day, i.config.DailyStatsMinInterval)
+	if days == nil {
+		i.scheduleDeferredDailyStats(ctx)
+		return
+	}
+	go func() {
+		defer i.scheduleDeferredDailyStats(ctx)
+		defer i.dailyStats.done()
+		for _, d := range days {
+			if !i.updateDailyStatsForDate(ctx, d) {
+				i.dailyStats.markDirty(d)
+			}
+		}
+	}()
+}
+
+func (i *Indexer) scheduleDeferredDailyStats(ctx context.Context) {
+	if wait, ok := i.dailyStats.arm(i.config.DailyStatsMinInterval); ok {
+		time.AfterFunc(wait, func() {
+			i.dailyStats.disarm()
+			i.scheduleDailyStats(ctx, 0, time.Time{})
+		})
+	}
 }
 
 func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64, isContract bool) {
@@ -1116,16 +1264,17 @@ func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta
 	}
 }
 
-func (i *Indexer) updateDailyStatsForDate(ctx context.Context, blockTimestamp uint64) {
-	date := time.Unix(int64(blockTimestamp), 0).UTC().Truncate(24 * time.Hour)
+func (i *Indexer) updateDailyStatsForDate(ctx context.Context, date time.Time) bool {
 	stats, err := i.db.ComputeDailyStats(ctx, date)
 	if err != nil {
-		log.Warn("failed to compute daily stats", "date", date.Format("2006-01-02"), "error", err)
-		return
+		log.Warn("failed to compute daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)
+		return false
 	}
 	if err := i.db.UpsertDailyStats(ctx, stats); err != nil {
-		log.Warn("failed to upsert daily stats", "date", date.Format("2006-01-02"), "error", err)
+		log.Warn("failed to upsert daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)
+		return false
 	}
+	return true
 }
 
 // bumpTokenTransferDelta records this address as a participant in a Transfer
