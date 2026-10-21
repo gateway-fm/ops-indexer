@@ -83,19 +83,17 @@ func (d *DB) BatchGetTokenBalances(ctx context.Context, addresses []string, toke
 	var args []any
 	if tokenAddress != "" {
 		query = `
-			SELECT DISTINCT ON (address, token_address)
-				address, token_address, block_number, balance::text
-			FROM balances
+			SELECT address, token_address, block_number, balance::text
+			FROM token_balances_current
 			WHERE address = ANY($1) AND token_address = $2
-			ORDER BY address, token_address, block_number DESC`
+			ORDER BY address, token_address`
 		args = []any{lowered, lowerAddress(tokenAddress)}
 	} else {
 		query = `
-			SELECT DISTINCT ON (address, token_address)
-				address, token_address, block_number, balance::text
-			FROM balances
+			SELECT address, token_address, block_number, balance::text
+			FROM token_balances_current
 			WHERE address = ANY($1)
-			ORDER BY address, token_address, block_number DESC`
+			ORDER BY address, token_address`
 		args = []any{lowered}
 	}
 

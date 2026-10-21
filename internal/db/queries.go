@@ -1057,27 +1057,22 @@ func scanTokenTransfers(rows pgx.Rows) ([]types.TokenTransfer, error) {
 // Token holder operations
 
 func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenHolder, int64, error) {
+	// Current balances, not the balances history: retention drops history by range (migration 014), and the
+	// history read showed a holder's older positive balance after it went to zero.
 	var total int64
-	d.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT address) FROM balances
-		WHERE token_address = LOWER($1) AND balance > 0`, tokenAddress).Scan(&total)
+	d.pool.QueryRow(ctx, `SELECT COALESCE(holder_count, 0) FROM tokens WHERE address = LOWER($1)`, tokenAddress).Scan(&total)
 
 	rows, err := d.pool.Query(ctx, `
-		WITH latest_balances AS (
-			SELECT address, balance,
-				ROW_NUMBER() OVER (PARTITION BY address ORDER BY block_number DESC) as rn
-			FROM balances
+		WITH total_supply AS (
+			SELECT COALESCE(SUM(balance), 1) as supply FROM token_balances_current
 			WHERE token_address = LOWER($1) AND balance > 0
-		),
-		total_supply AS (
-			SELECT COALESCE(SUM(balance), 1) as supply FROM latest_balances WHERE rn = 1
 		)
-		SELECT lb.address, lb.balance::text,
-			(lb.balance::numeric / NULLIF(ts.supply::numeric, 0) * 100)::numeric(10,4) as percentage,
-			COALESCE((SELECT true FROM contracts WHERE address = LOWER(lb.address)), false) as is_contract
-		FROM latest_balances lb, total_supply ts
-		WHERE lb.rn = 1
-		ORDER BY lb.balance DESC
+		SELECT c.address, c.balance::text,
+			(c.balance::numeric / NULLIF(ts.supply::numeric, 0) * 100)::numeric(10,4) as percentage,
+			COALESCE((SELECT true FROM contracts WHERE address = LOWER(c.address)), false) as is_contract
+		FROM token_balances_current c, total_supply ts
+		WHERE c.token_address = LOWER($1) AND c.balance > 0
+		ORDER BY c.balance DESC
 		LIMIT $2 OFFSET $3`, tokenAddress, limit, offset)
 	if err != nil {
 		return nil, 0, err
@@ -1150,9 +1145,8 @@ func (d *DB) GetLatestBalance(ctx context.Context, address string, tokenAddress 
 	var balanceStr string
 	err := d.pool.QueryRow(ctx, `
 		SELECT address, token_address, block_number, balance::text
-		FROM balances
-		WHERE address = LOWER($1) AND token_address = LOWER($2)
-		ORDER BY block_number DESC LIMIT 1`, address, tokenAddress).Scan(
+		FROM token_balances_current
+		WHERE address = LOWER($1) AND token_address = LOWER($2)`, address, tokenAddress).Scan(
 		&b.Address, &b.TokenAddress, &b.BlockNumber, &balanceStr)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -1190,14 +1184,9 @@ func (d *DB) GetBalanceHistory(ctx context.Context, address string, tokenAddress
 
 func (d *DB) GetTokenBalances(ctx context.Context, address string) ([]types.Balance, error) {
 	rows, err := d.pool.Query(ctx, `
-		WITH latest_balances AS (
-			SELECT address, token_address, balance, block_number,
-				ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY block_number DESC) as rn
-			FROM balances
-			WHERE address = LOWER($1)
-		)
 		SELECT address, token_address, block_number, balance::text
-		FROM latest_balances WHERE rn = 1 AND balance > 0
+		FROM token_balances_current
+		WHERE address = LOWER($1) AND balance > 0
 		ORDER BY balance DESC`, address)
 	if err != nil {
 		return nil, err
