@@ -47,6 +47,8 @@ type Config struct {
 	PrunedLookupTimeout     time.Duration `mapstructure:"pruned_lookup_timeout"`
 	PrunedLookupConcurrency int           `mapstructure:"pruned_lookup_concurrency"`
 	LedgerMaxHeadLag        uint64        `mapstructure:"ledger_max_head_lag_blocks"`
+	VerifyRecountInterval   time.Duration `mapstructure:"verify_recount_interval"`
+	VerifyRepair            bool          `mapstructure:"verify_repair"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -134,6 +136,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pruned_lookup_timeout", "5s")
 	v.SetDefault("pruned_lookup_concurrency", 4)
 	v.SetDefault("ledger_max_head_lag_blocks", 0)
+	v.SetDefault("verify_recount_interval", "1m")
+	v.SetDefault("verify_repair", true)
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -225,6 +229,8 @@ func Load() (*Config, error) {
 	cfg.PrunedLookupTimeout = v.GetDuration("pruned_lookup_timeout")
 	cfg.PrunedLookupConcurrency = v.GetInt("pruned_lookup_concurrency")
 	cfg.LedgerMaxHeadLag = v.GetUint64("ledger_max_head_lag_blocks")
+	cfg.VerifyRecountInterval = v.GetDuration("verify_recount_interval")
+	cfg.VerifyRepair = v.GetBool("verify_repair")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")
@@ -358,6 +364,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("PARTITION_BLOCKS=%d with retention on: two partitions are kept ahead of the head every %s, and partitions "+
 			"this small let a chain of up to %d blocks/s outrun them; set PARTITION_BLOCKS to at least %d",
 			c.PartitionBlocks, partitionKeeperInterval, MaxChainBlocksPerSecond, MinPartitionBlocks)
+	}
+	if c.VerifyRecountInterval <= 0 {
+		return fmt.Errorf("VERIFY_RECOUNT_INTERVAL must be greater than 0")
 	}
 	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
 		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+

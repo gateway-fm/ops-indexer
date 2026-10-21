@@ -175,7 +175,12 @@ func main() {
 
 	stop := &workerStop{cancel: cancel}
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
+
+	go func() {
+		defer wg.Done()
+		database.RunVerify(ctx, db.VerifyConfig{RecountInterval: cfg.VerifyRecountInterval, Repair: cfg.VerifyRepair})
+	}()
 
 	reconciled := make(chan struct{})
 	afterReconcile := func() bool {

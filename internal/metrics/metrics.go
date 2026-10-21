@@ -47,6 +47,41 @@ var (
 		Buckets: latencyBuckets,
 	})
 
+	verifyChecked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_verify_ranges_checked_total",
+		Help: "Ledger checks run, by check (recount: one retained span; running: chain, tokens and one address bucket; node: one pruned span).",
+	}, []string{"check"})
+
+	verifyDrifted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_verify_ranges_drifted_total",
+		Help: "Ledger checks that found at least one differing counter, by check.",
+	}, []string{"check"})
+
+	verifyDrift = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "indexer_verify_drift",
+		Help: "Differing counters found by the last check, by check.",
+	}, []string{"check"})
+
+	verifyRepairs = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_verify_repairs_total",
+		Help: "Ledger checks whose drift was repaired, by check.",
+	}, []string{"check"})
+
+	verifyQuarantined = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_verify_quarantined",
+		Help: "Spans and running keys that drifted again after a repair: no longer repaired.",
+	})
+
+	verifyCycleSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "indexer_verify_cycle_seconds",
+		Help: "Duration of the last full cycle over every range (or address bucket), by check.",
+	}, []string{"check"})
+
+	verifyLastFullCycle = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "indexer_verify_last_full_cycle_timestamp",
+		Help: "Unix time the last full cycle finished, by check.",
+	}, []string{"check"})
+
 	retentionStepSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "indexer_retention_step_seconds",
 		Help:    "Duration of one retention step: cut_constrain, cut_validate, cut_finish, ensure, advance, detach, archive, drop.",
@@ -169,6 +204,26 @@ func SetStartWaitingBlocks(n uint64) { startWaitingBlocks.Set(float64(n)) }
 func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
 
 func SetPruneWatermark(block uint64) { pruneWatermark.Set(float64(block)) }
+
+// VerifyChecked records one check's outcome: its differing counters and the state it left (ok, drift, repaired,
+// quarantined).
+func VerifyChecked(check string, drifted int, state string) {
+	verifyChecked.WithLabelValues(check).Inc()
+	verifyDrift.WithLabelValues(check).Set(float64(drifted))
+	if drifted > 0 {
+		verifyDrifted.WithLabelValues(check).Inc()
+	}
+	if state == "repaired" && drifted > 0 {
+		verifyRepairs.WithLabelValues(check).Inc()
+	}
+}
+
+func SetVerifyQuarantined(n int64) { verifyQuarantined.Set(float64(n)) }
+
+func VerifyCycle(check string, d time.Duration) {
+	verifyCycleSeconds.WithLabelValues(check).Set(d.Seconds())
+	verifyLastFullCycle.WithLabelValues(check).SetToCurrentTime()
+}
 
 func SetLedgerClosedThrough(block uint64) { ledgerClosedThrough.Set(float64(block)) }
 

@@ -9,7 +9,8 @@ import (
 
 func validConfig() *Config {
 	return &Config{RPCURL: "http://node", RPCTimeout: time.Minute, DatabaseURL: "postgres://db", APIPort: 8080, RPCWorkers: 1, RPCRateLimit: 1,
-		LedgerSpanBlocks: 100_000, LedgerCloseInterval: 10 * time.Second, PruneInterval: time.Minute, PartitionBlocks: 10_000}
+		LedgerSpanBlocks: 100_000, LedgerCloseInterval: 10 * time.Second, PruneInterval: time.Minute, PartitionBlocks: 10_000,
+		VerifyRecountInterval: time.Minute}
 }
 
 func TestValidateRefusesStartBlockWithRetentionUntilTheStatsBackfill(t *testing.T) {
