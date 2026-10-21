@@ -655,8 +655,14 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	}
 
 	if len(data.AddressStats) > 0 && !data.SkipAddressStats {
+		addresses := make([]string, 0, len(data.AddressStats))
+		for addr := range data.AddressStats {
+			addresses = append(addresses, addr)
+		}
+		sort.Strings(addresses)
 		batch := &pgx.Batch{}
-		for _, s := range data.AddressStats {
+		for _, addr := range addresses {
+			s := data.AddressStats[addr]
 			batch.Queue(`
 				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
 				VALUES (LOWER($1), $2, $3, $4, $5, $5, $6, NOW())
@@ -664,8 +670,9 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 					tx_count = address_stats.tx_count + $2,
 					internal_tx_count = address_stats.internal_tx_count + $3,
 					token_transfer_count = address_stats.token_transfer_count + $4,
-					last_seen = $5,
-					is_contract = COALESCE(EXCLUDED.is_contract, address_stats.is_contract),
+					first_seen = LEAST(address_stats.first_seen, EXCLUDED.first_seen),
+					last_seen = GREATEST(address_stats.last_seen, EXCLUDED.last_seen),
+					is_contract = COALESCE(address_stats.is_contract, false) OR EXCLUDED.is_contract,
 					updated_at = NOW()
 				RETURNING (xmax = 0)`,
 				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract)
