@@ -112,7 +112,7 @@ func TestRetentionCutsPrunesAndKeepsTotals(t *testing.T) {
 	archive := t.TempDir()
 	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000, ArchiveDir: archive}
 
-	seedHistory(t, d, 1, 40_001, 500)
+	seedHistory(t, d, 0, 40_001, 1)
 	before := totalsAfterReseed(t, d)
 
 	require.NoError(t, d.retentionPass(ctx, cfg))
@@ -120,7 +120,7 @@ func TestRetentionCutsPrunesAndKeepsTotals(t *testing.T) {
 		partitionRanges(t, d), "cut at head + 2 partitions; a partition covers head + 2 partitions")
 
 	ensurePartitions(t, d, 80_001, cfg)
-	seedHistory(t, d, 40_501, 80_001, 500)
+	seedHistory(t, d, 40_002, 80_001, 1)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 
 	wm, _, err := d.PrunedThrough(ctx)
@@ -136,7 +136,7 @@ func TestRetentionCutsPrunesAndKeepsTotals(t *testing.T) {
 		require.False(t, exists, "%s_legacy dropped", tbl)
 	}
 
-	more := int64(80) // blocks 40,501..80,001 step 500
+	more := int64(40_000) // blocks 40,002..80,001
 	after := totalsAfterReseed(t, d)
 	require.Equal(t, before.blocks+more, after.blocks, "blocks_total counts pruned blocks")
 	require.Equal(t, before.txs+more, after.txs)
@@ -158,10 +158,10 @@ func TestRetentionWaitsForDailyStats(t *testing.T) {
 	ctx := context.Background()
 	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
 
-	seedHistory(t, d, 1, 40_001, 500)
+	seedHistory(t, d, 0, 40_001, 1)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	ensurePartitions(t, d, 80_001, cfg)
-	seedHistory(t, d, 40_501, 80_001, 500)
+	seedHistory(t, d, 40_002, 80_001, 1)
 	_, err := d.pool.Exec(ctx, `UPDATE daily_stats_watermark SET last_block = 10000`)
 	require.NoError(t, err)
 	require.NoError(t, d.retentionPass(ctx, cfg))
@@ -175,7 +175,7 @@ func TestReorgDeletesAcrossPartitions(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
-	seedHistory(t, d, 1, 40_001, 500)
+	seedHistory(t, d, 0, 40_001, 1)
 	require.NoError(t, d.retentionPass(ctx, RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}))
 	seedHistory(t, d, 44_001, 44_001, 1)
 
@@ -233,23 +233,23 @@ func TestRetentionResumesAfterCrashBeforeDetach(t *testing.T) {
 	ctx := context.Background()
 	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
 
-	seedHistory(t, d, 1, 40_001, 500)
+	seedHistory(t, d, 0, 40_001, 1)
 	before := totalsAfterReseed(t, d)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	ensurePartitions(t, d, 80_001, cfg)
-	seedHistory(t, d, 40_501, 80_001, 500)
+	seedHistory(t, d, 40_002, 80_001, 1)
 
 	_, err := d.pool.Exec(ctx, `SELECT prune_prepare('legacy')`)
 	require.NoError(t, err)
 	_, err = d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
 	require.NoError(t, err)
-	require.Equal(t, before.blocks+80, totalsAfterReseed(t, d).blocks, "attached rows below the watermark are not counted twice")
+	require.Equal(t, before.blocks+40_000, totalsAfterReseed(t, d).blocks, "attached rows below the watermark are not counted twice")
 
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	var exists bool
 	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('blocks_legacy') IS NOT NULL`).Scan(&exists))
 	require.False(t, exists)
-	require.Equal(t, before.blocks+80, totalsAfterReseed(t, d).blocks)
+	require.Equal(t, before.blocks+40_000, totalsAfterReseed(t, d).blocks)
 }
 
 // A DETACH CONCURRENTLY cancelled while it waits for older snapshots leaves the partition "detach pending"; the
@@ -260,10 +260,10 @@ func TestRetentionFinalizesPendingDetach(t *testing.T) {
 	ctx := context.Background()
 	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
 
-	seedHistory(t, d, 1, 40_001, 500)
+	seedHistory(t, d, 0, 40_001, 1)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	ensurePartitions(t, d, 80_001, cfg)
-	seedHistory(t, d, 40_501, 80_001, 500)
+	seedHistory(t, d, 40_002, 80_001, 1)
 	_, err := d.pool.Exec(ctx, `SELECT prune_prepare('legacy')`)
 	require.NoError(t, err)
 	_, err = d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
@@ -306,10 +306,10 @@ func TestRetentionDropsOnlyArchivedRanges(t *testing.T) {
 	require.NoError(t, os.WriteFile(blocked, nil, 0o644))
 	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000, ArchiveDir: blocked}
 
-	seedHistory(t, d, 1, 40_001, 500)
+	seedHistory(t, d, 0, 40_001, 1)
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	ensurePartitions(t, d, 80_001, cfg)
-	seedHistory(t, d, 40_501, 80_001, 500)
+	seedHistory(t, d, 40_002, 80_001, 1)
 	require.Error(t, d.retentionPass(ctx, cfg), "the archive directory is a file")
 
 	var state string
