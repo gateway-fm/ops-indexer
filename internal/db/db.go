@@ -47,7 +47,18 @@ func (d *DB) Close() {
 	d.pool.Close()
 }
 
+// Migrate applies the pending migrations and then reconciles, for callers that
+// do not open the API in between.
 func (d *DB) Migrate() error {
+	if err := d.MigrateSchema(); err != nil {
+		return err
+	}
+	return d.Reconcile(context.Background())
+}
+
+// MigrateSchema applies the pending migrations only. The indexer binary runs it
+// before opening gRPC, then Reconcile before ingest.
+func (d *DB) MigrateSchema() error {
 	ctx := context.Background()
 
 	conn, err := d.pool.Acquire(ctx)
@@ -81,7 +92,13 @@ func (d *DB) Migrate() error {
 	if err = migrator.Migrate(ctx); err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
+	return nil
+}
 
+// Reconcile re-derives the stored counters and the current-balance cache from
+// the history tables. It must run before ingest starts: its absolute writes
+// would otherwise overwrite deltas that committed while it was counting.
+func (d *DB) Reconcile(ctx context.Context) error {
 	if err := reseedCounters(ctx, d.pool); err != nil {
 		return err
 	}

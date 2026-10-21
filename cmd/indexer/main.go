@@ -77,7 +77,7 @@ func main() {
 		}
 	}
 
-	if err := database.Migrate(); err != nil {
+	if err := database.MigrateSchema(); err != nil {
 		log.Fatal("failed to run migrations", "error", err)
 	}
 	if cfg.TxHashIndexes {
@@ -152,8 +152,21 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(4)
 
+	reconciled := make(chan struct{})
+	afterReconcile := func() bool {
+		select {
+		case <-reconciled:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	go func() {
 		defer wg.Done()
+		if !afterReconcile() {
+			return
+		}
 		database.RunLedger(ctx, db.LedgerConfig{
 			SpanBlocks: cfg.LedgerSpanBlocks,
 			FirstBlock: cfg.StartBlock,
@@ -163,6 +176,9 @@ func main() {
 
 	go func() {
 		defer wg.Done()
+		if !afterReconcile() {
+			return
+		}
 		database.RunRetention(ctx, db.RetentionConfig{
 			RetainBlocks:    cfg.PruneRetainBlocks,
 			PartitionBlocks: cfg.PartitionBlocks,
@@ -173,6 +189,10 @@ func main() {
 
 	go func() {
 		defer wg.Done()
+		if err := database.Reconcile(ctx); err != nil {
+			log.Fatal("failed to reconcile counters", "error", err)
+		}
+		close(reconciled)
 		log.Info("starting indexer worker")
 		if err := idx.Start(ctx); err != nil {
 			log.Error("indexer worker error", "error", err)
