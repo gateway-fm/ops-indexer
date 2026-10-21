@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
+	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
@@ -20,7 +22,11 @@ import (
 type backfillStore interface {
 	StatsBackfillState(ctx context.Context) (db.BackfillState, error)
 	CommitBackfillBatch(ctx context.Context, b *db.BackfillBatch) error
+	NextBackfillBalanceKeys(ctx context.Context, n int) ([]db.BalanceKey, error)
+	SettleBackfillBalances(ctx context.Context, keys []db.BalanceKey, balances []*types.Balance) error
 }
+
+const balanceKeysPerRead = 1000
 
 type StatsBackfillConfig struct {
 	// RPS bounds every node call of the backfill; Workers is its fetch parallelism under that budget.
@@ -166,12 +172,45 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 	return to-1 == uint64(s.Target), nil
 }
 
-// RunStatsBackfill walks the backfill to its target, batch by batch, resuming from the recorded progress.
+// readBalances reads, at latest, the balance of up to n keys the backfill touched, once each; a key whose
+// balanceOf fails (not a token after all) is dropped, as the head path's balance worker drops it. It reports how
+// many keys it took.
+func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
+	keys, err := b.store.NextBackfillBalanceKeys(ctx, n)
+	if err != nil || len(keys) == 0 {
+		return 0, err
+	}
+	balances := make([]*types.Balance, 0, len(keys))
+	for _, k := range keys {
+		if err := b.limiter.Wait(ctx); err != nil {
+			return 0, err
+		}
+		data := append(append([]byte{}, balanceOfSelector...), common.LeftPadBytes(common.HexToAddress(k.Address).Bytes(), 32)...)
+		out, err := b.idx.rpc.CallContract(ctx, common.HexToAddress(k.Token), data)
+		if err != nil || len(out) < 32 {
+			continue
+		}
+		balances = append(balances, &types.Balance{Address: k.Address, TokenAddress: k.Token, BlockNumber: k.Block,
+			Balance: types.JSONString(new(big.Int).SetBytes(out[:32]).String())})
+	}
+	return len(keys), b.store.SettleBackfillBalances(ctx, keys, balances)
+}
+
+// RunStatsBackfill walks the backfill to its target, batch by batch, resuming from the recorded progress, and reads
+// the balances of the keys it touched as it goes.
 func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg StatsBackfillConfig) {
 	b := i.newBackfiller(store, cfg)
 	log.Info("stats backfill started", "rps", cfg.RPS, "workers", cfg.Workers, "batch_blocks", cfg.BatchBlocks)
+	done := false
 	for ctx.Err() == nil {
-		done, err := b.step(ctx)
+		var err error
+		if !done {
+			done, err = b.step(ctx)
+		}
+		read := 0
+		if err == nil {
+			read, err = b.readBalances(ctx, balanceKeysPerRead)
+		}
 		switch {
 		case err != nil && ctx.Err() == nil:
 			log.Warn("stats backfill: batch failed; retrying", "error", err)
@@ -179,7 +218,7 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 			case <-ctx.Done():
 			case <-time.After(cfg.Retry):
 			}
-		case done:
+		case done && read == 0:
 			log.Info("stats backfill complete")
 			return
 		}

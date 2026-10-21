@@ -30,6 +30,8 @@ type fakeChain struct {
 	balances   map[string]*big.Int
 	failOnce   map[uint64]bool
 	mu         sync.Mutex
+	// balanceReads counts eth_call at latest (balanceOf reads).
+	balanceReads int
 }
 
 func (f *fakeChain) count() {
@@ -151,4 +153,11 @@ func (f *fakeChain) BlockTransactionCounts(_ context.Context, from, to uint64, _
 		return 0, nil
 	}
 	return min(to, f.busy) - from, nil
+}
+
+func (f *fakeChain) CallContract(ctx context.Context, to common.Address, data []byte) ([]byte, error) {
+	f.mu.Lock()
+	f.balanceReads++
+	f.mu.Unlock()
+	return f.CallContractAt(ctx, to, data, f.head)
 }

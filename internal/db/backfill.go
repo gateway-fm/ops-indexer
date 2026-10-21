@@ -243,3 +243,35 @@ func addToStage(ctx context.Context, tx pgx.Tx, lo int64, s *SpanTotals) error {
 			last_seen = GREATEST(ledger_stage_address.last_seen, EXCLUDED.last_seen)`, lo)
 	return err
 }
+
+// NextBackfillBalanceKeys is up to n (token, address) keys the backfill touched whose balance is not read yet.
+func (d *DB) NextBackfillBalanceKeys(ctx context.Context, n int) ([]BalanceKey, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT token_address, address, block_number FROM stats_backfill_balance_keys ORDER BY token_address, address LIMIT $1`, n)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (BalanceKey, error) {
+		var k BalanceKey
+		var block int64
+		err := r.Scan(&k.Token, &k.Address, &block)
+		k.Block = uint64(block)
+		return k, err
+	})
+}
+
+// SettleBackfillBalances stores balances read for backfill keys as current balances at each key's newest backfill
+// block, so any head-path write of the key (a later block) wins, and drops the keys.
+func (d *DB) SettleBackfillBalances(ctx context.Context, keys []BalanceKey, balances []*types.Balance) error {
+	if err := d.InsertCurrentBalances(ctx, balances); err != nil {
+		return err
+	}
+	tokens, addrs := make([]string, len(keys)), make([]string, len(keys))
+	for i, k := range keys {
+		tokens[i], addrs[i] = k.Token, k.Address
+	}
+	_, err := d.pool.Exec(ctx, `
+		DELETE FROM stats_backfill_balance_keys k USING unnest($1::TEXT[], $2::TEXT[]) AS u(token_address, address)
+		WHERE k.token_address = u.token_address AND k.address = u.address`, tokens, addrs)
+	return err
+}

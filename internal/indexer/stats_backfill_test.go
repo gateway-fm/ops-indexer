@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/types"
 )
 
 const backfillStart = 1_200
@@ -202,4 +204,47 @@ func TestPrepareStatsBackfillNeedsTheRangeAndItsDayFinal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, [2]int64{5_999, 1_700_005_999}, [2]int64{int64(wm), ts}, "pruned from day one")
 	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 6_000), "a prepared backfill is resumed, not restarted")
+}
+
+func TestStatsBackfillReadsEachTouchedBalanceOnce(t *testing.T) {
+	ctx := context.Background()
+	store, sql := setupPostgres(t)
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 2_000, busy: 2_001,
+		balances: map[string]*big.Int{chainRecipient.Hex(): big.NewInt(7007)}}
+	require.NoError(t, store.InitStatsBackfill(ctx, backfillStart-1, uint64(blockTime(backfillStart-1))))
+	idx := newTestIndexer(store, chain)
+	indexBlocks(t, idx, backfillStart, 1500)
+	require.NoError(t, store.InsertBalancesBatch(ctx, []*types.Balance{{Address: strings.ToLower(chainSender.Hex()),
+		TokenAddress: strings.ToLower(chainToken.Hex()), BlockNumber: 1500, Balance: "9"}}), "the head path's balance worker")
+
+	b := idx.newBackfiller(store, testBackfill)
+	var err error
+	for done := false; !done; {
+		done, err = b.step(ctx)
+		require.NoError(t, err)
+	}
+	read, err := b.readBalances(ctx, balanceKeysPerRead)
+	require.NoError(t, err)
+	require.Equal(t, 2, read)
+	require.Equal(t, 2, chain.balanceReads, "one balanceOf per key, not one per transfer (600 below START_BLOCK)")
+	read, err = b.readBalances(ctx, balanceKeysPerRead)
+	require.NoError(t, err)
+	require.Zero(t, read)
+
+	rows, err := sql.Query(ctx, `SELECT address || ' ' || balance || ' ' || block_number FROM token_balances_current ORDER BY address`)
+	require.NoError(t, err)
+	var got []string
+	for rows.Next() {
+		var s string
+		require.NoError(t, rows.Scan(&s))
+		got = append(got, s)
+	}
+	rows.Close()
+	require.Equal(t, []string{
+		"0x00000000000000000000000000000000000000a1 9 1500",
+		"0x00000000000000000000000000000000000000b2 7007 1198",
+	}, got, "the recipient's balance at latest, at its newest backfill block; the sender's head-path row (block 1,500) wins")
+	var holders int64
+	require.NoError(t, sql.QueryRow(ctx, `SELECT holder_count FROM tokens`).Scan(&holders))
+	require.Equal(t, int64(2), holders, "holder_count follows the current balances")
 }

@@ -911,6 +911,16 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {
+	return d.insertBalances(ctx, balances, true)
+}
+
+// InsertCurrentBalances writes current balances (and holder_count) without balance-history rows: the stats
+// backfill reads balances it has no history for.
+func (d *DB) InsertCurrentBalances(ctx context.Context, balances []*types.Balance) error {
+	return d.insertBalances(ctx, balances, false)
+}
+
+func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, history bool) error {
 	if len(balances) == 0 {
 		return nil
 	}
@@ -1053,8 +1063,10 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	}
 
 	// Phase 1: the history rows.
-	if _, err := tx.Exec(ctx, balancesInsertSQL, histAddr, histTok, histBlk, histBal); err != nil {
-		return fmt.Errorf("insert balances: %w", err)
+	if history {
+		if _, err := tx.Exec(ctx, balancesInsertSQL, histAddr, histTok, histBlk, histBal); err != nil {
+			return fmt.Errorf("insert balances: %w", err)
+		}
 	}
 
 	// Phase 2: the current rows, returning (token, delta) for every key written.
