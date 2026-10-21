@@ -89,6 +89,21 @@ func (p *BalanceWorkerPool) QueueWorkBatch(works []BalanceWork) int {
 	return queued
 }
 
+// QueueWorkBatchWait queues every item, waiting for room instead of dropping (spike: backpressure). A full
+// queue then slows the committer to what the balance workers absorb, instead of losing balance updates.
+func (p *BalanceWorkerPool) QueueWorkBatchWait(ctx context.Context, works []BalanceWork) int {
+	queued := 0
+	for _, work := range works {
+		select {
+		case p.workChan <- work:
+			queued++
+		case <-ctx.Done():
+			return queued
+		}
+	}
+	return queued
+}
+
 func (p *BalanceWorkerPool) QueueSize() int {
 	return len(p.workChan)
 }

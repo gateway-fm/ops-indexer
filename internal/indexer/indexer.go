@@ -1061,10 +1061,12 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 	}
 
 	if i.balanceWorkers != nil && len(balanceWork) > 0 {
-		queued := i.balanceWorkers.QueueWorkBatch(balanceWork)
+		queueStart := time.Now()
+		queued := i.balanceWorkers.QueueWorkBatchWait(ctx, balanceWork)
+		metrics.ObserveStage(metrics.StageBalanceQueueWait, time.Since(queueStart))
 		if queued < len(balanceWork) {
 			metrics.BalanceQueueDropped(len(balanceWork) - queued)
-			log.Warn("balance queue full, dropped items", "dropped", len(balanceWork)-queued)
+			log.Warn("balance work dropped: enqueue cancelled by shutdown", "dropped", len(balanceWork)-queued)
 		}
 		metrics.SetQueueDepth(metrics.QueueBalance, i.balanceWorkers.QueueSize())
 	}

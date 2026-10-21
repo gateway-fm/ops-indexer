@@ -79,7 +79,7 @@ var (
 
 	balanceQueueDropped = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "indexer_balance_queue_dropped_total",
-		Help: "Balance refreshes dropped because the queue was full; non-zero means lost balance updates.",
+		Help: "Balance refreshes dropped instead of queued: the enqueue was cancelled at shutdown, or a non-blocking enqueue found the queue full. Non-zero means lost balance updates.",
 	})
 
 	reorgs = promauto.NewCounter(prometheus.CounterOpts{
@@ -96,6 +96,7 @@ var (
 const (
 	StageBlockTotal        = "block_total"
 	StageDBCommit          = "db_commit"
+	StageBalanceQueueWait  = "balance_queue_wait"
 	StageRefreshTokenStats = "refresh_token_stats"
 
 	QueueBalance = "balance"
