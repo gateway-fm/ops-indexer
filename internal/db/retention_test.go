@@ -223,3 +223,105 @@ func countGzipLines(t *testing.T, path string) int64 {
 	require.NoError(t, s.Err())
 	return n
 }
+
+// A crash after the watermark moved and before the detach leaves the range 'detaching' with its partitions still
+// attached: the next pass finishes it, and the re-seed (rows from the first retained block + offsets) keeps the
+// totals meanwhile.
+func TestRetentionResumesAfterCrashBeforeDetach(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
+
+	seedHistory(t, d, 1, 40_001, 500)
+	before := totalsAfterReseed(t, d)
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	ensurePartitions(t, d, 80_001, cfg)
+	seedHistory(t, d, 40_501, 80_001, 500)
+
+	_, err := d.pool.Exec(ctx, `SELECT prune_prepare('legacy')`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
+	require.NoError(t, err)
+	require.Equal(t, before.blocks+80, totalsAfterReseed(t, d).blocks, "attached rows below the watermark are not counted twice")
+
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	var exists bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('blocks_legacy') IS NOT NULL`).Scan(&exists))
+	require.False(t, exists)
+	require.Equal(t, before.blocks+80, totalsAfterReseed(t, d).blocks)
+}
+
+// A DETACH CONCURRENTLY cancelled while it waits for older snapshots leaves the partition "detach pending"; the
+// next pass finalizes it instead of failing on it.
+func TestRetentionFinalizesPendingDetach(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
+
+	seedHistory(t, d, 1, 40_001, 500)
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	ensurePartitions(t, d, 80_001, cfg)
+	seedHistory(t, d, 40_501, 80_001, 500)
+	_, err := d.pool.Exec(ctx, `SELECT prune_prepare('legacy')`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `SELECT prune_advance('legacy')`)
+	require.NoError(t, err)
+
+	holder, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = holder.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`)
+	require.NoError(t, err)
+	var n int64
+	require.NoError(t, holder.QueryRow(ctx, `SELECT count(*) FROM transactions`).Scan(&n))
+	conn, err := d.pool.Acquire(ctx)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, `SET statement_timeout = '1s'`)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, `ALTER TABLE transactions DETACH PARTITION transactions_legacy CONCURRENTLY`)
+	require.Error(t, err, "the detach waits for the open snapshot and is cancelled")
+	_, err = conn.Exec(ctx, `RESET statement_timeout`)
+	require.NoError(t, err)
+	conn.Release()
+	require.NoError(t, holder.Rollback(ctx))
+	var pending bool
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT inhdetachpending FROM pg_inherits WHERE inhrelid = 'transactions_legacy'::regclass`).Scan(&pending))
+	require.True(t, pending)
+
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	var exists bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('transactions_legacy') IS NOT NULL`).Scan(&exists))
+	require.False(t, exists, "finalized, then dropped")
+}
+
+// A detached range is dropped only once every table's archive is recorded: an archive that fails leaves the
+// detached tables in place, and the next pass with a working archive finishes the job.
+func TestRetentionDropsOnlyArchivedRanges(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	blocked := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(blocked, nil, 0o644))
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000, ArchiveDir: blocked}
+
+	seedHistory(t, d, 1, 40_001, 500)
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	ensurePartitions(t, d, 80_001, cfg)
+	seedHistory(t, d, 40_501, 80_001, 500)
+	require.Error(t, d.retentionPass(ctx, cfg), "the archive directory is a file")
+
+	var state string
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT state FROM history_partitions WHERE suffix = 'legacy'`).Scan(&state))
+	require.Equal(t, "detached", state)
+	var exists bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('blocks_legacy') IS NOT NULL`).Scan(&exists))
+	require.True(t, exists, "not dropped without its archive")
+
+	cfg.ArchiveDir = t.TempDir()
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('blocks_legacy') IS NOT NULL`).Scan(&exists))
+	require.False(t, exists)
+	require.Equal(t, int64(len(HistoryTables)), countArchives(t, d, "legacy"))
+}
