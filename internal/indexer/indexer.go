@@ -51,6 +51,15 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
+	// CountersOnly builds blocks for their counters alone (stats backfill, recount of a pruned span): no token
+	// metadata or tokenURI fetches, and a failed trace fetch fails the block instead of dropping its internal calls.
+	CountersOnly bool
+
+	// NodeRecountRPS bounds the recount of pruned spans from the node; 0 turns it off. VerifyRepair lets it
+	// replace a drifted span's ledger rows.
+	NodeRecountRPS int
+	VerifyRepair   bool
+
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
@@ -418,6 +427,10 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 	if i.balanceWorkers != nil {
 		i.balanceWorkers.Start()
+	}
+
+	if store, ok := i.db.(prunedSpanStore); ok && i.config.NodeRecountRPS > 0 {
+		go i.RunNodeRecount(ctx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)
@@ -1069,6 +1082,7 @@ type builtBlock struct {
 	start          time.Time
 	blockNumber    uint64
 	blockTimestamp uint64
+	tracesErr      error
 }
 
 func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) *builtBlock {
@@ -1111,6 +1125,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	newTokenAddresses := make([]common.Address, 0)
 	newTokenTxHashes := make(map[common.Address]string)
 	addressTxs := make(map[string]map[int]struct{})
+	var tracesErr error
 	balanceWork := make([]BalanceWork, 0)
 
 	// NFT instances touched this block, and (for mints) the tokenURI fetches to
@@ -1368,6 +1383,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 		internalTxs, err := i.rpc.FetchTracesBatch(ctx, txHashes, blockNumber, blockTimestamp,
 			i.config.TraceWorkers, i.config.TraceRateLimit)
 		if err != nil {
+			tracesErr = err
 			log.Warn("failed to fetch traces for block", "block", blockNumber, "error", err)
 		} else if len(internalTxs) > 0 {
 			blockData.InternalTransactions = internalTxs
@@ -1394,7 +1410,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	// see the Add below the batch.
 	var discovered []string
 
-	if len(newTokenAddresses) > 0 {
+	if len(newTokenAddresses) > 0 && !i.config.CountersOnly {
 		// A token is only ever discovered from a Transfer event we just parsed,
 		// and that path already classifies ERC721 by its 4-topic signature (the
 		// tokenId is carried as an indexed topic). Carry that signal over to the
@@ -1433,7 +1449,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	// Resolve tokenURI for freshly minted NFTs and attach to their rows.
-	if len(nftURIReqs) > 0 {
+	if len(nftURIReqs) > 0 && !i.config.CountersOnly {
 		uris := i.rpc.FetchTokenURIsBatch(ctx, nftURIReqs, i.config.TokenMetadataWorkers, i.config.RPCRateLimit)
 		for k, rowIdx := range nftURIRowIdx {
 			if uri, ok := uris[k]; ok {
@@ -1444,7 +1460,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	return &builtBlock{raw: rawBlock, data: blockData, balanceWork: balanceWork, discovered: discovered,
-		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp}
+		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp, tracesErr: tracesErr}
 }
 
 func (i *Indexer) afterCommit(ctx context.Context, b *builtBlock) {

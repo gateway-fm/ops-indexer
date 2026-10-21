@@ -141,6 +141,8 @@ func main() {
 		BalanceDedupWindow:    cfg.BalanceDedupWindow,
 		BalanceReaderBatch:    cfg.BalanceReaderBatch,
 		BalanceSkipL1:         cfg.BalanceSkipL1,
+		NodeRecountRPS:        cfg.VerifyNodeRecountRPS,
+		VerifyRepair:          cfg.VerifyRepair,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

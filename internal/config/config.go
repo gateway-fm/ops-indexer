@@ -49,6 +49,7 @@ type Config struct {
 	LedgerMaxHeadLag        uint64        `mapstructure:"ledger_max_head_lag_blocks"`
 	VerifyRecountInterval   time.Duration `mapstructure:"verify_recount_interval"`
 	VerifyRepair            bool          `mapstructure:"verify_repair"`
+	VerifyNodeRecountRPS    int           `mapstructure:"verify_node_recount_rps"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -138,6 +139,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ledger_max_head_lag_blocks", 0)
 	v.SetDefault("verify_recount_interval", "1m")
 	v.SetDefault("verify_repair", true)
+	v.SetDefault("verify_node_recount_rps", 50)
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -231,6 +233,7 @@ func Load() (*Config, error) {
 	cfg.LedgerMaxHeadLag = v.GetUint64("ledger_max_head_lag_blocks")
 	cfg.VerifyRecountInterval = v.GetDuration("verify_recount_interval")
 	cfg.VerifyRepair = v.GetBool("verify_repair")
+	cfg.VerifyNodeRecountRPS = v.GetInt("verify_node_recount_rps")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")
