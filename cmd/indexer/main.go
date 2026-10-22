@@ -171,6 +171,19 @@ func main() {
 			SpanBlocks: cfg.LedgerSpanBlocks,
 			FirstBlock: cfg.StartBlock,
 			Interval:   cfg.LedgerCloseInterval,
+			WorkMem:    cfg.LedgerWorkMem,
+			HeadLag: func(ctx context.Context) (uint64, error) {
+				node, err := rpcClient.BlockNumber(ctx)
+				if err != nil {
+					return 0, err
+				}
+				stored, err := database.GetLatestBlockNumber(ctx)
+				if err != nil || stored >= node {
+					return 0, err
+				}
+				return node - stored, nil
+			},
+			MaxHeadLag: cfg.LedgerMaxHeadLag,
 		})
 	}()
 
