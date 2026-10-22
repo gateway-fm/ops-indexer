@@ -28,6 +28,9 @@ type RetentionConfig struct {
 	// PartitionBlocks is the size of each range partition once the legacy partition is cut.
 	PartitionBlocks uint64
 	Interval        time.Duration
+	// EnsureInterval is how often partitions are kept ahead of the head, apart from Interval: at the catch-up rate
+	// 2 partitions last minutes, and a pass can be held for the length of a cut. Default 10 s.
+	EnsureInterval time.Duration
 	// ArchiveDir, when set, receives every detached partition before it is dropped.
 	ArchiveDir string
 	// NodeHead, when set, is the chain head: the cut is placed above it, not only above the stored head, so a cut
@@ -58,6 +61,8 @@ func (d *DB) HistoryCut(ctx context.Context) (bool, error) {
 // uses the newest partition's size: ensuring only up to the head itself would leave the next block no partition
 // to go into, and ingest would stop there for good.
 func (d *DB) EnsurePartitionsAhead(ctx context.Context, head, partitionBlocks uint64) (int, error) {
+	d.ensureMu.Lock()
+	defer d.ensureMu.Unlock()
 	size := partitionBlocks
 	if size == 0 {
 		var newest *int64
@@ -97,6 +102,7 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 	}
 	log.Info("retention started", "retain_blocks", cfg.RetainBlocks, "partition_blocks", cfg.PartitionBlocks,
 		"interval", cfg.Interval, "archive_dir", cfg.ArchiveDir)
+	go d.keepPartitionsAhead(ctx, cfg)
 	for {
 		if err := d.retentionPass(ctx, cfg); err != nil && ctx.Err() == nil {
 			log.Warn("retention pass failed; retrying next interval", "error", err)
@@ -105,6 +111,32 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 		case <-ctx.Done():
 			return
 		case <-time.After(cfg.Interval):
+		}
+	}
+}
+
+func (d *DB) keepPartitionsAhead(ctx context.Context, cfg RetentionConfig) {
+	interval := cfg.EnsureInterval
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		head, err := d.GetLatestBlockNumber(ctx)
+		if err == nil {
+			var made int
+			if made, err = d.EnsurePartitionsAhead(ctx, head, cfg.PartitionBlocks); made > 0 {
+				log.Info("retention: history partitions created", "count", made, "head", head)
+			}
+		}
+		if err != nil && ctx.Err() == nil {
+			log.Warn("retention: keeping partitions ahead failed; retrying", "error", err)
 		}
 	}
 }

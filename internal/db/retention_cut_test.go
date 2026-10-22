@@ -178,3 +178,26 @@ func TestRetentionOffAfterTheCutKeepsPartitionsAhead(t *testing.T) {
 	ranges := partitionRanges(t, d)
 	require.Equal(t, "p62001:64001:attached", ranges[len(ranges)-1], "still two 2,000-block partitions ahead")
 }
+
+// Partitions are kept ahead on their own short ticker, not only in the retention pass: at the catch-up rate the
+// head crosses 2 partitions in minutes, far inside a PRUNE_INTERVAL of 10 min, and every insert above them fails.
+func TestPartitionsAreKeptAheadBetweenRetentionPasses(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seedHistory(t, d, 0, 40_001, 1)
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000, Interval: time.Hour, EnsureInterval: 100 * time.Millisecond}
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	go d.RunRetention(ctx, cfg)
+
+	for from := int64(40_002); from <= 60_000; from += 1_000 {
+		require.Eventually(t, func() bool {
+			ranges := partitionRanges(t, d)
+			var top int64
+			_, err := fmt.Sscanf(ranges[len(ranges)-1], "p%d:", &top)
+			return err == nil && top+2_000 >= from+2*2_000
+		}, 5*time.Second, 50*time.Millisecond, "two partitions ahead of %d", from)
+		seedHistory(t, d, from, from+999, 1)
+	}
+}

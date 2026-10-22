@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math/big"
+	"sync"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
 
@@ -31,6 +32,7 @@ type DB struct {
 	// cutMargin is added to the next history cut's distance from the head after a cut that the head caught up with
 	// while it validated (only the retention goroutine reads or writes it).
 	cutMargin uint64
+	ensureMu  sync.Mutex
 }
 
 func New(databaseURL string) (*DB, error) {
