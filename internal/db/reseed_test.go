@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
@@ -83,18 +85,83 @@ func TestReseedTotalsAreExactInEveryPruneState(t *testing.T) {
 	requireTotalsAcrossRestarts(t, d, wantTotals(100_002), "(c) with the partition's detach pending")
 }
 
-// The counts that scan whole history tables carry no filter on the block, so Postgres can scan them in parallel
-// instead of an index-only scan with heap fetches; only the pruned-but-attached partitions are subtracted, whole.
-func TestReseedCountsHistoryParentsWithoutAFilter(t *testing.T) {
-	pruned := map[string][]string{
-		"blocks": {"blocks_legacy"}, "transactions": {"transactions_legacy"}, "token_transfers": {"token_transfers_legacy"},
+// The counts that scan whole history tables carry no filter on the block and call no function, and every one of them
+// is a read-only SELECT: forced to consider parallel plans, Postgres gives each a Gather. Inside a statement that
+// writes (an earlier INSERT ... VALUES ((SELECT COUNT(*) ...))) it never does: that is what ran serially in production.
+func TestReseedReadsArePlannedInParallel(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 2_000, 1)
+
+	var reads []string
+	pruned := map[string][]string{"blocks": {"blocks_legacy"}, "transactions": {"transactions_legacy"}, "token_transfers": {"token_transfers_legacy"}}
+	for _, table := range []string{"blocks", "transactions", "token_transfers"} {
+		whole, subtract := retainedCountSQLs(table, pruned[table])
+		reads = append(reads, whole)
+		reads = append(reads, subtract...)
 	}
-	for name, sql := range map[string]string{
-		"chain": reseedChainCountersSQL(pruned), "token": reseedTokenCountersSQL(pruned), "zero": zeroTokenCountersSQL,
-	} {
-		require.NotContains(t, sql, "history_from", name)
-		require.NotContains(t, sql, "block_number", name)
-		require.False(t, regexp.MustCompile(`FROM "?(blocks|transactions|token_transfers)(_legacy)?"? WHERE (number|block_number)`).MatchString(sql), name)
+	reads = append(reads, retainedTokenTotalsSQL(pruned["token_transfers"]))
+	for _, sql := range reads {
+		require.NotContains(t, sql, "history_from")
+		require.NotContains(t, sql, "block_number")
+		require.NotContains(t, sql, "WHERE")
 	}
-	require.Contains(t, reseedChainCountersSQL(pruned), `(SELECT COUNT(*) FROM "transactions") - (SELECT COUNT(*) FROM "transactions_legacy")`)
+
+	conn, err := d.pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+	for _, set := range []string{"parallel_setup_cost = 0", "parallel_tuple_cost = 0", "min_parallel_table_scan_size = 0"} {
+		_, err := conn.Exec(ctx, "SET "+set)
+		require.NoError(t, err)
+	}
+	plan := func(sql string) string {
+		rows, err := conn.Query(ctx, "EXPLAIN "+sql)
+		require.NoError(t, err)
+		defer rows.Close()
+		var out string
+		for rows.Next() {
+			var line string
+			require.NoError(t, rows.Scan(&line))
+			out += line + "\n"
+		}
+		return out
+	}
+	for _, sql := range reads {
+		require.Contains(t, plan(sql), "Gather", "a parallel plan for: %s", sql)
+	}
+
+	rec := &recordingExecer{execer: conn}
+	require.NoError(t, reseedCounters(ctx, rec))
+	history := regexp.MustCompile(`FROM "?(blocks|transactions|token_transfers)(_[a-z0-9]+)?"?\b`)
+	for _, sql := range rec.statements {
+		if !history.MatchString(sql) || sql == zeroTokenCountersSQL {
+			continue
+		}
+		require.Regexp(t, `^\s*SELECT`, sql, "every re-seed statement that reads history is a read-only SELECT")
+		require.Contains(t, plan(sql), "Gather", "a parallel plan for: %s", sql)
+	}
+	require.NotContains(t, plan(`INSERT INTO chain_counters (name, count) VALUES ('transactions_total', (SELECT COUNT(*) FROM transactions))
+		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count`), "Gather", "the premise: a writing statement gets no parallel plan")
+}
+
+// recordingExecer records every statement the re-seed runs.
+type recordingExecer struct {
+	execer
+	statements []string
+}
+
+func (r *recordingExecer) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	r.statements = append(r.statements, sql)
+	return r.execer.Exec(ctx, sql, args...)
+}
+
+func (r *recordingExecer) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	r.statements = append(r.statements, sql)
+	return r.execer.Query(ctx, sql, args...)
+}
+
+func (r *recordingExecer) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	r.statements = append(r.statements, sql)
+	return r.execer.QueryRow(ctx, sql, args...)
 }
