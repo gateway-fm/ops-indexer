@@ -125,7 +125,7 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 // cutHistory bounds the legacy partitions at C = head + 2 partitions and creates the first partition above it.
 // From the CHECK until the re-attach a legacy row at or above C is refused, so C keeps that much room ahead of
 // ingest; if the head comes within one partition of C while the checks validate, the cut is abandoned and retried.
-func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) error {
+func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	head, err := d.GetLatestBlockNumber(ctx)
 	if err != nil {
 		return err
@@ -141,22 +141,28 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) error {
 		return err
 	}
 	metrics.ObserveRetentionStep("cut_constrain", time.Since(start))
+	defer func() {
+		if err != nil {
+			if rerr := d.ReleaseAbandonedCut(context.WithoutCancel(ctx)); rerr != nil {
+				log.Error("retention: dropping an abandoned cut's check failed; it is dropped again at the next start", "error", rerr)
+			}
+		}
+	}()
 
 	start = time.Now()
 	for _, t := range HistoryTables {
 		if _, err := d.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s VALIDATE CONSTRAINT history_cut`, pgx.Identifier{t + "_legacy"}.Sanitize())); err != nil {
 			return fmt.Errorf("validate %s_legacy: %w", t, err)
 		}
+		if head, err = d.GetLatestBlockNumber(ctx); err != nil {
+			return err
+		}
+		if head+cfg.PartitionBlocks >= cutAt {
+			return fmt.Errorf("head %d came within a partition of the cut %d while validating; retrying higher", head, cutAt)
+		}
 	}
 	metrics.ObserveRetentionStep("cut_validate", time.Since(start))
 	log.Info("retention: legacy partitions validated below the cut", "cut_at", cutAt, "elapsed", time.Since(start))
-
-	if head, err = d.GetLatestBlockNumber(ctx); err != nil {
-		return err
-	}
-	if head+cfg.PartitionBlocks >= cutAt {
-		return fmt.Errorf("head %d came within a partition of the cut %d while validating; retrying higher", head, cutAt)
-	}
 
 	start = time.Now()
 	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
@@ -167,6 +173,35 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) error {
 	}
 	metrics.ObserveRetentionStep("cut_finish", time.Since(start))
 	log.Info("retention: history cut", "cut_at", cutAt, "finish", time.Since(start))
+	return nil
+}
+
+// ReleaseAbandonedCut drops the cut's check from the legacy partitions while the history is not cut: a cut that was
+// abandoned (the head came near it, a failure, a restart) leaves a validated "below the cut" check, and once the
+// head reaches it every insert into the legacy partition is refused. After the cut the check stays.
+func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
+	cut, err := d.HistoryCut(ctx)
+	if err != nil || cut {
+		return err
+	}
+	for _, t := range HistoryTables {
+		var exists bool
+		if err := d.pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass($1) AND conname = 'history_cut')`,
+			t+"_legacy").Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS history_cut`, pgx.Identifier{t + "_legacy"}.Sanitize()))
+			return err
+		}); err != nil {
+			return fmt.Errorf("drop the abandoned cut on %s_legacy: %w", t, err)
+		}
+		log.Warn("retention: dropped an abandoned cut's check", "table", t+"_legacy")
+	}
 	return nil
 }
 
