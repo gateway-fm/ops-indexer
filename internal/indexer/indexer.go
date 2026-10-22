@@ -51,6 +51,10 @@ type Config struct {
 	// block instead of rebuilding the table from history afterwards, which would drop the pruned counts.
 	RetentionEnabled bool
 
+	// SkipAddressStatsRebuild skips the address_stats rebuild after the initial catch-up (retention off), which
+	// truncates the table and blocks ingest for as long as it runs (ADDRESS_STATS_REBUILD=false).
+	SkipAddressStatsRebuild bool
+
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration

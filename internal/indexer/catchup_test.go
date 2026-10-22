@@ -423,6 +423,40 @@ func TestCatchupIndexer_RebuildAddressStats_FiresOncePerProcess(t *testing.T) {
 	mockDB.AssertNumberOfCalls(t, "RebuildAddressStats", 1)
 }
 
+func TestCatchupIndexer_RebuildAddressStats_SkippedWhenTurnedOff(t *testing.T) {
+	mockDB := new(MockDatabase)
+	mockRPC := new(MockRPCClient)
+
+	cfg := &CatchupConfig{Workers: 1, BatchSize: 100, QueueSize: 100}
+	idxCfg := &Config{RPCWorkers: 1, RPCRateLimit: 100, SkipAddressStatsRebuild: true}
+	catchup := NewCatchupIndexer(mockDB, mockRPC, cfg, idxCfg, NewTokenCache(), NewContractCache(), nil, false)
+	catchup.pollInterval = 2 * time.Millisecond
+
+	scripted := &scriptedCollectorDB{MockDatabase: new(MockDatabase)}
+	catchup.collector = NewMissingRangeCollector(scripted, new(MockRPCClient), nil)
+	completed := make(chan struct{}, 8)
+	catchup.SetOnComplete(func() { completed <- struct{}{} })
+
+	for _, blockNum := range []uint64{1, 2} {
+		mockDB.On("HasBlock", mock.Anything, blockNum).Return(false, nil)
+		mockRPC.On("RawBlockByNumber", mock.Anything, blockNum).Return(makeRawBlock(blockNum), nil)
+		scripted.On("DeleteMissingRangeByBlock", mock.Anything, blockNum).Return(nil)
+	}
+	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockDB.On("InsertBlockDataBatch", mock.Anything, mock.Anything).Return(nil).Maybe()
+	scripted.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
+	mockDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
+
+	require.NoError(t, catchup.Start(context.Background(), 1, 2))
+	defer catchup.Stop()
+	select {
+	case <-completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial sync did not complete")
+	}
+	mockDB.AssertNotCalled(t, "RebuildAddressStats", mock.Anything)
+}
+
 // --- Realtime Indexer Tests ---
 
 func TestRealtimeIndexer_DetectReorg_BlockNotInDB_Continues(t *testing.T) {

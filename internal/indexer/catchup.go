@@ -185,7 +185,9 @@ func (c *CatchupIndexer) blockProducerFromRanges() {
 					log.Info("catchup: initial sync complete, continuing to monitor for new gaps",
 						"processed", processed)
 
-					if !c.idxCfg.RetentionEnabled {
+					if !c.idxCfg.RetentionEnabled && c.idxCfg.SkipAddressStatsRebuild {
+						log.Warn("catchup: address_stats rebuild skipped (ADDRESS_STATS_REBUILD=false); blocks catch-up filled are not in address_stats")
+					} else if !c.idxCfg.RetentionEnabled {
 						log.Info("catchup: rebuilding address_stats table")
 						if err := c.db.RebuildAddressStats(context.Background()); err != nil {
 							log.Error("catchup: failed to rebuild address_stats", "error", err)
