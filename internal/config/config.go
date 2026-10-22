@@ -66,6 +66,9 @@ type Config struct {
 	CatchupWorkers   int  `mapstructure:"catchup_workers"`
 	CatchupBatchSize int  `mapstructure:"catchup_batch_size"`
 	CatchupQueueSize int  `mapstructure:"catchup_queue_size"`
+	// RealtimeMaxBehind: realtime further behind the node than this jumps to the head and hands the skipped blocks
+	// to catch-up. 0 never jumps.
+	RealtimeMaxBehind uint64 `mapstructure:"realtime_max_behind_blocks"`
 
 	// Set PRIVACY_PROXY_URL to enable proxy mode (auth + privacy enforcement).
 	// Leave empty for standalone mode (direct DB/RPC access).
@@ -145,6 +148,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("catchup_workers", 10)
 	v.SetDefault("catchup_batch_size", 100)
 	v.SetDefault("catchup_queue_size", 1000)
+	v.SetDefault("realtime_max_behind_blocks", 1000)
 
 	v.SetDefault("privacy_proxy_url", "")
 	v.SetDefault("privacy_proxy_public_url", "")
@@ -230,6 +234,7 @@ func Load() (*Config, error) {
 	cfg.CatchupWorkers = v.GetInt("catchup_workers")
 	cfg.CatchupBatchSize = v.GetInt("catchup_batch_size")
 	cfg.CatchupQueueSize = v.GetInt("catchup_queue_size")
+	cfg.RealtimeMaxBehind = v.GetUint64("realtime_max_behind_blocks")
 
 	cfg.PrivacyProxyURL = v.GetString("privacy_proxy_url")
 	cfg.PrivacyProxyPublicURL = v.GetString("privacy_proxy_public_url")

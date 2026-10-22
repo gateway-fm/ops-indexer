@@ -117,6 +117,7 @@ func main() {
 		CatchupWorkers:          cfg.CatchupWorkers,
 		CatchupBatchSize:        cfg.CatchupBatchSize,
 		CatchupQueueSize:        cfg.CatchupQueueSize,
+		RealtimeMaxBehind:       cfg.RealtimeMaxBehind,
 		SkipReceiptTxTypes:      skipReceipts,
 		DailyStatsMinInterval:   cfg.DailyStatsMinInterval,
 		CommitPipelineDepth:     cfg.CommitPipelineDepth,
@@ -175,11 +176,11 @@ func main() {
 				if err != nil {
 					return 0, err
 				}
-				stored, err := database.GetLatestBlockNumber(ctx)
-				if err != nil || stored >= node {
+				ingested, err := idx.IngestHead(ctx)
+				if err != nil || ingested >= node {
 					return 0, err
 				}
-				return node - stored, nil
+				return node - ingested, nil
 			},
 			MaxHeadLag: cfg.LedgerMaxHeadLag,
 		})

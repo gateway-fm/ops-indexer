@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
@@ -167,6 +168,7 @@ func (r *RealtimeIndexer) runSubscriptionMode(ctx context.Context, headers <-cha
 			latestBlock := header.Number.Uint64()
 			safeBlock := latestBlock - uint64(r.config.ConfirmationBlocks)
 
+			r.jumpIfFarBehind(ctx, safeBlock)
 			r.indexUpTo(ctx, safeBlock)
 		}
 	}
@@ -197,6 +199,7 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 			}
 
 			safeBlock := latestOnChain - uint64(r.config.ConfirmationBlocks)
+			r.jumpIfFarBehind(ctx, safeBlock)
 			r.indexUpTo(ctx, safeBlock)
 		}
 	}
@@ -305,6 +308,26 @@ func (r *RealtimeIndexer) blockIndexer() *Indexer {
 		eventBus:         r.eventBus,
 		dailyStats:       r.dailyStats,
 	}
+}
+
+// jumpIfFarBehind returns where realtime continues from. More than RealtimeMaxBehind blocks behind safeBlock (a long
+// stall), it moves to just below safeBlock, as a fresh start does, and registers the blocks it skips with catch-up:
+// walked one by one, they kept the explorer's head minutes old while the chain moved on.
+func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64) uint64 {
+	lastProcessed := r.GetLastProcessedBlock()
+	limit := r.idxCfg.RealtimeMaxBehind
+	if limit == 0 || safeBlock <= lastProcessed+limit {
+		return lastProcessed
+	}
+	skipped := db.BlockRange{FromNumber: lastProcessed + 1, ToNumber: safeBlock - 1}
+	if err := r.db.SaveMissingRanges(ctx, []db.BlockRange{skipped}); err != nil {
+		log.Error("realtime: registering the blocks a jump to the head would skip failed; walking them instead", "error", err)
+		return lastProcessed
+	}
+	log.Warn("realtime: far behind the node; jumping to the head, catch-up fills the skipped blocks",
+		"from", skipped.FromNumber, "to", skipped.ToNumber, "max_behind", limit)
+	r.SetLastProcessedBlock(safeBlock - 1)
+	return safeBlock - 1
 }
 
 // detectReorg: see Indexer.detectReorg. Same walk, same fix (PRST-5320): it

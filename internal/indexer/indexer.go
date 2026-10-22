@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -43,6 +44,8 @@ type Config struct {
 	CatchupWorkers   int
 	CatchupBatchSize int
 	CatchupQueueSize int
+	// RealtimeMaxBehind: see config.Config.RealtimeMaxBehind.
+	RealtimeMaxBehind uint64
 
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
@@ -99,6 +102,8 @@ type Indexer struct {
 
 	catchupIndexer  *CatchupIndexer
 	realtimeIndexer *RealtimeIndexer
+	// liveRealtime is realtimeIndexer for readers outside the indexer's goroutine (IngestHead).
+	liveRealtime atomic.Pointer[RealtimeIndexer]
 
 	catchupRunning bool
 
@@ -495,6 +500,16 @@ func (i *Indexer) newCatchupIndexer(cfg *CatchupConfig) *CatchupIndexer {
 	return c
 }
 
+// IngestHead is the block the head path has written up to: realtime's cursor once realtime runs. The highest stored
+// block is not it: catch-up can store blocks near the node head while realtime is far behind. Before realtime
+// starts (standard mode, or startup) it is the highest stored block.
+func (i *Indexer) IngestHead(ctx context.Context) (uint64, error) {
+	if r := i.liveRealtime.Load(); r != nil {
+		return r.GetLastProcessedBlock(), nil
+	}
+	return i.db.GetLatestBlockNumber(ctx)
+}
+
 func (i *Indexer) newRealtimeIndexer(cfg *RealtimeConfig) *RealtimeIndexer {
 	r := NewRealtimeIndexer(
 		i.db, i.rpc, cfg, i.config,
@@ -526,6 +541,7 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.liveRealtime.Store(i.realtimeIndexer)
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {
@@ -593,6 +609,7 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.liveRealtime.Store(i.realtimeIndexer)
 	i.missingRangeCollector.SetCeiling(i.realtimeIndexer.GetLastProcessedBlock)
 
 	i.catchupRunning = true
