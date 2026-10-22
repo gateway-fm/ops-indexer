@@ -31,6 +31,14 @@ on any drift. The ledger and the checks run with retention on or off.
 | `chain_nonce` | A sample of non-contract senders: `sent_count` against `eth_getTransactionCount` at the stored head. It starts once a full `running` cycle has recounted `sent_count`. | Alert only. |
 | `chain_span_txs` | One closed span per pass, retained or pruned: its ledger transaction total against the sum of `eth_getBlockTransactionCountByNumber`. | Alert only (`node` repairs the span). |
 
+- The `running` check, and the one-off address reconciliation below, wait until the open tail (stored blocks above
+  the closed spans) is at most 3 × `LEDGER_SPAN_BLOCKS`: before the closer has caught up they would read most of
+  history every pass.
+- **Address reconciliation** (once per database, after migration 030): with repair on, every address bucket is
+  repaired against the closed ledger rows plus the open tail, one bucket per transaction (row locks only), its
+  progress recorded in the same transaction so a restart resumes at the next bucket. It repairs address_stats left
+  short by a catch-up that did not write it (retention off, before catch-up wrote address_stats in every mode),
+  without a rebuild.
 - Every repair is logged per key in `ledger_repairs`.
 - A span, or a running key, that drifts again after its repair is **quarantined**: it is no longer repaired, and
   `indexer_verify_quarantined` alerts.

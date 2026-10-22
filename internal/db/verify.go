@@ -21,6 +21,81 @@ type VerifyConfig struct {
 	Repair          bool
 	// WorkMem is the recount transaction's work_mem (LEDGER_WORK_MEM).
 	WorkMem string
+	// MaxOpenTail is the most blocks above the ledger's closed spans for which the running check and the address
+	// reconciliation run: beyond it they would read most of history every pass. 0 means no limit.
+	MaxOpenTail int64
+}
+
+// OpenTail is how many stored blocks lie above the ledger's closed spans.
+func (d *DB) OpenTail(ctx context.Context) (int64, error) {
+	var n int64
+	err := d.pool.QueryRow(ctx, `SELECT GREATEST(COALESCE((SELECT max(number) FROM blocks), 0) + 1 - ledger_closed_through(), 0)`).Scan(&n)
+	return n, err
+}
+
+func (d *DB) tailShort(ctx context.Context, cfg VerifyConfig) bool {
+	if cfg.MaxOpenTail <= 0 {
+		return true
+	}
+	tail, err := d.OpenTail(ctx)
+	if err != nil {
+		return false
+	}
+	if tail > cfg.MaxOpenTail {
+		log.Debug("ledger: open tail too long for the running check; waiting for the closer", "blocks", tail, "max", cfg.MaxOpenTail)
+		return false
+	}
+	return true
+}
+
+// ReconcileAddressBucket repairs the address counters of the next bucket not reconciled yet against the closed
+// ledger rows plus the open tail, and records the bucket done in the same transaction: an interrupted bucket rolls
+// back and is redone, a finished one is never redone. done is true once all 256 are.
+func (d *DB) ReconcileAddressBucket(ctx context.Context) (bucket, drifted int, done bool, err error) {
+	err = inRepeatableRead(ctx, d, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_reconcile_next' FOR UPDATE`).Scan(&bucket); err != nil {
+			return err
+		}
+		if bucket >= addressBuckets {
+			done = true
+			return nil
+		}
+		drifts, err := collectDrifts(ctx, tx,
+			`SELECT family, key, counter, running::TEXT, expected::TEXT FROM ledger_running_diff_address($1)`, bucket)
+		if err != nil {
+			return err
+		}
+		for _, dr := range drifts {
+			if err := repairRunning(ctx, tx, dr); err != nil {
+				return err
+			}
+		}
+		drifted = len(drifts)
+		_, err = tx.Exec(ctx, `UPDATE ledger_verify_state SET value = $1 WHERE name = 'address_reconcile_next'`, bucket+1)
+		return err
+	})
+	return bucket, drifted, done, err
+}
+
+// reconcileAddresses runs the reconciliation bucket after bucket, a second apart, until it is done or the open tail
+// grows too long; it reports whether it is done.
+func (d *DB) reconcileAddresses(ctx context.Context, cfg VerifyConfig) bool {
+	for ctx.Err() == nil && d.tailShort(ctx, cfg) {
+		bucket, drifted, done, err := d.ReconcileAddressBucket(ctx)
+		if err != nil {
+			log.Warn("ledger: address reconciliation failed; retrying next interval", "error", err)
+			return false
+		}
+		if done {
+			return true
+		}
+		log.Info("ledger: address bucket reconciled", "bucket", bucket, "repaired_counters", drifted)
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+		}
+	}
+	return false
 }
 
 // Drift is one counter that disagrees: stored (or running) against the recount.
@@ -202,7 +277,9 @@ func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 }
 
 func ensureAddressRow(ctx context.Context, tx pgx.Tx, address string) error {
-	tag, err := tx.Exec(ctx, `INSERT INTO address_stats (address) VALUES ($1) ON CONFLICT DO NOTHING`, address)
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO address_stats (address, is_contract) VALUES ($1, EXISTS (SELECT 1 FROM contracts WHERE address = $1))
+		ON CONFLICT DO NOTHING`, address)
 	if err != nil || tag.RowsAffected() == 0 {
 		return err
 	}
@@ -216,7 +293,11 @@ func (d *DB) RunVerify(ctx context.Context, cfg VerifyConfig) {
 	log.Info("ledger verification started", "interval", cfg.RecountInterval, "repair", cfg.Repair)
 	bucket := 0
 	recountCycle, runningCycle := time.Now(), time.Now()
+	reconciled := !cfg.Repair
 	for {
+		if !reconciled {
+			reconciled = d.reconcileAddresses(ctx, cfg)
+		}
 		if c, ok, err := d.RecountRetainedSpan(ctx, cfg.Repair, cfg.WorkMem); err != nil && ctx.Err() == nil {
 			log.Warn("ledger: retained recount failed", "error", err)
 		} else if ok {
@@ -226,17 +307,8 @@ func (d *DB) RunVerify(ctx context.Context, cfg VerifyConfig) {
 				recountCycle = time.Now()
 			}
 		}
-		if drifts, err := d.CheckRunning(ctx, bucket, cfg.Repair); err != nil && ctx.Err() == nil {
-			log.Warn("ledger: running check failed", "bucket", bucket, "error", err)
-		} else if err == nil {
-			metrics.VerifyChecked("running", len(drifts), runningState(len(drifts), cfg.Repair))
-			if bucket = (bucket + 1) % addressBuckets; bucket == 0 {
-				metrics.VerifyCycle("running", time.Since(runningCycle))
-				runningCycle = time.Now()
-				if err := d.countRunningCycle(ctx); err != nil {
-					log.Warn("ledger: recording a running cycle failed", "error", err)
-				}
-			}
+		if d.tailShort(ctx, cfg) {
+			d.checkRunningBucket(ctx, cfg, &bucket, &runningCycle)
 		}
 		if n, err := d.QuarantinedCount(ctx); err == nil {
 			metrics.SetVerifyQuarantined(n)
@@ -245,6 +317,25 @@ func (d *DB) RunVerify(ctx context.Context, cfg VerifyConfig) {
 		case <-ctx.Done():
 			return
 		case <-time.After(cfg.RecountInterval):
+		}
+	}
+}
+
+// checkRunningBucket runs the running check on one address bucket and moves to the next.
+func (d *DB) checkRunningBucket(ctx context.Context, cfg VerifyConfig, bucket *int, cycle *time.Time) {
+	drifts, err := d.CheckRunning(ctx, *bucket, cfg.Repair)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Warn("ledger: running check failed", "bucket", *bucket, "error", err)
+		}
+		return
+	}
+	metrics.VerifyChecked("running", len(drifts), runningState(len(drifts), cfg.Repair))
+	if *bucket = (*bucket + 1) % addressBuckets; *bucket == 0 {
+		metrics.VerifyCycle("running", time.Since(*cycle))
+		*cycle = time.Now()
+		if err := d.countRunningCycle(ctx); err != nil {
+			log.Warn("ledger: recording a running cycle failed", "error", err)
 		}
 	}
 }

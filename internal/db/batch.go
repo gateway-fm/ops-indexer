@@ -781,9 +781,11 @@ func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
 // ErrHistoryPruned refuses a recount of history that pruning has made partial.
 var ErrHistoryPruned = errors.New("history is pruned: a recount from the retained rows would drop the pruned counts")
 
-// RebuildAddressStats rebuilds address_stats from the stored history, then recounts the days' address columns from it.
-// It refuses once anything was pruned. The indexer no longer calls it (catch-up writes address_stats itself); it stays
-// as the tests' oracle for what the writer counts.
+// ErrAddressStatsFilled refuses a rebuild into a live address_stats: the ledger reconciliation repairs it in place.
+var ErrAddressStatsFilled = errors.New("address_stats is not empty: a rebuild would block every ingest write; the ledger reconciliation repairs it in place")
+
+// RebuildAddressStats builds an empty address_stats from history (a test oracle and an empty database's tool), then
+// recounts the days' address columns from it. It refuses once anything was pruned, and on a table that holds rows.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	if wm, _, err := d.PrunedThrough(ctx); err != nil {
 		return err
@@ -801,9 +803,14 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 		return err
 	}
 
+	var filled bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM address_stats)`).Scan(&filled); err != nil {
+		return err
+	}
+	if filled {
+		return ErrAddressStatsFilled
+	}
 	if _, err := tx.Exec(ctx, `
-		TRUNCATE address_stats;
-
 		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
 		SELECT x.address, count(DISTINCT x.tx), sum(x.internal), sum(x.transfers), sum(x.sent), min(x.block), max(x.block),
 		       EXISTS (SELECT 1 FROM contracts c WHERE c.address = x.address), NOW()
