@@ -68,3 +68,19 @@ func TestAbandonedCutDropsItsChecks(t *testing.T) {
 	require.Zero(t, historyCutChecks(t, d), "the abandoned cut's checks are dropped")
 	require.NoError(t, insertCutTestBlock(d, 44_001))
 }
+
+// A cut the head caught up with retries further out: at least twice the head's advance during the attempt, at
+// least twice the last margin, so the margin outgrows the validation time.
+func TestCutMarginGrowsAfterTheHeadCatchesUp(t *testing.T) {
+	require.Equal(t, uint64(6_000), nextCutMargin(0, 3_000))
+	require.Equal(t, uint64(12_000), nextCutMargin(6_000, 3_000), "doubles even when the head moved no faster")
+	require.Equal(t, uint64(20_000), nextCutMargin(6_000, 10_000), "follows a faster head")
+
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	seedHistory(t, d, 0, 40_001, 1)
+	d.cutMargin = 6_000
+	require.NoError(t, d.cutHistory(context.Background(), RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}))
+	require.Equal(t, []string{"legacy:50001:attached", "p50001:52001:attached"}, partitionRanges(t, d),
+		"cut at head 40,001 + 2 partitions + 6,000")
+}

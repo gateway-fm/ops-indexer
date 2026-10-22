@@ -130,8 +130,9 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	if err != nil {
 		return err
 	}
-	cutAt := head + 2*cfg.PartitionBlocks
-	log.Info("retention: cutting the legacy partitions", "head", head, "cut_at", cutAt)
+	headAtStart := head
+	cutAt := head + 2*cfg.PartitionBlocks + d.cutMargin
+	log.Info("retention: cutting the legacy partitions", "head", head, "cut_at", cutAt, "extra_margin", d.cutMargin)
 
 	start := time.Now()
 	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
@@ -158,7 +159,9 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 			return err
 		}
 		if head+cfg.PartitionBlocks >= cutAt {
-			return fmt.Errorf("head %d came within a partition of the cut %d while validating; retrying higher", head, cutAt)
+			d.cutMargin = nextCutMargin(d.cutMargin, head-headAtStart)
+			return fmt.Errorf("head %d came within a partition of the cut %d while validating; retrying with %d more blocks of margin",
+				head, cutAt, d.cutMargin)
 		}
 	}
 	metrics.ObserveRetentionStep("cut_validate", time.Since(start))
@@ -174,6 +177,13 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	metrics.ObserveRetentionStep("cut_finish", time.Since(start))
 	log.Info("retention: history cut", "cut_at", cutAt, "finish", time.Since(start))
 	return nil
+}
+
+// nextCutMargin widens the cut's extra margin after the head advanced by advanced blocks during one attempt's
+// validation: at least twice that advance, and at least twice the previous margin, so it outgrows validation time
+// even while a catch-up runs.
+func nextCutMargin(prev, advanced uint64) uint64 {
+	return max(2*prev, 2*advanced)
 }
 
 // ReleaseAbandonedCut drops the cut's check from the legacy partitions while the history is not cut: a cut that was

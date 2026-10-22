@@ -28,6 +28,9 @@ type DB struct {
 	RebuildWorkMem string
 	lateDays       lateDays
 	statsGap       statsGap
+	// cutMargin is added to the next history cut's distance from the head after a cut that the head caught up with
+	// while it validated (only the retention goroutine reads or writes it).
+	cutMargin uint64
 }
 
 func New(databaseURL string) (*DB, error) {
