@@ -96,7 +96,7 @@ func main() {
 	// Once the history is cut a block above the newest partition cannot be stored: create them before ingest.
 	if head, err := database.GetLatestBlockNumber(context.Background()); err != nil {
 		log.Fatal("failed to read the stored head", "error", err)
-	} else if _, err := database.EnsureHistoryPartitions(context.Background(), head+2*cfg.PartitionBlocks, cfg.PartitionBlocks); err != nil {
+	} else if _, err := database.EnsurePartitionsAhead(context.Background(), head, cfg.PartitionBlocks); err != nil {
 		log.Fatal("failed to create history partitions", "error", err)
 	}
 

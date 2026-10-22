@@ -156,3 +156,25 @@ func TestCutIsPlacedAboveTheNodeHead(t *testing.T) {
 	require.Equal(t, []string{"legacy:49001:attached", "p49001:51001:attached"}, partitionRanges(t, d),
 		"node head 45,001 + 2 partitions, not stored head 40,001 + 2")
 }
+
+// Retention switched off after the cut, with PARTITION_BLOCKS unset (it defaults to PRUNE_RETAIN_BLOCKS / 10 = 0):
+// partitions must still be kept ahead of the head, at the newest partition's size, or ingest stops at the last one.
+func TestRetentionOffAfterTheCutKeepsPartitionsAhead(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 40_001, 1)
+	require.NoError(t, d.retentionPass(ctx, RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}))
+	require.Equal(t, []string{"legacy:44001:attached", "p44001:46001:attached"}, partitionRanges(t, d))
+
+	off := RetentionConfig{RetainBlocks: 0, PartitionBlocks: 0}
+	for from := int64(40_002); from <= 60_000; from += 1_000 {
+		require.NoError(t, d.retentionPass(ctx, off))
+		seedHistory(t, d, from, from+999, 1)
+	}
+	var head int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT max(number) FROM blocks`).Scan(&head))
+	require.Equal(t, int64(60_001), head, "ingest went on past the original partitions")
+	ranges := partitionRanges(t, d)
+	require.Equal(t, "p62001:64001:attached", ranges[len(ranges)-1], "still two 2,000-block partitions ahead")
+}

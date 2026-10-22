@@ -53,6 +53,26 @@ func (d *DB) HistoryCut(ctx context.Context) (bool, error) {
 	return bounded, err
 }
 
+// EnsurePartitionsAhead keeps two partitions ahead of the head once the history is cut. With no partition size
+// configured (retention switched off after a cut: PARTITION_BLOCKS defaults to PRUNE_RETAIN_BLOCKS / 10 = 0) it
+// uses the newest partition's size: ensuring only up to the head itself would leave the next block no partition
+// to go into, and ingest would stop there for good.
+func (d *DB) EnsurePartitionsAhead(ctx context.Context, head, partitionBlocks uint64) (int, error) {
+	size := partitionBlocks
+	if size == 0 {
+		var newest *int64
+		if err := d.pool.QueryRow(ctx, `
+			SELECT hi - lo FROM history_partitions WHERE lo IS NOT NULL AND hi IS NOT NULL ORDER BY lo DESC LIMIT 1`).Scan(&newest); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return 0, err
+		}
+		if newest == nil {
+			return 0, nil
+		}
+		size = uint64(*newest)
+	}
+	return d.EnsureHistoryPartitions(ctx, head+2*size, size)
+}
+
 // EnsureHistoryPartitions creates partitions of sizeBlocks up to at least upto; a no-op before the cut.
 func (d *DB) EnsureHistoryPartitions(ctx context.Context, upto, sizeBlocks uint64) (int, error) {
 	start := time.Now()
@@ -103,7 +123,7 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 	if err != nil {
 		return err
 	}
-	if made, err := d.EnsureHistoryPartitions(ctx, head+2*cfg.PartitionBlocks, cfg.PartitionBlocks); err != nil {
+	if made, err := d.EnsurePartitionsAhead(ctx, head, cfg.PartitionBlocks); err != nil {
 		return fmt.Errorf("ensure partitions: %w", err)
 	} else if made > 0 {
 		log.Info("retention: history partitions created", "count", made, "head", head)
