@@ -8,6 +8,7 @@ import (
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/tern/v2/migrate"
@@ -171,64 +172,114 @@ func (d *DB) reconcileTokenBalancesCurrent(ctx context.Context) error {
 
 type execer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-func reseedCounters(ctx context.Context, q execer) error {
-	// Reconciles counters against actual row counts in case earlier writes
-	// bypassed the live-increment path (e.g. pre-existing rows on first deploy).
-	// Pruned history counts through prune_offsets (migration 014): the retained
-	// rows alone would decrement every counter.
-	if _, err := q.Exec(ctx, `
-		INSERT INTO chain_counters (name, count, updated_at) VALUES
-			('blocks_total',       (SELECT COUNT(*) FROM blocks WHERE number >= (SELECT history_from()))                + prune_offset('chain', 'blocks_total'),       NOW()),
-			('transactions_total', (SELECT COUNT(*) FROM transactions WHERE block_number >= (SELECT history_from()))    + prune_offset('chain', 'transactions_total'), NOW()),
-			('addresses_total',    (SELECT COUNT(*) FROM address_stats),                                                                                   NOW()),
-			('tokens_total',       (SELECT COUNT(*) FROM tokens),                                                                                          NOW()),
-			('transfers_total',    (SELECT COUNT(*) FROM token_transfers WHERE block_number >= (SELECT history_from())) + prune_offset('chain', 'transfers_total'),    NOW())
-		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`); err != nil {
-		return fmt.Errorf("failed to re-seed chain_counters: %w", err)
+// prunedButAttached lists, per history table, the partitions whose whole range is at or below the prune watermark
+// but which are still attached: a prune moved the watermark past them and has not detached them yet. A parent's
+// rows minus these are its retained rows. The watermark only moves past whole ranges, and a detach pending
+// partition is no longer read through its parent.
+func prunedButAttached(ctx context.Context, q execer) (map[string][]string, error) {
+	rows, err := q.Query(ctx, `
+		SELECT t, history_relname(t, p.suffix)
+		FROM history_partitions p CROSS JOIN unnest(history_tables()) AS t
+		WHERE p.hi IS NOT NULL AND p.hi <= (SELECT history_from())
+		  AND EXISTS (SELECT 1 FROM pg_inherits i
+		              WHERE i.inhrelid = to_regclass(history_relname(t, p.suffix)) AND i.inhparent = to_regclass(t)
+		                AND NOT i.inhdetachpending)
+		ORDER BY 1, 2`)
+	if err != nil {
+		return nil, err
 	}
-	log.Info("chain_counters re-seeded from row counts")
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var table, child string
+		if err := rows.Scan(&table, &child); err != nil {
+			return nil, err
+		}
+		out[table] = append(out[table], child)
+	}
+	return out, rows.Err()
+}
 
-	// Same reconciliation, one level down: tokens.transfer_count and
-	// tokens.total_supply are maintained by deltas in InsertBlockDataBatch, so
-	// every row written before that existed still holds a value computed the
-	// old way -- and rows written by a build without the delta would keep
-	// drifting. One absolute pass at startup makes them agree with the stored
-	// transfers plus the pruned ones' offsets.
-	//
-	// ERC721 total_supply is left alone: it derives from nft_tokens rather than
-	// from token_transfers and RefreshTokenStats still recomputes it per block.
-	if _, err := q.Exec(ctx, `
+// retainedCount counts a history table's retained rows: the whole parent (a parallel sequential scan: a filter on
+// the block made Postgres pick an index-only scan whose heap fetches on a written table took 24-30 min on a production deployment)
+// minus each pruned-but-attached partition, counted whole.
+func retainedCount(table string, pruned []string) string {
+	sql := `(SELECT COUNT(*) FROM ` + pgx.Identifier{table}.Sanitize() + `)`
+	for _, child := range pruned {
+		sql += ` - (SELECT COUNT(*) FROM ` + pgx.Identifier{child}.Sanitize() + `)`
+	}
+	return sql
+}
+
+const transferSupply = `COALESCE(
+		SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+	  - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
+		0)`
+
+// retainedTokenTotals is each token's retained transfer count and ERC20 supply, built the same way.
+func retainedTokenTotals(pruned []string) string {
+	sql := `SELECT token_address, COUNT(*) AS cnt, ` + transferSupply + ` AS supply FROM token_transfers GROUP BY token_address`
+	for _, child := range pruned {
+		sql += `
+			UNION ALL
+			SELECT token_address, -COUNT(*), -` + transferSupply + ` FROM ` + pgx.Identifier{child}.Sanitize() + ` GROUP BY token_address`
+	}
+	return sql
+}
+
+func reseedChainCountersSQL(pruned map[string][]string) string {
+	return `
+		INSERT INTO chain_counters (name, count, updated_at) VALUES
+			('blocks_total',       ` + retainedCount("blocks", pruned["blocks"]) + ` + prune_offset('chain', 'blocks_total'), NOW()),
+			('transactions_total', ` + retainedCount("transactions", pruned["transactions"]) + ` + prune_offset('chain', 'transactions_total'), NOW()),
+			('addresses_total',    (SELECT COUNT(*) FROM address_stats), NOW()),
+			('tokens_total',       (SELECT COUNT(*) FROM tokens), NOW()),
+			('transfers_total',    ` + retainedCount("token_transfers", pruned["token_transfers"]) + ` + prune_offset('chain', 'transfers_total'), NOW())
+		ON CONFLICT (name) DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()`
+}
+
+func reseedTokenCountersSQL(pruned map[string][]string) string {
+	return `
 		UPDATE tokens t SET
 			transfer_count = s.cnt,
-			total_supply = CASE WHEN t.token_type = 'ERC20' THEN `+clampSupply(`s.supply`)+` ELSE t.total_supply END
+			total_supply = CASE WHEN t.token_type = 'ERC20' THEN ` + clampSupply(`s.supply`) + ` ELSE t.total_supply END
 		FROM (
 			SELECT token_address, SUM(cnt) AS cnt, SUM(supply) AS supply FROM (
-				SELECT token_address,
-				       COUNT(*) AS cnt,
-				       COALESCE(
-				           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
-				         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
-				           0) AS supply
-				FROM token_transfers WHERE block_number >= (SELECT history_from()) GROUP BY token_address
+				` + retainedTokenTotals(pruned["token_transfers"]) + `
 				UNION ALL
 				SELECT key, count, supply FROM prune_offsets WHERE kind = 'token'
 			) u GROUP BY token_address
 		) s
 		WHERE t.address = s.token_address
 		  AND (t.transfer_count IS DISTINCT FROM s.cnt
-		       OR (t.token_type = 'ERC20' AND t.total_supply IS DISTINCT FROM s.supply))`); err != nil {
-		return fmt.Errorf("failed to re-seed token transfer counters: %w", err)
-	}
+		       OR (t.token_type = 'ERC20' AND t.total_supply IS DISTINCT FROM s.supply))`
+}
 
-	// A token whose every transfer row is gone (or that never had one) is not
-	// covered by the join above; zero it so a stale count cannot survive.
-	if _, err := q.Exec(ctx, `
+// A token with no transfer row at all (attached, pruned or not) and no offset is not covered by the re-seed above.
+const zeroTokenCountersSQL = `
 		UPDATE tokens SET transfer_count = 0
 		WHERE transfer_count <> 0
-		  AND NOT EXISTS (SELECT 1 FROM token_transfers WHERE token_address = tokens.address AND block_number >= (SELECT history_from()))
-		  AND NOT EXISTS (SELECT 1 FROM prune_offsets WHERE kind = 'token' AND key = tokens.address)`); err != nil {
+		  AND NOT EXISTS (SELECT 1 FROM token_transfers WHERE token_address = tokens.address)
+		  AND NOT EXISTS (SELECT 1 FROM prune_offsets WHERE kind = 'token' AND key = tokens.address)`
+
+// reseedCounters re-derives chain_counters and the tokens' transfer counts and supply from the retained rows plus
+// what pruned rows contributed (prune_offsets), the counters being maintained by deltas.
+func reseedCounters(ctx context.Context, q execer) error {
+	pruned, err := prunedButAttached(ctx, q)
+	if err != nil {
+		return fmt.Errorf("failed to list pruned partitions: %w", err)
+	}
+	if _, err := q.Exec(ctx, reseedChainCountersSQL(pruned)); err != nil {
+		return fmt.Errorf("failed to re-seed chain_counters: %w", err)
+	}
+	log.Info("chain_counters re-seeded from row counts")
+	if _, err := q.Exec(ctx, reseedTokenCountersSQL(pruned)); err != nil {
+		return fmt.Errorf("failed to re-seed token transfer counters: %w", err)
+	}
+	if _, err := q.Exec(ctx, zeroTokenCountersSQL); err != nil {
 		return fmt.Errorf("failed to zero token transfer counters: %w", err)
 	}
 	log.Info("token transfer counters re-seeded from token_transfers")

@@ -220,20 +220,20 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 	if last > head-cfg.RetainBlocks || last+PruneFloorGap > head || *hi-1 > *dsw {
 		return false, nil
 	}
-	var complete bool
-	if err := d.pool.QueryRow(ctx, `SELECT history_range_complete($1)`, suffix).Scan(&complete); err != nil {
-		return false, err
-	}
-	if !complete {
-		log.Info("retention: oldest range is missing blocks; not pruned", "range", suffix, "below", *hi)
-		return false, nil
-	}
 	var closed bool
 	if err := d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ledger_spans WHERE hi = $1)`, *hi).Scan(&closed); err != nil {
 		return false, err
 	}
 	if !closed {
 		log.Info("retention: oldest range is not closed in the ledger yet; not pruned", "range", suffix, "below", *hi)
+		return false, nil
+	}
+	var complete bool
+	if err := d.pool.QueryRow(ctx, `SELECT history_range_complete($1)`, suffix).Scan(&complete); err != nil {
+		return false, err
+	}
+	if !complete {
+		log.Info("retention: oldest range is missing blocks; not pruned", "range", suffix, "below", *hi)
 		return false, nil
 	}
 
