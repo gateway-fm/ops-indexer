@@ -257,6 +257,10 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// ReorgFloorBlocks is the minimum retention window: nothing within 100x the deepest reorg the indexer reverts is
+// ever pruned (db.PruneFloorGap, prune_floor_gap()).
+const ReorgFloorBlocks = 12800
+
 func (c *Config) Validate() error {
 	if c.RPCURL == "" {
 		return fmt.Errorf("RPC_URL is required")
@@ -278,6 +282,9 @@ func (c *Config) Validate() error {
 	}
 	if err := c.CheckCommitPipeline(); err != nil {
 		return err
+	}
+	if c.PruneRetainBlocks > 0 && c.PruneRetainBlocks < ReorgFloorBlocks {
+		return fmt.Errorf("PRUNE_RETAIN_BLOCKS %d is inside the reorg floor (%d blocks)", c.PruneRetainBlocks, ReorgFloorBlocks)
 	}
 	if c.LedgerSpanBlocks == 0 {
 		return fmt.Errorf("LEDGER_SPAN_BLOCKS must be greater than 0")

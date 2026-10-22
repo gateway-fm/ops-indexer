@@ -86,9 +86,6 @@ func main() {
 		}
 	}
 
-	if cfg.PruneRetainBlocks > 0 && cfg.PruneRetainBlocks < db.PruneFloorGap {
-		log.Fatal("PRUNE_RETAIN_BLOCKS is inside the reorg floor", "retain_blocks", cfg.PruneRetainBlocks, "floor", db.PruneFloorGap)
-	}
 	prunedThrough, _, err := database.PrunedThrough(context.Background())
 	if err != nil {
 		log.Fatal("failed to read the prune watermark", "error", err)

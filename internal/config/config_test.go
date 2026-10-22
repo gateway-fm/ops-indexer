@@ -23,3 +23,11 @@ func TestValidateKeepsStartBlockWithoutRetention(t *testing.T) {
 	c.StartBlock, c.PruneRetainBlocks = 0, 100_000
 	require.NoError(t, c.Validate())
 }
+
+func TestValidateRefusesAWindowInsideTheReorgFloor(t *testing.T) {
+	c := validConfig()
+	c.PruneRetainBlocks = 1_000
+	require.ErrorContains(t, c.Validate(), "reorg floor")
+	c.PruneRetainBlocks = ReorgFloorBlocks
+	require.NoError(t, c.Validate())
+}
