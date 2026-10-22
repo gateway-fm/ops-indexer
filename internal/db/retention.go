@@ -128,7 +128,14 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 // cutHistory bounds the legacy partitions at C = head + 2 partitions and creates the first partition above it.
 // From the CHECK until the re-attach a legacy row at or above C is refused, so C keeps that much room ahead of
 // ingest; if the head comes within one partition of C while the checks validate, the cut is abandoned and retried.
+// The gate is held for the whole cut and taken before the check exists: waiting for a ledger span with the check in
+// force would let the head reach the cut, where every insert into the legacy partition is refused.
 func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
+	release, err := d.holdHistoryDDLGate(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	head, err := d.GetLatestBlockNumber(ctx)
 	if err != nil {
 		return err
@@ -144,7 +151,7 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	log.Info("retention: cutting the legacy partitions", "head", head, "node_head", base, "cut_at", cutAt, "extra_margin", d.cutMargin)
 
 	start := time.Now()
-	if err := d.withHistoryDDL(ctx, func(tx pgx.Tx) error {
+	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `SELECT history_cut_constrain($1)`, int64(cutAt))
 		return err
 	}); err != nil {
@@ -153,7 +160,7 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	metrics.ObserveRetentionStep("cut_constrain", time.Since(start))
 	defer func() {
 		if err != nil {
-			if rerr := d.ReleaseAbandonedCut(context.WithoutCancel(ctx)); rerr != nil {
+			if rerr := d.dropCutChecks(context.WithoutCancel(ctx)); rerr != nil {
 				log.Error("retention: dropping an abandoned cut's check failed; it is dropped again at the next start", "error", rerr)
 			}
 		}
@@ -177,7 +184,7 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	log.Info("retention: legacy partitions validated below the cut", "cut_at", cutAt, "elapsed", time.Since(start))
 
 	start = time.Now()
-	if err := d.withHistoryDDL(ctx, func(tx pgx.Tx) error {
+	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `SELECT history_cut_finish($1, $2)`, int64(cutAt), int64(cfg.PartitionBlocks))
 		return err
 	}); err != nil {
@@ -199,6 +206,16 @@ func nextCutMargin(prev, advanced uint64) uint64 {
 // abandoned (the head came near it, a failure, a restart) leaves a validated "below the cut" check, and once the
 // head reaches it every insert into the legacy partition is refused. After the cut the check stays.
 func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
+	release, err := d.holdHistoryDDLGate(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return d.dropCutChecks(ctx)
+}
+
+// dropCutChecks is ReleaseAbandonedCut for a caller that already holds the history-DDL gate.
+func (d *DB) dropCutChecks(ctx context.Context) error {
 	cut, err := d.HistoryCut(ctx)
 	if err != nil || cut {
 		return err
@@ -213,7 +230,7 @@ func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
 		if !exists {
 			continue
 		}
-		if err := d.withHistoryDDL(ctx, func(tx pgx.Tx) error {
+		if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS history_cut`, pgx.Identifier{t + "_legacy"}.Sanitize()))
 			return err
 		}); err != nil {
@@ -228,30 +245,35 @@ func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
 // shared while it closes a span, retention exclusively while it changes the history tables.
 const historyDDLGate = 4673
 
-// withHistoryDDL runs fn, DDL that needs ACCESS EXCLUSIVE on history tables, once no ledger span is being closed.
-// Queued behind a span read, the DDL's lock request would hold up ingest's own statements on those tables. Taking
-// the gate exclusively waits for the span in progress (up to 30 min, then the pass is retried), and a waiting
-// exclusive request keeps the closer from starting another; fn then competes with ingest alone. Ingest never takes
-// the gate.
-func (d *DB) withHistoryDDL(ctx context.Context, fn func(pgx.Tx) error) error {
+// holdHistoryDDLGate takes the history-DDL gate exclusively on its own connection, waiting up to 30 min for the
+// span in progress; a waiting exclusive request keeps the closer from starting another. Queued behind a span read
+// instead, a DDL lock request would hold up ingest's own statements on the history tables. Ingest never takes the
+// gate. The returned func releases it.
+func (d *DB) holdHistoryDDLGate(ctx context.Context) (func(), error) {
 	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer conn.Release()
+	reset := func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`)
+		conn.Release()
+	}
 	start := time.Now()
 	if _, err := conn.Exec(ctx, `SET lock_timeout = '30min'`); err != nil {
-		return err
+		reset()
+		return nil, err
 	}
-	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`) }()
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, historyDDLGate); err != nil {
-		return fmt.Errorf("wait for the ledger closer: %w", err)
+		reset()
+		return nil, fmt.Errorf("wait for the ledger closer: %w", err)
 	}
-	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1, 1)`, historyDDLGate) }()
 	if waited := time.Since(start); waited > time.Second {
 		log.Info("retention: waited for the ledger closer before history DDL", "waited", waited)
 	}
-	return d.withLockTimeout(ctx, fn)
+	return func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1, 1)`, historyDDLGate)
+		reset()
+	}, nil
 }
 
 // withLockTimeout runs fn in a transaction that gives up on a lock after 2 s, retrying up to 20 times: a DDL lock

@@ -129,6 +129,7 @@ func TestCutWaitsForTheLedgerSpanWithoutStallingIngest(t *testing.T) {
 	default:
 	}
 
+	require.Zero(t, historyCutChecks(t, d), "no check is in force while the cut waits")
 	require.NoError(t, span.Rollback(ctx), "the span ends")
 	select {
 	case err := <-cut:
@@ -140,6 +141,8 @@ func TestCutWaitsForTheLedgerSpanWithoutStallingIngest(t *testing.T) {
 	cutDone, err := d.HistoryCut(ctx)
 	require.NoError(t, err)
 	require.True(t, cutDone)
+	require.Equal(t, "legacy:44011:attached", partitionRanges(t, d)[0],
+		"the cut is placed from the head after the wait (40,011 + 2 partitions), with no check in force while it waited")
 }
 
 // A cut started while ingest is behind (a restart) is placed above the node's head, keeping its full margin.
