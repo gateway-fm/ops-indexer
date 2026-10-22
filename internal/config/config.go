@@ -38,7 +38,13 @@ type Config struct {
 	LedgerSpanBlocks    uint64        `mapstructure:"ledger_span_blocks"`
 	LedgerCloseInterval time.Duration `mapstructure:"ledger_close_interval"`
 	LedgerWorkMem       string        `mapstructure:"ledger_work_mem"`
-	LedgerMaxHeadLag    uint64        `mapstructure:"ledger_max_head_lag_blocks"`
+	// PrunedLookup serves blocks and transactions below the prune watermark from the node (PRST-5375).
+	PrunedLookup            bool          `mapstructure:"pruned_lookup"`
+	PrunedLookupCacheBlocks int           `mapstructure:"pruned_lookup_cache_blocks"`
+	PrunedLookupCacheMB     int           `mapstructure:"pruned_lookup_cache_mb"`
+	PrunedLookupTimeout     time.Duration `mapstructure:"pruned_lookup_timeout"`
+	PrunedLookupConcurrency int           `mapstructure:"pruned_lookup_concurrency"`
+	LedgerMaxHeadLag        uint64        `mapstructure:"ledger_max_head_lag_blocks"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -120,6 +126,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ledger_span_blocks", 100000)
 	v.SetDefault("ledger_close_interval", "10s")
 	v.SetDefault("ledger_work_mem", "512MB")
+	v.SetDefault("pruned_lookup", false)
+	v.SetDefault("pruned_lookup_cache_blocks", 2000)
+	v.SetDefault("pruned_lookup_cache_mb", 256)
+	v.SetDefault("pruned_lookup_timeout", "5s")
+	v.SetDefault("pruned_lookup_concurrency", 4)
 	v.SetDefault("ledger_max_head_lag_blocks", 0)
 
 	v.SetDefault("rpc_workers", 50)
@@ -206,6 +217,11 @@ func Load() (*Config, error) {
 	cfg.LedgerSpanBlocks = v.GetUint64("ledger_span_blocks")
 	cfg.LedgerCloseInterval = v.GetDuration("ledger_close_interval")
 	cfg.LedgerWorkMem = v.GetString("ledger_work_mem")
+	cfg.PrunedLookup = v.GetBool("pruned_lookup")
+	cfg.PrunedLookupCacheBlocks = v.GetInt("pruned_lookup_cache_blocks")
+	cfg.PrunedLookupCacheMB = v.GetInt("pruned_lookup_cache_mb")
+	cfg.PrunedLookupTimeout = v.GetDuration("pruned_lookup_timeout")
+	cfg.PrunedLookupConcurrency = v.GetInt("pruned_lookup_concurrency")
 	cfg.LedgerMaxHeadLag = v.GetUint64("ledger_max_head_lag_blocks")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")

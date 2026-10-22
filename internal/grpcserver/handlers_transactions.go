@@ -21,6 +21,18 @@ func (s *Server) GetTransaction(ctx context.Context, req *indexerv1.GetTransacti
 		return nil, internalErr(err, "GetTransaction")
 	}
 	if tx == nil {
+		if through, ok, err := s.prunedThroughForNode(ctx); err != nil {
+			return nil, err
+		} else if ok {
+			ntx, err := s.cfg.NodeLookup.Transaction(ctx, req.GetHash(), through)
+			if err != nil {
+				return nil, nodeLookupErr(err, "transaction")
+			}
+			if ntx != nil {
+				servedFromNode(ctx)
+				return mapTransaction(ntx), nil
+			}
+		}
 		return nil, s.notFoundByHash(ctx, "transaction", req.GetHash())
 	}
 	return mapTransaction(tx), nil
@@ -71,6 +83,12 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 	case *indexerv1.ListTransactionsRequest_ByBlock:
 		switch b := f.ByBlock.GetSelector().(type) {
 		case *indexerv1.ListTransactionsRequest_BlockFilter_Number:
+			if nb, err := s.prunedBlockByNumber(ctx, b.Number); err != nil || nb != nil {
+				if err != nil {
+					return nil, err
+				}
+				return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(nb.Txs), Page: &indexerv1.PageResponse{}}, nil
+			}
 			if err := s.checkRetained(ctx, b.Number); err != nil {
 				return nil, err
 			}
@@ -96,6 +114,12 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 				return nil, internalErr(err, "ListTransactions")
 			}
 			if blk == nil {
+				if nb, err := s.prunedBlockByHash(ctx, b.Hash); err != nil || nb != nil {
+					if err != nil {
+						return nil, err
+					}
+					return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(nb.Txs), Page: &indexerv1.PageResponse{}}, nil
+				}
 				return nil, s.notFoundByHash(ctx, "block", b.Hash)
 			}
 			rows, err := s.db.GetTransactionsByBlock(ctx, blk.Number)

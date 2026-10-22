@@ -11,6 +11,12 @@ import (
 func (s *Server) GetBlock(ctx context.Context, req *indexerv1.GetBlockRequest) (*indexerv1.Block, error) {
 	switch sel := req.GetSelector().(type) {
 	case *indexerv1.GetBlockRequest_Number:
+		if nb, err := s.prunedBlockByNumber(ctx, sel.Number); err != nil || nb != nil {
+			if err != nil {
+				return nil, err
+			}
+			return mapBlock(nb.Block), nil
+		}
 		if err := s.checkRetained(ctx, sel.Number); err != nil {
 			return nil, err
 		}
@@ -36,6 +42,12 @@ func (s *Server) GetBlock(ctx context.Context, req *indexerv1.GetBlockRequest) (
 			return nil, internalErr(err, "GetBlock")
 		}
 		if b == nil {
+			if nb, err := s.prunedBlockByHash(ctx, sel.Hash); err != nil || nb != nil {
+				if err != nil {
+					return nil, err
+				}
+				return mapBlock(nb.Block), nil
+			}
 			return nil, s.notFoundByHash(ctx, "block", sel.Hash)
 		}
 		return mapBlock(b), nil

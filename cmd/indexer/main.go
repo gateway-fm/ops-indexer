@@ -28,6 +28,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/indexer"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
+	"github.com/gateway-fm/chain-indexer/internal/nodelookup"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
@@ -129,9 +130,19 @@ func main() {
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
+	var nodeLookup *nodelookup.Lookup
+	if cfg.PrunedLookup {
+		nodeLookup = nodelookup.New(nodelookup.NewNodeSource(rpcClient), nodelookup.Config{
+			MaxBlocks:   cfg.PrunedLookupCacheBlocks,
+			MaxBytes:    cfg.PrunedLookupCacheMB << 20,
+			Timeout:     cfg.PrunedLookupTimeout,
+			Concurrency: cfg.PrunedLookupConcurrency,
+		})
+	}
 	grpcSrv, err := grpcserver.New(grpcserver.Config{
 		ListenAddr:     cfg.GRPCListenAddr,
 		OPStackEnabled: cfg.EnableOPDeposits,
+		NodeLookup:     nodeLookup,
 	}, database)
 	if err != nil {
 		log.Fatal("failed to create grpc server", "error", err)

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/nodelookup"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 )
@@ -40,6 +41,9 @@ type Config struct {
 	// OPStackEnabled gates the OP-Stack RPCs. When false, GetOPDeposit and
 	// ListOPDeposits return Unavailable.
 	OPStackEnabled bool
+
+	// NodeLookup, when set, serves blocks and transactions below the prune watermark from the node.
+	NodeLookup *nodelookup.Lookup
 
 	// DefaultPageSize is the page_size used when a request sends 0. 25.
 	DefaultPageSize int32

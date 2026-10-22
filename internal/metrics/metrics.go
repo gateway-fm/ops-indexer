@@ -258,3 +258,54 @@ func BalanceQueueDropped(n int) {
 func ReorgDetected() { reorgs.Inc() }
 
 func ChainResetDetected() { chainResets.Inc() }
+
+var (
+	nodeLookupCache = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_node_lookup_cache_total",
+		Help: "Pruned-block lookups served from the node-lookup cache (hit) or fetched from the node (miss).",
+	}, []string{"result"})
+
+	nodeLookupRPC = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "indexer_node_lookup_rpc_seconds",
+		Help:    "Latency of the node calls that serve pruned blocks and transactions.",
+		Buckets: latencyBuckets,
+	}, []string{"method", "outcome"})
+
+	nodeLookupBusy = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_node_lookup_busy_total",
+		Help: "Pruned lookups refused because every node slot stayed taken for the request timeout.",
+	})
+
+	nodeLookupCachedBlocks = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_node_lookup_cached_blocks",
+		Help: "Blocks held in the node-lookup cache.",
+	})
+
+	nodeLookupCachedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_node_lookup_cached_bytes",
+		Help: "Estimated size of the node-lookup cache.",
+	})
+)
+
+func NodeLookupCache(hit bool) {
+	if hit {
+		nodeLookupCache.WithLabelValues("hit").Inc()
+		return
+	}
+	nodeLookupCache.WithLabelValues("miss").Inc()
+}
+
+func ObserveNodeLookupRPC(method string, d time.Duration, err error) {
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	nodeLookupRPC.WithLabelValues(method, outcome).Observe(d.Seconds())
+}
+
+func NodeLookupBusy() { nodeLookupBusy.Inc() }
+
+func SetNodeLookupCache(blocks, bytes int) {
+	nodeLookupCachedBlocks.Set(float64(blocks))
+	nodeLookupCachedBytes.Set(float64(bytes))
+}
