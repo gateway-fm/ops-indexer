@@ -30,6 +30,9 @@ type RetentionConfig struct {
 	Interval        time.Duration
 	// ArchiveDir, when set, receives every detached partition before it is dropped.
 	ArchiveDir string
+	// NodeHead, when set, is the chain head: the cut is placed above it, not only above the stored head, so a cut
+	// started while ingest is behind (a restart) keeps its full margin.
+	NodeHead func(ctx context.Context) (uint64, error)
 }
 
 // PrunedThrough returns the prune watermark (every block at or below it is gone on purpose) and the timestamp of
@@ -131,11 +134,17 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 		return err
 	}
 	headAtStart := head
-	cutAt := head + 2*cfg.PartitionBlocks + d.cutMargin
-	log.Info("retention: cutting the legacy partitions", "head", head, "cut_at", cutAt, "extra_margin", d.cutMargin)
+	base := head
+	if cfg.NodeHead != nil {
+		if node, err := cfg.NodeHead(ctx); err == nil && node > base {
+			base = node
+		}
+	}
+	cutAt := base + 2*cfg.PartitionBlocks + d.cutMargin
+	log.Info("retention: cutting the legacy partitions", "head", head, "node_head", base, "cut_at", cutAt, "extra_margin", d.cutMargin)
 
 	start := time.Now()
-	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
+	if err := d.withHistoryDDL(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `SELECT history_cut_constrain($1)`, int64(cutAt))
 		return err
 	}); err != nil {
@@ -168,7 +177,7 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	log.Info("retention: legacy partitions validated below the cut", "cut_at", cutAt, "elapsed", time.Since(start))
 
 	start = time.Now()
-	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
+	if err := d.withHistoryDDL(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `SELECT history_cut_finish($1, $2)`, int64(cutAt), int64(cfg.PartitionBlocks))
 		return err
 	}); err != nil {
@@ -204,7 +213,7 @@ func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
 		if !exists {
 			continue
 		}
-		if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
+		if err := d.withHistoryDDL(ctx, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS history_cut`, pgx.Identifier{t + "_legacy"}.Sanitize()))
 			return err
 		}); err != nil {
@@ -213,6 +222,36 @@ func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
 		log.Warn("retention: dropped an abandoned cut's check", "table", t+"_legacy")
 	}
 	return nil
+}
+
+// historyDDLGate is the advisory key that keeps retention's DDL and the ledger closer apart: the closer holds it
+// shared while it closes a span, retention exclusively while it changes the history tables.
+const historyDDLGate = 4673
+
+// withHistoryDDL runs fn, DDL that needs ACCESS EXCLUSIVE on history tables, once no ledger span is being closed.
+// Queued behind a span read, the DDL's lock request would hold up ingest's own statements on those tables. Taking
+// the gate exclusively waits for the span in progress (up to 30 min, then the pass is retried), and a waiting
+// exclusive request keeps the closer from starting another; fn then competes with ingest alone. Ingest never takes
+// the gate.
+func (d *DB) withHistoryDDL(ctx context.Context, fn func(pgx.Tx) error) error {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	start := time.Now()
+	if _, err := conn.Exec(ctx, `SET lock_timeout = '30min'`); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`) }()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, historyDDLGate); err != nil {
+		return fmt.Errorf("wait for the ledger closer: %w", err)
+	}
+	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1, 1)`, historyDDLGate) }()
+	if waited := time.Since(start); waited > time.Second {
+		log.Info("retention: waited for the ledger closer before history DDL", "waited", waited)
+	}
+	return d.withLockTimeout(ctx, fn)
 }
 
 // withLockTimeout runs fn in a transaction that gives up on a lock after 2 s, retrying up to 20 times: a DDL lock

@@ -198,6 +198,7 @@ func main() {
 			PartitionBlocks: cfg.PartitionBlocks,
 			Interval:        cfg.PruneInterval,
 			ArchiveDir:      cfg.PruneArchiveDir,
+			NodeHead:        rpcClient.BlockNumber,
 		})
 	}()
 

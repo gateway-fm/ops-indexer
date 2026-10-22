@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -83,4 +85,71 @@ func TestCutMarginGrowsAfterTheHeadCatchesUp(t *testing.T) {
 	require.NoError(t, d.cutHistory(context.Background(), RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}))
 	require.Equal(t, []string{"legacy:50001:attached", "p50001:52001:attached"}, partitionRanges(t, d),
 		"cut at head 40,001 + 2 partitions + 6,000")
+}
+
+// The ledger closer reads the history tables in long transactions; the cut's DDL needs ACCESS EXCLUSIVE on them.
+// Retention waits for the span on the history-DDL gate, not in the tables' lock queue, so ingest is never held
+// behind a queued DDL lock, the closer starts no new span meanwhile, and the cut finishes on its first attempt.
+func TestCutWaitsForTheLedgerSpanWithoutStallingIngest(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 40_001, 1)
+
+	span, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = span.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, historyDDLGate)
+	require.NoError(t, err)
+	var n int64
+	require.NoError(t, span.QueryRow(ctx, `SELECT count(*) FROM transactions`).Scan(&n), "a span read holds ACCESS SHARE until it ends")
+
+	cut := make(chan error, 1)
+	go func() { cut <- d.cutHistory(ctx, RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}) }()
+	time.Sleep(500 * time.Millisecond)
+
+	nextSpan := make(chan error, 1)
+	go func() {
+		nextSpan <- pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, historyDDLGate)
+			return err
+		})
+	}()
+
+	for b := uint64(40_002); b < 40_012; b++ {
+		start := time.Now()
+		require.NoError(t, insertCutTestBlock(d, b))
+		require.Less(t, time.Since(start), 500*time.Millisecond, "ingest is not held behind the cut's DDL (block %d)", b)
+		time.Sleep(300 * time.Millisecond)
+	}
+	select {
+	case err := <-nextSpan:
+		t.Fatalf("the closer started another span while the cut waited: %v", err)
+	case err := <-cut:
+		t.Fatalf("the cut ran while a span read the history tables: %v", err)
+	default:
+	}
+
+	require.NoError(t, span.Rollback(ctx), "the span ends")
+	select {
+	case err := <-cut:
+		require.NoError(t, err, "the cut finishes on its first attempt")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cut did not finish after the span ended")
+	}
+	require.NoError(t, <-nextSpan, "the closer resumes after the cut")
+	cutDone, err := d.HistoryCut(ctx)
+	require.NoError(t, err)
+	require.True(t, cutDone)
+}
+
+// A cut started while ingest is behind (a restart) is placed above the node's head, keeping its full margin.
+func TestCutIsPlacedAboveTheNodeHead(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	seedHistory(t, d, 0, 40_001, 1)
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000,
+		NodeHead: func(context.Context) (uint64, error) { return 45_001, nil }}
+	require.NoError(t, d.cutHistory(context.Background(), cfg))
+	require.Equal(t, []string{"legacy:49001:attached", "p49001:51001:attached"}, partitionRanges(t, d),
+		"node head 45,001 + 2 partitions, not stored head 40,001 + 2")
 }

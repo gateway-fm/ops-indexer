@@ -38,6 +38,9 @@ func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (i
 					return err
 				}
 			}
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, historyDDLGate); err != nil {
+				return err
+			}
 			return tx.QueryRow(ctx, `SELECT ledger_close_span($1, $2)`, lo, hi).Scan(&ok)
 		}); err != nil {
 			return closed, err
