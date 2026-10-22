@@ -399,3 +399,34 @@ func TestScanForward_NoopWhenChainNotAdvanced(t *testing.T) {
 	mockDB.AssertNotCalled(t, "SaveMissingRanges", mock.Anything, mock.Anything)
 	mockDB.AssertNotCalled(t, "UpdateIndexerProgress", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
+
+// The forward scan stops at realtime's cursor: the blocks between it and the node head are realtime's next writes,
+// and registering them sent catch-up after the same blocks (in production: "new missing ranges detected" every minute and
+// 23505 on the tip block). Once realtime moves on, the scan covers what it passed.
+func TestMissingRangeCollector_ForwardScanStopsAtRealtime(t *testing.T) {
+	mockDB := new(MockDatabase)
+	mockRPC := new(MockRPCClient)
+	collector := NewMissingRangeCollector(mockDB, mockRPC, &MissingRangeCollectorConfig{BatchSize: 1000})
+	collector.maxFetchedBlock = 100
+	realtime := uint64(110)
+	collector.SetCeiling(func() uint64 { return realtime })
+
+	mockRPC.On("BlockNumber", mock.Anything).Return(uint64(130), nil)
+	mockDB.On("UpdateIndexerProgress", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockDB.On("FindMissingBlocksInRange", mock.Anything, uint64(101), uint64(110)).Return([]db.BlockRange{}, nil).Once()
+	collector.scanForward()
+
+	collector.scanForward()
+
+	realtime = 125
+	mockDB.On("FindMissingBlocksInRange", mock.Anything, uint64(111), uint64(125)).
+		Return([]db.BlockRange{{FromNumber: 117, ToNumber: 117}}, nil).Once()
+	mockDB.On("SaveMissingRanges", mock.Anything, []db.BlockRange{{FromNumber: 117, ToNumber: 117}}).Return(nil).Once()
+	collector.scanForward()
+
+	_, maxFetched, chainHead, _ := collector.GetProgress()
+	assert.Equal(t, uint64(125), maxFetched)
+	assert.Equal(t, uint64(130), chainHead)
+	mockDB.AssertExpectations(t)
+	collector.Stop()
+}

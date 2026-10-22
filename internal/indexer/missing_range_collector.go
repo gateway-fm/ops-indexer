@@ -45,6 +45,9 @@ type MissingRangeCollector struct {
 
 	// Chain head
 	chainHead uint64
+	// ceiling, when set, is realtime's cursor: the forward scan stops there, since the blocks above are realtime's
+	// to write and catch-up chasing them races it at the tip.
+	ceiling func() uint64
 
 	// State
 	backfillComplete bool
@@ -285,6 +288,13 @@ func (c *MissingRangeCollector) scanBackward() {
 	c.mu.Unlock()
 }
 
+// SetCeiling bounds the forward scan at ceiling().
+func (c *MissingRangeCollector) SetCeiling(ceiling func() uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ceiling = ceiling
+}
+
 func (c *MissingRangeCollector) scanForward() {
 	chainHead, err := c.rpc.BlockNumber(c.ctx)
 	if err != nil {
@@ -292,14 +302,22 @@ func (c *MissingRangeCollector) scanForward() {
 		return
 	}
 
+	c.mu.RLock()
+	ceiling := c.ceiling
+	c.mu.RUnlock()
+	toBlock := chainHead
+	if ceiling != nil {
+		toBlock = min(toBlock, ceiling())
+	}
+
 	c.mu.Lock()
-	if chainHead <= c.maxFetchedBlock {
+	if toBlock <= c.maxFetchedBlock {
+		c.chainHead = max(c.chainHead, chainHead)
 		c.mu.Unlock()
 		return
 	}
 
 	fromBlock := c.maxFetchedBlock + 1
-	toBlock := chainHead
 	c.mu.Unlock()
 
 	ranges, err := c.db.FindMissingBlocksInRange(c.ctx, fromBlock, toBlock)

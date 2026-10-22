@@ -36,7 +36,7 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 			size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-		ON CONFLICT (number) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		b.Number, b.Hash, b.ParentHash, b.Timestamp, b.GasUsed, b.GasLimit, b.BaseFeePerGas, b.TransactionCount,
 		b.Size, b.Difficulty, b.TotalDifficulty, b.Nonce, b.Miner, b.ExtraData, b.StateRoot, b.TransactionsRoot, b.ReceiptsRoot)
 	if err != nil {

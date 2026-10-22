@@ -593,6 +593,7 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.missingRangeCollector.SetCeiling(i.realtimeIndexer.GetLastProcessedBlock)
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {

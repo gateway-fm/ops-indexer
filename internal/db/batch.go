@@ -136,6 +136,9 @@ type AddressStatsDelta struct {
 // blocks a prefix of the chain, and it is what rules out a deadlock Postgres cannot see: a later
 // block never holds a shared row while it waits for an earlier block to commit.
 type BlockWrite struct {
+	// stored: another writer had committed this block (realtime and catch-up meet at the tip); its rows and
+	// deltas are in, so this write is dropped.
+	stored                                bool
 	tx                                    pgx.Tx
 	data                                  *BlockData
 	deltaBlocks, deltaTxs, deltaTransfers int64
@@ -153,6 +156,9 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 
 // Rollback abandons a write that will not be finished.
 func (w *BlockWrite) Rollback(ctx context.Context) {
+	if w.stored {
+		return
+	}
 	_ = w.tx.Rollback(ctx)
 }
 
@@ -230,7 +236,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 				size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-			ON CONFLICT (number) DO NOTHING`,
+			ON CONFLICT DO NOTHING`,
 			data.Block.Number, data.Block.Hash, data.Block.ParentHash, data.Block.Timestamp,
 			data.Block.GasUsed, data.Block.GasLimit, data.Block.BaseFeePerGas, data.Block.TransactionCount,
 			data.Block.Size, data.Block.Difficulty, data.Block.TotalDifficulty, data.Block.Nonce,
@@ -238,7 +244,11 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 		if err != nil {
 			return nil, err
 		}
-		deltaBlocks += ct.RowsAffected()
+		if ct.RowsAffected() == 0 {
+			_ = tx.Rollback(ctx)
+			return &BlockWrite{stored: true}, nil
+		}
+		deltaBlocks++
 	}
 
 	if len(data.Transactions) > 0 {
@@ -408,6 +418,9 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 }
 
 func (w *BlockWrite) Finish(ctx context.Context) error {
+	if w.stored {
+		return nil
+	}
 	tx, data, tokenDeltas := w.tx, w.data, w.tokenDeltas
 	defer tx.Rollback(ctx)
 	deltaBlocks, deltaTxs, deltaTransfers := w.deltaBlocks, w.deltaTxs, w.deltaTransfers
