@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
@@ -31,6 +32,9 @@ type RetentionConfig struct {
 	// EnsureInterval is how often partitions are kept ahead of the head, apart from Interval: at the catch-up rate
 	// 2 partitions last minutes, and a pass can be held for the length of a cut. Default 10 s.
 	EnsureInterval time.Duration
+	// DropGateWait bounds how long a detach or a drop waits for the ledger closer's span; past it the range is left
+	// for the next pass. Default 10 min.
+	DropGateWait time.Duration
 	// ArchiveDir, when set, receives every detached partition before it is dropped.
 	ArchiveDir string
 	// NodeHead, when set, is the chain head: the cut is placed above it, not only above the stored head, so a cut
@@ -163,7 +167,7 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 	if cfg.RetainBlocks == 0 {
 		return nil
 	}
-	if err := d.finishDetached(ctx, cfg); err != nil {
+	if finished, err := d.finishDetached(ctx, cfg); err != nil || !finished {
 		return err
 	}
 	for {
@@ -171,7 +175,7 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 		if err != nil || !pruned {
 			return err
 		}
-		if err := d.finishDetached(ctx, cfg); err != nil {
+		if finished, err := d.finishDetached(ctx, cfg); err != nil || !finished {
 			return err
 		}
 	}
@@ -183,7 +187,7 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 // The gate is held for the whole cut and taken before the check exists: waiting for a ledger span with the check in
 // force would let the head reach the cut, where every insert into the legacy partition is refused.
 func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
-	release, err := d.holdHistoryDDLGate(ctx)
+	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
 	if err != nil {
 		return err
 	}
@@ -258,7 +262,7 @@ func nextCutMargin(prev, advanced uint64) uint64 {
 // abandoned (the head came near it, a failure, a restart) leaves a validated "below the cut" check, and once the
 // head reaches it every insert into the legacy partition is refused. After the cut the check stays.
 func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
-	release, err := d.holdHistoryDDLGate(ctx)
+	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
 	if err != nil {
 		return err
 	}
@@ -297,11 +301,16 @@ func (d *DB) dropCutChecks(ctx context.Context) error {
 // shared while it closes a span, retention exclusively while it changes the history tables.
 const historyDDLGate = 4673
 
-// holdHistoryDDLGate takes the history-DDL gate exclusively on its own connection, waiting up to 30 min for the
-// span in progress; a waiting exclusive request keeps the closer from starting another. Queued behind a span read
+const cutGateWait = 30 * time.Minute
+
+// errHistoryDDLGateBusy: the closer's span outlasted the wait.
+var errHistoryDDLGateBusy = errors.New("the ledger closer held the history-DDL gate past the wait")
+
+// holdHistoryDDLGate takes the history-DDL gate exclusively on its own connection, waiting up to wait for the span
+// in progress; a waiting exclusive request keeps the closer from starting another. Queued behind a span read
 // instead, a DDL lock request would hold up ingest's own statements on the history tables. Ingest never takes the
 // gate. The returned func releases it.
-func (d *DB) holdHistoryDDLGate(ctx context.Context) (func(), error) {
+func (d *DB) holdHistoryDDLGate(ctx context.Context, wait time.Duration) (func(), error) {
 	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -311,12 +320,15 @@ func (d *DB) holdHistoryDDLGate(ctx context.Context) (func(), error) {
 		conn.Release()
 	}
 	start := time.Now()
-	if _, err := conn.Exec(ctx, `SET lock_timeout = '30min'`); err != nil {
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`SET lock_timeout = '%dms'`, wait.Milliseconds())); err != nil {
 		reset()
 		return nil, err
 	}
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, historyDDLGate); err != nil {
 		reset()
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			return nil, fmt.Errorf("%w (%s)", errHistoryDDLGateBusy, wait)
+		}
 		return nil, fmt.Errorf("wait for the ledger closer: %w", err)
 	}
 	if waited := time.Since(start); waited > time.Second {
@@ -407,12 +419,13 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 }
 
 // finishDetached completes every range past the watermark: detaches what is still attached, archives it if
-// archiving is on, and drops it once nothing more is owed.
-func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) error {
+// archiving is on, and drops it once nothing more is owed. The detach and the drop each run under the history-DDL
+// gate; when the closer holds it past DropGateWait the range is left as it is and finished reports false.
+func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) (finished bool, err error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT suffix, state FROM history_partitions WHERE state IN ('detaching', 'detached') ORDER BY lo NULLS FIRST`)
 	if err != nil {
-		return err
+		return false, err
 	}
 	type pending struct{ suffix, state string }
 	var ranges []pending
@@ -420,30 +433,46 @@ func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) error {
 		var p pending
 		if err := rows.Scan(&p.suffix, &p.state); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		ranges = append(ranges, p)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return false, err
+	}
+	wait := cfg.DropGateWait
+	if wait == 0 {
+		wait = 10 * time.Minute
+	}
+	underGate := func(step, suffix string, fn func() error) (bool, error) {
+		release, err := d.holdHistoryDDLGate(ctx, wait)
+		if errors.Is(err, errHistoryDDLGateBusy) {
+			log.Info("retention: the ledger closer kept the history-DDL gate; retrying next pass", "step", step, "range", suffix, "wait", wait)
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		defer release()
+		return true, fn()
 	}
 	for _, p := range ranges {
 		if p.state == "detaching" {
-			if err := d.detachRange(ctx, p.suffix); err != nil {
-				return err
+			if ok, err := underGate("detach", p.suffix, func() error { return d.detachRange(ctx, p.suffix) }); err != nil || !ok {
+				return false, err
 			}
 		}
 		if cfg.ArchiveDir != "" {
 			if err := d.archiveRange(ctx, cfg.ArchiveDir, p.suffix); err != nil {
-				return fmt.Errorf("archive %s: %w", p.suffix, err)
+				return false, fmt.Errorf("archive %s: %w", p.suffix, err)
 			}
 		}
-		if err := d.dropRange(ctx, p.suffix); err != nil {
-			return err
+		if ok, err := underGate("drop", p.suffix, func() error { return d.dropRange(ctx, p.suffix) }); err != nil || !ok {
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // detachRange detaches the range's partition of every history table with DETACH CONCURRENTLY (SHARE UPDATE
