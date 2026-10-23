@@ -54,12 +54,25 @@ type DailyRefillOptions struct {
 	// BatchesPerSecond limits the batch requests to the node; Batch is the calls per batch.
 	BatchesPerSecond float64
 	Batch            int
-	// Plan only finds each day's blocks and reports what a refill would cost; Dry counts and reports, writes nothing.
+	// Plan only finds each day's blocks and reports what a refill would cost. Dry counts and reports the rows and
+	// writes nothing to daily_stats; it does checkpoint the counted days, so the real run after it reads nothing
+	// from the node again.
 	Plan, Dry bool
+}
+
+// Duration is how long counting blocks takes at the request rate.
+func (o DailyRefillOptions) Duration(blocks uint64) time.Duration {
+	perBlock := uint64(1)
+	if o.Receipts {
+		perBlock = 2
+	}
+	batches := (blocks*perBlock + uint64(o.Batch) - 1) / uint64(o.Batch)
+	return time.Duration(float64(batches) / o.BatchesPerSecond * float64(time.Second))
 }
 
 type DailyRefillReport struct {
 	Days     []DayRange
+	Duration time.Duration
 	Requests int
 	Calls    int
 	Rows     []types.DailyStats
@@ -84,7 +97,7 @@ func RefillDailyStats(ctx context.Context, d DailyRefillDB, node DailyRefillNode
 		opts.Batch = 100
 	}
 	if opts.BatchesPerSecond <= 0 {
-		opts.BatchesPerSecond = 10
+		opts.BatchesPerSecond = 2
 	}
 	r := &dailyRefill{node: node, opts: opts, limiter: rate.NewLimiter(rate.Limit(opts.BatchesPerSecond), 1), ts: map[uint64]uint64{},
 		retryPause: 2 * time.Second}
@@ -94,10 +107,11 @@ func RefillDailyStats(ctx context.Context, d DailyRefillDB, node DailyRefillNode
 	}
 	r.head = head
 	report := &DailyRefillReport{}
-	var counted []db.RefillDay
+	var toCount []DayRange
+	var blocks uint64
 	for _, day := range days {
 		day = day.UTC().Truncate(24 * time.Hour)
-		if !opts.Plan && !opts.Dry {
+		if !opts.Plan {
 			saved, bodies, receipts, err := d.SavedRefillDay(ctx, day)
 			if err != nil {
 				return report, err
@@ -121,30 +135,30 @@ func RefillDailyStats(ctx context.Context, d DailyRefillDB, node DailyRefillNode
 		}
 		dr := DayRange{Date: day, First: first, End: end}
 		report.Days = append(report.Days, dr)
-		if opts.Plan {
-			continue
-		}
+		toCount = append(toCount, dr)
+		blocks += dr.Blocks()
+	}
+	report.Duration = opts.Duration(blocks)
+	log.Info("refill-daily-stats: plan", "days_to_count", len(toCount), "blocks", blocks, "batch", opts.Batch,
+		"batches_per_second", opts.BatchesPerSecond, "expected_duration", report.Duration.Round(time.Second))
+	if opts.Plan {
+		report.Requests, report.Calls = r.requests, r.calls
+		return report, nil
+	}
+	for _, dr := range toCount {
 		rd, err := r.countDay(ctx, dr)
 		if err != nil {
 			return report, err
 		}
-		log.Info("refill-daily-stats: day counted", "day", day.Format("2006-01-02"), "blocks", rd.Blocks, "txs", rd.Txs)
-		if opts.Dry {
-			counted = append(counted, rd)
-			continue
-		}
+		log.Info("refill-daily-stats: day counted", "day", dr.Date.Format("2006-01-02"), "blocks", rd.Blocks, "txs", rd.Txs)
 		if err := d.SaveRefillDay(ctx, rd); err != nil {
 			return report, err
 		}
 	}
 	report.Requests, report.Calls = r.requests, r.calls
-	if opts.Plan {
-		return report, nil
-	}
-	if !opts.Dry {
-		if counted, err = d.SavedRefillDays(ctx); err != nil {
-			return report, err
-		}
+	counted, err := d.SavedRefillDays(ctx)
+	if err != nil {
+		return report, err
 	}
 	report.Rows, err = d.WriteRefilledDailyStats(ctx, counted, opts.Dry)
 	return report, err

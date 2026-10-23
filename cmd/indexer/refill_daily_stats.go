@@ -26,10 +26,10 @@ func runRefillDailyStats(args []string, database *db.DB, rpcURL string) int {
 	to := fs.String("to", "", "last UTC day, YYYY-MM-DD (inclusive)")
 	bodies := fs.Bool("bodies", false, "fetch full transactions: avg_gas_price, active_addresses")
 	receipts := fs.Bool("receipts", false, "fetch block receipts: successful/failed, token_transfer_count")
-	perSecond := fs.Float64("rate", 10, "batch requests per second")
+	perSecond := fs.Float64("rate", 2, "batch requests per second (the node is shared: keep it low)")
 	batch := fs.Int("batch", 100, "calls per batch request (a rate-limited endpoint may need 10)")
 	plan := fs.Bool("plan", false, "find each day's blocks and print the cost; count nothing")
-	dry := fs.Bool("dry-run", false, "count and print the rows; write nothing")
+	dry := fs.Bool("dry-run", false, "count and print the rows; write nothing to daily_stats (the counted days are checkpointed, so the real run does not read them again)")
 	_ = fs.Parse(args)
 
 	first, err1 := time.Parse("2006-01-02", *from)

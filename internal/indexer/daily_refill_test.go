@@ -212,6 +212,7 @@ func TestRefilledDaysEqualAFullSync(t *testing.T) {
 		DailyRefillOptions{Bodies: true, Receipts: true, BatchesPerSecond: 1e6, Batch: 7, Plan: true})
 	require.NoError(t, err)
 	require.Len(t, plan.Days, 3)
+	require.Positive(t, plan.Duration, "the plan says how long counting takes at the rate")
 	require.Equal(t, lost, dailyRows(t, lossy, day1, day4), "a plan writes nothing")
 
 	headers, err := RefillDailyStats(ctx, lossy, chain, []time.Time{day1, day1.Add(24 * time.Hour), day3},
@@ -237,9 +238,10 @@ func TestRefilledDaysEqualAFullSync(t *testing.T) {
 	require.Equal(t, want, dry.Rows[:4], "the dry run prints the rows the refill writes")
 	require.Equal(t, lost, dailyRows(t, lossy, day1, day4), "a dry run writes nothing")
 
-	_, err = RefillDailyStats(ctx, lossy, chain, []time.Time{day1, day1.Add(24 * time.Hour), day3},
+	real, err := RefillDailyStats(ctx, lossy, chain, []time.Time{day1, day1.Add(24 * time.Hour), day3},
 		DailyRefillOptions{Bodies: true, Receipts: true, BatchesPerSecond: 1e6, Batch: 7})
 	require.NoError(t, err)
+	require.Zero(t, real.Calls, "the dry run checkpointed every day: the real run reads nothing from the node")
 	require.Equal(t, want, dailyRows(t, lossy, day1, day4), "before, boundary and after days equal a full sync")
 
 	_, err = RefillDailyStats(ctx, lossy, chain, []time.Time{day1, day1.Add(24 * time.Hour), day3},
