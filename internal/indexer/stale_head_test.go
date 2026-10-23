@@ -74,3 +74,16 @@ func TestStartChecksTheStoredHeadBeforeChoosingAMode(t *testing.T) {
 	require.ErrorContains(t, err, "stale fork")
 	mockDB.AssertCalled(t, "DeleteBlock", mock.Anything, uint64(100))
 }
+
+// In the standard loop, a revert that fails ends the tick on the stale block. Indexing on would write the new fork on
+// top of the stale blocks; only the stored-head check of the first prefetched block happened to stop it.
+func TestStandardTickStaysOnTheStaleBlockWhenTheRevertFails(t *testing.T) {
+	mockDB, mockRPC := staleHeadChain(3)
+	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(100), nil).Maybe()
+	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(errors.New("refused"))
+	mockRPC.On("RawBlockByNumber", mock.Anything, mock.Anything).Return(nil, errors.New("not read")).Maybe()
+	idx := newPrefetchIndexer(mockDB, mockRPC)
+
+	require.Equal(t, uint64(100), idx.standardTick(context.Background(), 100, 120, &receiptSkip{}))
+	mockRPC.AssertNotCalled(t, "RawBlockByNumber", mock.Anything, mock.Anything)
+}

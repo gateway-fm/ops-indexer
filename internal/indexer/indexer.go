@@ -701,29 +701,33 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 				continue
 			}
 
-			if lastIndexed > 0 {
-				reorgDepth, err := i.detectReorg(ctx, lastIndexed)
-				if err != nil {
-					log.Error("failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
-					continue
-				}
-				if reorgDepth > 0 {
-					log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
-					if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
-						log.Error("failed to handle reorg", "error", err)
-						continue
-					}
-					lastIndexed = lastIndexed - reorgDepth
-				}
-			}
-
-			if i.config.CommitPipelineDepth > 1 {
-				lastIndexed = i.indexPipelined(ctx, lastIndexed, latestOnChain, i.config.CommitPipelineDepth, &receipts)
-			} else {
-				lastIndexed = i.indexPrefetched(ctx, lastIndexed, latestOnChain, &receipts)
-			}
+			lastIndexed = i.standardTick(ctx, lastIndexed, latestOnChain, &receipts)
 		}
 	}
+}
+
+// standardTick reverts a reorg at the stored head, then indexes up to latestOnChain, and returns the new last
+// indexed block. A revert that fails ends the tick on the stale block, to retry on the next one, as realtime does:
+// indexing on would write the new fork on top of the stale blocks.
+func (i *Indexer) standardTick(ctx context.Context, lastIndexed, latestOnChain uint64, receipts *receiptSkip) uint64 {
+	if lastIndexed > 0 {
+		reorgDepth, err := i.detectReorg(ctx, lastIndexed)
+		if err != nil {
+			log.Error("failed to check for reorg", "error", err)
+		} else if reorgDepth > 0 {
+			log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
+			if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
+				log.Error("failed to handle reorg; staying on the stale block to retry", "error", err)
+				return lastIndexed
+			}
+			lastIndexed = lastIndexed - reorgDepth
+		}
+	}
+
+	if i.config.CommitPipelineDepth > 1 {
+		return i.indexPipelined(ctx, lastIndexed, latestOnChain, i.config.CommitPipelineDepth, receipts)
+	}
+	return i.indexPrefetched(ctx, lastIndexed, latestOnChain, receipts)
 }
 
 // detectReorg walks down from blockNumber comparing stored and chain hashes and
