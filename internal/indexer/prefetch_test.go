@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -398,4 +399,55 @@ func TestFailedRevertReplaysWithoutWaitingForANewBlock(t *testing.T) {
 			t.Fatalf("block %d stored as %q, want the new chain's: replayed while the head stays at 100", n, h)
 		}
 	}
+}
+
+// requestWatchChain reports, when a block request's block is read, how many of the database's block transactions
+// are still open: the pipelined loop must have committed all of them first.
+type requestWatchChain struct {
+	*fakeChain
+	requested uint64
+	openAt    func() int
+	open      chan int
+}
+
+func (c *requestWatchChain) RawBlockByNumber(ctx context.Context, n uint64) (*rpc.RawBlock, error) {
+	if n == c.requested {
+		c.open <- c.openAt()
+	}
+	return c.fakeChain.RawBlockByNumber(ctx, n)
+}
+
+// The pipelined loop serves a block request only after the blocks in flight are committed, so the
+// requested block never runs beside them. The other test's chain is empty blocks, which drain the pipeline anyway.
+func TestIndexPipelinedDrainsBeforeServingABlockRequest(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &requestWatchChain{
+		fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 400, busy: 400},
+		requested: 50,
+		open:      make(chan int, 1),
+		openAt: func() int {
+			var n int
+			require.NoError(t, sql.QueryRow(ctx, `
+				SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'idle in transaction'`).Scan(&n))
+			return n
+		},
+	}
+	idx := newTestIndexer(store, chain)
+
+	done := make(chan error, 1)
+	go func() {
+		for {
+			var n int
+			if sql.QueryRow(ctx, `SELECT count(*) FROM blocks WHERE number > 100`).Scan(&n) == nil && n >= 10 {
+				idx.indexRequests <- indexRequest{blockNumber: 50, done: done}
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	require.Equal(t, uint64(400), idx.indexPipelined(ctx, 100, 400, 4, &receiptSkip{}))
+	require.NoError(t, <-done)
+	require.Zero(t, <-chain.open, "block transactions were still open when the requested block was read")
 }
