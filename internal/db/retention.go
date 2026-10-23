@@ -364,12 +364,19 @@ func (d *DB) holdHistoryDDLGate(ctx context.Context, wait time.Duration) (func()
 func (d *DB) withLockTimeout(ctx context.Context, fn func(pgx.Tx) error) error {
 	var err error
 	for attempt := 1; attempt <= 20; attempt++ {
-		err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
-				return err
-			}
-			return fn(tx)
-		})
+		if holder, held, herr := d.longHistoryHolder(ctx); herr != nil {
+			err = herr
+		} else if held {
+			// Requesting ACCESS EXCLUSIVE now would queue every insert behind the request until it times out.
+			err = fmt.Errorf("a transaction open for %s holds a history table (pid %d, application %q)", holder.age, holder.pid, holder.app)
+		} else {
+			err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+				if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+					return err
+				}
+				return fn(tx)
+			})
+		}
 		if err == nil || ctx.Err() != nil {
 			return err
 		}
@@ -381,6 +388,38 @@ func (d *DB) withLockTimeout(ctx context.Context, fn func(pgx.Tx) error) error {
 		}
 	}
 	return err
+}
+
+type historyHolder struct {
+	pid int
+	app string
+	age time.Duration
+}
+
+// longHistoryHolder finds another backend whose transaction, open for more than a second, holds a lock on a history
+// table or one of its partitions: a reader the cut's DDL would wait for while ingest queues behind the DDL.
+// Ingest's own transactions last milliseconds and do not count.
+func (d *DB) longHistoryHolder(ctx context.Context) (historyHolder, bool, error) {
+	var h historyHolder
+	var ageMS int64
+	err := d.pool.QueryRow(ctx, `
+		SELECT a.pid, COALESCE(a.application_name, ''), (extract(epoch FROM now() - a.xact_start) * 1000)::BIGINT
+		FROM pg_locks l
+		JOIN pg_stat_activity a ON a.pid = l.pid
+		WHERE l.granted AND l.pid <> pg_backend_pid() AND a.xact_start < now() - interval '1 second'
+		  AND l.relation IN (
+		      SELECT c.oid FROM pg_class c WHERE c.relname = ANY(history_tables())
+		      UNION SELECT i.inhrelid FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent
+		            WHERE p.relname = ANY(history_tables()))
+		ORDER BY a.xact_start LIMIT 1`).Scan(&h.pid, &h.app, &ageMS)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return h, false, nil
+	}
+	if err != nil {
+		return h, false, err
+	}
+	h.age = time.Duration(ageMS) * time.Millisecond
+	return h, true, nil
 }
 
 // pruneOldest moves the watermark past the oldest attached range if it is entirely below the window, then
