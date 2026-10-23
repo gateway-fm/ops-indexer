@@ -639,3 +639,16 @@ func TestIndexerLinksCatchupToRealtime(t *testing.T) {
 	require.NotNil(t, i.catchupIndexer.realtimeBehind)
 	require.Equal(t, uint64(42), i.catchupIndexer.realtimeBehind())
 }
+
+// The collector-mode start itself links catch-up to realtime, not only linkCatchupToRealtime.
+func TestCollectorModeStartLinksCatchupToRealtime(t *testing.T) {
+	store, _ := setupPostgres(t)
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 100, busy: 100}
+	chain.On("SubscribeNewHead", mock.Anything, mock.Anything).Return(newMockSubscription(), fmt.Errorf("not supported"))
+	idx := newTestIndexer(store, chain)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.ErrorIs(t, idx.startWithMissingRangeCollector(ctx, 100), context.DeadlineExceeded, "it ran until stopped")
+	require.NotNil(t, idx.missingRangeCollector.ceiling, "the collector's forward scan is bounded by realtime's cursor")
+	require.NotNil(t, idx.catchupIndexer.realtimeBehind, "catch-up reads how far behind realtime is")
+}
