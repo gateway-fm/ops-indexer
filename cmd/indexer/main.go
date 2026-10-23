@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/gateway-fm/chain-indexer/internal/config"
@@ -177,6 +178,7 @@ func main() {
 		cancel()
 	}()
 
+	stop := &workerStop{cancel: cancel}
 	var wg sync.WaitGroup
 	wg.Add(4)
 
@@ -237,16 +239,14 @@ func main() {
 		close(reconciled)
 		log.Info("starting indexer worker")
 		if err := idx.Start(ctx); err != nil {
-			log.Error("indexer worker error", "error", err)
-			cancel()
+			stop.fail("indexer worker error", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		if err := grpcSrv.Serve(ctx); err != nil {
-			log.Error("grpc server error", "error", err)
-			cancel()
+			stop.fail("grpc server error", err)
 		}
 	}()
 
@@ -255,8 +255,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			if err := metrics.ServeMetrics(ctx, cfg.MetricsListenAddr); err != nil {
-				log.Error("metrics server error", "error", err)
-				cancel()
+				stop.fail("metrics server error", err)
 			}
 		}()
 	} else {
@@ -268,12 +267,35 @@ func main() {
 		go func() {
 			defer wg.Done()
 			if err := metrics.ServePprof(ctx, cfg.PprofListenAddr); err != nil {
-				log.Error("pprof server error", "error", err)
-				cancel()
+				stop.fail("pprof server error", err)
 			}
 		}()
 	}
 
 	wg.Wait()
 	log.Info("chain-indexer stopped")
+	if code := stop.exitCode(); code != 0 {
+		database.Close()
+		os.Exit(code)
+	}
+}
+
+// workerStop shuts the process down when a worker fails, and makes it exit non-zero then, so a refused start (a
+// stale fork it cannot revert, a chain reset) reaches restart policies and exit-code alerts like any failure.
+type workerStop struct {
+	cancel context.CancelFunc
+	failed atomic.Bool
+}
+
+func (s *workerStop) fail(what string, err error) {
+	log.Error(what, "error", err)
+	s.failed.Store(true)
+	s.cancel()
+}
+
+func (s *workerStop) exitCode() int {
+	if s.failed.Load() {
+		return 1
+	}
+	return 0
 }
