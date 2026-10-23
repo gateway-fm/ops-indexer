@@ -135,6 +135,8 @@ func ensureInterval(cfg RetentionConfig) time.Duration {
 	return cfg.EnsureInterval
 }
 
+// keepPartitionsAhead keeps partitions ahead of the higher of the stored head and the node head: after a stall,
+// realtime's jump writes at the node head before the stored head gets there.
 func (d *DB) keepPartitionsAhead(ctx context.Context, cfg RetentionConfig) {
 	ticker := time.NewTicker(ensureInterval(cfg))
 	defer ticker.Stop()
@@ -145,6 +147,11 @@ func (d *DB) keepPartitionsAhead(ctx context.Context, cfg RetentionConfig) {
 		case <-ticker.C:
 		}
 		head, err := d.GetLatestBlockNumber(ctx)
+		if err == nil && cfg.NodeHead != nil {
+			if node, nerr := cfg.NodeHead(ctx); nerr == nil && node > head {
+				head = node
+			}
+		}
 		if err == nil {
 			var made int
 			if made, err = d.EnsurePartitionsAhead(ctx, head, cfg.PartitionBlocks); made > 0 {
