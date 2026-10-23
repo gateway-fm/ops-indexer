@@ -101,6 +101,9 @@ func main() {
 			log.Fatal("failed to build the tx_hash lookup indexes", "error", err)
 		}
 	}
+	if err := database.EnsureContractsBlockIndex(context.Background()); err != nil {
+		log.Fatal("failed to build the contracts block index", "error", err)
+	}
 
 	prunedThrough, _, err := database.PrunedThrough(context.Background())
 	if err != nil {
