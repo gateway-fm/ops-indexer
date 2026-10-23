@@ -228,6 +228,9 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		metrics.ObserveStage(metrics.StageBlockTotal, time.Since(f.built.start))
 		i.afterCommit(ctx, f.built)
 		lastIndexed = f.built.blockNumber
+		if i.onIndexed != nil {
+			i.onIndexed(lastIndexed)
+		}
 		if lastIndexed%10 == 0 {
 			i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 		}
@@ -280,6 +283,9 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
 			receipts.skipped, receipts.skippedHash = b.number, b.raw.Hash
+			if i.onIndexed != nil {
+				i.onIndexed(lastIndexed)
+			}
 			continue
 		}
 		prevHash = b.raw.Hash
@@ -293,6 +299,9 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 				return lastIndexed
 			}
 			lastIndexed = b.number
+			if i.onIndexed != nil {
+				i.onIndexed(lastIndexed)
+			}
 			continue
 		}
 

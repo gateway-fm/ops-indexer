@@ -10,8 +10,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
+	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 // PRST-5438: realtime read up to ten stored hashes back from the node before every block (detectReorg) and walked
@@ -101,4 +103,63 @@ func TestRealtimeKeepsItsCursorWhenTheRevertFails(t *testing.T) {
 	rt.indexUpTo(ctx, 100, 120)
 	assert.Equal(t, uint64(100), rt.GetLastProcessedBlock(), "the cursor stays on the stale block until the revert succeeds")
 	mockRPC.AssertNotCalled(t, "RawBlockByNumber", mock.Anything, mock.Anything)
+}
+
+// With COMMIT_PIPELINE above 1, realtime commits through the pipeline as the standard loop does. It used
+// to commit one block at a time whatever the setting, ~2.8 blocks/s on 1 ms storage, so a deployment that came back
+// behind in catch-up mode jumped and never caught up.
+func TestRealtimeUsesTheCommitPipeline(t *testing.T) {
+	ctx := context.Background()
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	chain := chainOfEmptyBlocks(101, 104)
+	receipts := map[common.Hash]*rpclient.Receipt{}
+	for n, b := range chain {
+		h := common.BytesToHash(new(big.Int).SetUint64(5000 + n).Bytes())
+		b.Transactions = []rpc.RawTransaction{{Hash: h}}
+		receipts[h] = &rpclient.Receipt{Status: 1, TxHash: h, BlockNumber: new(big.Int).SetUint64(n)}
+		mockRPC.On("RawBlockByNumber", mock.Anything, n).Return(b, nil).Maybe()
+	}
+	mockRPC.On("FetchReceiptsBatch", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(receipts, nil).Maybe()
+	parent := common.BytesToHash(new(big.Int).SetUint64(1000 + 100).Bytes()).Hex()
+	mockDB.On("GetBlock", mock.Anything, uint64(100)).Return(&types.Block{Number: 100, Hash: parent}, nil).Maybe()
+	mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil)
+	mockRPC.On("RawBlockHash", mock.Anything, uint64(100)).Return(parent, nil).Maybe()
+	mockDB.On("BeginBlockData", mock.Anything, mock.Anything).Return(nil, errors.New("stop after the first begin")).Maybe()
+	mockDB.On("InsertBlockDataBatch", mock.Anything, mock.Anything).Return(errors.New("serial commit")).Maybe()
+	mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	rt := realtimeAt(mockDB, 100, 0)
+	rt.rpc = mockRPC
+	rt.idxCfg.CommitPipelineDepth = 4
+	rt.indexUpTo(ctx, 100, 104)
+	mockDB.AssertCalled(t, "BeginBlockData", mock.Anything, mock.Anything)
+	mockDB.AssertNotCalled(t, "InsertBlockDataBatch", mock.Anything, mock.Anything)
+}
+
+// Through the pipeline too, realtime's cursor moves with every committed block, as catch-up's ceiling and
+// the jump read it.
+func TestRealtimeCursorMovesPerBlockThroughThePipeline(t *testing.T) {
+	ctx := context.Background()
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	chain := chainOfEmptyBlocks(101, 110)
+	for n, b := range chain {
+		mockRPC.On("RawBlockByNumber", mock.Anything, n).Return(b, nil).Maybe()
+	}
+	parent := common.BytesToHash(new(big.Int).SetUint64(1000 + 100).Bytes()).Hex()
+	mockDB.On("GetBlock", mock.Anything, uint64(100)).Return(&types.Block{Number: 100, Hash: parent}, nil).Maybe()
+	mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil)
+	mockRPC.On("RawBlockHash", mock.Anything, uint64(100)).Return(parent, nil).Maybe()
+	rt := realtimeAt(mockDB, 100, 0)
+	rt.rpc = mockRPC
+	rt.idxCfg.CommitPipelineDepth = 4
+	cursorAtInsert := map[uint64]uint64{}
+	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		cursorAtInsert[args.Get(1).(*types.Block).Number] = rt.GetLastProcessedBlock()
+	}).Return(nil)
+	mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	rt.indexUpTo(ctx, 100, 110)
+	assert.Equal(t, uint64(110), rt.GetLastProcessedBlock())
+	for n := uint64(101); n <= 110; n++ {
+		assert.Equal(t, n-1, cursorAtInsert[n], "the cursor moves with every block")
+	}
 }

@@ -238,6 +238,10 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBloc
 		r.SetLastProcessedBlock(n)
 		r.behind.Store(safeBlock - n)
 	}
+	if depth := r.idxCfg.CommitPipelineDepth; depth > 1 {
+		r.SetLastProcessedBlock(idx.indexPipelined(ctx, lastProcessed, safeBlock, depth, &r.receipts))
+		return
+	}
 	r.SetLastProcessedBlock(idx.indexPrefetched(ctx, lastProcessed, safeBlock, &r.receipts))
 }
 
