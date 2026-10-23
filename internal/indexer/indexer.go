@@ -541,6 +541,7 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.catchupIndexer.SetRealtimeBehind(i.realtimeIndexer.Behind)
 	i.liveRealtime.Store(i.realtimeIndexer)
 
 	i.catchupRunning = true
@@ -609,6 +610,7 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.catchupIndexer.SetRealtimeBehind(i.realtimeIndexer.Behind)
 	i.liveRealtime.Store(i.realtimeIndexer)
 	i.missingRangeCollector.SetCeiling(i.realtimeIndexer.GetLastProcessedBlock)
 

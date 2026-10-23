@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -41,8 +42,11 @@ type RealtimeIndexer struct {
 
 	// State tracking
 	lastProcessedBlock uint64
-	mu                 sync.RWMutex
-	receipts           receiptSkip
+	// behind is how many blocks realtime has left before the node's safe head; catch-up yields to it (Behind).
+	behind   atomic.Uint64
+	lastSafe atomic.Uint64
+	mu       sync.RWMutex
+	receipts receiptSkip
 	// failedRevertFrom is the fork point of a revert that returned an error, until the next tick has checked what it
 	// left stored; 0 when there is none.
 	failedRevertFrom uint64
@@ -214,6 +218,7 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
 	}
 	reverted := false
 	for blockNum := r.GetLastProcessedBlock() + 1; blockNum <= safeBlock; blockNum++ {
+		r.behind.Store(safeBlock - blockNum + 1)
 		select {
 		case req := <-r.indexRequests:
 			err := r.processBlock(ctx, req.blockNumber)
@@ -310,11 +315,23 @@ func (r *RealtimeIndexer) blockIndexer() *Indexer {
 	}
 }
 
+// Behind is how many blocks realtime had left before the node's safe head when it last looked: 0 once caught up.
+func (r *RealtimeIndexer) Behind() uint64 {
+	if r.GetLastProcessedBlock() >= r.lastSafe.Load() {
+		return 0
+	}
+	return r.behind.Load()
+}
+
 // jumpIfFarBehind returns where realtime continues from. More than RealtimeMaxBehind blocks behind safeBlock (a long
 // stall), it moves to just below safeBlock, as a fresh start does, and registers the blocks it skips with catch-up:
 // walked one by one, they kept the explorer's head minutes old while the chain moved on.
 func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64) uint64 {
 	lastProcessed := r.GetLastProcessedBlock()
+	r.lastSafe.Store(safeBlock)
+	if safeBlock > lastProcessed {
+		r.behind.Store(safeBlock - lastProcessed)
+	}
 	limit := r.idxCfg.RealtimeMaxBehind
 	if limit == 0 || safeBlock <= lastProcessed+limit {
 		return lastProcessed

@@ -28,6 +28,9 @@ type CatchupIndexer struct {
 	// Missing range collector (shared with main indexer)
 	collector *MissingRangeCollector
 
+	// realtimeBehind, when set, is how far realtime is behind the node; catch-up yields to it (yieldToRealtime).
+	realtimeBehind func() uint64
+
 	// Caches (shared with main indexer)
 	tokenCache    *TokenCache
 	contractCache *ContractCache
@@ -111,6 +114,35 @@ func (c *CatchupIndexer) SetCollector(collector *MissingRangeCollector) {
 // Start runs continuously, polling for missing ranges from the collector.
 // It processes existing gaps and continues monitoring for new gaps
 // that appear when the chain head advances.
+// SetRealtimeBehind makes catch-up yield to realtime: see yieldToRealtime.
+func (c *CatchupIndexer) SetRealtimeBehind(behind func() uint64) {
+	c.realtimeBehind = behind
+}
+
+// Catch-up pauses while realtime is more than catchupYieldAbove blocks behind the node, until it is within
+// catchupResumeBelow.
+const (
+	catchupYieldAbove  = 64
+	catchupResumeBelow = 16
+)
+
+// yieldToRealtime holds a catch-up worker while realtime is behind. Catch-up's workers otherwise take every pool
+// connection: in a load test after a 20-min stall they committed ~45 blocks/s while realtime managed 1.6, so the head
+// fell behind again and realtime jumped three more times. Realtime alone is the head; catch-up gets the rest.
+func (c *CatchupIndexer) yieldToRealtime(id int) {
+	if c.realtimeBehind == nil || c.realtimeBehind() <= catchupYieldAbove {
+		return
+	}
+	log.Debug("catchup: yielding to realtime", "worker", id, "realtime_behind", c.realtimeBehind())
+	for c.realtimeBehind() > catchupResumeBelow {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func (c *CatchupIndexer) Start(ctx context.Context, fromBlock, toBlock uint64) error {
 	if c.collector != nil {
 		total, _ := c.collector.GetTotalMissingBlocks(ctx)
@@ -283,6 +315,8 @@ func (c *CatchupIndexer) worker(id int) {
 			// Every dequeue, not just the successful ones: the paths below that
 			// skip a block still drain the queue.
 			metrics.SetQueueDepth(metrics.QueueCatchup, len(c.workQueue))
+
+			c.yieldToRealtime(id)
 
 			// Block may have been indexed by another process in the meantime
 			exists, err := c.db.HasBlock(c.ctx, blockNum)
