@@ -2115,6 +2115,9 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 	// list child tables first for clarity.
 	tables := []string{
 		"daily_stats",
+		"daily_stats_acc",
+		"daily_active_addresses",
+		"daily_stats_watermark",
 		"internal_transactions",
 		"logs",
 		"token_transfers",
