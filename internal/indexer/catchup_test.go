@@ -654,3 +654,21 @@ func TestCatchupWorkersYieldWhileRealtimeIsBehind(t *testing.T) {
 	require.Eventually(t, func() bool { return atomic.LoadInt64(&catchup.processedBlocks) == 1 }, 2*time.Second, 20*time.Millisecond,
 		"the block is taken once realtime is back under 16 behind")
 }
+
+// In collector mode the indexer stops the collector's forward scan at realtime's cursor and lets
+// catch-up read how far behind realtime is.
+func TestIndexerLinksCatchupToRealtime(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	i := &Indexer{
+		catchupIndexer:        newTestCatchupIndexer(mockDB, mockRPC),
+		missingRangeCollector: NewMissingRangeCollector(mockDB, mockRPC, nil),
+		realtimeIndexer:       realtimeAt(mockDB, 777, 0),
+	}
+	i.realtimeIndexer.lastSafe.Store(819)
+	i.realtimeIndexer.behind.Store(42)
+	i.linkCatchupToRealtime()
+	require.NotNil(t, i.missingRangeCollector.ceiling, "the collector's forward scan is bounded")
+	require.Equal(t, uint64(777), i.missingRangeCollector.ceiling(), "at realtime's cursor")
+	require.NotNil(t, i.catchupIndexer.realtimeBehind)
+	require.Equal(t, uint64(42), i.catchupIndexer.realtimeBehind())
+}

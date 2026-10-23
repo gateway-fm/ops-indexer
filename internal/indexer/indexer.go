@@ -578,6 +578,13 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 	return ctx.Err()
 }
 
+// linkCatchupToRealtime makes catch-up yield while realtime is far behind and stops the collector's forward scan at
+// realtime's cursor, so the two never write the same blocks at the tip.
+func (i *Indexer) linkCatchupToRealtime() {
+	i.catchupIndexer.SetRealtimeBehind(i.realtimeIndexer.Behind)
+	i.missingRangeCollector.SetCeiling(i.realtimeIndexer.GetLastProcessedBlock)
+}
+
 func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnChain uint64) error {
 	log.Info("starting with missing range collector",
 		"start_block", i.startBlock,
@@ -612,9 +619,8 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
-	i.catchupIndexer.SetRealtimeBehind(i.realtimeIndexer.Behind)
 	i.liveRealtime.Store(i.realtimeIndexer)
-	i.missingRangeCollector.SetCeiling(i.realtimeIndexer.GetLastProcessedBlock)
+	i.linkCatchupToRealtime()
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {
