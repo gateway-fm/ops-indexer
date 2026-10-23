@@ -459,9 +459,10 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	// A tokens row can be created long after the token's first transfer was
 	// stored. Discovery needs an RPC metadata fetch, and a fetch that fails is
 	// retried on a later block while the transfers keep landing -- so those
-	// earlier transfers never reached a delta. Seed each freshly created row
-	// from the history already on disk, before this batch's own transfers are
-	// added on top below. Absolute recompute made the old code immune to this
+	// earlier transfers never reached a delta, nor did the holders a balance
+	// flush counted meanwhile. Seed each freshly created row from the history
+	// and the current balances already on disk, before this batch's own
+	// transfers are added on top below. Absolute recompute made the old code immune to this
 	// by accident; the deltas have to say it out loud.
 	//
 	// This runs once per token over that token's own index range, and for a
@@ -474,7 +475,9 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 					transfer_count = s.cnt,
 					total_supply = CASE WHEN tokens.token_type = 'ERC20'
 						THEN `+clampSupply(`s.supply`)+`
-						ELSE tokens.total_supply END
+						ELSE tokens.total_supply END,
+					holder_count = (SELECT COUNT(*) FROM token_balances_current
+						WHERE token_address = $1 AND balance > 0)
 				FROM (`+tokenStatsFromTransfers+`) AS s(cnt, supply)
 				WHERE tokens.address = $1`, addr)
 		}

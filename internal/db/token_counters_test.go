@@ -315,6 +315,32 @@ func TestTokenCounters_SeedsTokenRowCreatedAfterItsTransfers(t *testing.T) {
 	f.requireAgrees(t, d, 4, "1500")
 }
 
+// A balance flush that lands before the tokens row exists moves no holder_count, so the row is seeded
+// with the holders already in token_balances_current, as it is with the transfers already stored.
+func TestTokenCounters_SeedsHolderCountOfATokenRowCreatedAfterItsBalances(t *testing.T) {
+	d, cleanup := setupBenchDB(t)
+	defer cleanup()
+	f, drop := newCtrFixture(t, d, 5, 4_500_000)
+	defer drop()
+	ctx := context.Background()
+
+	require.NoError(t, d.InsertBalancesBatch(ctx, []*types.Balance{
+		{Address: "0xholder1", TokenAddress: f.token, BlockNumber: uint64(f.base), Balance: "500"},
+		{Address: "0xholder2", TokenAddress: f.token, BlockNumber: uint64(f.base), Balance: "200"},
+		{Address: "0xholder3", TokenAddress: f.token, BlockNumber: uint64(f.base), Balance: "0"},
+	}))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{Tokens: []*types.Token{{
+		Address: f.token, Symbol: "CTR", Decimals: 18, TokenType: types.TokenTypeERC20, BlockNumber: uint64(f.base),
+	}}}))
+
+	var stored int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT holder_count FROM tokens WHERE address = $1`, f.token).Scan(&stored))
+	want, err := d.countTokenHolders(ctx, f.token)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), want)
+	require.Equal(t, want, stored, "holder_count of a tokens row created after its holders' balances")
+}
+
 // TestTokenCounters_SupplyIsERC20OnlyButCountIsNot pins the split the two
 // counters make. transfer_count is every transfer of the token whatever its
 // type; total_supply is the ERC20 mint-minus-burn figure and must not move for
