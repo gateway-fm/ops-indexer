@@ -398,3 +398,13 @@ func (n RefillNode) BlockReceipts(ctx context.Context, numbers []uint64) ([][]*r
 	}
 	return out, n.C.BatchCallContext(ctx, "eth_getBlockReceipts", args, results)
 }
+
+// RecomputeDailyStats writes the checkpointed days again and recounts every day's history-wide columns, without the
+// node: for after a fix to the recount, or after address_stats changed (a repair, a contracts backfill).
+func RecomputeDailyStats(ctx context.Context, d DailyRefillDB, dry bool) ([]types.DailyStats, error) {
+	days, err := d.SavedRefillDays(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return d.WriteRefilledDailyStats(ctx, days, dry)
+}

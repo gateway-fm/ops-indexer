@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 )
 
@@ -48,16 +49,19 @@ const insertRefillSQL = ` (date, first_block, last_block, blocks, txs, gas_used,
 	block_time_n, gas_price_sum, active_addresses, successful_txs, failed_txs, token_transfers)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::NUMERIC, $12, $13, $14, $15)`
 
-// SaveRefillDay checkpoints a counted day.
+// SaveRefillDay checkpoints a counted day; one statement, so two runs counting the same day both succeed with the
+// same row.
 func (d *DB) SaveRefillDay(ctx context.Context, r RefillDay) error {
 	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+DailyStatsRefillTable+` (`+refillColumns+`)`); err != nil {
 		return err
 	}
-	_, err := d.pool.Exec(ctx, `DELETE FROM `+DailyStatsRefillTable+` WHERE date = $1`, r.Date)
-	if err != nil {
-		return err
-	}
-	_, err = d.pool.Exec(ctx, `INSERT INTO `+DailyStatsRefillTable+insertRefillSQL, refillArgs(r)...)
+	_, err := d.pool.Exec(ctx, `INSERT INTO `+DailyStatsRefillTable+insertRefillSQL+`
+		ON CONFLICT (date) DO UPDATE SET first_block = EXCLUDED.first_block, last_block = EXCLUDED.last_block,
+			blocks = EXCLUDED.blocks, txs = EXCLUDED.txs, gas_used = EXCLUDED.gas_used, size_sum = EXCLUDED.size_sum,
+			size_n = EXCLUDED.size_n, block_time_sum = EXCLUDED.block_time_sum, block_time_n = EXCLUDED.block_time_n,
+			gas_price_sum = EXCLUDED.gas_price_sum, active_addresses = EXCLUDED.active_addresses,
+			successful_txs = EXCLUDED.successful_txs, failed_txs = EXCLUDED.failed_txs, token_transfers = EXCLUDED.token_transfers`,
+		refillArgs(r)...)
 	return err
 }
 
@@ -115,9 +119,9 @@ var errRefillDryRun = errors.New("dry run")
 //     value.
 //   - A refilled day's sums and first block also go into daily_stats_acc, which records every day's first block from
 //     then on (a day the first run cut held a wrong one there).
-//   - Every day in daily_stats_acc gets its address and contract columns from address_stats by its first block, as
-//     daily_stats_advance does: new_* in [first, the next recorded day's first), cumulative_* below that; the
-//     newest day ends at the watermark.
+//   - Every day in daily_stats whose block span is known gets its address and contract columns from address_stats,
+//     as daily_stats_advance counts them: new_* in [its first block, the next day's), cumulative_* below the next
+//     day's; the newest day ends at the watermark (recountDailyAddressColumns).
 //   - cumulative_transactions runs backwards from the transactions_total counter: the newest aggregated day ends at
 //     the counter minus the stored transactions above the watermark, and each earlier consecutive day at the next
 //     one's minus its transactions. daily_stats_acc.txs_before follows, so later advances continue from it.
@@ -170,28 +174,7 @@ func (d *DB) WriteRefilledDailyStats(ctx context.Context, days []RefillDay, dry 
 				active_addresses = EXCLUDED.active_addresses, token_transfers = EXCLUDED.token_transfers`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `
-			WITH firsts AS (
-				SELECT date, first_block FROM daily_stats_acc WHERE first_block IS NOT NULL
-			), spans AS (
-				SELECT date, first_block AS lo,
-				       COALESCE(lead(first_block) OVER (ORDER BY date), (SELECT last_block + 1 FROM daily_stats_watermark WHERE id = 1)) AS hi
-				FROM firsts
-			), counted AS (
-				SELECT sp.date, c.*
-				FROM spans sp
-				CROSS JOIN LATERAL (
-					SELECT count(*) FILTER (WHERE first_seen >= sp.lo AND first_seen < sp.hi) AS new_addresses,
-					       count(*) FILTER (WHERE is_contract AND first_seen >= sp.lo AND first_seen < sp.hi) AS new_contracts,
-					       count(*) FILTER (WHERE first_seen < sp.hi) AS cumulative_addresses,
-					       count(*) FILTER (WHERE is_contract AND first_seen < sp.hi) AS cumulative_contracts
-					FROM address_stats
-				) c
-				WHERE sp.hi IS NOT NULL
-			)
-			UPDATE daily_stats s SET new_addresses = c.new_addresses, new_contracts = c.new_contracts,
-				cumulative_addresses = c.cumulative_addresses, cumulative_contracts = c.cumulative_contracts
-			FROM counted c WHERE s.date = c.date`); err != nil {
+		if err := recountDailyAddressColumns(ctx, tx); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -247,4 +230,137 @@ func (d *DB) WriteRefilledDailyStats(ctx context.Context, days []RefillDay, dry 
 		err = nil
 	}
 	return out, err
+}
+
+// DaySpan is a day's block range [Lo, Hi), as the address columns count it.
+type DaySpan struct {
+	Date   time.Time
+	Lo, Hi uint64
+}
+
+// DayRow is what daySpans reads of a daily_stats day: its block count, and its first block where it is recorded.
+type DayRow struct {
+	Date        time.Time
+	TotalBlocks uint64
+	FirstBlock  *uint64
+}
+
+// daySpans gives every day its block range [first, next day's first), the newest ending at watermark+1.
+//
+// A day whose first block is not recorded (a day daily_stats_acc never had a first block for, e.g. one 021 found
+// with its blocks not stored yet) is inferred from the day before: first(d+1) = first(d) + total_blocks(d). A run
+// of such days is accepted only when it lands exactly on the next recorded first block, which verifies every
+// total_blocks it used; otherwise those days are left out. A day is never stretched over a neighbour whose start
+// is unknown, as the recount used to (on a production deployment one day took the next two days' addresses). It returns the spans, the first blocks it
+// inferred, and the days it left out.
+func daySpans(days []DayRow, watermark uint64) (spans []DaySpan, inferred map[time.Time]uint64, skipped []time.Time) {
+	first := make([]*uint64, len(days))
+	for i := range days {
+		first[i] = days[i].FirstBlock
+	}
+	next := func(i int) bool { return i+1 < len(days) && days[i+1].Date.Equal(days[i].Date.Add(24*time.Hour)) }
+	inferred = map[time.Time]uint64{}
+	for i := 1; i < len(days); i++ {
+		if first[i] != nil || first[i-1] == nil || !next(i-1) {
+			continue
+		}
+		j, at := i, *first[i-1]+days[i-1].TotalBlocks
+		guess := map[int]uint64{}
+		for ; j < len(days) && first[j] == nil; j++ {
+			if j > i && !next(j-1) {
+				break
+			}
+			guess[j] = at
+			at += days[j].TotalBlocks
+		}
+		if j < len(days) && first[j] != nil && next(j-1) && at == *first[j] {
+			for k, v := range guess {
+				v := v
+				first[k] = &v
+				inferred[days[k].Date] = v
+			}
+		}
+		i = j
+	}
+	for i, d := range days {
+		switch {
+		case first[i] == nil:
+			skipped = append(skipped, d.Date)
+		case i == len(days)-1:
+			if watermark+1 > *first[i] {
+				spans = append(spans, DaySpan{Date: d.Date, Lo: *first[i], Hi: watermark + 1})
+			} else {
+				skipped = append(skipped, d.Date)
+			}
+		case next(i) && first[i+1] != nil:
+			spans = append(spans, DaySpan{Date: d.Date, Lo: *first[i], Hi: *first[i+1]})
+		default:
+			skipped = append(skipped, d.Date)
+		}
+	}
+	return spans, inferred, skipped
+}
+
+// recountDailyAddressColumns sets new/cumulative addresses and contracts on every day whose block range daySpans
+// knows, records the first blocks it inferred in daily_stats_acc, and logs the days it could not place.
+func recountDailyAddressColumns(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, `
+		SELECT d.date, d.total_blocks, a.first_block FROM daily_stats d LEFT JOIN daily_stats_acc a USING (date) ORDER BY d.date`)
+	if err != nil {
+		return err
+	}
+	var days []DayRow
+	for rows.Next() {
+		var r DayRow
+		var total int64
+		var firstBlock *int64
+		if err := rows.Scan(&r.Date, &total, &firstBlock); err != nil {
+			rows.Close()
+			return err
+		}
+		r.TotalBlocks = uint64(total)
+		if firstBlock != nil {
+			v := uint64(*firstBlock)
+			r.FirstBlock = &v
+		}
+		days = append(days, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var watermark int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT last_block FROM daily_stats_watermark WHERE id = 1), -1)`).Scan(&watermark); err != nil {
+		return err
+	}
+	spans, inferred, skipped := daySpans(days, uint64(max(watermark, 0)))
+	for date, first := range inferred {
+		if _, err := tx.Exec(ctx, `UPDATE daily_stats_acc SET first_block = $2 WHERE date = $1 AND first_block IS NULL`, date, int64(first)); err != nil {
+			return err
+		}
+	}
+	if len(skipped) > 0 {
+		log.Warn("daily_stats: days whose block range is unknown keep their address columns", "days", skipped)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE refill_spans (date DATE PRIMARY KEY, lo BIGINT NOT NULL, hi BIGINT NOT NULL) ON COMMIT DROP`); err != nil {
+		return err
+	}
+	for _, sp := range spans {
+		if _, err := tx.Exec(ctx, `INSERT INTO refill_spans VALUES ($1, $2, $3)`, sp.Date, int64(sp.Lo), int64(sp.Hi)); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE daily_stats s SET new_addresses = c.new_addresses, new_contracts = c.new_contracts,
+			cumulative_addresses = c.cumulative_addresses, cumulative_contracts = c.cumulative_contracts
+		FROM refill_spans sp
+		CROSS JOIN LATERAL (
+			SELECT count(*) FILTER (WHERE first_seen >= sp.lo AND first_seen < sp.hi) AS new_addresses,
+			       count(*) FILTER (WHERE is_contract AND first_seen >= sp.lo AND first_seen < sp.hi) AS new_contracts,
+			       count(*) FILTER (WHERE first_seen < sp.hi) AS cumulative_addresses,
+			       count(*) FILTER (WHERE is_contract AND first_seen < sp.hi) AS cumulative_contracts
+			FROM address_stats
+		) c
+		WHERE s.date = sp.date`)
+	return err
 }
