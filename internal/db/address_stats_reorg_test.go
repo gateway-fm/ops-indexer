@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
@@ -72,4 +73,36 @@ func TestReorgRevertsAddressCounters(t *testing.T) {
 			require.NotEqual(t, "address", dr.Family, "address counters agree with the rows: %+v", dr)
 		}
 	}
+}
+
+// DeleteBlock takes address_stats before chain_counters, the order every writer uses. While a writer
+// holds an address row, a revert touching that address waits there, holding no chain_counters row, so a writer
+// that next wants chain_counters goes ahead instead of deadlocking.
+func TestDeleteBlockTakesAddressStatsBeforeChainCounters(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBlock("old")))
+
+	writer, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer writer.Rollback(ctx)
+	_, err = writer.Exec(ctx, `SELECT 1 FROM address_stats WHERE address = '0xa' FOR UPDATE`)
+	require.NoError(t, err)
+
+	reverted := make(chan error, 1)
+	go func() { reverted <- d.DeleteBlock(ctx, 10) }()
+	time.Sleep(300 * time.Millisecond)
+
+	other, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer other.Rollback(ctx)
+	_, err = other.Exec(ctx, `SET LOCAL lock_timeout = '1s'`)
+	require.NoError(t, err)
+	_, err = other.Exec(ctx, `UPDATE chain_counters SET count = count WHERE name = 'blocks_total'`)
+	require.NoError(t, err, "the waiting revert holds no chain_counters row")
+	require.NoError(t, other.Rollback(ctx))
+
+	require.NoError(t, writer.Rollback(ctx))
+	require.NoError(t, <-reverted)
 }
