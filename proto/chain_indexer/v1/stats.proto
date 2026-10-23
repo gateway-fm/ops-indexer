@@ -24,6 +24,10 @@ message ChainStats {
   uint64 pruned_through_block = 9;
   // Timestamp of pruned_through_block (unset: nothing pruned).
   google.protobuf.Timestamp pruned_through_timestamp = 10;
+  // 11 and 12 are stats_incomplete and stats_backfilled_through_block, the stats backfill on prune/after-demo.
+  reserved 11, 12;
+  // Tokens the indexer has discovered (chain_counters tokens_total).
+  uint64 total_tokens = 13;
 }
 
 // TransactionHistoryBucket is one bin in a tx-count-over-time histogram.

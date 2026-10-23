@@ -450,7 +450,7 @@ func mapChainStats(c *types.ChainStats) *indexerv1.ChainStats {
 		TotalBlocks:        uint64(c.TotalBlocks),
 		TotalTransactions:  uint64(c.TotalTransactions),
 		TotalAddresses:     uint64(c.TotalAddresses),
-		TotalContracts:     0, // not in types.ChainStats; populate if extended
+		TotalTokens:        uint64(c.TotalTokens),
 		AvgBlockTimeSeconds: float32(c.AvgBlockTime),
 	}
 }
