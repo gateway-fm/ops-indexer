@@ -311,7 +311,8 @@ func (r *RealtimeIndexer) Behind() uint64 {
 // jumpIfFarBehind returns where realtime continues from. More than RealtimeMaxBehind blocks behind safeBlock (a long
 // stall), it moves to just below safeBlock, as a fresh start does, and registers the blocks it skips with catch-up:
 // walked one by one, they kept the explorer's head minutes old while the chain moved on. It does not jump while a
-// revert is pending: catch-up fills only the skipped blocks and never compares the stale fork below them.
+// revert is pending, nor over a head the node has replaced: catch-up fills only the skipped blocks and never
+// compares the stale fork below them.
 func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64) uint64 {
 	lastProcessed := r.GetLastProcessedBlock()
 	r.lastSafe.Store(safeBlock)
@@ -321,6 +322,13 @@ func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64)
 	limit := r.idxCfg.RealtimeMaxBehind
 	if limit == 0 || safeBlock <= lastProcessed+limit || r.revertPending.Load() {
 		return lastProcessed
+	}
+	// A head the node has replaced is reverted from where it stands first: the jump would leave it below the cursor,
+	// where nothing compares it again.
+	if lastProcessed > 0 {
+		if depth, err := r.detectReorg(ctx, lastProcessed); err != nil || depth > 0 {
+			return lastProcessed
+		}
 	}
 	skipped := db.BlockRange{FromNumber: lastProcessed + 1, ToNumber: safeBlock - 1}
 	if err := r.db.SaveMissingRanges(ctx, []db.BlockRange{skipped}); err != nil {

@@ -26,6 +26,8 @@ func TestRealtimeJumpsToTheHeadAfterALongStall(t *testing.T) {
 
 	mockDB := new(MockDatabase)
 	rt := realtimeAt(mockDB, 10_000, 1_000)
+	// Nothing is stored below the cursor here, so the reorg check before the jump has nothing to compare.
+	mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	mockDB.On("SaveMissingRanges", mock.Anything, []db.BlockRange{{FromNumber: 10_001, ToNumber: 14_999}}).Return(nil).Once()
 	assert.Equal(t, uint64(14_999), rt.jumpIfFarBehind(ctx, 15_000), "the next block realtime writes is the safe head")
 	assert.Equal(t, uint64(14_999), rt.GetLastProcessedBlock())
@@ -40,6 +42,7 @@ func TestRealtimeJumpsToTheHeadAfterALongStall(t *testing.T) {
 
 	failing := new(MockDatabase)
 	rt = realtimeAt(failing, 10_000, 1_000)
+	failing.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	failing.On("SaveMissingRanges", mock.Anything, mock.Anything).Return(errors.New("down")).Once()
 	assert.Equal(t, uint64(10_000), rt.jumpIfFarBehind(ctx, 15_000), "no jump unless catch-up has the skipped blocks")
 }

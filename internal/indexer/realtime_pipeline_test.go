@@ -190,3 +190,25 @@ func TestRealtimeDoesNotJumpWhileARevertIsPending(t *testing.T) {
 	assert.Equal(t, uint64(100), rt.GetLastProcessedBlock())
 	mockDB.AssertNotCalled(t, "SaveMissingRanges", mock.Anything, mock.Anything)
 }
+
+// Realtime does not jump past a stored head the node has replaced. The jump moves the cursor above it,
+// and catch-up never compares it, so the stale block would stay stored.
+func TestRealtimeDoesNotJumpPastAReorgedHead(t *testing.T) {
+	ctx := context.Background()
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	for n := uint64(91); n <= 100; n++ {
+		stored := fmt.Sprintf("0x%064x", 1000+n)
+		chain := stored
+		if n == 100 {
+			chain = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil).Maybe()
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil).Maybe()
+	}
+	mockDB.On("SaveMissingRanges", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	rt := realtimeAt(mockDB, 100, 1_000)
+	rt.rpc = mockRPC
+	assert.Equal(t, uint64(100), rt.jumpIfFarBehind(ctx, 2_100), "no jump over a reorged head")
+	mockDB.AssertNotCalled(t, "SaveMissingRanges", mock.Anything, mock.Anything)
+}
