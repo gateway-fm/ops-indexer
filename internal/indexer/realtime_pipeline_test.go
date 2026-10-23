@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"testing"
 
@@ -46,4 +47,33 @@ func TestRealtimeChecksForAReorgOncePerBatch(t *testing.T) {
 	for n := uint64(101); n <= 120; n++ {
 		assert.Equal(t, n-1, cursorAtInsert[n], "the cursor moves with every block, not at the end of the batch")
 	}
+}
+
+// PRST-5320 with PRST-5438: realtime checks for a reorg once per batch, and that one check still reverts every
+// mismatching block below the head, not only the head. Blocks 98-100 are stale: all three are deleted and the
+// batch resumes at 97.
+func TestRealtimeBatchRevertsADepthThreeReorg(t *testing.T) {
+	ctx := context.Background()
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	for n := uint64(91); n <= 100; n++ {
+		stored := fmt.Sprintf("0x%064x", 1000+n)
+		chain := stored
+		if n >= 98 {
+			stored = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil).Maybe()
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil).Maybe()
+	}
+	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(100), nil)
+	var deleted []uint64
+	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		deleted = append(deleted, args.Get(1).(uint64))
+	}).Return(nil)
+
+	rt := realtimeAt(mockDB, 100, 0)
+	rt.rpc = mockRPC
+	rt.indexUpTo(ctx, 100, 120)
+	assert.Equal(t, []uint64{100, 99, 98}, deleted, "every stale block, not only the head")
+	assert.Equal(t, uint64(97), rt.GetLastProcessedBlock())
+	mockRPC.AssertNotCalled(t, "RawBlockByNumber", mock.Anything, mock.Anything)
 }
