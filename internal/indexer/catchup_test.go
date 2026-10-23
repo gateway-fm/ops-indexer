@@ -574,3 +574,23 @@ func TestRealtimeIndexer_ReorgError_DoesNotDeleteBlocks(t *testing.T) {
 
 	rt.Stop()
 }
+
+// Realtime's detector reports the deepest stale block in its window, not the first one it meets,
+// so every stale block is reverted (PRST-5320).
+func TestRealtimeIndexer_DetectReorg_ReportsTheDeepestStaleBlock(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	rt := NewRealtimeIndexer(mockDB, mockRPC, &RealtimeConfig{ConfirmationBlocks: 1, PollInterval: 100 * time.Millisecond},
+		&Config{}, NewTokenCache(), NewContractCache(), nil, false)
+	for n := uint64(91); n <= 100; n++ {
+		stored := fmt.Sprintf("0x%064x", 1000+n)
+		chain := stored
+		if n >= 98 {
+			stored = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil)
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil)
+	}
+	depth, err := rt.detectReorg(context.Background(), 100)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(3), depth, "blocks 98, 99 and 100 are stale")
+}
