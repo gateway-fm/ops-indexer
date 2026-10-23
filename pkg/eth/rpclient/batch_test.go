@@ -3,6 +3,7 @@ package rpclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -50,5 +51,17 @@ func TestBatchCallContextMatchesRepliesById(t *testing.T) {
 	failOn = "c"
 	if err := c.BatchCallContext(context.Background(), "m", [][]any{{"a"}, {"c"}}, []any{new(string), new(string)}); err == nil {
 		t.Fatal("an element's error must fail the batch")
+	}
+}
+
+func TestBatchCallContextReportsTheHTTPStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	err := Dial(srv.URL).BatchCallContext(context.Background(), "m", [][]any{{"a"}}, []any{new(string)})
+	var status *HTTPStatusError
+	if !errors.As(err, &status) || status.Code != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want HTTP 429", err)
 	}
 }

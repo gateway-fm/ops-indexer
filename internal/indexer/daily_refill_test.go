@@ -12,6 +12,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"golang.org/x/time/rate"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -245,4 +246,35 @@ func TestRefilledDaysEqualAFullSync(t *testing.T) {
 		DailyRefillOptions{Bodies: true, Receipts: true, BatchesPerSecond: 1e6, Batch: 7})
 	require.NoError(t, err)
 	require.Equal(t, want, dailyRows(t, lossy, day1, day4), "a rerun resumes from the checkpointed days and changes nothing")
+}
+
+// throttledChain answers the first refused batches with HTTP 429, as some public RPC endpoints do for large batches.
+type throttledChain struct {
+	*refillChain
+	refused int
+}
+
+func (c *throttledChain) Blocks(ctx context.Context, numbers []uint64, bodies bool) ([]*RefillBlock, error) {
+	if c.refused > 0 {
+		c.refused--
+		return nil, &rpclient.HTTPStatusError{Code: 429}
+	}
+	return c.refillChain.Blocks(ctx, numbers, bodies)
+}
+
+// A throttled batch is retried after a pause; a day is not lost half-way to a rate-limiting proxy.
+func TestRefillRetriesAThrottledBatch(t *testing.T) {
+	chain := &throttledChain{refillChain: newRefillChain(), refused: 3}
+	r := &dailyRefill{node: chain, opts: DailyRefillOptions{Batch: 10}, limiter: rate.NewLimiter(rate.Inf, 1), ts: map[uint64]uint64{},
+		retryPause: time.Millisecond}
+	r.head = uint64(len(chain.blocks))
+	rd, err := r.countDay(context.Background(), DayRange{Date: chain.day0, First: 5, End: 40})
+	require.NoError(t, err)
+	require.EqualValues(t, 35, rd.Blocks)
+	require.Zero(t, chain.refused)
+
+	chain.refused = 10
+	_, err = r.countDay(context.Background(), DayRange{Date: chain.day0, First: 5, End: 40})
+	var status *rpclient.HTTPStatusError
+	require.ErrorAs(t, err, &status, "refused six times in a row: the error is reported")
 }

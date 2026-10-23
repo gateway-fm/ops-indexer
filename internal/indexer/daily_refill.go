@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -85,7 +86,8 @@ func RefillDailyStats(ctx context.Context, d DailyRefillDB, node DailyRefillNode
 	if opts.BatchesPerSecond <= 0 {
 		opts.BatchesPerSecond = 10
 	}
-	r := &dailyRefill{node: node, opts: opts, limiter: rate.NewLimiter(rate.Limit(opts.BatchesPerSecond), 1), ts: map[uint64]uint64{}}
+	r := &dailyRefill{node: node, opts: opts, limiter: rate.NewLimiter(rate.Limit(opts.BatchesPerSecond), 1), ts: map[uint64]uint64{},
+		retryPause: 2 * time.Second}
 	head, err := node.BlockNumber(ctx)
 	if err != nil {
 		return nil, err
@@ -155,15 +157,39 @@ type dailyRefill struct {
 	head            uint64
 	ts              map[uint64]uint64
 	requests, calls int
+	retryPause      time.Duration
+}
+
+// withRetry runs one batch request, again after a pause on a 429 or 5xx (a throttling proxy), up to 6 times.
+func (r *dailyRefill) withRetry(ctx context.Context, calls int, fn func() error) error {
+	pause := r.retryPause
+	for attempt := 1; ; attempt++ {
+		if err := r.limiter.Wait(ctx); err != nil {
+			return err
+		}
+		r.requests++
+		r.calls += calls
+		err := fn()
+		var status *rpclient.HTTPStatusError
+		if err == nil || attempt == 6 || !errors.As(err, &status) || (status.Code != 429 && status.Code < 500) {
+			return err
+		}
+		log.Warn("refill-daily-stats: node refused a batch; retrying", "status", status.Code, "attempt", attempt, "pause", pause)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pause):
+		}
+		pause *= 2
+	}
 }
 
 func (r *dailyRefill) blocks(ctx context.Context, numbers []uint64, bodies bool) ([]*RefillBlock, error) {
-	if err := r.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-	r.requests++
-	r.calls += len(numbers)
-	out, err := r.node.Blocks(ctx, numbers, bodies)
+	var out []*RefillBlock
+	err := r.withRetry(ctx, len(numbers), func() (err error) {
+		out, err = r.node.Blocks(ctx, numbers, bodies)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -254,13 +280,11 @@ func (r *dailyRefill) countDay(ctx context.Context, dr DayRange) (db.RefillDay, 
 			delete(r.ts, b.Number)
 		}
 		if r.opts.Receipts {
-			if err := r.limiter.Wait(ctx); err != nil {
-				return rd, err
-			}
-			r.requests++
-			r.calls += len(numbers)
-			receipts, err := r.node.BlockReceipts(ctx, numbers)
-			if err != nil {
+			var receipts [][]*rpclient.Receipt
+			if err := r.withRetry(ctx, len(numbers), func() (err error) {
+				receipts, err = r.node.BlockReceipts(ctx, numbers)
+				return err
+			}); err != nil {
 				return rd, err
 			}
 			for _, block := range receipts {

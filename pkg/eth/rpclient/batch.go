@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// HTTPStatusError is a reply whose HTTP status is not 200, e.g. 429 from a rate-limiting proxy.
+type HTTPStatusError struct{ Code int }
+
+func (e *HTTPStatusError) Error() string { return fmt.Sprintf("rpc: HTTP %d", e.Code) }
+
 // BatchCallContext sends one JSON-RPC batch: method once per args[i], each result decoded into results[i]. A null
 // result leaves results[i] as it is; any element's error fails the batch.
 func (c *Client) BatchCallContext(ctx context.Context, method string, args [][]any, results []any) error {
@@ -50,6 +55,9 @@ func (c *Client) BatchCallContext(ctx context.Context, method string, args [][]a
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("rpc: read batch response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &HTTPStatusError{Code: resp.StatusCode}
 	}
 	var replies []jsonrpcResponse
 	if err := json.Unmarshal(respBody, &replies); err != nil {
