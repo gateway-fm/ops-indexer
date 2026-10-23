@@ -89,6 +89,7 @@ type ChainStats struct {
 	PrunedThroughBlock uint64 `protobuf:"varint,9,opt,name=pruned_through_block,json=prunedThroughBlock,proto3" json:"pruned_through_block,omitempty"`
 	// Timestamp of pruned_through_block (unset: nothing pruned).
 	PrunedThroughTimestamp *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=pruned_through_timestamp,json=prunedThroughTimestamp,proto3" json:"pruned_through_timestamp,omitempty"`
+	// 11 and 12 are left free for the stats backfill's fields.
 	// Tokens the indexer has discovered (chain_counters tokens_total).
 	TotalTokens   uint64 `protobuf:"varint,13,opt,name=total_tokens,json=totalTokens,proto3" json:"total_tokens,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -830,7 +831,7 @@ var File_chain_indexer_v1_stats_proto protoreflect.FileDescriptor
 
 const file_chain_indexer_v1_stats_proto_rawDesc = "" +
 	"\n" +
-	"\x1cchain_indexer/v1/stats.proto\x12\x10chain_indexer.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dchain_indexer/v1/common.proto\"\xc7\x04\n" +
+	"\x1cchain_indexer/v1/stats.proto\x12\x10chain_indexer.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dchain_indexer/v1/common.proto\"\xbb\x04\n" +
 	"\n" +
 	"ChainStats\x12.\n" +
 	"\x13latest_block_number\x18\x01 \x01(\x04R\x11latestBlockNumber\x12P\n" +
@@ -844,7 +845,7 @@ const file_chain_indexer_v1_stats_proto_rawDesc = "" +
 	"\x14pruned_through_block\x18\t \x01(\x04R\x12prunedThroughBlock\x12T\n" +
 	"\x18pruned_through_timestamp\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\x16prunedThroughTimestamp\x12!\n" +
-	"\ftotal_tokens\x18\r \x01(\x04R\vtotalTokensJ\x04\b\v\x10\fJ\x04\b\f\x10\r\"\xc1\x01\n" +
+	"\ftotal_tokens\x18\r \x01(\x04R\vtotalTokens\"\xc1\x01\n" +
 	"\x18TransactionHistoryBucket\x12=\n" +
 	"\fbucket_start\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\vbucketStart\x129\n" +
 	"\n" +

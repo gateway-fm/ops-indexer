@@ -24,8 +24,7 @@ message ChainStats {
   uint64 pruned_through_block = 9;
   // Timestamp of pruned_through_block (unset: nothing pruned).
   google.protobuf.Timestamp pruned_through_timestamp = 10;
-  // 11 and 12 are stats_incomplete and stats_backfilled_through_block, the stats backfill on prune/after-demo.
-  reserved 11, 12;
+  // 11 and 12 are left free for the stats backfill's fields.
   // Tokens the indexer has discovered (chain_counters tokens_total).
   uint64 total_tokens = 13;
 }
