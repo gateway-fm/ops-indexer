@@ -163,3 +163,30 @@ func TestRealtimeCursorMovesPerBlockThroughThePipeline(t *testing.T) {
 		assert.Equal(t, n-1, cursorAtInsert[n], "the cursor moves with every block")
 	}
 }
+
+// While a revert keeps failing, realtime does not jump to the head however far behind it falls. The jump
+// moves the cursor past the stale fork, which catch-up never compares, so the fork would stay stored after all.
+func TestRealtimeDoesNotJumpWhileARevertIsPending(t *testing.T) {
+	ctx := context.Background()
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	for n := uint64(91); n <= 100; n++ {
+		stored := fmt.Sprintf("0x%064x", 1000+n)
+		chain := stored
+		if n >= 98 {
+			stored = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil).Maybe()
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil).Maybe()
+	}
+	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(100), nil)
+	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(errors.New("daily_stats_invalidate: day partly pruned"))
+
+	mockDB.On("SaveMissingRanges", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	rt := realtimeAt(mockDB, 100, 1_000)
+	rt.rpc = mockRPC
+	rt.indexUpTo(ctx, rt.jumpIfFarBehind(ctx, 120), 120)
+	assert.Equal(t, uint64(100), rt.jumpIfFarBehind(ctx, 2_100), "no jump while the revert is pending")
+	assert.Equal(t, uint64(100), rt.GetLastProcessedBlock())
+	mockDB.AssertNotCalled(t, "SaveMissingRanges", mock.Anything, mock.Anything)
+}

@@ -51,6 +51,9 @@ type RealtimeIndexer struct {
 	// left stored; 0 when there is none.
 	failedRevertFrom uint64
 
+	// revertPending is set while a reorg revert keeps failing: realtime stays on the stale block and does not jump.
+	revertPending atomic.Bool
+
 	// Coordination
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -226,8 +229,10 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBloc
 			log.Warn("realtime: detected reorg", "depth", depth)
 			if err := r.handleReorg(ctx, lastProcessed+1-depth); err != nil {
 				log.Error("realtime: failed to handle reorg; staying on the stale block to retry", "error", err)
+				r.revertPending.Store(true)
 				return
 			}
+			r.revertPending.Store(false)
 			r.SetLastProcessedBlock(lastProcessed - depth)
 			return
 		}
@@ -305,7 +310,8 @@ func (r *RealtimeIndexer) Behind() uint64 {
 
 // jumpIfFarBehind returns where realtime continues from. More than RealtimeMaxBehind blocks behind safeBlock (a long
 // stall), it moves to just below safeBlock, as a fresh start does, and registers the blocks it skips with catch-up:
-// walked one by one, they kept the explorer's head minutes old while the chain moved on.
+// walked one by one, they kept the explorer's head minutes old while the chain moved on. It does not jump while a
+// revert is pending: catch-up fills only the skipped blocks and never compares the stale fork below them.
 func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64) uint64 {
 	lastProcessed := r.GetLastProcessedBlock()
 	r.lastSafe.Store(safeBlock)
@@ -313,7 +319,7 @@ func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64)
 		r.behind.Store(safeBlock - lastProcessed)
 	}
 	limit := r.idxCfg.RealtimeMaxBehind
-	if limit == 0 || safeBlock <= lastProcessed+limit {
+	if limit == 0 || safeBlock <= lastProcessed+limit || r.revertPending.Load() {
 		return lastProcessed
 	}
 	skipped := db.BlockRange{FromNumber: lastProcessed + 1, ToNumber: safeBlock - 1}
