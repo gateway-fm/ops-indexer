@@ -96,10 +96,18 @@ func (d *DB) EnsureHistoryPartitions(ctx context.Context, upto, sizeBlocks uint6
 // RunRetention keeps partitions ahead of the head once the history is cut and, with a window, cuts it and drops
 // whole ranges below the window. With RetainBlocks 0 on an uncut database it returns at once.
 func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
-	cut, err := d.HistoryCut(ctx)
-	if err != nil {
-		log.Error("retention: read partition state failed", "error", err)
-		return
+	var cut bool
+	for {
+		var err error
+		if cut, err = d.HistoryCut(ctx); err == nil {
+			break
+		}
+		log.Error("retention: read partition state failed; retrying", "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(ensureInterval(cfg)):
+		}
 	}
 	if !cut && cfg.RetainBlocks == 0 {
 		return
@@ -119,12 +127,16 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 	}
 }
 
-func (d *DB) keepPartitionsAhead(ctx context.Context, cfg RetentionConfig) {
-	interval := cfg.EnsureInterval
-	if interval == 0 {
-		interval = 10 * time.Second
+// ensureInterval is how often partitions are kept ahead, and how long a failed start waits before reading again.
+func ensureInterval(cfg RetentionConfig) time.Duration {
+	if cfg.EnsureInterval == 0 {
+		return 10 * time.Second
 	}
-	ticker := time.NewTicker(interval)
+	return cfg.EnsureInterval
+}
+
+func (d *DB) keepPartitionsAhead(ctx context.Context, cfg RetentionConfig) {
+	ticker := time.NewTicker(ensureInterval(cfg))
 	defer ticker.Stop()
 	for {
 		select {
