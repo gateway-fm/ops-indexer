@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"testing"
@@ -75,5 +76,29 @@ func TestRealtimeBatchRevertsADepthThreeReorg(t *testing.T) {
 	rt.indexUpTo(ctx, 100, 120)
 	assert.Equal(t, []uint64{100, 99, 98}, deleted, "every stale block, not only the head")
 	assert.Equal(t, uint64(97), rt.GetLastProcessedBlock())
+	mockRPC.AssertNotCalled(t, "RawBlockByNumber", mock.Anything, mock.Anything)
+}
+
+// When the revert fails, realtime stays on the stale block and retries. Moving the cursor below the fork
+// would hide the reorg from the next check, and the new fork's blocks would then be dropped as already stored.
+func TestRealtimeKeepsItsCursorWhenTheRevertFails(t *testing.T) {
+	ctx := context.Background()
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	for n := uint64(91); n <= 100; n++ {
+		stored := fmt.Sprintf("0x%064x", 1000+n)
+		chain := stored
+		if n >= 98 {
+			stored = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil).Maybe()
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil).Maybe()
+	}
+	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(100), nil)
+	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(errors.New("daily_stats_invalidate: day partly pruned"))
+
+	rt := realtimeAt(mockDB, 100, 0)
+	rt.rpc = mockRPC
+	rt.indexUpTo(ctx, 100, 120)
+	assert.Equal(t, uint64(100), rt.GetLastProcessedBlock(), "the cursor stays on the stale block until the revert succeeds")
 	mockRPC.AssertNotCalled(t, "RawBlockByNumber", mock.Anything, mock.Anything)
 }

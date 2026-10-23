@@ -225,7 +225,8 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBloc
 		} else if depth > 0 {
 			log.Warn("realtime: detected reorg", "depth", depth)
 			if err := r.handleReorg(ctx, lastProcessed+1-depth); err != nil {
-				log.Error("realtime: failed to handle reorg", "error", err)
+				log.Error("realtime: failed to handle reorg; staying on the stale block to retry", "error", err)
+				return
 			}
 			r.SetLastProcessedBlock(lastProcessed - depth)
 			return
