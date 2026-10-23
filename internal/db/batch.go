@@ -844,12 +844,17 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	// The days' address columns were counted from the address_stats this replaced (migration 021 reads 0.4.0's), so
 	// they are recounted from the rebuilt one, under daily_stats_advance's lock. A separate transaction: waiting for
 	// that lock while holding address_stats would deadlock with an advance reading it.
-	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
 			return err
 		}
 		return recountDailyAddressColumns(ctx, tx)
 	})
+	if err != nil {
+		return fmt.Errorf("address_stats is rebuilt, but recounting the days' address columns failed "+
+			"(refill-daily-stats --recompute-only repeats it): %w", err)
+	}
+	return nil
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {

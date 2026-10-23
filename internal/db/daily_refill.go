@@ -350,17 +350,31 @@ func recountDailyAddressColumns(ctx context.Context, tx pgx.Tx) error {
 			return err
 		}
 	}
+	// One pass over address_stats: each address goes to the first span ending above its first_seen, new in it when
+	// first_seen is also at or above the span's start, and the cumulative columns are running sums in span order.
+	// A count per day read address_stats once for every day, under the advance's lock.
+	if _, err := tx.Exec(ctx, `CREATE INDEX ON refill_spans (hi)`); err != nil {
+		return err
+	}
 	_, err = tx.Exec(ctx, `
+		WITH placed AS (
+			SELECT sp.date, a.first_seen >= sp.lo AS new, a.is_contract
+			FROM address_stats a
+			CROSS JOIN LATERAL (SELECT date, lo FROM refill_spans WHERE hi > a.first_seen ORDER BY hi LIMIT 1) sp
+			WHERE a.first_seen IS NOT NULL
+		), per_day AS (
+			SELECT date, count(*) FILTER (WHERE new) AS new_addresses, count(*) FILTER (WHERE new AND is_contract) AS new_contracts,
+			       count(*) AS below, count(*) FILTER (WHERE is_contract) AS below_contracts
+			FROM placed GROUP BY date
+		), c AS (
+			SELECT sp.date, COALESCE(p.new_addresses, 0) AS new_addresses, COALESCE(p.new_contracts, 0) AS new_contracts,
+			       sum(COALESCE(p.below, 0)) OVER (ORDER BY sp.hi) AS cumulative_addresses,
+			       sum(COALESCE(p.below_contracts, 0)) OVER (ORDER BY sp.hi) AS cumulative_contracts
+			FROM refill_spans sp LEFT JOIN per_day p USING (date)
+		)
 		UPDATE daily_stats s SET new_addresses = c.new_addresses, new_contracts = c.new_contracts,
 			cumulative_addresses = c.cumulative_addresses, cumulative_contracts = c.cumulative_contracts
-		FROM refill_spans sp
-		CROSS JOIN LATERAL (
-			SELECT count(*) FILTER (WHERE first_seen >= sp.lo AND first_seen < sp.hi) AS new_addresses,
-			       count(*) FILTER (WHERE is_contract AND first_seen >= sp.lo AND first_seen < sp.hi) AS new_contracts,
-			       count(*) FILTER (WHERE first_seen < sp.hi) AS cumulative_addresses,
-			       count(*) FILTER (WHERE is_contract AND first_seen < sp.hi) AS cumulative_contracts
-			FROM address_stats
-		) c
-		WHERE s.date = sp.date`)
+		FROM c
+		WHERE s.date = c.date`)
 	return err
 }

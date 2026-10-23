@@ -104,3 +104,54 @@ func TestAddressStatsRebuildRecountsTheDaysAddressColumns(t *testing.T) {
 		require.Equal(t, want, [2]int{n, cum}, "%s: new and cumulative addresses", day(i).Format("2006-01-02"))
 	}
 }
+
+// The one-pass recount writes what a count per day over address_stats wrote, for addresses on
+// days, between days and with no first_seen, and it reads address_stats once instead of once per day.
+func TestRecountDailyAddressColumnsEqualsACountPerDay(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	day := func(i int) time.Time { return time.Date(2026, 9, 1+i, 0, 0, 0, 0, time.UTC) }
+	const days, perDay = 30, 1_000
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT n, 'b' || n, 'b' || (n - 1), $1 + (n - 1)::bigint * 86400 / $2, 0, 30000000, 0 FROM generate_series(1, $3::int) n`,
+		day(0).Unix(), perDay, days*perDay)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO address_stats (address, first_seen, last_seen, is_contract)
+		SELECT '0x' || lpad(to_hex(g), 40, '0'), CASE WHEN g % 97 = 0 THEN NULL ELSE (g * 7919) % ($1::int + 500) END, 1, g % 5 = 0
+		FROM generate_series(1, 200000) g`, days*perDay)
+	require.NoError(t, err)
+	for i := 0; i < days; i++ {
+		_, err := d.pool.Exec(ctx, `INSERT INTO daily_stats (date, total_blocks) VALUES ($1, $2)`, day(i), perDay)
+		require.NoError(t, err)
+		if i%7 != 3 {
+			_, err = d.pool.Exec(ctx, `INSERT INTO daily_stats_acc (date, first_block, blocks) VALUES ($1, $2, $3)`, day(i), 1+i*perDay, perDay)
+			require.NoError(t, err)
+		}
+	}
+	_, err = d.pool.Exec(ctx, `INSERT INTO daily_stats_watermark (id, last_block) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET last_block = $1`, days*perDay)
+	require.NoError(t, err)
+
+	tx, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	start := time.Now()
+	require.NoError(t, recountDailyAddressColumns(ctx, tx))
+	took := time.Since(start)
+	var wrong, placed int
+	require.NoError(t, tx.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE (s.new_addresses, s.new_contracts, s.cumulative_addresses, s.cumulative_contracts)
+		                         IS DISTINCT FROM (c.n, c.nc, c.cum, c.cumc)), count(*)
+		FROM refill_spans sp JOIN daily_stats s USING (date)
+		CROSS JOIN LATERAL (
+			SELECT count(*) FILTER (WHERE first_seen >= sp.lo AND first_seen < sp.hi) AS n,
+			       count(*) FILTER (WHERE is_contract AND first_seen >= sp.lo AND first_seen < sp.hi) AS nc,
+			       count(*) FILTER (WHERE first_seen < sp.hi) AS cum,
+			       count(*) FILTER (WHERE is_contract AND first_seen < sp.hi) AS cumc
+			FROM address_stats) c`).Scan(&wrong, &placed))
+	require.Equal(t, days, placed, "every day placed")
+	require.Zero(t, wrong, "days that differ from a count per day")
+	t.Logf("recount of %d days over 200,000 addresses: %s", days, took)
+}
