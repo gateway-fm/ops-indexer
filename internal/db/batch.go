@@ -735,7 +735,8 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 // ErrHistoryPruned refuses a recount of history that pruning has made partial.
 var ErrHistoryPruned = errors.New("history is pruned: a recount from the retained rows would drop the pruned counts")
 
-// RebuildAddressStats rebuilds address_stats after catchup completes. It refuses once anything was pruned.
+// RebuildAddressStats rebuilds address_stats after catchup completes, then recounts the days' address columns from it.
+// It refuses once anything was pruned.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	if wm, _, err := d.PrunedThrough(ctx); err != nil {
 		return err
@@ -837,7 +838,18 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	// The days' address columns were counted from the address_stats this replaced (migration 021 reads 0.4.0's), so
+	// they are recounted from the rebuilt one, under daily_stats_advance's lock. A separate transaction: waiting for
+	// that lock while holding address_stats would deadlock with an advance reading it.
+	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
+			return err
+		}
+		return recountDailyAddressColumns(ctx, tx)
+	})
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {
