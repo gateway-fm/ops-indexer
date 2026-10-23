@@ -630,3 +630,27 @@ func TestRealtimeIndexer_DetectReorg_ReportsTheDeepestStaleBlock(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(3), depth, "blocks 98, 99 and 100 are stale")
 }
+
+// While realtime is more than 64 blocks behind the node, catch-up's workers take no block; they resume
+// once it is back under 16 (PRST-5438).
+func TestCatchupWorkersYieldWhileRealtimeIsBehind(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	catchup := newTestCatchupIndexer(mockDB, mockRPC)
+	var behind atomic.Uint64
+	behind.Store(100)
+	catchup.SetRealtimeBehind(behind.Load)
+	mockDB.On("HasBlock", mock.Anything, uint64(5)).Return(true, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	catchup.ctx, catchup.cancel = ctx, cancel
+	catchup.wg.Add(1)
+	go catchup.worker(0)
+	catchup.workQueue <- 5
+
+	time.Sleep(400 * time.Millisecond)
+	mockDB.AssertNotCalled(t, "HasBlock", mock.Anything, mock.Anything)
+	behind.Store(10)
+	require.Eventually(t, func() bool { return atomic.LoadInt64(&catchup.processedBlocks) == 1 }, 2*time.Second, 20*time.Millisecond,
+		"the block is taken once realtime is back under 16 behind")
+}
