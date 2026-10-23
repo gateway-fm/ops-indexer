@@ -54,6 +54,11 @@ func main() {
 	}
 	defer database.Close()
 	database.RebuildWorkMem = cfg.RebuildWorkMem
+	if len(os.Args) > 1 && os.Args[1] == "repair-address-stats" {
+		code := runRepairAddressStats(os.Args[2:], database)
+		database.Close()
+		os.Exit(code)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "backfill-contracts" {
 		code := runBackfillContracts(os.Args[2:], database, cfg.RPCURL)
 		database.Close()

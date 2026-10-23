@@ -14,7 +14,7 @@ import (
 func tipBlock(number uint64) *BlockData {
 	tx, to := fmt.Sprintf("0xtip%d", number), "0xb1"
 	return &BlockData{
-		Block: &types.Block{Number: number, Hash: fmt.Sprintf("0xblk%d", number), Timestamp: 1_700_000_000 + number},
+		Block:        &types.Block{Number: number, Hash: fmt.Sprintf("0xblk%d", number), Timestamp: 1_700_000_000 + number},
 		Transactions: []*types.Transaction{{Hash: tx, BlockNumber: number, From: "0xa1", To: &to, Value: "0", Status: 1}},
 		AddressStats: map[string]*AddressStatsDelta{
 			"0xa1": {Address: "0xa1", TxCountDelta: 1, BlockNumber: number},
