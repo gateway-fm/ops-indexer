@@ -42,6 +42,8 @@ on any drift. The ledger and the checks run with retention on or off.
 |---|---|---|
 | `LEDGER_SPAN_BLOCKS` | 100000 | Span size (grid). |
 | `LEDGER_CLOSE_INTERVAL` | 10s | One span closed per interval. |
+| `LEDGER_WORK_MEM` | 512MB | work_mem of the transaction that closes or recounts a span, so its per-address grouping stays in memory. One backend, no parallel workers: at most about 2.5 GB (two hash nodes at 2 × work_mem, one sort), far less in practice. |
+| `LEDGER_MAX_HEAD_LAG_BLOCKS` | 0 (off) | The closer skips its interval while ingest is more than this many blocks behind the node. A span already being closed finishes. |
 | `LEDGER_COMPACT_SPANS` | 0 (off) | When 2 or more: per interval, that many consecutive pruned spans the `node` check verified are merged into one. Totals do not move; per-address rows shrink where an address is active in several of them; the merged span is recounted from the node over its larger range. |
 | `VERIFY_RECOUNT_INTERVAL` | 1m | One retained span and one address bucket per interval (`recount`, `running`). |
 | `VERIFY_REPAIR` | true | Whether `recount`, `running` and `node` repair. |

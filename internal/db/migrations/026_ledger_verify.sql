@@ -45,19 +45,57 @@ $f$;
 CREATE FUNCTION ledger_stage_from_rows(p_lo BIGINT, p_hi BIGINT) RETURNS VOID LANGUAGE plpgsql AS $f$
 BEGIN
     PERFORM ledger_stage_clear(p_lo);
+    PERFORM set_config('enable_indexscan', 'off', true);
+    PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+
+    DROP TABLE IF EXISTS span_transfers;
+    CREATE TEMP TABLE span_transfers ON COMMIT DROP AS
+    SELECT tx_hash, token_address, token_type, from_address, to_address, value, block_number
+    FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi;
+    ANALYZE span_transfers;
+
     INSERT INTO ledger_stage_chain (lo, name, value)
     VALUES (p_lo, 'blocks_total', (SELECT count(*) FROM blocks WHERE number >= p_lo AND number < p_hi)),
            (p_lo, 'transactions_total', (SELECT count(*) FROM transactions WHERE block_number >= p_lo AND block_number < p_hi)),
-           (p_lo, 'transfers_total', (SELECT count(*) FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi));
+           (p_lo, 'transfers_total', (SELECT count(*) FROM span_transfers));
     INSERT INTO ledger_stage_token (lo, token, transfers, supply)
     SELECT p_lo, token_address, count(*),
            COALESCE(SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
                   - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END), 0)
-    FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
+    FROM span_transfers
     GROUP BY token_address;
+
     INSERT INTO ledger_stage_address (lo, address, txs, sent, internal, transfers, first_seen, last_seen)
-    SELECT p_lo, address, count(DISTINCT tx), sum(sent), sum(internal), sum(transfers), min(block), max(block)
-    FROM ledger_address_contributions(p_lo, p_hi) x
+    SELECT p_lo, address, sum(txs), sum(sent), sum(internal), sum(transfers), min(block), max(block)
+    FROM (
+        SELECT x.address, 1 AS txs, x.sent, 0 AS internal, 0 AS transfers, t.block_number AS block
+        FROM transactions t
+        LEFT JOIN (
+            SELECT tx_hash, array_agg(DISTINCT p.address) AS addresses
+            FROM span_transfers CROSS JOIN LATERAL (VALUES (from_address), (to_address)) AS p(address)
+            WHERE p.address <> '0x0000000000000000000000000000000000000000'
+            GROUP BY tx_hash
+        ) part ON part.tx_hash = t.hash
+        CROSS JOIN LATERAL (
+            SELECT t.from_address AS address, CASE WHEN t.tx_type BETWEEN 0 AND 4 THEN 1 ELSE 0 END AS sent
+            UNION ALL
+            SELECT t.to_address, 0 WHERE t.to_address IS NOT NULL AND t.to_address <> t.from_address
+            UNION ALL
+            SELECT a, 0 FROM unnest(part.addresses) AS a WHERE a <> t.from_address AND a IS DISTINCT FROM t.to_address
+        ) x
+        WHERE t.block_number >= p_lo AND t.block_number < p_hi
+        UNION ALL
+        SELECT x.address, 0, 0, 0, 1, s.block_number
+        FROM span_transfers s CROSS JOIN LATERAL (VALUES (s.from_address, true), (s.to_address, false)) AS x(address, sender)
+        WHERE x.address <> '0x0000000000000000000000000000000000000000' AND (x.sender OR s.to_address <> s.from_address)
+        UNION ALL
+        SELECT x.address, 0, 0, 1, 0, i.block_number
+        FROM internal_transactions i CROSS JOIN LATERAL (VALUES (i.from_address, true), (i.to_address, false)) AS x(address, sender)
+        WHERE i.block_number >= p_lo AND i.block_number < p_hi
+          AND x.address IS NOT NULL AND (x.sender OR i.to_address <> i.from_address)
+        UNION ALL
+        SELECT address, 0, 0, 0, 0, block_number FROM contracts WHERE block_number >= p_lo AND block_number < p_hi
+    ) u
     GROUP BY address;
 END
 $f$;
@@ -295,45 +333,57 @@ BEGIN
         RETURN false;
     END IF;
 
+    PERFORM set_config('enable_indexscan', 'off', true);
+    PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+
+    CREATE TEMP TABLE span_transfers ON COMMIT DROP AS
+    SELECT tx_hash, token_address, token_type, from_address, to_address, value, block_number
+    FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi;
+    ANALYZE span_transfers;
+
     INSERT INTO ledger_spans (lo, hi, source) VALUES (p_lo, p_hi, 'rows');
     INSERT INTO ledger_chain (lo, name, value)
     VALUES (p_lo, 'blocks_total', (SELECT count(*) FROM blocks WHERE number >= p_lo AND number < p_hi)),
            (p_lo, 'transactions_total', (SELECT count(*) FROM transactions WHERE block_number >= p_lo AND block_number < p_hi)),
-           (p_lo, 'transfers_total', (SELECT count(*) FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi));
+           (p_lo, 'transfers_total', (SELECT count(*) FROM span_transfers));
     INSERT INTO ledger_token (lo, token, transfers, supply)
     SELECT p_lo, token_address, count(*),
            COALESCE(SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
                   - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END), 0)
-    FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
+    FROM span_transfers
     GROUP BY token_address;
+
     INSERT INTO ledger_address (lo, address, txs, sent, internal, transfers, first_seen, last_seen)
-    SELECT p_lo, address, count(DISTINCT tx), sum(sent), sum(internal), sum(transfers), min(block), max(block)
+    SELECT p_lo, address, sum(txs), sum(sent), sum(internal), sum(transfers), min(block), max(block)
     FROM (
-        SELECT from_address AS address, hash AS tx, block_number AS block,
-               CASE WHEN tx_type BETWEEN 0 AND 4 THEN 1 ELSE 0 END AS sent, 0 AS internal, 0 AS transfers
-        FROM transactions WHERE block_number >= p_lo AND block_number < p_hi
+        SELECT x.address, 1 AS txs, x.sent, 0 AS internal, 0 AS transfers, t.block_number AS block
+        FROM transactions t
+        LEFT JOIN (
+            SELECT tx_hash, array_agg(DISTINCT p.address) AS addresses
+            FROM span_transfers CROSS JOIN LATERAL (VALUES (from_address), (to_address)) AS p(address)
+            WHERE p.address <> '0x0000000000000000000000000000000000000000'
+            GROUP BY tx_hash
+        ) part ON part.tx_hash = t.hash
+        CROSS JOIN LATERAL (
+            SELECT t.from_address AS address, CASE WHEN t.tx_type BETWEEN 0 AND 4 THEN 1 ELSE 0 END AS sent
+            UNION ALL
+            SELECT t.to_address, 0 WHERE t.to_address IS NOT NULL AND t.to_address <> t.from_address
+            UNION ALL
+            SELECT a, 0 FROM unnest(part.addresses) AS a WHERE a <> t.from_address AND a IS DISTINCT FROM t.to_address
+        ) x
+        WHERE t.block_number >= p_lo AND t.block_number < p_hi
         UNION ALL
-        SELECT to_address, hash, block_number, 0, 0, 0
-        FROM transactions WHERE block_number >= p_lo AND block_number < p_hi AND to_address IS NOT NULL
+        SELECT x.address, 0, 0, 0, 1, s.block_number
+        FROM span_transfers s CROSS JOIN LATERAL (VALUES (s.from_address, true), (s.to_address, false)) AS x(address, sender)
+        WHERE x.address <> '0x0000000000000000000000000000000000000000' AND (x.sender OR s.to_address <> s.from_address)
         UNION ALL
-        SELECT from_address, tx_hash, block_number, 0, 0, 1
-        FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
-          AND from_address <> '0x0000000000000000000000000000000000000000'
+        SELECT x.address, 0, 0, 1, 0, i.block_number
+        FROM internal_transactions i CROSS JOIN LATERAL (VALUES (i.from_address, true), (i.to_address, false)) AS x(address, sender)
+        WHERE i.block_number >= p_lo AND i.block_number < p_hi
+          AND x.address IS NOT NULL AND (x.sender OR i.to_address <> i.from_address)
         UNION ALL
-        SELECT to_address, tx_hash, block_number, 0, 0, 1
-        FROM token_transfers WHERE block_number >= p_lo AND block_number < p_hi
-          AND to_address <> '0x0000000000000000000000000000000000000000' AND to_address <> from_address
-        UNION ALL
-        SELECT from_address, NULL, block_number, 0, 1, 0
-        FROM internal_transactions WHERE block_number >= p_lo AND block_number < p_hi
-        UNION ALL
-        SELECT to_address, NULL, block_number, 0, 1, 0
-        FROM internal_transactions WHERE block_number >= p_lo AND block_number < p_hi
-          AND to_address IS NOT NULL AND to_address <> from_address
-        UNION ALL
-        SELECT address, NULL, block_number, 0, 0, 0
-        FROM contracts WHERE block_number >= p_lo AND block_number < p_hi
-    ) x
+        SELECT address, 0, 0, 0, 0, block_number FROM contracts WHERE block_number >= p_lo AND block_number < p_hi
+    ) u
     GROUP BY address;
     RETURN true;
 END

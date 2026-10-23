@@ -42,7 +42,7 @@ func recountSpan(t *testing.T, d *DB, lo int64, repair bool) SpanCheck {
 	ctx := context.Background()
 	_, err := d.pool.Exec(ctx, `UPDATE ledger_spans SET checked_at = CASE WHEN lo = $1 THEN NULL ELSE now() END`, lo)
 	require.NoError(t, err)
-	c, ok, err := d.RecountRetainedSpan(ctx, repair)
+	c, ok, err := d.RecountRetainedSpan(ctx, repair, "64MB")
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, lo, c.Lo)

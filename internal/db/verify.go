@@ -19,6 +19,8 @@ type VerifyConfig struct {
 	// RecountInterval paces the retained-span recount and the running check: one span and one address bucket per tick.
 	RecountInterval time.Duration
 	Repair          bool
+	// WorkMem is the recount transaction's work_mem (LEDGER_WORK_MEM).
+	WorkMem string
 }
 
 // Drift is one counter that disagrees: stored (or running) against the recount.
@@ -47,8 +49,13 @@ func inRepeatableRead(ctx context.Context, d *DB, fn func(pgx.Tx) error) error {
 
 // RecountRetainedSpan recounts, from its history rows, the closed retained span checked longest ago and settles it
 // (ledger_span_settle); ok is false when there is none.
-func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool) (c SpanCheck, ok bool, err error) {
+func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool, workMem string) (c SpanCheck, ok bool, err error) {
 	err = inRepeatableRead(ctx, d, func(tx pgx.Tx) error {
+		if workMem != "" {
+			if _, err := tx.Exec(ctx, `SELECT set_config('work_mem', $1, true)`, workMem); err != nil {
+				return err
+			}
+		}
 		err := tx.QueryRow(ctx, `
 			SELECT lo, hi FROM ledger_spans
 			WHERE lo >= (SELECT history_from()) AND check_state <> 'quarantined'
@@ -210,7 +217,7 @@ func (d *DB) RunVerify(ctx context.Context, cfg VerifyConfig) {
 	bucket := 0
 	recountCycle, runningCycle := time.Now(), time.Now()
 	for {
-		if c, ok, err := d.RecountRetainedSpan(ctx, cfg.Repair); err != nil && ctx.Err() == nil {
+		if c, ok, err := d.RecountRetainedSpan(ctx, cfg.Repair, cfg.WorkMem); err != nil && ctx.Err() == nil {
 			log.Warn("ledger: retained recount failed", "error", err)
 		} else if ok {
 			metrics.VerifyChecked("recount", c.Drifted, c.State)
