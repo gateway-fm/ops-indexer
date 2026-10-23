@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/jackc/pgx/v5"
@@ -151,6 +152,40 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 // would otherwise suppress a re-delivery does not fire, so the same transfers
 // are counted twice. Nothing but a process restart would repair it. See
 // PRST-4493.
+// keepDailyStatsWatermarkOnStoredBlocks lowers the daily_stats watermark, after daily_stats_invalidate, when the
+// block it names is not stored. The invalidate sets it below the day's first *stored* block; with the day's start in
+// a catch-up gap that is mid-day, and the gap's blocks, stored later, would never be counted (PRST-5436, the same
+// fault as the first run's). The watermark goes to the last stored block below it, so the advance waits for the gap
+// and counts its blocks into their days: every stored block it passes again was counted before, the unstored ones
+// never were. It never goes below the earliest aggregated day's first block, where a day that was never aggregated
+// would get a partial row. When the reorged day is itself the earliest aggregated day its start cannot be known
+// here: the watermark stays, and refill-daily-stats recounts the day.
+func keepDailyStatsWatermarkOnStoredBlocks(ctx context.Context, tx pgx.Tx) error {
+	var lowered, stuck bool
+	err := tx.QueryRow(ctx, `
+		WITH w AS (SELECT last_block FROM daily_stats_watermark WHERE id = 1),
+		below AS (SELECT max(number) AS n FROM blocks, w WHERE number <= w.last_block),
+		floor AS (SELECT min(first_block) - 1 AS n FROM daily_stats_acc WHERE first_block IS NOT NULL
+		          AND first_block <= (SELECT last_block FROM w)),
+		target AS (SELECT GREATEST(below.n, floor.n) AS n FROM below, floor
+		           WHERE below.n IS NOT NULL AND floor.n IS NOT NULL),
+		up AS (
+			UPDATE daily_stats_watermark d SET last_block = target.n FROM target, w
+			WHERE d.id = 1 AND target.n < w.last_block
+			RETURNING 1
+		)
+		SELECT EXISTS (SELECT 1 FROM up),
+		       EXISTS (SELECT 1 FROM w WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE number = w.last_block) AND w.last_block >= 0)`).
+		Scan(&lowered, &stuck)
+	if err != nil {
+		return err
+	}
+	if stuck && !lowered {
+		log.Warn("daily_stats: a reorg left the watermark on a block that is not stored; recount the day with refill-daily-stats")
+	}
+	return nil
+}
+
 func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
@@ -160,6 +195,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 
 	// The block's day is re-aggregated from its first block on the next advance (migration 012).
 	if _, err := tx.Exec(ctx, `SELECT daily_stats_invalidate($1)`, number); err != nil {
+		return err
+	}
+	if err := keepDailyStatsWatermarkOnStoredBlocks(ctx, tx); err != nil {
 		return err
 	}
 
