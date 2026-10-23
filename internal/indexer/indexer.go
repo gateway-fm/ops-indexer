@@ -88,7 +88,9 @@ type Indexer struct {
 	startBlock   uint64
 
 	indexRequests chan indexRequest
-	config        *Config
+	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
+	onIndexed func(uint64)
+	config    *Config
 
 	tokenCache    *TokenCache
 	contractCache *ContractCache

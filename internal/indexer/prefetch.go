@@ -152,6 +152,9 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
 			receipts.skipped, receipts.skippedHash = b.number, b.raw.Hash
+			if i.onIndexed != nil {
+				i.onIndexed(lastIndexed)
+			}
 			continue
 		}
 
@@ -167,6 +170,9 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 		}
 		lastIndexed = b.number
 		prevHash = b.raw.Hash
+		if i.onIndexed != nil {
+			i.onIndexed(lastIndexed)
+		}
 
 		if lastIndexed%10 == 0 {
 			i.db.UpdateSyncStatus(ctx, lastIndexed, true)
