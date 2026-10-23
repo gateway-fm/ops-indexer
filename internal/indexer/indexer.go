@@ -1175,25 +1175,13 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 				}
 			}
 			for _, it := range internalCreations(internalTxs) {
-				code := strings.TrimPrefix(strOr(it.Output, ""), "0x")
-				if code == "" {
-					raw, err := i.rpc.GetCode(ctx, common.HexToAddress(*it.To))
-					if err != nil || len(raw) == 0 {
-						continue
-					}
-					code = common.Bytes2Hex(raw)
+				c := contractFromCreation(ctx, i.rpc.GetCode, it, blockNumber)
+				if c == nil {
+					continue
 				}
-				bytecodeHash := common.BytesToHash(common.FromHex(code)).Hex()
-				blockData.Contracts = append(blockData.Contracts, &types.Contract{
-					Address:      *it.To,
-					Bytecode:     code,
-					BytecodeHash: &bytecodeHash,
-					Creator:      it.From,
-					CreationTx:   it.TxHash,
-					BlockNumber:  blockNumber,
-				})
-				i.contractCache.Add(*it.To)
-				addressDelta(blockData.AddressStats, *it.To, blockNumber).IsContract = true
+				blockData.Contracts = append(blockData.Contracts, c)
+				i.contractCache.Add(c.Address)
+				addressDelta(blockData.AddressStats, c.Address, blockNumber).IsContract = true
 			}
 		}
 	}

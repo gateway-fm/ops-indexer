@@ -1,9 +1,11 @@
 package indexer
 
 import (
+	"context"
 	"strings"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 )
 
 // internalCreations are the contracts a transaction deployed from inside a call (a factory's CREATE / CREATE2),
@@ -42,4 +44,27 @@ func strOr(s *string, fallback string) string {
 		return fallback
 	}
 	return strings.TrimSpace(*s)
+}
+
+// contractFromCreation is the contracts row for an internal creation frame, as ingest and the backfill write it:
+// the deployed code from the frame's output, else from the node; nil when neither has code.
+func contractFromCreation(ctx context.Context, getCode func(context.Context, common.Address) ([]byte, error),
+	it *types.InternalTransaction, blockNumber uint64) *types.Contract {
+	code := strings.TrimPrefix(strOr(it.Output, ""), "0x")
+	if code == "" {
+		raw, err := getCode(ctx, common.HexToAddress(*it.To))
+		if err != nil || len(raw) == 0 {
+			return nil
+		}
+		code = common.Bytes2Hex(raw)
+	}
+	bytecodeHash := common.BytesToHash(common.FromHex(code)).Hex()
+	return &types.Contract{
+		Address:      strings.ToLower(*it.To),
+		Bytecode:     code,
+		BytecodeHash: &bytecodeHash,
+		Creator:      strings.ToLower(it.From),
+		CreationTx:   it.TxHash,
+		BlockNumber:  blockNumber,
+	}
 }
