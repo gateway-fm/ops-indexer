@@ -87,3 +87,42 @@ func TestStandardTickStaysOnTheStaleBlockWhenTheRevertFails(t *testing.T) {
 	require.Equal(t, uint64(100), idx.standardTick(context.Background(), 100, 120, &receiptSkip{}))
 	mockRPC.AssertNotCalled(t, "RawBlockByNumber", mock.Anything, mock.Anything)
 }
+
+// A devnet reset whose new chain already reached the old height looks like a stale fork deeper than any
+// reorg, not like a reset. The start is refused with the advice to set FORCE_REINDEX, and with it set it wipes.
+func TestStartWipesAStaleForkDeeperThanAnyReorgWithForceReindex(t *testing.T) {
+	start := func(force bool) (*MockDatabase, error) {
+		mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+		for n := uint64(1); n <= 300; n++ {
+			mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: fmt.Sprintf("0x%064x", 9000+n)}, nil).Maybe()
+			mockRPC.On("RawBlockHash", mock.Anything, n).Return(fmt.Sprintf("0x%064x", 1000+n), nil).Maybe()
+		}
+		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(300), nil)
+		mockDB.On("GetBlockCount", mock.Anything).Return(int64(300), nil)
+		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(300), nil).Maybe()
+		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
+		mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+		mockDB.On("WipeAllData", mock.Anything).Return(nil).Maybe()
+		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		mockDB.On("BackfillDailyStats", mock.Anything).Return(nil).Maybe()
+		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(305), nil)
+		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
+		idx := NewWithConfig(mockDB, mockRPC, time.Second, 0, &Config{RPCWorkers: 4, RPCRateLimit: 100, DBBatchSize: 100})
+		if force {
+			t.Setenv("FORCE_REINDEX", "true")
+		} else {
+			t.Setenv("FORCE_REINDEX", "")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		return mockDB, idx.Start(ctx)
+	}
+
+	mockDB, err := start(false)
+	require.ErrorContains(t, err, "FORCE_REINDEX=true")
+	mockDB.AssertNotCalled(t, "WipeAllData", mock.Anything)
+
+	mockDB, err = start(true)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the start goes on after the wipe")
+	mockDB.AssertCalled(t, "WipeAllData", mock.Anything)
+}

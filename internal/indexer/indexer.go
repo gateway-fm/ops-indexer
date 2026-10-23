@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -448,6 +449,20 @@ func (i *Indexer) Start(ctx context.Context) error {
 		"has_gaps", hasGaps,
 		"blocks_behind", blocksToSync)
 
+	wipe := func() error {
+		log.Warn("FORCE_REINDEX=true: wiping indexed data and re-indexing from scratch")
+		if err := i.db.WipeAllData(ctx); err != nil {
+			return fmt.Errorf("failed to wipe data for reindex: %w", err)
+		}
+		lastIndexed = 0
+		blockCount = 0
+		expectedBlocks = 0
+		hasGaps = false
+		blocksToSync = latestOnChain
+		log.Info("data wiped, re-indexing from block 0")
+		return nil
+	}
+
 	// Detect chain reset: if the chain head is significantly behind our last
 	// indexed block, this is a chain reset (e.g. Anvil restart), not a reorg.
 	if lastIndexed > 0 && latestOnChain+maxReorgDepth < lastIndexed {
@@ -459,16 +474,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 			"max_reorg_depth", maxReorgDepth)
 
 		if os.Getenv("FORCE_REINDEX") == "true" {
-			log.Warn("FORCE_REINDEX=true: wiping indexed data and re-indexing from scratch")
-			if err := i.db.WipeAllData(ctx); err != nil {
-				return fmt.Errorf("failed to wipe data for reindex: %w", err)
+			if err := wipe(); err != nil {
+				return err
 			}
-			lastIndexed = 0
-			blockCount = 0
-			expectedBlocks = 0
-			hasGaps = false
-			blocksToSync = latestOnChain
-			log.Info("data wiped, re-indexing from block 0")
 		} else {
 			return fmt.Errorf(
 				"chain reset detected (chain_head=%d, last_indexed=%d). "+
@@ -482,12 +490,18 @@ func (i *Indexer) Start(ctx context.Context) error {
 	// until a restart. It is reverted before the start mode is chosen: collector mode starts realtime at the node
 	// head, whose reorg check never reaches below its own cursor, and catch-up fills the gap with no parent check.
 	// Stored blocks above the node's head cannot be compared yet; a stale fork below them takes them with it.
+	// A stale fork deeper than any reorg is a reset whose new chain already reached the old height: FORCE_REINDEX
+	// wipes it, as it does a reset the height gives away.
 	if top := min(lastIndexed, latestOnChain); top > 0 {
 		head, err := i.revertStaleHead(ctx, top)
-		if err != nil {
+		if errors.Is(err, errStaleForkTooDeep) && os.Getenv("FORCE_REINDEX") == "true" {
+			metrics.ChainResetDetected()
+			if err := wipe(); err != nil {
+				return err
+			}
+		} else if err != nil {
 			return err
-		}
-		if head < top {
+		} else if head < top {
 			lastIndexed = head
 			blocksToSync = latestOnChain - lastIndexed
 		}
@@ -787,6 +801,8 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 	return 0, nil
 }
 
+var errStaleForkTooDeep = errors.New("is on a stale fork deeper than any reorg")
+
 // revertStaleHead reverts the stored blocks at top and below that no longer match the chain, with every stored
 // block above them, ten blocks per check as detectReorg reads them, and returns the block the stored chain then
 // ends at (top when nothing was stale). A stale fork deeper than maxReorgDepth, or one whose revert fails, refuses
@@ -802,8 +818,8 @@ func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, erro
 			return head, nil
 		}
 		if top-head+depth > maxReorgDepth {
-			return head, fmt.Errorf("the stored chain below block %d is on a stale fork deeper than %d blocks: "+
-				"set FORCE_REINDEX=true to wipe and re-index", top, maxReorgDepth)
+			return head, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset; "+
+				"set FORCE_REINDEX=true to wipe and re-index", top, errStaleForkTooDeep, maxReorgDepth)
 		}
 		log.Warn("the stored head is on a stale fork; reverting it before starting", "block", head, "depth", depth)
 		if err := i.handleReorg(ctx, head-depth+1); err != nil {
