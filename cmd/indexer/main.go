@@ -80,6 +80,11 @@ func main() {
 	if err := database.Migrate(); err != nil {
 		log.Fatal("failed to run migrations", "error", err)
 	}
+	if cfg.TxHashIndexes {
+		if err := database.EnsureTxHashIndexes(context.Background()); err != nil {
+			log.Fatal("failed to build the tx_hash lookup indexes", "error", err)
+		}
+	}
 
 	rpcClient, err := rpc.New(cfg.RPCURL)
 	if err != nil {

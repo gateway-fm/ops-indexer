@@ -9,13 +9,13 @@ import (
 )
 
 type Config struct {
-	RPCURL          string        `mapstructure:"rpc_url"`
-	DatabaseURL     string        `mapstructure:"database_url"`
+	RPCURL      string `mapstructure:"rpc_url"`
+	DatabaseURL string `mapstructure:"database_url"`
 	// GRPCListenAddr is the address the chain-indexer gRPC server binds to,
 	// e.g. ":50051". Required.
-	GRPCListenAddr  string        `mapstructure:"grpc_listen_addr"`
-	APIPort         int           `mapstructure:"api_port"`
-	PollInterval    time.Duration `mapstructure:"poll_interval"`
+	GRPCListenAddr string        `mapstructure:"grpc_listen_addr"`
+	APIPort        int           `mapstructure:"api_port"`
+	PollInterval   time.Duration `mapstructure:"poll_interval"`
 	// Minimum interval between recomputations of the current day's daily_stats
 	// row (PRST-4669). 0 = every 100 blocks (legacy).
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
@@ -24,7 +24,10 @@ type Config struct {
 	BalanceDedupWindow    time.Duration `mapstructure:"balance_dedup_window"`
 	BalanceReaderBatch    int           `mapstructure:"balance_reader_batch"`
 	BalanceSkipL1         bool          `mapstructure:"balance_skip_l1"`
-	StartBlock            uint64        `mapstructure:"start_block"`
+	// TxHashIndexes keeps an index on tx_hash in logs and token_transfers for consumers that read them by
+	// transaction hash (0.4.0 had one); false spares ingest its random writes.
+	TxHashIndexes bool   `mapstructure:"tx_hash_indexes"`
+	StartBlock    uint64 `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -55,7 +58,7 @@ type Config struct {
 
 	// Set PRIVACY_PROXY_URL to enable proxy mode (auth + privacy enforcement).
 	// Leave empty for standalone mode (direct DB/RPC access).
-	PrivacyProxyURL       string `mapstructure:"privacy_proxy_url"`
+	PrivacyProxyURL string `mapstructure:"privacy_proxy_url"`
 	// PrivacyProxyPublicURL is the browser-facing URL for OAuth redirects.
 	// Defaults to PrivacyProxyURL if not set. Set this when the proxy is on a
 	// Docker-internal hostname (e.g. privacy-proxy-proxy-backend-1) but the
@@ -64,15 +67,15 @@ type Config struct {
 	SSOClientID           string `mapstructure:"sso_client_id"`
 	SSORedirectURI        string `mapstructure:"sso_redirect_uri"`
 
-	LogLevel              string        `mapstructure:"log_level"`
+	LogLevel string `mapstructure:"log_level"`
 
 	// HiddenTxTypes is a comma-separated list of transaction type numbers to
 	// exclude from the default transaction listings (e.g. "126" for OP deposit TXs).
-	HiddenTxTypes         string        `mapstructure:"hidden_tx_types"`
+	HiddenTxTypes string `mapstructure:"hidden_tx_types"`
 
 	// RebuildWorkMem sets work_mem (via SET LOCAL) for the one-shot address_stats
 	// rebuild. Env: REBUILD_WORK_MEM. Lower it on memory-tight Postgres.
-	RebuildWorkMem        string        `mapstructure:"rebuild_work_mem"`
+	RebuildWorkMem string `mapstructure:"rebuild_work_mem"`
 
 	EnableOPDeposits      bool          `mapstructure:"enable_op_deposits"`
 	L1RPCURL              string        `mapstructure:"l1_rpc_url"`
@@ -93,6 +96,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("balance_dedup_window", "0s")
 	v.SetDefault("balance_reader_batch", 0)
 	v.SetDefault("balance_skip_l1", false)
+	v.SetDefault("tx_hash_indexes", true)
 	v.SetDefault("start_block", 0)
 
 	v.SetDefault("rpc_workers", 50)
@@ -166,6 +170,7 @@ func Load() (*Config, error) {
 	cfg.BalanceDedupWindow = v.GetDuration("balance_dedup_window")
 	cfg.BalanceReaderBatch = v.GetInt("balance_reader_batch")
 	cfg.BalanceSkipL1 = v.GetBool("balance_skip_l1")
+	cfg.TxHashIndexes = v.GetBool("tx_hash_indexes")
 	cfg.StartBlock = v.GetUint64("start_block")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
