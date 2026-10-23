@@ -89,6 +89,10 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	var upto *int64
 	var pending []int64
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var started bool
+		if err := tx.QueryRow(ctx, startDailyStatsWatermarkSQL).Scan(&started); err != nil || !started {
+			return err
+		}
 		var before *int64
 		if err := tx.QueryRow(ctx, `
 			SELECT (SELECT last_block FROM daily_stats_watermark WHERE id = 1)
