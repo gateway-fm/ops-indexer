@@ -98,6 +98,7 @@ func TestIndexPrefetchedSkipsABlockWhoseReceiptsNeverCome(t *testing.T) {
 	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	mockDB.On("RequeueMissingBlock", mock.Anything, uint64(3)).Return(nil).Once()
+	mockDB.On("GetBlock", mock.Anything, uint64(2)).Return(&types.Block{Number: 2, Hash: blocks[2].Hash.Hex()}, nil)
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
 	var skip receiptSkip
@@ -125,6 +126,7 @@ func TestIndexPipelinedSkipsABlockWhoseReceiptsNeverCome(t *testing.T) {
 	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	mockDB.On("RequeueMissingBlock", mock.Anything, uint64(3)).Return(nil).Once()
+	mockDB.On("GetBlock", mock.Anything, uint64(2)).Return(&types.Block{Number: 2, Hash: blocks[2].Hash.Hex()}, nil)
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
 	var skip receiptSkip
@@ -175,5 +177,32 @@ func TestIndexPipelinedServesBlockRequests(t *testing.T) {
 	}
 	if !saw99 {
 		t.Fatalf("inserted %v, want block 99 among them", inserted)
+	}
+}
+
+// The first block of a tick must extend the stored head. Read after a reorg replaced the head, it is
+// discarded, as every later block already is; written, it and the blocks after it would bury the stale head below
+// the next tick's ten-block reorg check.
+func TestIndexPrefetchedStopsWhenTheFirstBlockDoesNotExtendTheStoredHead(t *testing.T) {
+	for _, pipelined := range []bool{false, true} {
+		mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+		for n, b := range chainOfEmptyBlocks(4, 8) {
+			mockRPC.On("RawBlockByNumber", mock.Anything, n).Return(b, nil).Maybe()
+		}
+		mockDB.On("GetBlock", mock.Anything, uint64(3)).Return(&types.Block{Number: 3, Hash: common.BytesToHash([]byte{0xde, 0xad}).Hex()}, nil)
+		mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		idx := newPrefetchIndexer(mockDB, mockRPC)
+
+		var last uint64
+		if pipelined {
+			last = idx.indexPipelined(context.Background(), 3, 8, 2, &receiptSkip{})
+		} else {
+			last = idx.indexPrefetched(context.Background(), 3, 8, &receiptSkip{})
+		}
+		if last != 3 {
+			t.Fatalf("pipelined=%v: indexed up to %d over a stale head, want 3", pipelined, last)
+		}
+		mockDB.AssertNotCalled(t, "InsertBlock", mock.Anything, mock.Anything)
 	}
 }

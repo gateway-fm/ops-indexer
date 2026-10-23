@@ -63,6 +63,19 @@ func (i *Indexer) prefetchBlocks(ctx context.Context, from, to uint64, depth int
 	return slots
 }
 
+// storedHash is the hash of the stored block number, which the first block of a tick must extend, or the zero hash
+// (no check) when that block is 0, as in detectReorg, or is not stored or cannot be read.
+func (i *Indexer) storedHash(ctx context.Context, number uint64) common.Hash {
+	if number == 0 {
+		return common.Hash{}
+	}
+	b, err := i.db.GetBlock(ctx, number)
+	if err != nil || b == nil {
+		return common.Hash{}
+	}
+	return common.HexToHash(b.Hash)
+}
+
 // indexPrefetched indexes lastIndexed+1..latest in order and returns the new last indexed block.
 // It stops at the first failure, as the sequential loop did, and leaves the rest to the next tick.
 // A prefetched block whose parent is not the block just committed was read before a reorg; it is
@@ -75,7 +88,7 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 	fetchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var prevHash common.Hash
+	prevHash := i.storedHash(ctx, lastIndexed)
 	for slot := range i.prefetchBlocks(fetchCtx, lastIndexed+1, latest, blockPrefetchDepth) {
 		select {
 		case req := <-i.indexRequests:
@@ -183,7 +196,7 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		return true
 	}
 
-	var prevHash common.Hash
+	prevHash := i.storedHash(ctx, lastIndexed)
 	for slot := range i.prefetchBlocks(fetchCtx, lastIndexed+1, latest, blockPrefetchDepth+depth) {
 		// Serve a block request (as indexPrefetched does) between blocks. Finish what is in flight first, so the
 		// requested block never runs beside a pipelined one and committed blocks stay a prefix.
