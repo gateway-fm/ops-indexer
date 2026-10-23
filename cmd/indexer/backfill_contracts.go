@@ -21,6 +21,7 @@ func runBackfillContracts(args []string, database *db.DB, rpcURL string) int {
 	fs := flag.NewFlagSet("backfill-contracts", flag.ExitOnError)
 	csvPath := fs.String("csv", "", "address,creation_tx_hash,block_number rows of internal creations to trace (- for stdin)")
 	perSecond := fs.Float64("rate", 5, "node requests per second")
+	noTrace := fs.Bool("no-trace", false, "build listed rows without debug_traceTransaction (receipt, current code, creator from the list or the tx's to), for a node that cannot trace old blocks")
 	_ = fs.Parse(args)
 
 	var listed []indexer.Creation
@@ -48,7 +49,7 @@ func runBackfillContracts(args []string, database *db.DB, rpcURL string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	report, err := indexer.BackfillContracts(ctx, database, node, listed, *perSecond)
+	report, err := indexer.BackfillContracts(ctx, database, node, listed, indexer.ContractsBackfillOptions{PerSecond: *perSecond, WithoutTraces: *noTrace})
 	log.Info("backfill-contracts: done",
 		"from_internal_transactions", report.FromInternalTransactions, "listed", len(listed),
 		"txs_traced", report.TxsTraced, "txs_skipped_complete", report.TxsSkipped, "written", report.Written,

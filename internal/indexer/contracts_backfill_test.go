@@ -19,7 +19,9 @@ import (
 
 type backfillDB struct{ contracts map[string]*types.Contract }
 
-func (f *backfillDB) BackfillContractsFromInternalTransactions(context.Context) (int64, error) { return 0, nil }
+func (f *backfillDB) BackfillContractsFromInternalTransactions(context.Context) (int64, error) {
+	return 0, nil
+}
 
 func (f *backfillDB) ExistingContracts(_ context.Context, addresses []string) (map[string]bool, error) {
 	out := map[string]bool{}
@@ -39,14 +41,16 @@ func (f *backfillDB) InsertContract(_ context.Context, c *types.Contract) error 
 }
 
 type backfillNode struct {
-	traces map[common.Hash]*rpc.CallFrame
-	blocks map[common.Hash]uint64
-	fail   map[common.Hash]bool
-	calls  int
+	traces     map[common.Hash]*rpc.CallFrame
+	blocks     map[common.Hash]uint64
+	fail       map[common.Hash]bool
+	calls      int
+	traceCalls int
 }
 
 func (f *backfillNode) TraceTransaction(_ context.Context, h common.Hash) (*rpc.CallFrame, error) {
 	f.calls++
+	f.traceCalls++
 	if f.fail[h] {
 		return nil, errors.New("node timeout")
 	}
@@ -56,6 +60,12 @@ func (f *backfillNode) TraceTransaction(_ context.Context, h common.Hash) (*rpc.
 func (f *backfillNode) TransactionReceipt(_ context.Context, h common.Hash) (*rpclient.Receipt, error) {
 	f.calls++
 	return &rpclient.Receipt{Status: 1, TxHash: h, BlockNumber: new(big.Int).SetUint64(f.blocks[h])}, nil
+}
+
+func (f *backfillNode) TransactionByHash(_ context.Context, h common.Hash) (*rpclient.Transaction, bool, error) {
+	f.calls++
+	to := common.HexToAddress("0x00000000000000000000000000000000000FAC70")
+	return &rpclient.Transaction{Hash: h, To: &to}, false, nil
 }
 
 func (f *backfillNode) GetCode(context.Context, common.Address) ([]byte, error) {
@@ -95,7 +105,7 @@ func TestContractsBackfillTracesListedTransactionsAndResumes(t *testing.T) {
 		{Address: addr(0xc6), TxHash: txD.Hex(), Block: 13},
 	}
 
-	report, err := BackfillContracts(ctx, d, node, listed, 1_000)
+	report, err := BackfillContracts(ctx, d, node, listed, ContractsBackfillOptions{PerSecond: 1_000})
 	require.NoError(t, err)
 	assert.Equal(t, 2, report.TxsTraced, "A and C; D failed")
 	assert.Equal(t, 1, report.TxsSkipped, "B's contract exists")
@@ -114,7 +124,7 @@ func TestContractsBackfillTracesListedTransactionsAndResumes(t *testing.T) {
 
 	node.fail = nil
 	calls := node.calls
-	report, err = BackfillContracts(ctx, d, node, listed, 1_000)
+	report, err = BackfillContracts(ctx, d, node, listed, ContractsBackfillOptions{PerSecond: 1_000})
 	require.NoError(t, err)
 	assert.Equal(t, 2, report.TxsSkipped, "A and B are complete")
 	assert.Equal(t, 2, report.TxsTraced, "C again (c5 is still missing), and D")
@@ -136,4 +146,34 @@ func TestReadCreationsCSV(t *testing.T) {
 	assert.Equal(t, []Creation{{Address: "0xabc", TxHash: "0xdef", Block: 123}}, got)
 	_, err = ReadCreationsCSV(strings.NewReader("0xabc,0xdef\n"))
 	assert.Error(t, err)
+}
+
+// A node that cannot trace old blocks: rows from the receipt, the current code and the creator from the list (else
+// the transaction's to), with no trace call at all.
+func TestContractsBackfillWithoutTraces(t *testing.T) {
+	ctx := context.Background()
+	txE := common.HexToHash("0xe")
+	node := &backfillNode{blocks: map[common.Hash]uint64{txE: 480}}
+	d := &backfillDB{contracts: map[string]*types.Contract{}}
+	listed := []Creation{
+		{Address: addr(0xc7), TxHash: txE.Hex(), Block: 480, Creator: addr(0xfa)},
+		{Address: addr(0xc8), TxHash: txE.Hex(), Block: 480},
+	}
+	report, err := BackfillContracts(ctx, d, node, listed, ContractsBackfillOptions{PerSecond: 1_000, WithoutTraces: true})
+	require.NoError(t, err)
+	assert.Zero(t, node.traceCalls)
+	assert.Equal(t, 2, report.Written)
+	assert.Empty(t, report.NotCreated)
+	c7, c8 := d.contracts[addr(0xc7)], d.contracts[addr(0xc8)]
+	require.NotNil(t, c7)
+	require.NotNil(t, c8)
+	assert.Equal(t, addr(0xfa), c7.Creator, "the listed creator")
+	assert.Equal(t, "0x00000000000000000000000000000000000fac70", c8.Creator, "the transaction's to")
+	assert.Equal(t, [3]string{"6080dd", "0x00000000000000000000000000000000000000000000000000000000006080dd", txE.Hex()},
+		[3]string{c8.Bytecode, *c8.BytecodeHash, c8.CreationTx}, "the same row shape as the traced path")
+	assert.EqualValues(t, 480, c8.BlockNumber)
+
+	got, err := ReadCreationsCSV(strings.NewReader("0xABC,0xDEF,123,0xFAC\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "0xfac", got[0].Creator)
 }

@@ -29,17 +29,29 @@ type ContractsBackfillDB interface {
 type ContractsBackfillNode interface {
 	TraceTransaction(ctx context.Context, txHash common.Hash) (*rpc.CallFrame, error)
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*rpclient.Receipt, error)
+	TransactionByHash(ctx context.Context, txHash common.Hash) (*rpclient.Transaction, bool, error)
 	GetCode(ctx context.Context, address common.Address) ([]byte, error)
 }
 
-// Creation is one listed internal creation: a contract and the transaction that deployed it.
+// Creation is one listed internal creation: a contract, the transaction that deployed it and, optionally, the
+// contract that deployed it (only used without traces).
 type Creation struct {
 	Address string
 	TxHash  string
 	Block   uint64
+	Creator string
 }
 
-// ReadCreationsCSV reads address,creation_tx_hash,block_number rows, with or without that header row.
+type ContractsBackfillOptions struct {
+	PerSecond float64
+	// WithoutTraces builds each listed row from the node without debug_traceTransaction, for a node that cannot
+	// trace old blocks ("historical state is not available"): the block from the receipt, the code from
+	// eth_getCode at the latest block, the creator from the list, else the transaction's to (right for a direct
+	// factory call, not for a nested one). Unlisted creations cannot be found this way.
+	WithoutTraces bool
+}
+
+// ReadCreationsCSV reads address,creation_tx_hash,block_number[,creator] rows, with or without a header row.
 func ReadCreationsCSV(r io.Reader) ([]Creation, error) {
 	rows, err := csv.NewReader(r).ReadAll()
 	if err != nil {
@@ -51,14 +63,18 @@ func ReadCreationsCSV(r io.Reader) ([]Creation, error) {
 	}
 	out := make([]Creation, 0, len(rows)-first)
 	for i, row := range rows[first:] {
-		if len(row) != 3 || !strings.HasPrefix(row[0], "0x") || !strings.HasPrefix(row[1], "0x") {
-			return nil, fmt.Errorf("row %d: want address,creation_tx_hash,block_number", i+first+1)
+		if len(row) < 3 || len(row) > 4 || !strings.HasPrefix(row[0], "0x") || !strings.HasPrefix(row[1], "0x") {
+			return nil, fmt.Errorf("row %d: want address,creation_tx_hash,block_number[,creator]", i+first+1)
 		}
 		block, err := strconv.ParseUint(strings.TrimSpace(row[2]), 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("row %d: block_number: %w", i+first+1, err)
 		}
-		out = append(out, Creation{Address: strings.ToLower(strings.TrimSpace(row[0])), TxHash: strings.ToLower(strings.TrimSpace(row[1])), Block: block})
+		c := Creation{Address: strings.ToLower(strings.TrimSpace(row[0])), TxHash: strings.ToLower(strings.TrimSpace(row[1])), Block: block}
+		if len(row) == 4 {
+			c.Creator = strings.ToLower(strings.TrimSpace(row[3]))
+		}
+		out = append(out, c)
 	}
 	return out, nil
 }
@@ -80,7 +96,7 @@ type ContractsBackfillReport struct {
 // then, for the listed creations, by tracing each listed transaction once on the node. The list only says where to
 // look; every row comes from the node's trace. A transaction whose listed contracts all exist is skipped, so a
 // rerun resumes, and existing rows are never changed. Node calls are limited to perSecond.
-func BackfillContracts(ctx context.Context, d ContractsBackfillDB, node ContractsBackfillNode, listed []Creation, perSecond float64) (*ContractsBackfillReport, error) {
+func BackfillContracts(ctx context.Context, d ContractsBackfillDB, node ContractsBackfillNode, listed []Creation, opts ContractsBackfillOptions) (*ContractsBackfillReport, error) {
 	report := &ContractsBackfillReport{Failed: map[string]error{}}
 	n, err := d.BackfillContractsFromInternalTransactions(ctx)
 	if err != nil {
@@ -102,7 +118,7 @@ func BackfillContracts(ctx context.Context, d ContractsBackfillDB, node Contract
 		return a < b || a == b && txs[i] < txs[j]
 	})
 
-	limiter := rate.NewLimiter(rate.Limit(perSecond), 1)
+	limiter := rate.NewLimiter(rate.Limit(opts.PerSecond), 1)
 	getCode := func(ctx context.Context, a common.Address) ([]byte, error) {
 		if err := limiter.Wait(ctx); err != nil {
 			return nil, err
@@ -123,7 +139,12 @@ func BackfillContracts(ctx context.Context, d ContractsBackfillDB, node Contract
 			report.TxsSkipped++
 			continue
 		}
-		created, err := tracedCreations(ctx, node, limiter, getCode, tx)
+		var created []*types.Contract
+		if opts.WithoutTraces {
+			created, err = untracedCreations(ctx, node, limiter, getCode, tx, want)
+		} else {
+			created, err = tracedCreations(ctx, node, limiter, getCode, tx)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return report, ctx.Err()
@@ -186,6 +207,53 @@ func tracedCreations(ctx context.Context, node ContractsBackfillNode, limiter *r
 		if c := contractFromCreation(ctx, getCode, it, block); c != nil {
 			out = append(out, c)
 		}
+	}
+	return out, nil
+}
+
+func untracedCreations(ctx context.Context, node ContractsBackfillNode, limiter *rate.Limiter,
+	getCode func(context.Context, common.Address) ([]byte, error), tx string, want []Creation) ([]*types.Contract, error) {
+	hash := common.HexToHash(tx)
+	if err := limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	receipt, err := node.TransactionReceipt(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("receipt: %w", err)
+	}
+	if receipt == nil || receipt.BlockNumber == nil {
+		return nil, fmt.Errorf("the node has no receipt")
+	}
+	if receipt.Status != 1 {
+		return nil, nil
+	}
+	if err := limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	sent, _, err := node.TransactionByHash(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("transaction: %w", err)
+	}
+	block := receipt.BlockNumber.Uint64()
+	var out []*types.Contract
+	for _, c := range want {
+		creator := c.Creator
+		if creator == "" && sent != nil && sent.To != nil {
+			creator = sent.To.Hex()
+		}
+		code, err := getCode(ctx, common.HexToAddress(c.Address))
+		if err != nil {
+			return nil, fmt.Errorf("code of %s: %w", c.Address, err)
+		}
+		if len(code) == 0 || creator == "" {
+			continue
+		}
+		hex := common.Bytes2Hex(code)
+		bytecodeHash := common.BytesToHash(code).Hex()
+		out = append(out, &types.Contract{
+			Address: c.Address, Bytecode: hex, BytecodeHash: &bytecodeHash,
+			Creator: strings.ToLower(creator), CreationTx: hash.Hex(), BlockNumber: block,
+		})
 	}
 	return out, nil
 }
