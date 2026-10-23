@@ -3,22 +3,31 @@ package db
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// setupTestDB starts a postgres:15-alpine container, runs the full schema,
-// and returns a *DB plus a cleanup function.
-func setupTestDB(t *testing.T) (*DB, func()) {
-	t.Helper()
-	ctx := context.Background()
+// The package's tests share one postgres:15-alpine container. The schema is migrated once into the template
+// database testdb, and each test gets its own copy (CREATE DATABASE … TEMPLATE), dropped by its cleanup.
+var (
+	sharedPGOnce sync.Once
+	sharedPGURL  *url.URL
+	sharedPGErr  error
+	testDBSeq    atomic.Int64
+)
 
-	postgresContainer, err := postgres.RunContainer(ctx,
+func startSharedPG(ctx context.Context) (*url.URL, error) {
+	c, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("postgres:15-alpine"),
 		postgres.WithDatabase("testdb"),
 		postgres.WithUsername("testuser"),
@@ -30,36 +39,68 @@ func setupTestDB(t *testing.T) (*DB, func()) {
 		),
 	)
 	if err != nil {
-		t.Skipf("skipping: could not start postgres container (is Docker running?): %v", err)
+		return nil, fmt.Errorf("could not start postgres container (is Docker running?): %w", err)
 	}
-
-	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
+	connStr, err := c.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
-		postgresContainer.Terminate(ctx)
-		t.Fatalf("failed to get connection string: %v", err)
+		return nil, err
 	}
-
 	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
-		postgresContainer.Terminate(ctx)
+		return nil, err
+	}
+	err = (&DB{pool: pool}).Migrate()
+	pool.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
+	}
+	return url.Parse(connStr)
+}
+
+// setupTestDB returns a *DB on a fresh, fully migrated database of its own, plus a cleanup function.
+func setupTestDB(t *testing.T) (*DB, func()) {
+	t.Helper()
+	ctx := context.Background()
+
+	sharedPGOnce.Do(func() { sharedPGURL, sharedPGErr = startSharedPG(ctx) })
+	if sharedPGErr != nil {
+		if sharedPGURL == nil && strings.Contains(sharedPGErr.Error(), "could not start postgres container") {
+			t.Skipf("skipping: %v", sharedPGErr)
+		}
+		t.Fatal(sharedPGErr)
+	}
+
+	name := fmt.Sprintf("test_%d", testDBSeq.Add(1))
+	admin := *sharedPGURL
+	admin.Path = "/postgres"
+	conn, err := pgx.Connect(ctx, admin.String())
+	if err != nil {
+		t.Fatalf("failed to connect to the test server: %v", err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name+" TEMPLATE testdb"); err != nil {
+		t.Fatalf("failed to create %s: %v", name, err)
+	}
+
+	own := *sharedPGURL
+	own.Path = "/" + name
+	pool, err := pgxpool.New(ctx, own.String())
+	if err != nil {
 		t.Fatalf("failed to create pool: %v", err)
 	}
-
-	// Run the full schema from 001_schema.sql via the DB.Migrate() method.
-	d := &DB{pool: pool}
-	if err := d.Migrate(); err != nil {
-		pool.Close()
-		postgresContainer.Terminate(ctx)
-		t.Fatalf("failed to run migrations: %v", err)
-	}
-
 	cleanup := func() {
 		pool.Close()
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Logf("failed to terminate container: %v", err)
+		conn, err := pgx.Connect(ctx, admin.String())
+		if err != nil {
+			t.Logf("failed to connect to drop %s: %v", name, err)
+			return
+		}
+		defer conn.Close(ctx)
+		if _, err := conn.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)"); err != nil {
+			t.Logf("failed to drop %s: %v", name, err)
 		}
 	}
-	return d, cleanup
+	return &DB{pool: pool}, cleanup
 }
 
 // insertBlock inserts a minimal block row with just the required fields.
