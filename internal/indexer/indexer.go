@@ -803,31 +803,43 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 
 var errStaleForkTooDeep = errors.New("is on a stale fork deeper than any reorg")
 
-// revertStaleHead reverts the stored blocks at top and below that no longer match the chain, with every stored
-// block above them, ten blocks per check as detectReorg reads them, and returns the block the stored chain then
-// ends at (top when nothing was stale). A stale fork deeper than maxReorgDepth, or one whose revert fails, refuses
-// the start: starting on top of it would keep it stored for good.
+// revertStaleHead measures how far below top the stored chain no longer matches the node, down to the first stored
+// block that does, then reverts that many blocks, with every stored block above them, at once, and returns the
+// block the stored chain then ends at (top when nothing was stale). A stale fork deeper than maxReorgDepth (a reset
+// chain, or RPC_URL pointing at another chain) refuses the start before anything is deleted, as does a revert that
+// fails: starting on top of the fork would keep it stored for good.
 func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, error) {
-	head := top
-	for head > 0 {
-		depth, err := i.detectReorg(ctx, head)
+	var depth uint64
+	for d := uint64(0); d < top && d <= maxReorgDepth; d++ {
+		n := top - d
+		stored, err := i.db.GetBlock(ctx, n)
 		if err != nil {
-			return head, fmt.Errorf("check the stored block %d against the chain: %w", head, err)
+			return top, fmt.Errorf("read the stored block %d: %w", n, err)
 		}
-		if depth == 0 {
-			return head, nil
+		if stored == nil {
+			continue
 		}
-		if top-head+depth > maxReorgDepth {
-			return head, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset; "+
-				"set FORCE_REINDEX=true to wipe and re-index", top, errStaleForkTooDeep, maxReorgDepth)
+		chainHash, err := i.rpc.RawBlockHash(ctx, n)
+		if err != nil {
+			return top, fmt.Errorf("check the stored block %d against the chain: %w", n, err)
 		}
-		log.Warn("the stored head is on a stale fork; reverting it before starting", "block", head, "depth", depth)
-		if err := i.handleReorg(ctx, head-depth+1); err != nil {
-			return head, fmt.Errorf("the stored block %d is on a stale fork and reverting it failed: %w", head, err)
+		if stored.Hash == chainHash {
+			break
 		}
-		head -= depth
+		if depth = d + 1; depth > maxReorgDepth {
+			return top, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset, or "+
+				"RPC_URL points at another chain; nothing was deleted. Set FORCE_REINDEX=true to wipe and re-index",
+				top, errStaleForkTooDeep, maxReorgDepth)
+		}
 	}
-	return head, nil
+	if depth == 0 {
+		return top, nil
+	}
+	log.Warn("the stored head is on a stale fork; reverting it before starting", "block", top, "depth", depth)
+	if err := i.handleReorg(ctx, top-depth+1); err != nil {
+		return top, fmt.Errorf("the stored block %d is on a stale fork and reverting it failed: %w", top, err)
+	}
+	return top - depth, nil
 }
 
 func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {

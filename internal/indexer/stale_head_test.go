@@ -29,14 +29,14 @@ func staleHeadChain(stale uint64) (*MockDatabase, *MockRPCClient) {
 }
 
 // A stored head on a stale fork (a reorg while the indexer was down, or a revert that kept failing until
-// a restart) is reverted before the start mode is chosen, however deep within the reorg limit: collector mode starts
+// a restart) is reverted before the start mode is chosen, however deep within the reorg limit (here past detectReorg's
+// ten-block window): collector mode starts
 // realtime at the node head, and nothing below it would ever compare the stale blocks again.
 func TestStartRevertsAStaleStoredHead(t *testing.T) {
 	ctx := context.Background()
 	mockDB, mockRPC := staleHeadChain(13)
-	// The check covers ten blocks: 91..100 are reverted first, then 88..90 below them.
+	// 88..100 no longer match; 87 does: the 13 blocks are measured first, then reverted in one go.
 	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(100), nil).Once()
-	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(90), nil).Once()
 	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil)
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
@@ -125,4 +125,21 @@ func TestStartWipesAStaleForkDeeperThanAnyReorgWithForceReindex(t *testing.T) {
 	mockDB, err = start(true)
 	require.ErrorIs(t, err, context.DeadlineExceeded, "the start goes on after the wipe")
 	mockDB.AssertCalled(t, "WipeAllData", mock.Anything)
+}
+
+// A stale fork deeper than any reorg (a reset chain, or RPC_URL pointing at another chain) is refused
+// before anything is deleted. Reverting ten blocks a round down to the limit first cost ~122 stored blocks.
+func TestStartRefusesATooDeepStaleForkWithoutDeleting(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	for n := uint64(1); n <= 300; n++ {
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: fmt.Sprintf("0x%064x", 9000+n)}, nil).Maybe()
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(fmt.Sprintf("0x%064x", 1000+n), nil).Maybe()
+	}
+	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(300), nil).Maybe()
+	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+	idx := newPrefetchIndexer(mockDB, mockRPC)
+
+	_, err := idx.revertStaleHead(context.Background(), 300)
+	require.ErrorIs(t, err, errStaleForkTooDeep)
+	mockDB.AssertNotCalled(t, "DeleteBlock", mock.Anything, mock.Anything)
 }
