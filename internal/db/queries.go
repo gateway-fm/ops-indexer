@@ -278,6 +278,10 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM op_deposits WHERE l2_tx_hash IN (SELECT hash FROM transactions WHERE block_number = $1)`, number); err != nil {
 		return err
 	}
+	// 014 dropped the creation_tx foreign key whose cascade used to remove the block's contracts.
+	if _, err := tx.Exec(ctx, "DELETE FROM contracts WHERE block_number = $1", number); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, "DELETE FROM internal_transactions WHERE block_number = $1", number); err != nil {
 		return err
 	}
@@ -316,7 +320,7 @@ func (d *DB) GetTransaction(ctx context.Context, hash string) (*types.Transactio
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 		FROM transactions t
-		LEFT JOIN contracts c ON c.creation_tx = t.hash
+		LEFT JOIN contracts c ON c.creation_tx = t.hash AND t.to_address IS NULL
 		WHERE t.hash = $1`, hash).Scan(
 		&tx.Hash, &tx.BlockNumber, &tx.TxIndex, &tx.From, &tx.To, &tx.ContractAddress, &valueStr,
 		&tx.GasUsed, &tx.GasPrice, &tx.GasLimit, &tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.Nonce,
@@ -625,7 +629,7 @@ func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*ty
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
 			t.categories
 		FROM transactions t
-		LEFT JOIN contracts c ON c.creation_tx = t.hash
+		LEFT JOIN contracts c ON c.creation_tx = t.hash AND t.to_address IS NULL
 		WHERE t.hash = $1`, hash).Scan(
 		&tx.Hash, &tx.BlockNumber, &tx.BlockTimestamp, &tx.TxIndex, &tx.From, &tx.To, &tx.ContractAddress, &valueStr,
 		&tx.GasUsed, &tx.GasPrice, &tx.GasLimit, &tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.Nonce,
