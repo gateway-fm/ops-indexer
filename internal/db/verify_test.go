@@ -166,3 +166,34 @@ func TestRunningCheckCountsOpenRowsAboveTheLedger(t *testing.T) {
 	}))
 	require.Empty(t, checkAllBuckets(t, d, false), "with no span closed every row is open, and the totals still agree")
 }
+
+// The running repair moves a counter by (expected - stored), not to expected, so a delta ingest
+// commits between the check and the repair is kept.
+func TestRunningRepairKeepsADeltaCommittedAfterTheCheck(t *testing.T) {
+	d, cleanup := verifiedDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	_, err := d.pool.Exec(ctx, `UPDATE chain_counters SET count = count + 1 WHERE name = 'transactions_total'`)
+	require.NoError(t, err)
+	var drift *Drift
+	for _, dr := range checkAllBuckets(t, d, false) {
+		if dr.Family == "chain" && dr.Key == "transactions_total" {
+			dr := dr
+			drift = &dr
+		}
+	}
+	require.NotNil(t, drift, "the corrupted counter is found")
+
+	seedHistory(t, d, 14_001, 14_001, 1)
+	_, err = d.pool.Exec(ctx, `UPDATE chain_counters SET count = count + 1 WHERE name = 'transactions_total'`)
+	require.NoError(t, err)
+
+	tx, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, repairRunning(ctx, tx, *drift))
+	require.NoError(t, tx.Commit(ctx))
+	var counter, rows int64
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT (SELECT count FROM chain_counters WHERE name = 'transactions_total'), (SELECT count(*) FROM transactions)`).Scan(&counter, &rows))
+	require.Equal(t, rows, counter, "the repair keeps the transaction ingested after the check")
+}
