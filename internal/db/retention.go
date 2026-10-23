@@ -398,7 +398,8 @@ type historyHolder struct {
 
 // longHistoryHolder finds another backend whose transaction, open for more than a second, holds a lock on a history
 // table or one of its partitions: a reader the cut's DDL would wait for while ingest queues behind the DDL.
-// Ingest's own transactions last milliseconds and do not count.
+// Ingest's own transactions last milliseconds and do not count, nor does an autovacuum, which the DDL's lock request
+// cancels, unless it is preventing wraparound.
 func (d *DB) longHistoryHolder(ctx context.Context) (historyHolder, bool, error) {
 	var h historyHolder
 	var ageMS int64
@@ -407,6 +408,7 @@ func (d *DB) longHistoryHolder(ctx context.Context) (historyHolder, bool, error)
 		FROM pg_locks l
 		JOIN pg_stat_activity a ON a.pid = l.pid
 		WHERE l.granted AND l.pid <> pg_backend_pid() AND a.xact_start < now() - interval '1 second'
+		  AND (a.backend_type <> 'autovacuum worker' OR a.query LIKE '%(to prevent wraparound)%')
 		  AND l.relation IN (
 		      SELECT c.oid FROM pg_class c WHERE c.relname = ANY(history_tables())
 		      UNION SELECT i.inhrelid FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent
