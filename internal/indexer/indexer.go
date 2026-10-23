@@ -478,6 +478,21 @@ func (i *Indexer) Start(ctx context.Context) error {
 		}
 	}
 
+	// The stored head may be on a stale fork: a reorg while the indexer was down, or a revert that kept failing
+	// until a restart. It is reverted before the start mode is chosen: collector mode starts realtime at the node
+	// head, whose reorg check never reaches below its own cursor, and catch-up fills the gap with no parent check.
+	// Stored blocks above the node's head cannot be compared yet; a stale fork below them takes them with it.
+	if top := min(lastIndexed, latestOnChain); top > 0 {
+		head, err := i.revertStaleHead(ctx, top)
+		if err != nil {
+			return err
+		}
+		if head < top {
+			lastIndexed = head
+			blocksToSync = latestOnChain - lastIndexed
+		}
+	}
+
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 	catchupThreshold := uint64(100)
 	useCatchup := i.config.CatchupEnabled && (hasGaps || blocksToSync > catchupThreshold)
@@ -766,6 +781,33 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 		return deepest, nil
 	}
 	return 0, nil
+}
+
+// revertStaleHead reverts the stored blocks at top and below that no longer match the chain, with every stored
+// block above them, ten blocks per check as detectReorg reads them, and returns the block the stored chain then
+// ends at (top when nothing was stale). A stale fork deeper than maxReorgDepth, or one whose revert fails, refuses
+// the start: starting on top of it would keep it stored for good.
+func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, error) {
+	head := top
+	for head > 0 {
+		depth, err := i.detectReorg(ctx, head)
+		if err != nil {
+			return head, fmt.Errorf("check the stored block %d against the chain: %w", head, err)
+		}
+		if depth == 0 {
+			return head, nil
+		}
+		if top-head+depth > maxReorgDepth {
+			return head, fmt.Errorf("the stored chain below block %d is on a stale fork deeper than %d blocks: "+
+				"set FORCE_REINDEX=true to wipe and re-index", top, maxReorgDepth)
+		}
+		log.Warn("the stored head is on a stale fork; reverting it before starting", "block", head, "depth", depth)
+		if err := i.handleReorg(ctx, head-depth+1); err != nil {
+			return head, fmt.Errorf("the stored block %d is on a stale fork and reverting it failed: %w", head, err)
+		}
+		head -= depth
+	}
+	return head, nil
 }
 
 func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {

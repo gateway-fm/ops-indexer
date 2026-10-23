@@ -647,6 +647,8 @@ func TestChainResetDetection(t *testing.T) {
 
 		// Chain head at 900, last indexed at 1000 — delta of 100, within maxReorgDepth (128)
 		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(1000), nil)
+		// The stale-head check compares from the node's head down; nothing is stored there in this fixture.
+		mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 		mockDB.On("GetBlockCount", mock.Anything).Return(int64(1000), nil)
 		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(1000), nil).Maybe()
 		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(900), nil)
