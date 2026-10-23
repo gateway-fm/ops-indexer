@@ -23,7 +23,7 @@ func (d *DB) EnsureTxHashIndexes(ctx context.Context) error {
 				SELECT 1 FROM pg_index i
 				JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
 				WHERE i.indrelid = $1::regclass AND i.indnatts = 1 AND a.attname = 'tx_hash'
-				  AND i.indexprs IS NULL AND i.indpred IS NULL)`, table).Scan(&present); err != nil {
+				  AND i.indexprs IS NULL AND i.indpred IS NULL AND i.indisvalid)`, table).Scan(&present); err != nil {
 			return err
 		}
 		if present {
