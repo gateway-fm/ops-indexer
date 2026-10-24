@@ -68,7 +68,8 @@ transport) keeps it, to be retried after every other key, ten seconds later at t
 failing holds `stats_incomplete` true and logs `stats backfill: batch failed; retrying`. Retention prunes nothing until
 the backfill has written its days, which it counts from the blocks stored from `START_BLOCK`: history grows past
 `PRUNE_RETAIN_BLOCKS` for as long as the backfill runs. Once every block below `START_BLOCK` is counted, the backfill
-waits for catch-up to store every block from `START_BLOCK` to daily_stats' first, and logs that once.
+waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-up has stored every block from
+`START_BLOCK` to daily_stats' first, and logs that once.
 
 | variable | default | bounds |
 |---|---|---|

@@ -226,3 +226,41 @@ func TestStatsBackfillCompletionWaitsForCatchup(t *testing.T) {
 		ts(start)/86_400).Scan(&blocks))
 	require.Equal(t, nextDay-start, blocks, "START_BLOCK's day counts every block, the gap's included")
 }
+
+// With no aggregate yet, the completion took the stored head + 1 as the aggregate's first
+// block, so a gap-free prefix of START_BLOCK's day passed the wait. That day was written short, and the blocks after
+// the prefix and before the aggregate's first day were counted nowhere. The completion now waits until the aggregate
+// has started.
+func TestStatsBackfillCompletionWaitsForTheAggregateToStart(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	const start = int64(1_000)
+	ts := func(n int64) int64 { return dayStart - 200*7 + (n-start)*7 }
+	nextDay := start
+	for ts(nextDay) < dayStart {
+		nextDay++
+	}
+	require.NoError(t, d.InitStatsBackfill(ctx, uint64(start-1), uint64(ts(start-1))))
+	storeBlocks(t, d, span(start, start+80), ts)
+	_, err := d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `UPDATE stats_backfill SET through = target`)
+	require.NoError(t, err)
+
+	var wait *BackfillWait
+	require.ErrorAs(t, d.CompleteStatsBackfill(ctx), &wait, "blocks 1,000-1,080 are stored without a gap, but the aggregate has not started")
+	require.Equal(t, start+81, wait.FirstMissing)
+	s, err := d.StatsBackfillState(ctx)
+	require.NoError(t, err)
+	require.False(t, s.Complete)
+
+	storeBlocks(t, d, span(start+81, nextDay+50), ts)
+	_, err = d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	require.NoError(t, d.CompleteStatsBackfill(ctx))
+	var blocks int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT total_blocks FROM daily_stats WHERE date = DATE '1970-01-01' + $1::int`,
+		ts(start)/86_400).Scan(&blocks))
+	require.Equal(t, nextDay-start, blocks, "START_BLOCK's day counts every block, not the prefix stored at the first try")
+}

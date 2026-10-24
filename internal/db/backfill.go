@@ -29,11 +29,10 @@ func (w *BackfillWait) Error() string {
 
 func (w *BackfillWait) Unwrap() error { return ErrBackfillWaitsForCatchup }
 
-// backfillCompletionRangeSQL is START_BLOCK and the aggregate's first block, as daily_stats_backfill_complete takes
-// them (NULL acc_from: no block stored).
+// backfillCompletionRangeSQL is START_BLOCK and the aggregate's first block (NULL acc_from: the aggregate has not
+// started, so the completion waits).
 const backfillCompletionRangeSQL = `
-	SELECT s.target + 1 AS start,
-	       COALESCE((SELECT min(first_block) FROM daily_stats_acc), (SELECT max(number) + 1 FROM blocks)) AS acc_from
+	SELECT s.target + 1 AS start, (SELECT min(first_block) FROM daily_stats_acc) AS acc_from
 	FROM stats_backfill s WHERE s.id = 1`
 
 // backfillWait reports, without a lock, whether a block in [START_BLOCK, the aggregate's first) is not stored, and
@@ -50,7 +49,16 @@ func (d *DB) backfillWait(ctx context.Context) (*BackfillWait, error) {
 	}
 	switch {
 	case accFrom == nil:
-		return &BackfillWait{FirstMissing: start}, nil
+		var first int64
+		if err := d.pool.QueryRow(ctx, `
+			SELECT CASE
+			         WHEN NOT EXISTS (SELECT 1 FROM blocks WHERE number = $1) THEN $1
+			         ELSE (SELECT min(b.number) + 1 FROM blocks b WHERE b.number >= $1
+			               AND NOT EXISTS (SELECT 1 FROM blocks c WHERE c.number = b.number + 1))
+			       END`, start).Scan(&first); err != nil {
+			return nil, err
+		}
+		return &BackfillWait{FirstMissing: first}, nil
 	case listed != nil:
 		return &BackfillWait{FirstMissing: *listed}, nil
 	}

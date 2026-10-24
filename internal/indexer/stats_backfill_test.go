@@ -264,7 +264,11 @@ func TestStatsBackfillReadsEachTouchedBalanceOnce(t *testing.T) {
 		balances: map[string]*big.Int{chainRecipient.Hex(): big.NewInt(7007)}}
 	require.NoError(t, store.InitStatsBackfill(ctx, backfillStart-1, uint64(blockTime(backfillStart-1))))
 	idx := newTestIndexer(store, chain)
-	indexBlocks(t, idx, backfillStart, 1500)
+	indexBlocks(t, idx, backfillStart, 1600)
+	for range 2 {
+		_, err := store.AdvanceDailyStats(ctx)
+		require.NoError(t, err, "the aggregate starts on the day after START_BLOCK's (block 1,547)")
+	}
 	require.NoError(t, store.InsertBalancesBatch(ctx, []*types.Balance{{Address: strings.ToLower(chainSender.Hex()),
 		TokenAddress: strings.ToLower(chainToken.Hex()), BlockNumber: 1500, Balance: "9"}}), "the head path's balance worker")
 
