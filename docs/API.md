@@ -221,8 +221,9 @@ still cover the whole chain. A stats backfill walks `[0, START_BLOCK)` on the no
 contributed to every counter, current balance and current state, without storing their history rows. Startup
 refuses a `START_BLOCK` whose day is not entirely below the reorg floor (12,800 blocks below the node head).
 
-While it runs, `GetChainStats` reports `stats_incomplete` = true and `stats_backfilled_through_block`. These are
-partial until it completes:
+While it runs, `GetChainStats` reports `stats_incomplete` = true and `stats_backfilled_through_block`. It runs until
+every block is counted and every balance those blocks touched is read at the node's latest block; the reads can
+outlast the counting. These are partial until it completes:
 
 - `GetChainStats` totals; `GetAddress` and `BatchGetAddressTransactionCounts` counts and first/last seen blocks.
 - `GetToken` (transfer count, supply, holder count, creation block and transaction).

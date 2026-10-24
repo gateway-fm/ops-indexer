@@ -160,7 +160,8 @@ func TestStatsBackfillEqualsAFullSyncFromGenesis(t *testing.T) {
 	s, err := store.StatsBackfillState(ctx)
 	require.NoError(t, err)
 	s.LastTs = nil
-	require.Equal(t, db.BackfillState{Exists: true, Complete: true, Target: backfillStart - 1, Through: backfillStart - 1}, s)
+	require.Equal(t, db.BackfillState{Exists: true, Complete: true, BalancesPending: true, Target: backfillStart - 1,
+		Through: backfillStart - 1}, s, "every block counted; the touched balances are not read here")
 
 	var spans []string
 	rows, err := sql.Query(ctx, `SELECT lo || '-' || hi || ' ' || source FROM ledger_spans ORDER BY lo`)

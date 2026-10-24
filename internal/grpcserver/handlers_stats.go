@@ -37,7 +37,7 @@ func (s *Server) GetChainStats(ctx context.Context, _ *indexerv1.Empty) (*indexe
 		return nil, internalErr(err, "StatsBackfillState")
 	}
 	if backfill.Exists {
-		resp.StatsIncomplete = !backfill.Complete
+		resp.StatsIncomplete = !backfill.Complete || backfill.BalancesPending
 		resp.StatsBackfilledThroughBlock = uint64(max(backfill.Through, 0))
 	}
 	return resp, nil

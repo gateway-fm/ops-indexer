@@ -16,18 +16,21 @@ import (
 // count its blocks twice.
 var ErrBackfillNotNext = errors.New("stats backfill: batch does not continue the recorded progress")
 
-// BackfillState: Complete once every block is counted and daily_stats written; LastTs is the timestamp of block
-// Through, for the next batch's first block time.
+// BackfillState: Complete once every block is counted and daily_stats written; BalancesPending while a touched
+// balance is not read yet, which can outlast Complete; LastTs is the timestamp of block Through, for the next batch's
+// first block time.
 type BackfillState struct {
-	Exists, Complete bool
-	Target, Through  int64
-	LastTs           *int64
+	Exists, Complete, BalancesPending bool
+	Target, Through                   int64
+	LastTs                            *int64
 }
 
 func (d *DB) StatsBackfillState(ctx context.Context) (BackfillState, error) {
 	var s BackfillState
-	err := d.pool.QueryRow(ctx, `SELECT target, through, completed_at IS NOT NULL, last_ts FROM stats_backfill WHERE id = 1`).
-		Scan(&s.Target, &s.Through, &s.Complete, &s.LastTs)
+	err := d.pool.QueryRow(ctx, `
+		SELECT target, through, completed_at IS NOT NULL, EXISTS (SELECT 1 FROM stats_backfill_balance_keys), last_ts
+		FROM stats_backfill WHERE id = 1`).
+		Scan(&s.Target, &s.Through, &s.Complete, &s.BalancesPending, &s.LastTs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return s, nil
 	}

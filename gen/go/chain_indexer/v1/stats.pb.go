@@ -89,8 +89,8 @@ type ChainStats struct {
 	PrunedThroughBlock uint64 `protobuf:"varint,9,opt,name=pruned_through_block,json=prunedThroughBlock,proto3" json:"pruned_through_block,omitempty"`
 	// Timestamp of pruned_through_block (unset: nothing pruned).
 	PrunedThroughTimestamp *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=pruned_through_timestamp,json=prunedThroughTimestamp,proto3" json:"pruned_through_timestamp,omitempty"`
-	// True while the stats backfill of a deployment started at START_BLOCK > 0 is still counting the blocks below it:
-	// totals are partial until it completes (docs/API.md "Stats backfill").
+	// True while the stats backfill of a deployment started at START_BLOCK > 0 is still counting the blocks below it
+	// or reading the balances they touched: totals are partial until it completes (docs/API.md "Stats backfill").
 	StatsIncomplete bool `protobuf:"varint,11,opt,name=stats_incomplete,json=statsIncomplete,proto3" json:"stats_incomplete,omitempty"`
 	// Every block at or below this is counted by the stats backfill (0 with no backfill).
 	StatsBackfilledThroughBlock uint64 `protobuf:"varint,12,opt,name=stats_backfilled_through_block,json=statsBackfilledThroughBlock,proto3" json:"stats_backfilled_through_block,omitempty"`
