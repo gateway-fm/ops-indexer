@@ -20,6 +20,56 @@ var ErrBackfillNotNext = errors.New("stats backfill: batch does not continue the
 // to the aggregate's first: the completion counts those days from them.
 var ErrBackfillWaitsForCatchup = errors.New("stats backfill: waiting for catch-up to store the blocks from START_BLOCK")
 
+// BackfillWait is ErrBackfillWaitsForCatchup with the first block from START_BLOCK that catch-up has not stored.
+type BackfillWait struct{ FirstMissing int64 }
+
+func (w *BackfillWait) Error() string {
+	return fmt.Sprintf("%v; block %d is the first not stored", ErrBackfillWaitsForCatchup, w.FirstMissing)
+}
+
+func (w *BackfillWait) Unwrap() error { return ErrBackfillWaitsForCatchup }
+
+// backfillCompletionRangeSQL is START_BLOCK and the aggregate's first block, as daily_stats_backfill_complete takes
+// them (NULL acc_from: no block stored).
+const backfillCompletionRangeSQL = `
+	SELECT s.target + 1 AS start,
+	       COALESCE((SELECT min(first_block) FROM daily_stats_acc), (SELECT max(number) + 1 FROM blocks)) AS acc_from
+	FROM stats_backfill s WHERE s.id = 1`
+
+// backfillWait reports, without a lock, whether a block in [START_BLOCK, the aggregate's first) is not stored, and
+// the first one: from a listed missing range without counting, else by counting the range.
+func (d *DB) backfillWait(ctx context.Context) (*BackfillWait, error) {
+	var start int64
+	var accFrom, listed *int64
+	if err := d.pool.QueryRow(ctx, `
+		SELECT r.start, r.acc_from,
+		       (SELECT greatest(min(from_number), r.start) FROM missing_block_ranges
+		        WHERE from_number < r.acc_from AND to_number >= r.start HAVING count(*) > 0)
+		FROM (`+backfillCompletionRangeSQL+`) r`).Scan(&start, &accFrom, &listed); err != nil {
+		return nil, err
+	}
+	switch {
+	case accFrom == nil:
+		return &BackfillWait{FirstMissing: start}, nil
+	case listed != nil:
+		return &BackfillWait{FirstMissing: *listed}, nil
+	}
+	var first *int64
+	if err := d.pool.QueryRow(ctx, `
+		SELECT CASE
+		         WHEN (SELECT count(*) FROM blocks WHERE number >= $1 AND number < $2) = $2 - $1 THEN NULL
+		         WHEN NOT EXISTS (SELECT 1 FROM blocks WHERE number = $1) THEN $1
+		         ELSE (SELECT min(b.number) + 1 FROM blocks b WHERE b.number >= $1 AND b.number < $2 - 1
+		               AND NOT EXISTS (SELECT 1 FROM blocks c WHERE c.number = b.number + 1))
+		       END`, start, *accFrom).Scan(&first); err != nil {
+		return nil, err
+	}
+	if first == nil {
+		return nil, nil
+	}
+	return &BackfillWait{FirstMissing: *first}, nil
+}
+
 // BackfillState: Complete once every block is counted and daily_stats written; BalancesPending while a touched
 // balance is not read yet, which can outlast Complete; LastTs is the timestamp of block Through, for the next batch's
 // first block time.
@@ -233,17 +283,22 @@ func addDailyParts(ctx context.Context, tx pgx.Tx, b *BackfillBatch) error {
 }
 
 // CompleteStatsBackfill writes daily_stats for the days the backfill counted and marks it complete: from here the
-// totals are whole. It waits (ErrBackfillWaitsForCatchup) until every block from START_BLOCK to the aggregate's first
-// is stored, under daily_stats_advance's lock, since it counts those days from them.
+// totals are whole. It waits (a BackfillWait) until every block from START_BLOCK to the aggregate's first is stored,
+// since it counts those days from them: checked first without a lock, then again under daily_stats_advance's.
 func (d *DB) CompleteStatsBackfill(ctx context.Context) error {
+	wait, err := d.backfillWait(ctx)
+	if err != nil {
+		return err
+	}
+	if wait != nil {
+		return wait
+	}
 	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		var stored bool
 		if err := tx.QueryRow(ctx, `
 			SELECT pg_advisory_xact_lock(4670, 1) IS NOT NULL AND r.acc_from IS NOT NULL
 			       AND (SELECT count(*) FROM blocks WHERE number >= r.start AND number < r.acc_from) = r.acc_from - r.start
-			FROM (SELECT s.target + 1 AS start,
-			             COALESCE((SELECT min(first_block) FROM daily_stats_acc), (SELECT max(number) + 1 FROM blocks)) AS acc_from
-			      FROM stats_backfill s WHERE s.id = 1) r`).Scan(&stored); err != nil {
+			FROM (`+backfillCompletionRangeSQL+`) r`).Scan(&stored); err != nil {
 			return err
 		}
 		if !stored {

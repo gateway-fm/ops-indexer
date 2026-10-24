@@ -313,7 +313,8 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 		waitingNow := errors.Is(stepErr, db.ErrBackfillWaitsForCatchup)
 		if waitingNow {
 			if !waiting {
-				log.Info("stats backfill: every block counted; waiting for catch-up to store the blocks from START_BLOCK")
+				log.Info("stats backfill: every block counted; waiting for catch-up to store the blocks from START_BLOCK",
+					"detail", stepErr)
 			}
 			stepErr = nil
 		}

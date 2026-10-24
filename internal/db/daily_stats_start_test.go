@@ -205,7 +205,16 @@ func TestStatsBackfillCompletionWaitsForCatchup(t *testing.T) {
 	_, err = d.pool.Exec(ctx, `UPDATE stats_backfill SET through = target`)
 	require.NoError(t, err)
 
-	require.ErrorIs(t, d.CompleteStatsBackfill(ctx), ErrBackfillWaitsForCatchup, "blocks 1,050-1,059 are not stored yet")
+	_, err = d.pool.Exec(ctx, `INSERT INTO missing_block_ranges (from_number, to_number) VALUES ($1, $2)`, start+50, start+59)
+	require.NoError(t, err)
+	var wait *BackfillWait
+	require.ErrorAs(t, d.CompleteStatsBackfill(ctx), &wait, "blocks 1,050-1,059 are not stored yet, and listed")
+	require.Equal(t, start+50, wait.FirstMissing)
+	_, err = d.pool.Exec(ctx, `DELETE FROM missing_block_ranges`)
+	require.NoError(t, err)
+	require.ErrorAs(t, d.CompleteStatsBackfill(ctx), &wait, "not listed, still not stored")
+	require.Equal(t, start+50, wait.FirstMissing)
+	require.ErrorIs(t, wait, ErrBackfillWaitsForCatchup)
 	s, err := d.StatsBackfillState(ctx)
 	require.NoError(t, err)
 	require.False(t, s.Complete)
