@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -288,6 +289,10 @@ type workerStop struct {
 }
 
 func (s *workerStop) fail(what string, err error) {
+	if errors.Is(err, context.Canceled) {
+		// The shutdown cancelled it (Start returns ctx.Err()): a SIGTERM, every rollout, is not a failure.
+		return
+	}
 	log.Error(what, "error", err)
 	s.failed.Store(true)
 	s.cancel()

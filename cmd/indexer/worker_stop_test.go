@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -20,5 +21,18 @@ func TestWorkerFailureExitsNonZero(t *testing.T) {
 	}
 	if code := stop.exitCode(); code != 1 {
 		t.Fatalf("exit %d after a worker failed, want 1", code)
+	}
+}
+
+// A worker that returns because the shutdown cancelled it (Start returns ctx.Err()) is not a failure: a
+// SIGTERM, every rollout, exits 0.
+func TestShutdownCancellationIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := &workerStop{cancel: cancel}
+	cancel()
+	stop.fail("indexer worker error", ctx.Err())
+	stop.fail("grpc server error", fmt.Errorf("serve: %w", context.Canceled))
+	if code := stop.exitCode(); code != 0 {
+		t.Fatalf("exit %d after a graceful shutdown, want 0", code)
 	}
 }
