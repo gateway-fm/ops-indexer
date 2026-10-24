@@ -24,7 +24,7 @@ type backfillStore interface {
 	StatsBackfillState(ctx context.Context) (db.BackfillState, error)
 	CommitBackfillBatch(ctx context.Context, b *db.BackfillBatch) error
 	CompleteStatsBackfill(ctx context.Context) error
-	NextBackfillBalanceKeys(ctx context.Context, n int) ([]db.BalanceKey, error)
+	NextBackfillBalanceKeys(ctx context.Context, after *db.BalanceKey, n int) ([]db.BalanceKey, error)
 	SettleBackfillBalances(ctx context.Context, keys []db.BalanceKey, balances []*types.Balance) error
 }
 
@@ -45,6 +45,9 @@ type backfiller struct {
 	store   backfillStore
 	cfg     StatsBackfillConfig
 	limiter *rate.Limiter
+	// readAfter is the last key the balance reads took: the next pass starts after it and wraps at the end, so a key
+	// kept after a failed read is retried after every other key.
+	readAfter *db.BalanceKey
 }
 
 func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *backfiller {
@@ -226,10 +229,15 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 // path's balance worker drops it; a key whose read fails otherwise (rate limit, timeout, transport) stays for the
 // next pass, and the pass reports the failure so the caller backs off. It reports how many keys it took.
 func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
-	keys, err := b.store.NextBackfillBalanceKeys(ctx, n)
+	keys, err := b.store.NextBackfillBalanceKeys(ctx, b.readAfter, n)
+	if err == nil && len(keys) == 0 && b.readAfter != nil {
+		b.readAfter = nil
+		keys, err = b.store.NextBackfillBalanceKeys(ctx, nil, n)
+	}
 	if err != nil || len(keys) == 0 {
 		return 0, err
 	}
+	b.readAfter = &keys[len(keys)-1]
 	read := make([]*types.Balance, len(keys))
 	failed := make([]error, len(keys))
 	g, gctx := errgroup.WithContext(ctx)

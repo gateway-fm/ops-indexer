@@ -320,10 +320,16 @@ func addToStage(ctx context.Context, tx pgx.Tx, lo int64, s *SpanTotals) error {
 	return err
 }
 
-// NextBackfillBalanceKeys is up to n (token, address) keys the backfill touched whose balance is not read yet.
-func (d *DB) NextBackfillBalanceKeys(ctx context.Context, n int) ([]BalanceKey, error) {
+// NextBackfillBalanceKeys is up to n (token, address) keys the backfill touched whose balance is not read yet,
+// after the key after (from the first with none).
+func (d *DB) NextBackfillBalanceKeys(ctx context.Context, after *BalanceKey, n int) ([]BalanceKey, error) {
+	var token, address string
+	if after != nil {
+		token, address = after.Token, after.Address
+	}
 	rows, err := d.pool.Query(ctx, `
-		SELECT token_address, address, block_number FROM stats_backfill_balance_keys ORDER BY token_address, address LIMIT $1`, n)
+		SELECT token_address, address, block_number FROM stats_backfill_balance_keys
+		WHERE (token_address, address) > ($1, $2) ORDER BY token_address, address LIMIT $3`, token, address, n)
 	if err != nil {
 		return nil, err
 	}

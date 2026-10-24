@@ -403,3 +403,25 @@ func TestStatsBackfillKeepsABalanceWhoseReadFailedInTransit(t *testing.T) {
 	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n))
 	require.Equal(t, 3, n, "every holder whose read failed in transit is written on the next pass")
 }
+
+func TestStatsBackfillReadsPastKeysThatKeepFailing(t *testing.T) {
+	ctx := context.Background()
+	store, sql := setupPostgres(t)
+	stuck1, stuck2, holder := common.HexToAddress("0xa1"), common.HexToAddress("0xa2"), common.HexToAddress("0xa3")
+	for _, a := range []common.Address{stuck1, stuck2, holder} {
+		_, err := sql.Exec(ctx, `INSERT INTO stats_backfill_balance_keys VALUES ($1, $2, 1)`,
+			strings.ToLower(chainToken.Hex()), strings.ToLower(a.Hex()))
+		require.NoError(t, err)
+	}
+	down := &rpclient.HTTPStatusError{Code: 503}
+	chain := &failingChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 2_000, busy: 2_001,
+		balances: map[string]*big.Int{holder.Hex(): big.NewInt(7)}}, errs: map[common.Address]error{stuck1: down, stuck2: down}}
+	b := newTestIndexer(store, chain).newBackfiller(store, testBackfill)
+
+	for range 3 {
+		_, _ = b.readBalances(ctx, 2)
+	}
+	var n int
+	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n))
+	require.Equal(t, 1, n, "a window full of keys that keep failing does not hold back the keys after it")
+}

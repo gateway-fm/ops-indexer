@@ -358,6 +358,11 @@ func TestIsExecutionError(t *testing.T) {
 	}{
 		{&RPCError{Code: 3, Message: "execution reverted: not a holder"}, true},
 		{fmt.Errorf("balanceOf: %w", &RPCError{Code: -32000, Message: "execution reverted"}), true},
+		{&RPCError{Code: -32000, Message: "invalid opcode: INVALID"}, true},
+		{&RPCError{Code: -32000, Message: "out of gas"}, true},
+		{&RPCError{Code: -32000, Message: "invalid jump destination"}, true},
+		{&RPCError{Code: -32000, Message: "stack underflow (0 <=> 1)"}, true},
+		{&RPCError{Code: -32000, Message: "execution aborted (timeout = 5s)"}, false},
 		{&RPCError{Code: 429, Message: "Too Many Requests"}, false},
 		{&RPCError{Code: -32005, Message: "limit exceeded"}, false},
 		{&HTTPStatusError{Code: 503}, false},
