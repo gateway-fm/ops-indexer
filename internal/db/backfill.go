@@ -16,6 +16,10 @@ import (
 // count its blocks twice.
 var ErrBackfillNotNext = errors.New("stats backfill: batch does not continue the recorded progress")
 
+// ErrBackfillWaitsForCatchup defers the backfill's completion until catch-up has stored every block from START_BLOCK
+// to the aggregate's first: the completion counts those days from them.
+var ErrBackfillWaitsForCatchup = errors.New("stats backfill: waiting for catch-up to store the blocks from START_BLOCK")
+
 // BackfillState: Complete once every block is counted and daily_stats written; BalancesPending while a touched
 // balance is not read yet, which can outlast Complete; LastTs is the timestamp of block Through, for the next batch's
 // first block time.
@@ -229,9 +233,22 @@ func addDailyParts(ctx context.Context, tx pgx.Tx, b *BackfillBatch) error {
 }
 
 // CompleteStatsBackfill writes daily_stats for the days the backfill counted and marks it complete: from here the
-// totals are whole. It needs START_BLOCK stored.
+// totals are whole. It waits (ErrBackfillWaitsForCatchup) until every block from START_BLOCK to the aggregate's first
+// is stored, under daily_stats_advance's lock, since it counts those days from them.
 func (d *DB) CompleteStatsBackfill(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var stored bool
+		if err := tx.QueryRow(ctx, `
+			SELECT pg_advisory_xact_lock(4670, 1) IS NOT NULL AND r.acc_from IS NOT NULL
+			       AND (SELECT count(*) FROM blocks WHERE number >= r.start AND number < r.acc_from) = r.acc_from - r.start
+			FROM (SELECT s.target + 1 AS start,
+			             COALESCE((SELECT min(first_block) FROM daily_stats_acc), (SELECT max(number) + 1 FROM blocks)) AS acc_from
+			      FROM stats_backfill s WHERE s.id = 1) r`).Scan(&stored); err != nil {
+			return err
+		}
+		if !stored {
+			return ErrBackfillWaitsForCatchup
+		}
 		if _, err := tx.Exec(ctx, `SELECT daily_stats_backfill_complete()`); err != nil {
 			return err
 		}

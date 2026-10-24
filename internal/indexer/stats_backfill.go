@@ -292,17 +292,27 @@ func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
 func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg StatsBackfillConfig) {
 	b := i.newBackfiller(store, cfg)
 	log.Info("stats backfill started", "rps", cfg.RPS, "workers", cfg.Workers, "batch_blocks", cfg.BatchBlocks)
-	done := false
+	done, waiting := false, false
 	for ctx.Err() == nil {
 		var stepErr error
 		if !done {
 			done, stepErr = b.step(ctx)
 		}
-		read, err := b.readBalances(ctx, balanceKeysPerRead)
-		err = errors.Join(stepErr, err)
+		read, readErr := b.readBalances(ctx, balanceKeysPerRead)
+		waitingNow := errors.Is(stepErr, db.ErrBackfillWaitsForCatchup)
+		if waitingNow {
+			if !waiting {
+				log.Info("stats backfill: every block counted; waiting for catch-up to store the blocks from START_BLOCK")
+			}
+			stepErr = nil
+		}
+		waiting = waitingNow
+		err := errors.Join(stepErr, readErr)
 		switch {
-		case err != nil && ctx.Err() == nil:
-			log.Warn("stats backfill: batch failed; retrying", "error", err)
+		case (err != nil || waitingNow) && ctx.Err() == nil:
+			if err != nil {
+				log.Warn("stats backfill: batch failed; retrying", "error", err)
+			}
 			select {
 			case <-ctx.Done():
 			case <-time.After(cfg.Retry):

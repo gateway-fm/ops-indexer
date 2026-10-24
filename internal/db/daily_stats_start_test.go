@@ -183,3 +183,37 @@ func TestDailyStatsFirstRunWithAStatsBackfillStartsAfterStartBlocksDay(t *testin
 	require.NoError(t, err)
 	require.NoError(t, d.CompleteStatsBackfill(ctx), "the backfill completes: the aggregate starts after START_BLOCK's day")
 }
+
+// The backfill's completion counted the days from START_BLOCK from whatever catch-up had
+// stored; a gap still open there left those days short for good, the blocks stored later being below the watermark.
+// The completion now waits until every block from START_BLOCK to the aggregate's first is stored.
+func TestStatsBackfillCompletionWaitsForCatchup(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	const start = int64(1_000)
+	ts := func(n int64) int64 { return dayStart - 200*7 + (n-start)*7 }
+	nextDay := start
+	for ts(nextDay) < dayStart {
+		nextDay++
+	}
+	require.NoError(t, d.InitStatsBackfill(ctx, uint64(start-1), uint64(ts(start-1))))
+	storeBlocks(t, d, span(start, start+49), ts)
+	storeBlocks(t, d, span(start+60, nextDay+50), ts)
+	_, err := d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `UPDATE stats_backfill SET through = target`)
+	require.NoError(t, err)
+
+	require.ErrorIs(t, d.CompleteStatsBackfill(ctx), ErrBackfillWaitsForCatchup, "blocks 1,050-1,059 are not stored yet")
+	s, err := d.StatsBackfillState(ctx)
+	require.NoError(t, err)
+	require.False(t, s.Complete)
+
+	storeBlocks(t, d, span(start+50, start+59), ts)
+	require.NoError(t, d.CompleteStatsBackfill(ctx))
+	var blocks int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT total_blocks FROM daily_stats WHERE date = DATE '1970-01-01' + $1::int`,
+		ts(start)/86_400).Scan(&blocks))
+	require.Equal(t, nextDay-start, blocks, "START_BLOCK's day counts every block, the gap's included")
+}

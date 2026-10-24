@@ -67,7 +67,8 @@ invalid opcode, out of gas) drops the key (not a token); a read that fails other
 transport) keeps it, to be retried after every other key, ten seconds later at the soonest. A node that keeps
 failing holds `stats_incomplete` true and logs `stats backfill: batch failed; retrying`. Retention prunes nothing until
 the backfill has written its days, which it counts from the blocks stored from `START_BLOCK`: history grows past
-`PRUNE_RETAIN_BLOCKS` for as long as the backfill runs.
+`PRUNE_RETAIN_BLOCKS` for as long as the backfill runs. Once every block below `START_BLOCK` is counted, the backfill
+waits for catch-up to store every block from `START_BLOCK` to daily_stats' first, and logs that once.
 
 | variable | default | bounds |
 |---|---|---|
