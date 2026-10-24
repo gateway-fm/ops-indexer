@@ -20,10 +20,18 @@ var ErrBackfillNotNext = errors.New("stats backfill: batch does not continue the
 // to the aggregate's first: the completion counts those days from them.
 var ErrBackfillWaitsForCatchup = errors.New("stats backfill: waiting for catch-up to store the blocks from START_BLOCK")
 
-// BackfillWait is ErrBackfillWaitsForCatchup with the first block from START_BLOCK that catch-up has not stored.
-type BackfillWait struct{ FirstMissing int64 }
+// BackfillWait is ErrBackfillWaitsForCatchup with the first block from START_BLOCK that catch-up has not stored, or
+// DailyStatsNotStarted: daily_stats starts on the first day after START_BLOCK's that catch-up reaches.
+type BackfillWait struct {
+	FirstMissing         int64
+	DailyStatsNotStarted bool
+}
 
 func (w *BackfillWait) Error() string {
+	if w.DailyStatsNotStarted {
+		return fmt.Sprintf("%v; daily_stats has not started yet, which it does on the first day after START_BLOCK's that catch-up stores",
+			ErrBackfillWaitsForCatchup)
+	}
 	return fmt.Sprintf("%v; block %d is the first not stored", ErrBackfillWaitsForCatchup, w.FirstMissing)
 }
 
@@ -49,16 +57,7 @@ func (d *DB) backfillWait(ctx context.Context) (*BackfillWait, error) {
 	}
 	switch {
 	case accFrom == nil:
-		var first int64
-		if err := d.pool.QueryRow(ctx, `
-			SELECT CASE
-			         WHEN NOT EXISTS (SELECT 1 FROM blocks WHERE number = $1) THEN $1
-			         ELSE (SELECT min(b.number) + 1 FROM blocks b WHERE b.number >= $1
-			               AND NOT EXISTS (SELECT 1 FROM blocks c WHERE c.number = b.number + 1))
-			       END`, start).Scan(&first); err != nil {
-			return nil, err
-		}
-		return &BackfillWait{FirstMissing: first}, nil
+		return &BackfillWait{DailyStatsNotStarted: true}, nil
 	case listed != nil:
 		return &BackfillWait{FirstMissing: *listed}, nil
 	}

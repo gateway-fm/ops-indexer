@@ -250,7 +250,8 @@ func TestStatsBackfillCompletionWaitsForTheAggregateToStart(t *testing.T) {
 
 	var wait *BackfillWait
 	require.ErrorAs(t, d.CompleteStatsBackfill(ctx), &wait, "blocks 1,000-1,080 are stored without a gap, but the aggregate has not started")
-	require.Equal(t, start+81, wait.FirstMissing)
+	require.True(t, wait.DailyStatsNotStarted)
+	require.ErrorContains(t, wait, "daily_stats has not started yet")
 	s, err := d.StatsBackfillState(ctx)
 	require.NoError(t, err)
 	require.False(t, s.Complete)
