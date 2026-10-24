@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"strings"
 	"sync"
@@ -424,4 +425,33 @@ func TestStatsBackfillReadsPastKeysThatKeepFailing(t *testing.T) {
 	var n int
 	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n))
 	require.Equal(t, 1, n, "a window full of keys that keep failing does not hold back the keys after it")
+}
+
+// refusingCompletion fails every completion, as daily_stats_backfill_complete did with the aggregate started on
+// START_BLOCK's day.
+type refusingCompletion struct{ *db.DB }
+
+func (refusingCompletion) CompleteStatsBackfill(context.Context) error {
+	return errors.New("the incremental aggregate covers START_BLOCK's day")
+}
+
+func TestStatsBackfillReadsBalancesWhileAStepFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, sql := setupPostgres(t)
+	require.NoError(t, store.InitStatsBackfill(ctx, backfillStart-1, uint64(blockTime(backfillStart-1))))
+	_, err := sql.Exec(ctx, `UPDATE stats_backfill SET through = target`)
+	require.NoError(t, err)
+	_, err = sql.Exec(ctx, `INSERT INTO stats_backfill_balance_keys VALUES ($1, $2, 1)`,
+		strings.ToLower(chainToken.Hex()), strings.ToLower(chainRecipient.Hex()))
+	require.NoError(t, err)
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 2_000, busy: 2_001,
+		balances: map[string]*big.Int{chainRecipient.Hex(): big.NewInt(7)}}
+	idx := newTestIndexer(store, chain)
+
+	go idx.RunStatsBackfill(ctx, refusingCompletion{store}, testBackfill)
+	require.Eventually(t, func() bool {
+		var n int
+		return sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n) == nil && n == 1
+	}, 20*time.Second, 50*time.Millisecond, "the balances are read although the step keeps failing")
 }

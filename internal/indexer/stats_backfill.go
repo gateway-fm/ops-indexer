@@ -3,6 +3,7 @@ package indexer
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -287,20 +288,18 @@ func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
 }
 
 // RunStatsBackfill walks the backfill to its target, batch by batch, resuming from the recorded progress, and reads
-// the balances of the keys it touched as it goes.
+// the balances of the keys it touched as it goes, whether or not the step succeeded.
 func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg StatsBackfillConfig) {
 	b := i.newBackfiller(store, cfg)
 	log.Info("stats backfill started", "rps", cfg.RPS, "workers", cfg.Workers, "batch_blocks", cfg.BatchBlocks)
 	done := false
 	for ctx.Err() == nil {
-		var err error
+		var stepErr error
 		if !done {
-			done, err = b.step(ctx)
+			done, stepErr = b.step(ctx)
 		}
-		read := 0
-		if err == nil {
-			read, err = b.readBalances(ctx, balanceKeysPerRead)
-		}
+		read, err := b.readBalances(ctx, balanceKeysPerRead)
+		err = errors.Join(stepErr, err)
 		switch {
 		case err != nil && ctx.Err() == nil:
 			log.Warn("stats backfill: batch failed; retrying", "error", err)
