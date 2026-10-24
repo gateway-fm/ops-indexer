@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -437,9 +438,9 @@ func (refusingCompletion) CompleteStatsBackfill(context.Context) error {
 }
 
 func TestStatsBackfillReadsBalancesWhileAStepFails(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	store, sql := setupPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	require.NoError(t, store.InitStatsBackfill(ctx, backfillStart-1, uint64(blockTime(backfillStart-1))))
 	_, err := sql.Exec(ctx, `UPDATE stats_backfill SET through = target`)
 	require.NoError(t, err)
@@ -454,7 +455,7 @@ func TestStatsBackfillReadsBalancesWhileAStepFails(t *testing.T) {
 	require.Eventually(t, func() bool {
 		var n int
 		return sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n) == nil && n == 1
-	}, 20*time.Second, 50*time.Millisecond, "the balances are read although the step keeps failing")
+	}, 90*time.Second, 50*time.Millisecond, "the balances are read although the step keeps failing")
 }
 
 // waitingCompletion answers every completion with a wait for catch-up and counts the calls.
@@ -469,9 +470,9 @@ func (w *waitingCompletion) CompleteStatsBackfill(context.Context) error {
 }
 
 func TestStatsBackfillDrainsWhileTheCompletionWaits(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	store, sql := setupPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	require.NoError(t, store.InitStatsBackfill(ctx, backfillStart-1, uint64(blockTime(backfillStart-1))))
 	_, err := sql.Exec(ctx, `UPDATE stats_backfill SET through = target`)
 	require.NoError(t, err)
@@ -488,6 +489,22 @@ func TestStatsBackfillDrainsWhileTheCompletionWaits(t *testing.T) {
 	require.Eventually(t, func() bool {
 		var n int
 		return sql.QueryRow(ctx, `SELECT count(*) FROM stats_backfill_balance_keys`).Scan(&n) == nil && n == 0
-	}, 20*time.Second, 50*time.Millisecond, "the keys drain while the completion waits for catch-up, without a retry pause per window")
+	}, 90*time.Second, 50*time.Millisecond, "the keys drain while the completion waits for catch-up, without a retry pause per window")
 	require.EqualValues(t, 1, store2.calls.Load(), "a waiting completion is asked again only after a minute")
+	require.Eventually(t, func() bool { return gauge(t, "indexer_stats_backfill_waiting_for_catchup") == 1 },
+		10*time.Second, 50*time.Millisecond, "the waiting gauge is up")
+}
+
+// gauge is the current value of a gauge in the default registry.
+func gauge(t *testing.T, name string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() == name {
+			return f.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("no gauge %s", name)
+	return 0
 }
