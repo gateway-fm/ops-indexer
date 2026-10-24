@@ -62,7 +62,9 @@ on any drift. The ledger and the checks run with retention on or off.
 
 With `START_BLOCK` > 0 and retention on, the stats backfill (docs/API.md "Stats backfill") counts `[0, START_BLOCK)`
 from the node into the counters and into ledger spans of source `node`, which the `node` check recounts like any
-pruned span:
+pruned span. It then reads each touched balance once, at the node's latest block. A read that reverts drops the key
+(not a token); a read that fails otherwise (rate limit, timeout, transport) keeps it for the next pass, ten seconds
+later, so a node that keeps failing holds `stats_incomplete` true and logs `stats backfill: batch failed; retrying`.
 
 | variable | default | bounds |
 |---|---|---|

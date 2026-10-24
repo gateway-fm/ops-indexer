@@ -77,16 +77,23 @@ type jsonrpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      uint64          `json:"id"`
 	Result  json.RawMessage `json:"result"`
-	Error   *jsonrpcError   `json:"error"`
+	Error   *RPCError       `json:"error"`
 }
 
-type jsonrpcError struct {
+type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-func (e *jsonrpcError) Error() string {
+func (e *RPCError) Error() string {
 	return fmt.Sprintf("rpc error: code %d, message: %s", e.Code, e.Message)
+}
+
+// IsExecutionError reports whether the node ran the call and it failed (a revert): the same call fails again.
+// Rate limits, timeouts and transport failures are not.
+func IsExecutionError(err error) bool {
+	var e *RPCError
+	return errors.As(err, &e) && (e.Code == 3 || strings.Contains(strings.ToLower(e.Message), "revert"))
 }
 
 func (c *Client) CallContext(ctx context.Context, result any, method string, args ...any) error {

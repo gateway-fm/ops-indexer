@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math/big"
@@ -221,14 +222,16 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 }
 
 // readBalances reads, at latest, the balance of up to n keys the backfill touched, once each, Workers at a time
-// within RPS; a key whose balanceOf fails (not a token after all) is dropped, as the head path's balance worker
-// drops it. It reports how many keys it took.
+// within RPS. A key whose balanceOf reverts or returns no uint256 (not a token after all) is dropped, as the head
+// path's balance worker drops it; a key whose read fails otherwise (rate limit, timeout, transport) stays for the
+// next pass, and the pass reports the failure so the caller backs off. It reports how many keys it took.
 func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
 	keys, err := b.store.NextBackfillBalanceKeys(ctx, n)
 	if err != nil || len(keys) == 0 {
 		return 0, err
 	}
 	read := make([]*types.Balance, len(keys))
+	failed := make([]error, len(keys))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(max(b.cfg.Workers, 1))
 	for i, k := range keys {
@@ -238,24 +241,41 @@ func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
 			}
 			data := append(append([]byte{}, balanceOfSelector...), common.LeftPadBytes(common.HexToAddress(k.Address).Bytes(), 32)...)
 			out, err := b.idx.rpc.CallContract(gctx, common.HexToAddress(k.Token), data)
-			if err != nil || len(out) < 32 {
-				return nil
+			switch {
+			case err != nil && !rpclient.IsExecutionError(err):
+				failed[i] = err
+			case err != nil || len(out) < 32:
+			default:
+				read[i] = &types.Balance{Address: k.Address, TokenAddress: k.Token, BlockNumber: k.Block,
+					Balance: types.JSONString(new(big.Int).SetBytes(out[:32]).String())}
 			}
-			read[i] = &types.Balance{Address: k.Address, TokenAddress: k.Token, BlockNumber: k.Block,
-				Balance: types.JSONString(new(big.Int).SetBytes(out[:32]).String())}
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return 0, err
 	}
+	settled := make([]db.BalanceKey, 0, len(keys))
 	balances := make([]*types.Balance, 0, len(keys))
-	for _, r := range read {
-		if r != nil {
-			balances = append(balances, r)
+	var firstErr error
+	for i, k := range keys {
+		if failed[i] != nil {
+			firstErr = cmp.Or(firstErr, failed[i])
+			continue
+		}
+		settled = append(settled, k)
+		if read[i] != nil {
+			balances = append(balances, read[i])
 		}
 	}
-	return len(keys), b.store.SettleBackfillBalances(ctx, keys, balances)
+	if err := b.store.SettleBackfillBalances(ctx, settled, balances); err != nil {
+		return 0, err
+	}
+	if firstErr != nil {
+		return len(keys), fmt.Errorf("%d of %d balance reads failed, kept for the next pass: %w",
+			len(keys)-len(settled), len(keys), firstErr)
+	}
+	return len(keys), nil
 }
 
 // RunStatsBackfill walks the backfill to its target, batch by batch, resuming from the recorded progress, and reads

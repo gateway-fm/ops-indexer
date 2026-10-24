@@ -8,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 const backfillStart = 1_200
@@ -345,4 +347,59 @@ func TestStatsBackfillReadsBalancesWithItsWorkers(t *testing.T) {
 	var n int
 	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current WHERE balance > 0`).Scan(&n))
 	require.Equal(t, 8, n, "every key read is written")
+}
+
+// failingChain answers balanceOf for some holders with an error instead of a balance.
+type failingChain struct {
+	*fakeChain
+	errs map[common.Address]error
+}
+
+func (c *failingChain) CallContract(ctx context.Context, to common.Address, data []byte) ([]byte, error) {
+	if err := c.errs[common.BytesToAddress(data[4:])]; err != nil {
+		return nil, err
+	}
+	return c.fakeChain.CallContract(ctx, to, data)
+}
+
+func TestStatsBackfillKeepsABalanceWhoseReadFailedInTransit(t *testing.T) {
+	ctx := context.Background()
+	store, sql := setupPostgres(t)
+	limited, timedOut, reverted, ok := common.HexToAddress("0xa1"), common.HexToAddress("0xa2"),
+		common.HexToAddress("0xa3"), common.HexToAddress("0xa4")
+	for _, a := range []common.Address{limited, timedOut, reverted, ok} {
+		_, err := sql.Exec(ctx, `INSERT INTO stats_backfill_balance_keys VALUES ($1, $2, 1)`,
+			strings.ToLower(chainToken.Hex()), strings.ToLower(a.Hex()))
+		require.NoError(t, err)
+	}
+	chain := &failingChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 2_000, busy: 2_001,
+		balances: map[string]*big.Int{limited.Hex(): big.NewInt(5), timedOut.Hex(): big.NewInt(6), ok.Hex(): big.NewInt(7)}},
+		errs: map[common.Address]error{
+			limited:  &rpclient.RPCError{Code: 429, Message: "Too Many Requests"},
+			timedOut: context.DeadlineExceeded,
+			reverted: &rpclient.RPCError{Code: 3, Message: "execution reverted"},
+		}}
+	b := newTestIndexer(store, chain).newBackfiller(store, testBackfill)
+
+	read, err := b.readBalances(ctx, balanceKeysPerRead)
+	require.Error(t, err, "a pass with failed reads backs off")
+	require.Equal(t, 4, read)
+	left := func() []string {
+		rows, err := sql.Query(ctx, `SELECT address FROM stats_backfill_balance_keys ORDER BY address`)
+		require.NoError(t, err)
+		got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		return got
+	}
+	require.Equal(t, []string{strings.ToLower(limited.Hex()), strings.ToLower(timedOut.Hex())}, left(),
+		"the rate-limited and timed-out keys stay for the next pass; the reverted one (not a token) is dropped")
+
+	delete(chain.errs, limited)
+	delete(chain.errs, timedOut)
+	_, err = b.readBalances(ctx, balanceKeysPerRead)
+	require.NoError(t, err)
+	require.Empty(t, left())
+	var n int
+	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n))
+	require.Equal(t, 3, n, "every holder whose read failed in transit is written on the next pass")
 }
