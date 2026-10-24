@@ -145,3 +145,41 @@ func TestDailyStatsReorgNeverStartsADayThatWasNotAggregated(t *testing.T) {
 	require.NoError(t, d.pool.QueryRow(ctx, `SELECT total_blocks FROM daily_stats WHERE date = DATE '1970-01-01' + $1::int - 1`, dayStart/86_400).Scan(&yesterday))
 	require.Equal(t, firstToday-1, yesterday, "the day before counts every one of its blocks, not a part")
 }
+
+// With a stats backfill, nothing below START_BLOCK is ever stored, so "nothing stored before the day" is not
+// a fresh start. Taken as one, the first watermark started on START_BLOCK's day, and daily_stats_backfill_complete
+// then refused for good: the backfill never completed and never read its balances. The watermark now waits for a day
+// whose previous block is stored, which is always after START_BLOCK's day.
+func TestDailyStatsFirstRunWithAStatsBackfillStartsAfterStartBlocksDay(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	const start = int64(1_000)
+	ts := func(n int64) int64 { return dayStart - 200*7 + (n-start)*7 }
+	nextDay := start
+	for ts(nextDay) < dayStart {
+		nextDay++
+	}
+	require.NoError(t, d.InitStatsBackfill(ctx, uint64(start-1), uint64(ts(start-1))))
+
+	storeBlocks(t, d, span(start+5, start+60), ts)
+	_, err := d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	storeBlocks(t, d, span(start, start+4), ts)
+	_, err = d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	var watermarks int
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM daily_stats_watermark`).Scan(&watermarks))
+	require.Zero(t, watermarks, "START_BLOCK's day is not a fresh start: nothing below START_BLOCK is ever stored")
+
+	storeBlocks(t, d, span(start+61, nextDay+50), ts)
+	_, err = d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	var first int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT min(first_block) FROM daily_stats_acc`).Scan(&first))
+	require.Equal(t, nextDay, first, "the aggregate starts at the day after START_BLOCK's")
+
+	_, err = d.pool.Exec(ctx, `UPDATE stats_backfill SET through = target`)
+	require.NoError(t, err)
+	require.NoError(t, d.CompleteStatsBackfill(ctx), "the backfill completes: the aggregate starts after START_BLOCK's day")
+}

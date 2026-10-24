@@ -2039,7 +2039,9 @@ func (d *DB) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) erro
 
 // startDailyStatsWatermark sets the first watermark just below the newest day's first block, but only once that
 // block is known to be the day's first: the block before it is stored (it belongs to an earlier day), or nothing
-// is stored before the day at all (a fresh start). daily_stats_advance's own first run takes the first *stored*
+// is stored before the day at all (a fresh start). With a stats backfill nothing below START_BLOCK is ever stored, so
+// that is no fresh start: the watermark waits for a day whose previous block is stored, always a day after
+// START_BLOCK's, which daily_stats_backfill_complete needs. daily_stats_advance's own first run takes the first *stored*
 // block of the day, so a day whose start catch-up had not stored yet was cut, and the blocks catch-up stored later
 // fell below the watermark and were never counted (PRST-5436). Until then the advance waits. It reports
 // whether a watermark exists.
@@ -2050,7 +2052,8 @@ const startDailyStatsWatermarkSQL = `
 		INSERT INTO daily_stats_watermark (id, last_block)
 		SELECT 1, first.n - 1 FROM first
 		WHERE first.n IS NOT NULL AND NOT EXISTS (SELECT 1 FROM daily_stats_watermark)
-		  AND (EXISTS (SELECT 1 FROM blocks WHERE number = first.n - 1) OR NOT EXISTS (SELECT 1 FROM blocks WHERE number < first.n))
+		  AND (EXISTS (SELECT 1 FROM blocks WHERE number = first.n - 1)
+		       OR (NOT EXISTS (SELECT 1 FROM blocks WHERE number < first.n) AND NOT EXISTS (SELECT 1 FROM stats_backfill)))
 		ON CONFLICT (id) DO NOTHING
 		RETURNING 1
 	)
