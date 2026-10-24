@@ -143,3 +143,27 @@ func TestStartRefusesATooDeepStaleForkWithoutDeleting(t *testing.T) {
 	require.ErrorIs(t, err, errStaleForkTooDeep)
 	mockDB.AssertNotCalled(t, "DeleteBlock", mock.Anything, mock.Anything)
 }
+
+// A stale block under a matching head (a partial revert left by an earlier build) is reverted at start
+// too: the check reads the whole ten-block window, as the per-tick check does, and reverts down to the deepest
+// mismatch.
+func TestStartRevertsAStaleBlockUnderAMatchingHead(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	for n := uint64(1); n <= 100; n++ {
+		chain := fmt.Sprintf("0x%064x", 1000+n)
+		stored := chain
+		if n == 97 {
+			stored = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil).Maybe()
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil).Maybe()
+	}
+	mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(100), nil).Maybe()
+	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil)
+	idx := newPrefetchIndexer(mockDB, mockRPC)
+
+	head, err := idx.revertStaleHead(context.Background(), 100)
+	require.NoError(t, err)
+	require.Equal(t, uint64(96), head)
+	mockDB.AssertNumberOfCalls(t, "DeleteBlock", 4)
+}

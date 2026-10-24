@@ -803,8 +803,12 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 
 var errStaleForkTooDeep = errors.New("is on a stale fork deeper than any reorg")
 
-// revertStaleHead measures how far below top the stored chain no longer matches the node, down to the first stored
-// block that does, then reverts that many blocks, with every stored block above them, at once, and returns the
+// staleHeadWindow is how many blocks below the stored head the start check reads at least, as detectReorg does per
+// tick: a stale block under a matching head (a partial revert) is reverted too.
+const staleHeadWindow = 10
+
+// revertStaleHead measures how far below top the stored chain no longer matches the node, down to the deepest
+// mismatch in the first staleHeadWindow blocks or, below them, to the first stored block that matches, then reverts that many blocks, with every stored block above them, at once, and returns the
 // block the stored chain then ends at (top when nothing was stale). A stale fork deeper than maxReorgDepth (a reset
 // chain, or RPC_URL pointing at another chain) refuses the start before anything is deleted, as does a revert that
 // fails: starting on top of the fork would keep it stored for good.
@@ -824,7 +828,10 @@ func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, erro
 			return top, fmt.Errorf("check the stored block %d against the chain: %w", n, err)
 		}
 		if stored.Hash == chainHash {
-			break
+			if d+1 >= staleHeadWindow {
+				break
+			}
+			continue
 		}
 		if depth = d + 1; depth > maxReorgDepth {
 			return top, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset, or "+
