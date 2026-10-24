@@ -319,6 +319,7 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 			stepErr = nil
 		}
 		waiting = waitingNow
+		metrics.SetStatsBackfillWaiting(waiting)
 		err := errors.Join(stepErr, readErr)
 		switch {
 		case (err != nil || waitingNow && read == 0) && ctx.Err() == nil:

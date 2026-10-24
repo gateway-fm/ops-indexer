@@ -83,6 +83,8 @@ waits for catch-up to store every block from `START_BLOCK` to daily_stats' first
 | `indexer_ledger_closed_through` | Every block at or below this is in a closed span. |
 | `indexer_ledger_close_seconds` | Time to close one span from its rows. |
 | `indexer_stats_backfill_through` | Every block at or below this is counted by the stats backfill. |
+| `indexer_stats_backfill_waiting_for_catchup` | 1 while the backfill has counted every block below `START_BLOCK` and waits for catch-up to store every block from it. |
+| `indexer_prune_blocked_by_stats_backfill` | 1 while retention prunes nothing because the backfill has not written its days; history grows meanwhile. |
 | `indexer_verify_ranges_checked_total{check}` | Spans, buckets or samples checked. |
 | `indexer_verify_ranges_drifted_total{check}` | Checks that found a difference. |
 | `indexer_verify_drift{check}` | Differences found by the last check. |

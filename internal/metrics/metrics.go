@@ -52,6 +52,16 @@ var (
 		Help: "Every block at or below this is counted by the stats backfill.",
 	})
 
+	statsBackfillWaiting = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_stats_backfill_waiting_for_catchup",
+		Help: "1 while the stats backfill has counted every block below START_BLOCK and waits for catch-up to store every block from it.",
+	})
+
+	pruneBlockedByBackfill = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_prune_blocked_by_stats_backfill",
+		Help: "1 while retention prunes nothing because the stats backfill has not written its days.",
+	})
+
 	verifyChecked = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "indexer_verify_ranges_checked_total",
 		Help: "Ledger checks run, by check (recount: one retained span; running: chain, tokens and one address bucket; node: one pruned span).",
@@ -235,6 +245,10 @@ func VerifyCheckedN(check string, checked, drifted int) {
 
 func SetStatsBackfillThrough(block uint64) { statsBackfillThrough.Set(float64(block)) }
 
+func SetStatsBackfillWaiting(waiting bool) { statsBackfillWaiting.Set(boolGauge(waiting)) }
+
+func SetPruneBlockedByBackfill(blocked bool) { pruneBlockedByBackfill.Set(boolGauge(blocked)) }
+
 func SetVerifyQuarantined(n int64) { verifyQuarantined.Set(float64(n)) }
 
 func VerifyCycle(check string, d time.Duration) {
@@ -388,4 +402,11 @@ func NodeLookupBusy() { nodeLookupBusy.Inc() }
 func SetNodeLookupCache(blocks, bytes int) {
 	nodeLookupCachedBlocks.Set(float64(blocks))
 	nodeLookupCachedBytes.Set(float64(bytes))
+}
+
+func boolGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }

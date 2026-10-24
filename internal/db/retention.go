@@ -786,6 +786,7 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 	if err := d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM stats_backfill WHERE NOT daily_done)`).Scan(&backfilling); err != nil {
 		return false, err
 	}
+	metrics.SetPruneBlockedByBackfill(backfilling)
 	if backfilling {
 		log.Info("retention: the stats backfill has not written its days yet; not pruned", "range", suffix, "below", *hi)
 		return false, nil
