@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -454,4 +455,39 @@ func TestStatsBackfillReadsBalancesWhileAStepFails(t *testing.T) {
 		var n int
 		return sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current`).Scan(&n) == nil && n == 1
 	}, 20*time.Second, 50*time.Millisecond, "the balances are read although the step keeps failing")
+}
+
+// waitingCompletion answers every completion with a wait for catch-up and counts the calls.
+type waitingCompletion struct {
+	*db.DB
+	calls atomic.Int32
+}
+
+func (w *waitingCompletion) CompleteStatsBackfill(context.Context) error {
+	w.calls.Add(1)
+	return db.ErrBackfillWaitsForCatchup
+}
+
+func TestStatsBackfillDrainsWhileTheCompletionWaits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, sql := setupPostgres(t)
+	require.NoError(t, store.InitStatsBackfill(ctx, backfillStart-1, uint64(blockTime(backfillStart-1))))
+	_, err := sql.Exec(ctx, `UPDATE stats_backfill SET through = target`)
+	require.NoError(t, err)
+	_, err = sql.Exec(ctx, `
+		INSERT INTO stats_backfill_balance_keys
+		SELECT $1, '0x' || lpad(to_hex(g), 40, '0'), 1 FROM generate_series(1, 2500) g`, strings.ToLower(chainToken.Hex()))
+	require.NoError(t, err)
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 2_000, busy: 2_001, balances: map[string]*big.Int{}}
+	store2 := &waitingCompletion{DB: store}
+	cfg := testBackfill
+	cfg.Retry = time.Hour
+
+	go newTestIndexer(store, chain).RunStatsBackfill(ctx, store2, cfg)
+	require.Eventually(t, func() bool {
+		var n int
+		return sql.QueryRow(ctx, `SELECT count(*) FROM stats_backfill_balance_keys`).Scan(&n) == nil && n == 0
+	}, 20*time.Second, 50*time.Millisecond, "the keys drain while the completion waits for catch-up, without a retry pause per window")
+	require.EqualValues(t, 1, store2.calls.Load(), "a waiting completion is asked again only after a minute")
 }

@@ -31,6 +31,9 @@ type backfillStore interface {
 
 const balanceKeysPerRead = 1000
 
+// completionRecheck spaces the checks of a completion that waits for catch-up; each counts the blocks it needs.
+const completionRecheck = time.Minute
+
 type StatsBackfillConfig struct {
 	// RPS bounds every node call of the backfill; Workers is its fetch and balance-read parallelism under that budget.
 	RPS, Workers int
@@ -49,6 +52,8 @@ type backfiller struct {
 	// readAfter is the last key the balance reads took: the next pass starts after it and wraps at the end, so a key
 	// kept after a failed read is retried after every other key.
 	readAfter *db.BalanceKey
+	// waitUntil is when a completion that waits for catch-up is checked again.
+	waitUntil time.Time
 }
 
 func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *backfiller {
@@ -203,7 +208,13 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 		return err == nil, err
 	}
 	if s.Through == s.Target {
+		if time.Now().Before(b.waitUntil) {
+			return false, db.ErrBackfillWaitsForCatchup
+		}
 		if err := b.store.CompleteStatsBackfill(ctx); err != nil {
+			if errors.Is(err, db.ErrBackfillWaitsForCatchup) {
+				b.waitUntil = time.Now().Add(completionRecheck)
+			}
 			return false, err
 		}
 		log.Info("stats backfill: every block counted and daily_stats written", "through", s.Target)
@@ -309,7 +320,7 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 		waiting = waitingNow
 		err := errors.Join(stepErr, readErr)
 		switch {
-		case (err != nil || waitingNow) && ctx.Err() == nil:
+		case (err != nil || waitingNow && read == 0) && ctx.Err() == nil:
 			if err != nil {
 				log.Warn("stats backfill: batch failed; retrying", "error", err)
 			}
