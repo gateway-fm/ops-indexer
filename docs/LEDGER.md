@@ -65,7 +65,9 @@ from the node into the counters and into ledger spans of source `node`, which th
 pruned span. It then reads each touched balance once, at the node's latest block. A read the EVM fails (a revert, an
 invalid opcode, out of gas) drops the key (not a token); a read that fails otherwise (rate limit, timeout,
 transport) keeps it, to be retried after every other key, ten seconds later at the soonest. A node that keeps
-failing holds `stats_incomplete` true and logs `stats backfill: batch failed; retrying`.
+failing holds `stats_incomplete` true and logs `stats backfill: batch failed; retrying`. Retention prunes nothing until
+the backfill has written its days, which it counts from the blocks stored from `START_BLOCK`: history grows past
+`PRUNE_RETAIN_BLOCKS` for as long as the backfill runs.
 
 | variable | default | bounds |
 |---|---|---|
