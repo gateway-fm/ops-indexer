@@ -30,7 +30,7 @@ type backfillStore interface {
 const balanceKeysPerRead = 1000
 
 type StatsBackfillConfig struct {
-	// RPS bounds every node call of the backfill; Workers is its fetch parallelism under that budget.
+	// RPS bounds every node call of the backfill; Workers is its fetch and balance-read parallelism under that budget.
 	RPS, Workers int
 	BatchBlocks  uint64
 	SpanBlocks   uint64
@@ -220,26 +220,40 @@ func (b *backfiller) step(ctx context.Context) (done bool, err error) {
 	return false, nil
 }
 
-// readBalances reads, at latest, the balance of up to n keys the backfill touched, once each; a key whose
-// balanceOf fails (not a token after all) is dropped, as the head path's balance worker drops it. It reports how
-// many keys it took.
+// readBalances reads, at latest, the balance of up to n keys the backfill touched, once each, Workers at a time
+// within RPS; a key whose balanceOf fails (not a token after all) is dropped, as the head path's balance worker
+// drops it. It reports how many keys it took.
 func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
 	keys, err := b.store.NextBackfillBalanceKeys(ctx, n)
 	if err != nil || len(keys) == 0 {
 		return 0, err
 	}
+	read := make([]*types.Balance, len(keys))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(max(b.cfg.Workers, 1))
+	for i, k := range keys {
+		g.Go(func() error {
+			if err := b.limiter.Wait(gctx); err != nil {
+				return err
+			}
+			data := append(append([]byte{}, balanceOfSelector...), common.LeftPadBytes(common.HexToAddress(k.Address).Bytes(), 32)...)
+			out, err := b.idx.rpc.CallContract(gctx, common.HexToAddress(k.Token), data)
+			if err != nil || len(out) < 32 {
+				return nil
+			}
+			read[i] = &types.Balance{Address: k.Address, TokenAddress: k.Token, BlockNumber: k.Block,
+				Balance: types.JSONString(new(big.Int).SetBytes(out[:32]).String())}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return 0, err
+	}
 	balances := make([]*types.Balance, 0, len(keys))
-	for _, k := range keys {
-		if err := b.limiter.Wait(ctx); err != nil {
-			return 0, err
+	for _, r := range read {
+		if r != nil {
+			balances = append(balances, r)
 		}
-		data := append(append([]byte{}, balanceOfSelector...), common.LeftPadBytes(common.HexToAddress(k.Address).Bytes(), 32)...)
-		out, err := b.idx.rpc.CallContract(ctx, common.HexToAddress(k.Token), data)
-		if err != nil || len(out) < 32 {
-			continue
-		}
-		balances = append(balances, &types.Balance{Address: k.Address, TokenAddress: k.Token, BlockNumber: k.Block,
-			Balance: types.JSONString(new(big.Int).SetBytes(out[:32]).String())})
 	}
 	return len(keys), b.store.SettleBackfillBalances(ctx, keys, balances)
 }

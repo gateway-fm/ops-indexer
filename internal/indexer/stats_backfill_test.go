@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/types"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 )
 
 const backfillStart = 1_200
@@ -291,4 +293,56 @@ func TestStatsBackfillReadsEachTouchedBalanceOnce(t *testing.T) {
 	var holders int64
 	require.NoError(t, sql.QueryRow(ctx, `SELECT holder_count FROM tokens`).Scan(&holders))
 	require.Equal(t, int64(2), holders, "holder_count follows the current balances")
+}
+
+// overlapChain holds each balanceOf until another is in flight (or a second passes) and records the most at once.
+type overlapChain struct {
+	*fakeChain
+	mu       sync.Mutex
+	inFlight int
+	most     int
+	arrived  chan struct{}
+}
+
+func (c *overlapChain) CallContract(ctx context.Context, to common.Address, data []byte) ([]byte, error) {
+	c.mu.Lock()
+	c.inFlight++
+	c.most = max(c.most, c.inFlight)
+	c.mu.Unlock()
+	select {
+	case c.arrived <- struct{}{}:
+	case <-c.arrived:
+	case <-time.After(time.Second):
+	}
+	defer func() {
+		c.mu.Lock()
+		c.inFlight--
+		c.mu.Unlock()
+	}()
+	return c.fakeChain.CallContract(ctx, to, data)
+}
+
+func TestStatsBackfillReadsBalancesWithItsWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, sql := setupPostgres(t)
+	balances := map[string]*big.Int{}
+	for i := int64(1); i <= 8; i++ {
+		a := common.BytesToAddress(big.NewInt(i).Bytes())
+		balances[a.Hex()] = big.NewInt(i)
+		_, err := sql.Exec(ctx, `INSERT INTO stats_backfill_balance_keys VALUES ($1, $2, 1)`,
+			strings.ToLower(chainToken.Hex()), strings.ToLower(a.Hex()))
+		require.NoError(t, err)
+	}
+	chain := &overlapChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 2_000, busy: 2_001,
+		balances: balances}, arrived: make(chan struct{})}
+	b := newTestIndexer(store, chain).newBackfiller(store, testBackfill)
+
+	read, err := b.readBalances(ctx, balanceKeysPerRead)
+	require.NoError(t, err)
+	require.Equal(t, 8, read)
+	require.GreaterOrEqual(t, chain.most, 2, "balanceOf reads overlap, up to STATS_BACKFILL_WORKERS")
+	require.LessOrEqual(t, chain.most, testBackfill.Workers)
+	var n int
+	require.NoError(t, sql.QueryRow(ctx, `SELECT count(*) FROM token_balances_current WHERE balance > 0`).Scan(&n))
+	require.Equal(t, 8, n, "every key read is written")
 }

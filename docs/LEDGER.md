@@ -67,7 +67,7 @@ pruned span:
 | variable | default | bounds |
 |---|---|---|
 | `STATS_BACKFILL_RPS` | 100 | Node calls per second of the backfill: about two per block (block, receipts), plus traces with internal transactions indexed, `eth_getCode` per contract creation, token metadata per new token, `tokenURI` per NFT mint. The head path's `RPC_RATE_LIMIT` is separate. |
-| `STATS_BACKFILL_WORKERS` | 4 | Fetch parallelism under that budget. |
+| `STATS_BACKFILL_WORKERS` | 4 | Parallelism of the block fetches and of the balance reads, under that budget. |
 | `STATS_BACKFILL_BATCH_BLOCKS` | 1000 | Blocks per transaction; a restart resumes after the last committed batch. |
 
 ## Metrics
