@@ -23,6 +23,7 @@ type DB struct {
 	// RebuildWorkMem is the work_mem for the address_stats rebuild transaction.
 	// Empty falls back to a safe default. Set via REBUILD_WORK_MEM env var.
 	RebuildWorkMem string
+	lateDays       lateDays
 }
 
 func New(databaseURL string) (*DB, error) {

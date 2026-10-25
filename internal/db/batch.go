@@ -139,6 +139,7 @@ type BlockWrite struct {
 	data                                  *BlockData
 	deltaBlocks, deltaTxs, deltaTransfers int64
 	tokenDeltas                           map[string]*tokenStatsDelta
+	lateDays                              *lateDays
 }
 
 func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
@@ -328,7 +329,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 	}
 
 	return &BlockWrite{tx: tx, data: data, deltaBlocks: deltaBlocks, deltaTxs: deltaTxs,
-		deltaTransfers: deltaTransfers, tokenDeltas: tokenDeltas}, nil
+		deltaTransfers: deltaTransfers, tokenDeltas: tokenDeltas, lateDays: &d.lateDays}, nil
 }
 
 func (w *BlockWrite) Finish(ctx context.Context) error {
@@ -621,7 +622,13 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if deltaBlocks > 0 {
+		w.lateDays.noteBlock(data.Block.Number, data.Block.Timestamp)
+	}
+	return nil
 }
 
 // RebuildAddressStats rebuilds address_stats after catchup completes.

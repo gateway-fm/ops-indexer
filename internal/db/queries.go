@@ -50,7 +50,13 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if ct.RowsAffected() > 0 {
+		d.lateDays.noteBlock(b.Number, b.Timestamp)
+	}
+	return nil
 }
 
 func (d *DB) GetBlock(ctx context.Context, number uint64) (*types.Block, error) {
@@ -1914,19 +1920,6 @@ func (d *DB) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) erro
 		stats.AvgBlockSize, stats.NewContracts, stats.TokenTransferCount, stats.CumulativeTransactions,
 		stats.CumulativeAddresses, stats.CumulativeContracts)
 	return err
-}
-
-// AdvanceDailyStats folds the blocks indexed since the last call into daily_stats (migration 012) and
-// returns the block it aggregated through.
-func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
-	var upto *int64
-	if err := d.pool.QueryRow(ctx, `SELECT daily_stats_advance()`).Scan(&upto); err != nil {
-		return 0, err
-	}
-	if upto == nil {
-		return 0, nil
-	}
-	return uint64(*upto), nil
 }
 
 func (d *DB) GetDailyStats(ctx context.Context, from, to time.Time) ([]types.DailyStats, error) {
