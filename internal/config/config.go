@@ -157,7 +157,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("catchup_workers", 10)
 	v.SetDefault("catchup_batch_size", 100)
 	v.SetDefault("catchup_queue_size", 1000)
-	v.SetDefault("realtime_max_behind_blocks", 1000)
+	v.SetDefault("realtime_max_behind_blocks", 0)
 
 	v.SetDefault("privacy_proxy_url", "")
 	v.SetDefault("privacy_proxy_public_url", "")
