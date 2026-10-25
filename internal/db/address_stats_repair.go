@@ -177,7 +177,8 @@ var errDryRun = errors.New("dry run")
 // address_stats rows in), and removes them from the staging table in the same transaction, so a stopped repair
 // resumes at the next batch and never applies one twice. Counters move by the correction, first_seen and last_seen
 // only outward; a row that did not exist is created (is_contract from contracts) and counted in addresses_total.
-// The staging table is dropped with the last batch.
+// The staging table is dropped with the last batch, which also recounts the days' address columns from the repaired
+// address_stats, under daily_stats_advance's lock: the repair moves first_seen and adds addresses.
 func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (applied, created int, done bool, err error) {
 	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		var exists bool
@@ -215,6 +216,12 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 		}
 		if applied == 0 {
 			done = true
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
+				return err
+			}
+			if err := recountDailyAddressColumns(ctx, tx); err != nil {
+				return err
+			}
 			_, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable)
 			return err
 		}

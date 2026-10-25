@@ -55,35 +55,7 @@ func TestDailyStatsAddressColumnsFollowLateBlocks(t *testing.T) {
 			}
 			advanceUntilStable(t, d)
 
-			rows, err := d.pool.Query(ctx, `
-				WITH spans AS (
-					SELECT date, lo, COALESCE(lead(lo) OVER (ORDER BY date), (SELECT max(number) + 1 FROM blocks)) AS hi
-					FROM (SELECT daily_stats_day(timestamp) AS date, min(number) AS lo FROM blocks GROUP BY 1) f
-				)
-				SELECT s.date::TEXT,
-				       count(a.address) FILTER (WHERE a.first_seen >= s.lo AND a.first_seen < s.hi),
-				       count(a.address) FILTER (WHERE a.is_contract AND a.first_seen >= s.lo AND a.first_seen < s.hi),
-				       count(a.address) FILTER (WHERE a.first_seen < s.hi),
-				       count(a.address) FILTER (WHERE a.is_contract AND a.first_seen < s.hi),
-				       d.new_addresses, d.new_contracts, d.cumulative_addresses, d.cumulative_contracts
-				FROM spans s CROSS JOIN address_stats a LEFT JOIN daily_stats d ON d.date = s.date
-				GROUP BY s.date, d.new_addresses, d.new_contracts, d.cumulative_addresses, d.cumulative_contracts
-				ORDER BY s.date`)
-			require.NoError(t, err)
-			defer rows.Close()
-			days := 0
-			for rows.Next() {
-				var date string
-				var want [4]int64
-				var got [4]*int64
-				require.NoError(t, rows.Scan(&date, &want[0], &want[1], &want[2], &want[3], &got[0], &got[1], &got[2], &got[3]))
-				require.NotNil(t, got[0], "no row for %s", date)
-				require.Equal(t, want, [4]int64{*got[0], *got[1], *got[2], *got[3]},
-					"%s: new addresses, new contracts, cumulative addresses, cumulative contracts", date)
-				days++
-			}
-			require.NoError(t, rows.Err())
-			require.Equal(t, 4, days)
+			requireAddressColumnsFollowTheBlocks(t, d)
 			requireDaysEqualRecompute(t, d, "the other columns")
 		})
 	}
@@ -126,4 +98,60 @@ func pgxCollectText(ctx context.Context, d *DB, query string, out *[]string) err
 	}
 	*out, err = pgx.CollectRows(rows, pgx.RowTo[string])
 	return err
+}
+
+// requireAddressColumnsFollowTheBlocks compares every day's address columns with 021's definition, counted from the
+// stored blocks and address_stats: a day's addresses are those first seen from its first block up to the next day's.
+func requireAddressColumnsFollowTheBlocks(t *testing.T, d *DB) {
+	t.Helper()
+	rows, err := d.pool.Query(context.Background(), `
+		WITH spans AS (
+			SELECT date, lo, COALESCE(lead(lo) OVER (ORDER BY date), (SELECT max(number) + 1 FROM blocks)) AS hi
+			FROM (SELECT daily_stats_day(timestamp) AS date, min(number) AS lo FROM blocks GROUP BY 1) f
+		)
+		SELECT s.date::TEXT,
+		       count(a.address) FILTER (WHERE a.first_seen >= s.lo AND a.first_seen < s.hi),
+		       count(a.address) FILTER (WHERE a.is_contract AND a.first_seen >= s.lo AND a.first_seen < s.hi),
+		       count(a.address) FILTER (WHERE a.first_seen < s.hi),
+		       count(a.address) FILTER (WHERE a.is_contract AND a.first_seen < s.hi),
+		       d.new_addresses, d.new_contracts, d.cumulative_addresses, d.cumulative_contracts
+		FROM spans s CROSS JOIN address_stats a LEFT JOIN daily_stats d ON d.date = s.date
+		GROUP BY s.date, d.new_addresses, d.new_contracts, d.cumulative_addresses, d.cumulative_contracts
+		ORDER BY s.date`)
+	require.NoError(t, err)
+	defer rows.Close()
+	days := 0
+	for rows.Next() {
+		var date string
+		var want [4]int64
+		var got [4]*int64
+		require.NoError(t, rows.Scan(&date, &want[0], &want[1], &want[2], &want[3], &got[0], &got[1], &got[2], &got[3]))
+		require.NotNil(t, got[0], "no row for %s", date)
+		require.Equal(t, want, [4]int64{*got[0], *got[1], *got[2], *got[3]},
+			"%s: new addresses, new contracts, cumulative addresses, cumulative contracts", date)
+		days++
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, 4, days)
+}
+
+// With no rebuild after catch-up, repair-address-stats is what corrects address_stats a skipped catch-up
+// left short, and it moves first_seen and creates rows. The days' address columns follow it once it finishes.
+func TestRepairAddressStatsRecountsTheDaysAddressColumns(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= lateBlocksTotal; n++ {
+		data := lateBlockWithAddresses(n)
+		data.SkipAddressStats = n < 60
+		require.NoError(t, d.InsertBlockDataBatch(ctx, data))
+	}
+	advanceUntilStable(t, d)
+	_, err := d.StageAddressStatsRepair(ctx, false)
+	require.NoError(t, err)
+	for done := false; !done; {
+		_, _, done, err = d.ApplyAddressStatsRepairBatch(ctx, 7)
+		require.NoError(t, err)
+	}
+	requireAddressColumnsFollowTheBlocks(t, d)
 }
