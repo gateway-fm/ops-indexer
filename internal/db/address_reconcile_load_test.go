@@ -62,6 +62,7 @@ func TestARunningRepairWhoseRebaseFailsIsDoneByTheNextCheck(t *testing.T) {
 
 	held, err := d.pool.Begin(ctx)
 	require.NoError(t, err)
+	defer held.Rollback(ctx)
 	_, err = held.Exec(ctx, `SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, rebaseHot)
 	require.NoError(t, err)
 	short, cancel := context.WithTimeout(ctx, 3*time.Second)

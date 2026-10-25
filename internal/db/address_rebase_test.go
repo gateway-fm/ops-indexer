@@ -263,6 +263,7 @@ func TestDaysRecountSurvivesAFailedFirstAttempt(t *testing.T) {
 
 	held, err := d.pool.Begin(ctx)
 	require.NoError(t, err)
+	defer held.Rollback(ctx)
 	_, err = held.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`)
 	require.NoError(t, err)
 	short, cancel := context.WithTimeout(ctx, 3*time.Second)
