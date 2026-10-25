@@ -2,6 +2,8 @@ package indexer
 
 import (
 	"context"
+	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/rpc"
 )
 
 // newTestIndexer runs no daily_stats advance of its own: tests advance it where production would.
@@ -91,4 +94,39 @@ func TestNodeRecountRateLimitsTheNode(t *testing.T) {
 	_, err := counter.count(context.Background(), 0, 50)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, time.Since(start), 450*time.Millisecond, "100 block and receipt reads at 200/s")
+}
+
+// flakyChain fails the first read of block fail, as a dropped keep-alive connection does.
+type flakyChain struct {
+	*fakeChain
+	fail   uint64
+	failed atomic.Bool
+}
+
+func (f *flakyChain) RawBlockByNumber(ctx context.Context, n uint64) (*rpc.RawBlock, error) {
+	if n == f.fail && f.failed.CompareAndSwap(false, true) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return f.fakeChain.RawBlockByNumber(ctx, n)
+}
+
+// One failed read made the recount of a pruned span start over from its first block; at 50 RPS a
+// 100,000-block span takes over an hour, so a flaky connection could keep it from ever finishing. A block's reads are
+// retried before the span gives up.
+func TestNodeRecountRetriesABlockInsteadOfTheSpan(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 14_000, busy: 1_000}
+	idx := newTestIndexer(store, chain)
+	ingestChain(t, idx, store, sql, chain)
+	_, err := sql.Exec(ctx, `UPDATE prune_state SET pruned_through = 999`)
+	require.NoError(t, err)
+	idx.rpc = &flakyChain{fakeChain: chain, fail: 500}
+	counter := idx.newSpanCounter(1_000_000)
+	counter.retry = time.Millisecond
+
+	c, ok, err := idx.RecountPrunedSpan(ctx, store, counter, true)
+	require.NoError(t, err, "block 500's dropped read is retried")
+	require.True(t, ok)
+	require.Equal(t, db.SpanCheck{Lo: 0, Hi: 1000, State: "ok"}, c)
 }
