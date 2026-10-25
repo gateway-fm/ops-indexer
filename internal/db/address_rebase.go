@@ -39,6 +39,12 @@ func (r *RebaseResult) add(o RebaseResult) {
 // row and the truth, and none can commit until the batch does. Inserting before locking keeps a row ingest creates
 // during the batch from being counted twice. A batch does not retry on a conflict, so it finishes under any ingest load.
 func (d *DB) RebaseAddresses(ctx context.Context, addresses, create []string) (RebaseResult, error) {
+	return d.rebaseAddresses(ctx, addresses, create, nil)
+}
+
+// rebaseAddresses is RebaseAddresses with inBatch, if not nil, run in each batch's transaction after its rows are set.
+func (d *DB) rebaseAddresses(ctx context.Context, addresses, create []string,
+	inBatch func(ctx context.Context, tx pgx.Tx, batch []string) error) (RebaseResult, error) {
 	sort.Strings(addresses)
 	creatable := make(map[string]bool, len(create))
 	for _, a := range create {
@@ -56,8 +62,10 @@ func (d *DB) RebaseAddresses(ctx context.Context, addresses, create []string) (R
 		var r RebaseResult
 		if err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 			var err error
-			r, err = rebaseAddressBatch(ctx, tx, batch, toCreate)
-			return err
+			if r, err = rebaseAddressBatch(ctx, tx, batch, toCreate); err != nil || inBatch == nil {
+				return err
+			}
+			return inBatch(ctx, tx, batch)
 		}); err != nil {
 			return total, err
 		}

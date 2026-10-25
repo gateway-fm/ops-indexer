@@ -219,24 +219,30 @@ func (d *DB) CheckRunning(ctx context.Context, bucket int, repair bool) ([]Drift
 	return drifts, d.repairDrifts(ctx, drifts)
 }
 
+// repairDrifts repairs drifts the running check found. A chain or token counter is logged in ledger_repairs and moved
+// by its drift in one transaction; a drifted address is rebased, its ledger_repairs rows written in the rebase batch's
+// transaction, so a rebase that fails leaves no repair on record to quarantine the address at the next check.
 func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
+	byAddress := map[string][]Drift{}
 	var addresses []string
-	seen := map[string]bool{}
 	if err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		for _, dr := range drifts {
-			apply, err := recordRepair(ctx, tx, dr)
-			if err != nil || !apply {
+			repair, err := repairable(ctx, tx, dr)
+			if err != nil || !repair {
 				if err != nil {
 					return err
 				}
 				continue
 			}
 			if dr.Family == "address" {
-				if !seen[dr.Key] {
-					seen[dr.Key] = true
+				if byAddress[dr.Key] == nil {
 					addresses = append(addresses, dr.Key)
 				}
+				byAddress[dr.Key] = append(byAddress[dr.Key], dr)
 				continue
+			}
+			if err := logRepair(ctx, tx, dr); err != nil {
+				return err
 			}
 			if err := applyRunning(ctx, tx, dr); err != nil {
 				return err
@@ -246,14 +252,34 @@ func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
 	}); err != nil || len(addresses) == 0 {
 		return err
 	}
-	if _, err := d.RebaseAddresses(ctx, addresses, addresses); err != nil {
+	if _, err := d.rebaseAddresses(ctx, addresses, addresses, func(ctx context.Context, tx pgx.Tx, batch []string) error {
+		for _, address := range batch {
+			for _, dr := range byAddress[address] {
+				if err := logRepair(ctx, tx, dr); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	return d.recountPendingDays(ctx)
 }
 
-// recordRepair logs a drift and says whether to repair it: a key that drifted again after a repair is quarantined.
+// recordRepair logs a drift in ledger_repairs and says whether to repair it: a key that drifted again after a repair
+// is quarantined instead.
 func recordRepair(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
+	repair, err := repairable(ctx, tx, dr)
+	if err != nil || !repair {
+		return false, err
+	}
+	return true, logRepair(ctx, tx, dr)
+}
+
+// repairable logs a drift and says whether to repair it: a key quarantined, or one that drifted again after a repair
+// (which quarantines it now), is not.
+func repairable(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
 	log.Warn("ledger: running counter drifted", "family", dr.Family, "key", dr.Key, "counter", dr.Counter,
 		"running", deref(dr.Stored), "expected", deref(dr.Recount))
 	var quarantined, repairedBefore bool
@@ -271,10 +297,14 @@ func recordRepair(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
 		_, err := tx.Exec(ctx, `INSERT INTO ledger_quarantine (family, key) VALUES ($1, $2) ON CONFLICT DO NOTHING`, dr.Family, dr.Key)
 		return false, err
 	}
+	return true, nil
+}
+
+func logRepair(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO ledger_repairs (family, key, counter, stored, repaired) VALUES ($1, $2, $3, $4::NUMERIC, $5::NUMERIC)`,
 		dr.Family, dr.Key, dr.Counter, dr.Stored, dr.Recount)
-	return err == nil, err
+	return err
 }
 
 func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
