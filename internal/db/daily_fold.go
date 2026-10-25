@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,6 +22,7 @@ type lateDays struct {
 	watermark *int64
 	days      map[int64]struct{}
 	searched  bool
+	recounts  atomic.Int64
 }
 
 func (l *lateDays) noteBlock(number, timestamp uint64) {
@@ -69,11 +72,22 @@ func (l *lateDays) advanced(watermark int64, searched bool) {
 
 // AdvanceDailyStats folds the blocks indexed since the last call into daily_stats (migration 012) and returns the
 // block it aggregated through. Then, under the same lock, it recounts every day that took a block below that block
-// (lateDays) from the stored blocks, so each block counts once whatever order it was stored in, and carries the
-// count of earlier transactions through every later day.
+// (lateDays) from the stored blocks once the day's blocks are complete, so each block counts once whatever order it
+// was stored in, and carries the count of earlier transactions through every later day. A day still missing blocks
+// waits for a later advance.
 func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	days, search := d.lateDays.take()
+	searched := false
+	if search {
+		found, ok, err := d.searchLateDays(ctx)
+		if err != nil {
+			d.lateDays.giveBack(days, true)
+			return 0, err
+		}
+		days, searched = append(days, found...), ok
+	}
 	var upto *int64
+	var pending []int64
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		var before *int64
 		if err := tx.QueryRow(ctx, `
@@ -87,14 +101,9 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 		if upto == nil {
 			return nil
 		}
-		if search {
-			found, err := searchLateDays(ctx, tx, *upto)
-			if err != nil {
-				return err
-			}
-			days = append(days, found...)
-		}
-		from, err := recountDays(ctx, tx, *upto, days)
+		var from *int64
+		var err error
+		from, pending, err = d.recountDays(ctx, tx, *upto, days)
 		if err != nil {
 			return err
 		}
@@ -112,23 +121,29 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 		}
 		return rewriteFrom(ctx, tx, *from)
 	})
-	if err != nil {
+	if err != nil || upto == nil {
 		d.lateDays.giveBack(days, search)
 		return 0, err
 	}
-	if upto == nil {
-		d.lateDays.giveBack(days, search)
-		return 0, nil
-	}
-	d.lateDays.advanced(*upto, search)
+	d.lateDays.giveBack(pending, search && !searched)
+	d.lateDays.advanced(*upto, searched)
 	return uint64(*upto), nil
 }
 
 // searchLateDays lists the days whose blocks up to the watermark are not all counted: a day aggregated with fewer
 // blocks or block-time pairs than are stored, or a day with stored blocks and no row at all. A day without an
-// aggregate whose row counts its stored blocks was written before the incremental path and is left alone.
-func searchLateDays(ctx context.Context, tx pgx.Tx, watermark int64) ([]int64, error) {
-	rows, err := tx.Query(ctx, `
+// aggregate whose row counts its stored blocks was written before the incremental path and is left alone. It runs
+// without the advance's lock, before the first watermark exists not at all (ok false).
+func (d *DB) searchLateDays(ctx context.Context) (days []int64, ok bool, err error) {
+	var watermark *int64
+	if err := d.pool.QueryRow(ctx, `SELECT last_block FROM daily_stats_watermark WHERE id = 1`).Scan(&watermark); err != nil &&
+		!errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, err
+	}
+	if watermark == nil {
+		return nil, false, nil
+	}
+	rows, err := d.pool.Query(ctx, `
 		WITH stored AS (
 			SELECT daily_stats_day(b.timestamp) AS date, count(*) AS blocks, count(p.number) AS pairs
 			FROM blocks b LEFT JOIN blocks p ON p.number = b.number - 1
@@ -138,63 +153,84 @@ func searchLateDays(ctx context.Context, tx pgx.Tx, watermark int64) ([]int64, e
 		SELECT s.date - DATE '1970-01-01'
 		FROM stored s LEFT JOIN daily_stats_acc a USING (date) LEFT JOIN daily_stats d USING (date)
 		WHERE CASE WHEN a.date IS NOT NULL THEN a.blocks <> s.blocks OR a.block_time_n <> s.pairs
-		           ELSE d.date IS NULL OR d.total_blocks <> s.blocks END`, watermark)
+		           ELSE d.date IS NULL OR d.total_blocks <> s.blocks END`, *watermark)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
+	days, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+	return days, err == nil, err
 }
 
-// recountDays rewrites each given day's aggregate from its stored blocks up to the watermark, the sums
-// daily_stats_advance would have built had every block arrived in order, and its address set, and returns the
-// earliest day. The day of the block after each day's last is recounted with it, for the block-time pair across the
-// boundary, wherever that block falls. A day older than every aggregated day takes the days up to the first
-// aggregated one with it, so that each day's count of earlier transactions follows from the aggregated day before it.
-func recountDays(ctx context.Context, tx pgx.Tx, watermark int64, days []int64) (*int64, error) {
+// recountDays rewrites the aggregate of each given day whose blocks up to the watermark are complete from those
+// blocks: the sums daily_stats_advance would have built had every block arrived in order, and its address set. A
+// day's blocks are complete when none is missing between its first and last, the block before its first is stored
+// (or none below it is), and the block after its last is stored or is the watermark. The day of that next block is
+// recounted with it, for the block-time pair across the boundary. A day older than every aggregated day takes the
+// days up to the first aggregated one with it, so that each day's count of earlier transactions follows from the
+// aggregated day before it. It returns the earliest day recounted, and the days left until their blocks are complete.
+func (d *DB) recountDays(ctx context.Context, tx pgx.Tx, watermark int64, days []int64) (from *int64, pending []int64, err error) {
 	if len(days) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT (SELECT timestamp / 86400 FROM blocks WHERE number = s.hi + 1)
-		FROM unnest($1::BIGINT[]) d(day)
+		SELECT d.day, s.n > 0 AND s.n = s.hi - s.lo + 1
+		              AND (s.lo = (SELECT min(number) FROM blocks) OR EXISTS (SELECT 1 FROM blocks WHERE number = s.lo - 1))
+		              AND (s.hi = $2 OR EXISTS (SELECT 1 FROM blocks WHERE number = s.hi + 1)),
+		       s.n = 0, (SELECT timestamp / 86400 FROM blocks WHERE number = s.hi + 1)
+		FROM (SELECT DISTINCT unnest($1::BIGINT[]) AS day) d
 		CROSS JOIN LATERAL (
-			SELECT max(number) AS hi FROM blocks
+			SELECT min(number) AS lo, max(number) AS hi, count(*) AS n FROM blocks
 			WHERE timestamp >= d.day * 86400 AND timestamp < (d.day + 1) * 86400 AND number <= $2
 		) s
-		WHERE s.hi IS NOT NULL`, days, watermark)
+		ORDER BY d.day`, days, watermark)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	next, err := pgx.CollectRows(rows, pgx.RowTo[*int64])
-	if err != nil {
-		return nil, err
-	}
-	for _, day := range next {
-		if day != nil {
-			days = append(days, *day)
+	var ready []int64
+	for rows.Next() {
+		var day int64
+		var complete, empty bool
+		var next *int64
+		if err := rows.Scan(&day, &complete, &empty, &next); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		switch {
+		case complete:
+			ready = append(ready, day)
+			if next != nil && *next != day {
+				ready = append(ready, *next)
+			}
+		case !empty:
+			pending = append(pending, day)
 		}
 	}
-	sort.Slice(days, func(i, j int) bool { return days[i] < days[j] })
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ready) == 0 {
+		return nil, pending, err
+	}
+	sort.Slice(ready, func(i, j int) bool { return ready[i] < ready[j] })
 	var firstAggregated *int64
 	if err := tx.QueryRow(ctx, `SELECT min(date) - DATE '1970-01-01' FROM daily_stats_acc`).Scan(&firstAggregated); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if firstAggregated != nil {
-		for day := days[0]; day < *firstAggregated; day++ {
-			days = append(days, day)
+		for day := ready[0]; day < *firstAggregated; day++ {
+			ready = append(ready, day)
 		}
 	}
 	recounted := map[int64]bool{}
-	for _, day := range days {
+	for _, day := range ready {
 		if recounted[day] {
 			continue
 		}
 		recounted[day] = true
 		if err := recountDay(ctx, tx, watermark, day); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		d.lateDays.recounts.Add(1)
 	}
-	return &days[0], nil
+	return &ready[0], pending, nil
 }
 
 // firstOfSeveralDays is the day of block first when blocks first to last span more than one day: 012 sets a new

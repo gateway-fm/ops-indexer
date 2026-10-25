@@ -244,6 +244,30 @@ func requireStoredDaysEqualRecompute(t *testing.T, d *DB, label string) {
 	}
 }
 
+// Catch-up stores a day's blocks over many advances, and each advance recounted the whole day again, under
+// the advance's lock. A day is now recounted once its stored blocks are complete: none missing between its first and
+// last, the block before its first stored, and the block after its last stored or at the watermark.
+func TestDailyStatsRecountsADayOnceItsBlocksAreComplete(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := lateBlocksTotal - 1; n <= lateBlocksTotal; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+	}
+	advanceUntilStable(t, d)
+	for n := 1; n < lateBlocksTotal-1; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+		if n%5 == 0 {
+			_, err := d.AdvanceDailyStats(ctx)
+			require.NoError(t, err)
+		}
+	}
+	advanceUntilStable(t, d)
+	requireDaysEqualRecompute(t, d, "catch-up in batches of five")
+	require.LessOrEqual(t, d.lateDays.recounts.Load(), int64(12),
+		"each of the four days recounted about twice (itself, and as the day after the day before), not once per advance")
+}
+
 // The block-time pair of a late block's successor belongs to the successor's day, which need not be the
 // next day: after an empty day it was never recounted, and kept the pair it had missed.
 func TestDailyStatsRecountsTheSuccessorsDayAcrossAnEmptyDay(t *testing.T) {
