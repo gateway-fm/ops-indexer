@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -34,10 +35,10 @@ func (r *RebaseResult) add(o RebaseResult) {
 // block has seen (ledger_address_seen), and any other address is only corrected. A row whose address has no truth, no
 // block left that saw it, is removed: an address no canonical block has seen has no row.
 //
-// A batch first inserts the missing rows it may create, then locks every row of the batch in byte order (ingest's
-// order), and only then counts the truth, in a later statement: every delta committed before the locks is in both the
-// row and the truth, and none can commit until the batch does. Inserting before locking keeps a row ingest creates
-// during the batch from being counted twice. A batch does not retry on a conflict, so it finishes under any ingest load.
+// A batch first takes every row of the batch in byte order (ingest's order), inserting a row for an address it may
+// create that has none, and only then counts the truth, in a later statement: every delta committed before the locks is
+// in both the row and the truth, and none can commit until the batch does. Inserting rather than only locking keeps a
+// row ingest creates during the batch from being counted twice. A batch does not retry on a conflict, so it finishes under any ingest load.
 func (d *DB) RebaseAddresses(ctx context.Context, addresses, create []string) (RebaseResult, error) {
 	return d.rebaseAddresses(ctx, addresses, create, nil)
 }
@@ -76,19 +77,50 @@ func (d *DB) rebaseAddresses(ctx context.Context, addresses, create []string,
 
 func rebaseAddressBatch(ctx context.Context, tx pgx.Tx, batch, create []string) (RebaseResult, error) {
 	var r RebaseResult
+	// Only an address some canonical block has seen may get a row.
+	creatable := make(map[string]bool, len(create))
 	if len(create) > 0 {
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, is_contract, updated_at)
-			SELECT a, 0, 0, 0, 0, EXISTS (SELECT 1 FROM contracts c WHERE c.address = a), NOW()
-			FROM ledger_address_seen($1::TEXT[]) a ORDER BY a COLLATE "C"
-			ON CONFLICT (address) DO NOTHING`, create)
+		rows, err := tx.Query(ctx, `SELECT a FROM ledger_address_seen($1::TEXT[]) a`, create)
 		if err != nil {
 			return r, err
 		}
-		r.Created = int(tag.RowsAffected())
+		seen, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return r, err
+		}
+		for _, a := range seen {
+			creatable[a] = true
+		}
 	}
-	if _, err := tx.Exec(ctx, `
-		SELECT 1 FROM address_stats WHERE address = ANY ($1::TEXT[]) ORDER BY address COLLATE "C" FOR UPDATE`, batch); err != nil {
+	// Every row in one pass, in byte order as ingest takes them: an address the batch may create is inserted, or its
+	// row taken by the conflict (WHERE false locks it without writing), and any other row is taken FOR UPDATE.
+	// Creating all missing rows first, then locking the rest, inverted ingest's order for an existing row sorting
+	// before a missing one, and deadlocked with it.
+	ordered := slices.Clone(batch)
+	sort.Strings(ordered)
+	locks := &pgx.Batch{}
+	for _, a := range ordered {
+		if creatable[a] {
+			locks.Queue(`
+				INSERT INTO address_stats AS s (address, tx_count, internal_tx_count, token_transfer_count, sent_count, is_contract, updated_at)
+				VALUES ($1, 0, 0, 0, 0, EXISTS (SELECT 1 FROM contracts c WHERE c.address = $1), NOW())
+				ON CONFLICT (address) DO UPDATE SET updated_at = s.updated_at WHERE false`, a)
+		} else {
+			locks.Queue(`SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, a)
+		}
+	}
+	results := tx.SendBatch(ctx, locks)
+	for _, a := range ordered {
+		tag, err := results.Exec()
+		if err != nil {
+			_ = results.Close()
+			return r, err
+		}
+		if creatable[a] {
+			r.Created += int(tag.RowsAffected())
+		}
+	}
+	if err := results.Close(); err != nil {
 		return r, err
 	}
 	if err := tx.QueryRow(ctx, `

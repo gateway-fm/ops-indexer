@@ -276,3 +276,40 @@ func TestDaysRecountSurvivesAFailedFirstAttempt(t *testing.T) {
 	require.NoError(t, err)
 	requireAddressColumnsFollowTheBlocks(t, d)
 }
+
+// A batch inserted its missing rows before it locked the others, so an existing row it only corrects (an
+// address of a reverted block) that sorts before a missing one inverted the order ingest locks them in, and the two
+// deadlocked. Every row is now taken in one pass in byte order.
+func TestRebaseTakesItsRowsInIngestsOrder(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	existing, missing := "0x0000000000000000000000000000000000000001", "0x0000000000000000000000000000000000000002"
+	_, err := d.pool.Exec(ctx, `INSERT INTO address_stats (address, tx_count, first_seen, last_seen) VALUES ($1, 1, 1, 1)`, existing)
+	require.NoError(t, err)
+
+	ingest, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer ingest.Rollback(ctx)
+	_, err = ingest.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 1 WHERE address = $1`, existing)
+	require.NoError(t, err)
+
+	rebased := make(chan error, 1)
+	go func() {
+		_, err := d.RebaseAddresses(ctx, []string{existing, missing}, []string{missing})
+		rebased <- err
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		require.NoError(t, d.pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%address_stats%')`).
+			Scan(&waiting))
+		return waiting
+	}, 10*time.Second, 10*time.Millisecond, "the rebase waits for ingest's row")
+	_, err = ingest.Exec(ctx, `
+		INSERT INTO address_stats (address, tx_count, first_seen, last_seen) VALUES ($1, 1, 2, 2)
+		ON CONFLICT (address) DO UPDATE SET tx_count = address_stats.tx_count + 1`, missing)
+	require.NoError(t, err, "ingest writes the next address in its order")
+	require.NoError(t, ingest.Commit(ctx))
+	require.NoError(t, <-rebased, "no deadlock")
+}
