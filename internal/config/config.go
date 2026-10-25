@@ -34,7 +34,6 @@ type Config struct {
 	PartitionBlocks     uint64        `mapstructure:"partition_blocks"`
 	PruneInterval       time.Duration `mapstructure:"prune_interval"`
 	PruneArchiveDir     string        `mapstructure:"prune_archive_dir"`
-	AddressStatsRebuild bool          `mapstructure:"address_stats_rebuild"`
 	LedgerSpanBlocks    uint64        `mapstructure:"ledger_span_blocks"`
 	LedgerCloseInterval time.Duration `mapstructure:"ledger_close_interval"`
 	LedgerWorkMem       string        `mapstructure:"ledger_work_mem"`
@@ -122,7 +121,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("partition_blocks", 0)
 	v.SetDefault("prune_interval", "1m")
 	v.SetDefault("prune_archive_dir", "")
-	v.SetDefault("address_stats_rebuild", true)
 	v.SetDefault("ledger_span_blocks", 100000)
 	v.SetDefault("ledger_close_interval", "10s")
 	v.SetDefault("ledger_work_mem", "512MB")
@@ -213,7 +211,6 @@ func Load() (*Config, error) {
 	}
 	cfg.PruneInterval = v.GetDuration("prune_interval")
 	cfg.PruneArchiveDir = v.GetString("prune_archive_dir")
-	cfg.AddressStatsRebuild = v.GetBool("address_stats_rebuild")
 	cfg.LedgerSpanBlocks = v.GetUint64("ledger_span_blocks")
 	cfg.LedgerCloseInterval = v.GetDuration("ledger_close_interval")
 	cfg.LedgerWorkMem = v.GetString("ledger_work_mem")

@@ -210,23 +210,11 @@ func (c *CatchupIndexer) blockProducerFromRanges() {
 			idleCount++
 
 			// Call completion callback once after being idle for a while
-			// This triggers address_stats rebuild but doesn't stop catchup
 			if !completionCalled && idleCount >= 3 {
 				processed := atomic.LoadInt64(&c.processedBlocks)
 				if processed > 0 {
 					log.Info("catchup: initial sync complete, continuing to monitor for new gaps",
 						"processed", processed)
-
-					if !c.idxCfg.RetentionEnabled && c.idxCfg.SkipAddressStatsRebuild {
-						log.Warn("catchup: address_stats rebuild skipped (ADDRESS_STATS_REBUILD=false); blocks catch-up filled are not in address_stats")
-					} else if !c.idxCfg.RetentionEnabled {
-						log.Info("catchup: rebuilding address_stats table")
-						if err := c.db.RebuildAddressStats(context.Background()); err != nil {
-							log.Error("catchup: failed to rebuild address_stats", "error", err)
-						} else {
-							log.Info("catchup: address_stats rebuild complete")
-						}
-					}
 
 					if c.onComplete != nil {
 						c.onComplete()
@@ -390,14 +378,6 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 
 func (c *CatchupIndexer) blockIndexer() *Indexer {
 	catchupConfig := *c.idxCfg
-	// Catchup never writes address_stats incrementally — the realtime indexer is
-	// the primary path that keeps it current. Trade-off: a block processed by
-	// catchup after the initial-sync rebuild (e.g. one realtime missed via an RPC
-	// blip and requeued) stays stale in address_stats until the next process
-	// restart. Acceptable, since post-sync catchup only handles rare gaps.
-	// With retention it writes them per block instead: a rebuild from the retained
-	// history would drop every pruned block's counts.
-	catchupConfig.SkipAddressStats = !c.idxCfg.RetentionEnabled
 
 	return &Indexer{
 		db:               c.db,

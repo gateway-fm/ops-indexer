@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"math/big"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -583,8 +584,17 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	}
 
 	if len(data.NFTTokens) > 0 {
+		// In key order, as address_stats: concurrent catch-up writers moving the same NFTs would otherwise deadlock.
+		// Stable, so repeated moves of one NFT keep their order.
+		nfts := slices.Clone(data.NFTTokens)
+		sort.SliceStable(nfts, func(i, j int) bool {
+			if nfts[i].TokenAddress != nfts[j].TokenAddress {
+				return nfts[i].TokenAddress < nfts[j].TokenAddress
+			}
+			return nfts[i].TokenID < nfts[j].TokenID
+		})
 		batch := &pgx.Batch{}
-		for _, n := range data.NFTTokens {
+		for _, n := range nfts {
 			batch.Queue(`
 				INSERT INTO nft_tokens (token_address, token_id, owner, token_uri, block_number)
 				VALUES ($1, $2, $3, $4, $5)

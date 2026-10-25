@@ -51,8 +51,7 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
-	// RetentionEnabled: history below a window is (or will be) pruned. Catch-up then writes address_stats per
-	// block instead of rebuilding the table from history afterwards, which would drop the pruned counts.
+	// RetentionEnabled: history below a window is (or will be) pruned.
 	RetentionEnabled bool
 
 	// SkipAddressStatsRebuild skips the address_stats rebuild after the initial catch-up (retention off), which

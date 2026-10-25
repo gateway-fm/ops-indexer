@@ -220,8 +220,6 @@ func TestCatchupIndexer_BlockProducer_QueuesAllBlocksInRange(t *testing.T) {
 
 	collectorDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(9), nil).Maybe()
 
-	mockDB.On("RebuildAddressStats", mock.Anything).Return(nil).Maybe()
-
 	err := catchup.Start(context.Background(), 1, 9)
 	assert.NoError(t, err)
 
@@ -288,7 +286,6 @@ func TestCatchupIndexer_BlockProducer_MultipleRanges(t *testing.T) {
 	}
 
 	collectorDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(20), nil).Maybe()
-	mockDB.On("RebuildAddressStats", mock.Anything).Return(nil).Maybe()
 
 	totalExpected := int64(11 + 9)
 
@@ -369,7 +366,7 @@ func (s *scriptedCollectorDB) GetMissingRangesBatch(ctx context.Context, batchSi
 	return nil, nil
 }
 
-func TestCatchupIndexer_RebuildAddressStats_FiresOncePerProcess(t *testing.T) {
+func TestCatchupIndexer_InitialSyncCompletesOnce(t *testing.T) {
 	mockDB := new(MockDatabase)
 	mockRPC := new(MockRPCClient)
 
@@ -382,58 +379,6 @@ func TestCatchupIndexer_RebuildAddressStats_FiresOncePerProcess(t *testing.T) {
 	collector := NewMissingRangeCollector(scripted, new(MockRPCClient), nil)
 	catchup.collector = collector
 
-	rebuilt := make(chan struct{}, 8)
-	catchup.SetOnComplete(func() { rebuilt <- struct{}{} })
-
-	for _, blockNum := range []uint64{1, 2} {
-		mockDB.On("HasBlock", mock.Anything, blockNum).Return(false, nil)
-		mockRPC.On("RawBlockByNumber", mock.Anything, blockNum).Return(makeRawBlock(blockNum), nil)
-		scripted.On("DeleteMissingRangeByBlock", mock.Anything, blockNum).Return(nil)
-	}
-	mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
-	mockDB.On("InsertBlockDataBatch", mock.Anything, mock.Anything).Return(nil).Maybe()
-	mockDB.On("RebuildAddressStats", mock.Anything).Return(nil)
-	scripted.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
-	mockDB.On("GetTotalMissingBlocks", mock.Anything).Return(int64(0), nil).Maybe()
-
-	require.NoError(t, catchup.Start(context.Background(), 1, 2))
-	defer catchup.Stop()
-
-	// Initial-sync rebuild must fire once; sync on the completion signal, not a
-	// wall-clock sleep.
-	select {
-	case <-rebuilt:
-	case <-time.After(5 * time.Second):
-		t.Fatal("initial address_stats rebuild did not fire")
-	}
-
-	// A steady-state chain-head block now arrives after initial sync.
-	scripted.releaseBlock2.Store(true)
-
-	// Wait until the producer has idled several cycles past block 2 — enough that
-	// a latch-resetting (buggy) implementation would have re-fired the rebuild.
-	require.Eventually(t, func() bool { return scripted.idlePollsAfter.Load() >= 5 },
-		5*time.Second, 2*time.Millisecond)
-
-	// HasBlock=false, so processedBlocks only advances via real processing —
-	// guards against a vacuous pass where blocks were never indexed.
-	require.Eventually(t, func() bool { return atomic.LoadInt64(&catchup.processedBlocks) >= 2 },
-		5*time.Second, 2*time.Millisecond)
-
-	mockDB.AssertNumberOfCalls(t, "RebuildAddressStats", 1)
-}
-
-func TestCatchupIndexer_RebuildAddressStats_SkippedWhenTurnedOff(t *testing.T) {
-	mockDB := new(MockDatabase)
-	mockRPC := new(MockRPCClient)
-
-	cfg := &CatchupConfig{Workers: 1, BatchSize: 100, QueueSize: 100}
-	idxCfg := &Config{RPCWorkers: 1, RPCRateLimit: 100, SkipAddressStatsRebuild: true}
-	catchup := NewCatchupIndexer(mockDB, mockRPC, cfg, idxCfg, NewTokenCache(), NewContractCache(), nil, false)
-	catchup.pollInterval = 2 * time.Millisecond
-
-	scripted := &scriptedCollectorDB{MockDatabase: new(MockDatabase)}
-	catchup.collector = NewMissingRangeCollector(scripted, new(MockRPCClient), nil)
 	completed := make(chan struct{}, 8)
 	catchup.SetOnComplete(func() { completed <- struct{}{} })
 
@@ -449,12 +394,36 @@ func TestCatchupIndexer_RebuildAddressStats_SkippedWhenTurnedOff(t *testing.T) {
 
 	require.NoError(t, catchup.Start(context.Background(), 1, 2))
 	defer catchup.Stop()
+
+	// Initial sync completes once; sync on the completion signal, not a wall-clock sleep.
 	select {
 	case <-completed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("initial sync did not complete")
 	}
-	mockDB.AssertNotCalled(t, "RebuildAddressStats", mock.Anything)
+
+	// A steady-state chain-head block now arrives after initial sync.
+	scripted.releaseBlock2.Store(true)
+
+	// Wait until the producer has idled several cycles past block 2 — enough that
+	// a latch-resetting (buggy) implementation would have fired completion again.
+	require.Eventually(t, func() bool { return scripted.idlePollsAfter.Load() >= 5 },
+		5*time.Second, 2*time.Millisecond)
+
+	// HasBlock=false, so processedBlocks only advances via real processing —
+	// guards against a vacuous pass where blocks were never indexed.
+	require.Eventually(t, func() bool { return atomic.LoadInt64(&catchup.processedBlocks) >= 2 },
+		5*time.Second, 2*time.Millisecond)
+
+}
+
+// Catch-up writes address_stats deltas whether or not retention is on: nothing rebuilds the table afterwards.
+func TestCatchupIndexer_WritesAddressStatsInEveryMode(t *testing.T) {
+	for _, retention := range []bool{false, true} {
+		c := NewCatchupIndexer(new(MockDatabase), new(MockRPCClient), &CatchupConfig{Workers: 1},
+			&Config{RetentionEnabled: retention}, NewTokenCache(), NewContractCache(), nil, false)
+		require.False(t, c.blockIndexer().config.SkipAddressStats, "retention %v", retention)
+	}
 }
 
 // --- Realtime Indexer Tests ---

@@ -27,7 +27,6 @@ type Database interface {
 	DeleteMissingRangeByBlock(ctx context.Context, blockNum uint64) error
 	RequeueMissingBlock(ctx context.Context, blockNum uint64) error
 	GetMissingRangesBatch(ctx context.Context, batchSize int) ([]db.BlockRange, error)
-	RebuildAddressStats(ctx context.Context) error
 	PrunedThrough(ctx context.Context) (uint64, int64, error)
 
 	InsertTransaction(ctx context.Context, tx *types.Transaction) error

@@ -109,11 +109,6 @@ func (m *MockDatabase) GetMissingRangesBatch(ctx context.Context, batchSize int)
 	return args.Get(0).([]db.BlockRange), args.Error(1)
 }
 
-func (m *MockDatabase) RebuildAddressStats(ctx context.Context) error {
-	args := m.Called(ctx)
-	return args.Error(0)
-}
-
 func (m *MockDatabase) PrunedThrough(ctx context.Context) (uint64, int64, error) {
 	return 0, 0, nil
 }
