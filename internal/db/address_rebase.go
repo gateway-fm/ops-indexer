@@ -191,7 +191,13 @@ func (d *DB) rebasePendingSpans(ctx context.Context) error {
 		log.Info("ledger: span's addresses rebased", "lo", lo, "addresses", len(members), "hot", len(hot),
 			"changed", spanResult.Changed, "created", spanResult.Created, "removed", spanResult.Removed)
 	}
-	if total.FirstSeenFrom == nil {
+	return d.recountDaysIfMoved(ctx, total)
+}
+
+// recountDaysIfMoved recounts the days' address columns from address_stats when a rebase moved a first_seen, under
+// daily_stats_advance's lock and holding no address_stats row.
+func (d *DB) recountDaysIfMoved(ctx context.Context, r RebaseResult) error {
+	if r.FirstSeenFrom == nil {
 		return nil
 	}
 	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {

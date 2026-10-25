@@ -48,33 +48,34 @@ func (d *DB) tailShort(ctx context.Context, cfg VerifyConfig) bool {
 	return true
 }
 
-// ReconcileAddressBucket repairs the address counters of the next bucket not reconciled yet against the closed
-// ledger rows plus the open tail, and records the bucket done in the same transaction: an interrupted bucket rolls
-// back and is redone, a finished one is never redone. done is true once all 256 are.
+// ReconcileAddressBucket sets the addresses of the next bucket not reconciled yet whose counters disagree with the
+// closed ledger rows plus the open tail to that count (RebaseAddresses), and then records the bucket done: an
+// interrupted bucket is redone, which changes nothing it already set. done is true once all 256 are.
 func (d *DB) ReconcileAddressBucket(ctx context.Context) (bucket, drifted int, done bool, err error) {
-	err = inRepeatableRead(ctx, d, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_reconcile_next' FOR UPDATE`).Scan(&bucket); err != nil {
-			return err
-		}
-		if bucket >= addressBuckets {
-			done = true
-			return nil
-		}
-		drifts, err := collectDrifts(ctx, tx,
-			`SELECT family, key, counter, running::TEXT, expected::TEXT FROM ledger_running_diff_address($1)`, bucket)
-		if err != nil {
-			return err
-		}
-		for _, dr := range drifts {
-			if err := repairRunning(ctx, tx, dr); err != nil {
-				return err
-			}
-		}
-		drifted = len(drifts)
-		_, err = tx.Exec(ctx, `UPDATE ledger_verify_state SET value = $1 WHERE name = 'address_reconcile_next'`, bucket+1)
-		return err
-	})
-	return bucket, drifted, done, err
+	if err := d.pool.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_reconcile_next'`).Scan(&bucket); err != nil {
+		return bucket, 0, false, err
+	}
+	if bucket >= addressBuckets {
+		return bucket, 0, true, nil
+	}
+	rows, err := d.pool.Query(ctx, `SELECT DISTINCT key FROM ledger_running_diff_address($1)`, bucket)
+	if err != nil {
+		return bucket, 0, false, err
+	}
+	addresses, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return bucket, 0, false, err
+	}
+	r, err := d.RebaseAddresses(ctx, addresses, addresses)
+	if err == nil {
+		err = d.recountDaysIfMoved(ctx, r)
+	}
+	if err != nil {
+		return bucket, r.Changed, false, err
+	}
+	_, err = d.pool.Exec(ctx, `UPDATE ledger_verify_state SET value = $1 WHERE name = 'address_reconcile_next' AND value = $2`,
+		bucket+1, bucket)
+	return bucket, r.Changed, false, err
 }
 
 // reconcileAddresses runs the reconciliation bucket after bucket, a second apart, until it is done or the open tail
@@ -197,8 +198,11 @@ var runningColumns = map[string]map[string]string{
 }
 
 // CheckRunning compares the running chain and token counters, and the address counters of one bucket, with the
-// closed ledger rows plus the open history rows, in one snapshot. With repair, each drifting counter is moved to the
-// expected value and logged in ledger_repairs; a key that drifts again after a repair is quarantined instead.
+// closed ledger rows plus the open history rows, in one snapshot. With repair, each drifting counter is logged in
+// ledger_repairs, or, if the key drifts again after a repair, quarantined instead. The repairs run after the snapshot,
+// in READ COMMITTED: a chain or token counter moves by its drift, which concurrent writes do not change; an address is
+// set to the ledger's count by RebaseAddresses. Under REPEATABLE READ any row ingest wrote after the snapshot failed
+// the repair with a serialization error, and a hot row always had one.
 func (d *DB) CheckRunning(ctx context.Context, bucket int, repair bool) ([]Drift, error) {
 	var drifts []Drift
 	err := inRepeatableRead(ctx, d, func(tx pgx.Tx) error {
@@ -207,20 +211,50 @@ func (d *DB) CheckRunning(ctx context.Context, bucket int, repair bool) ([]Drift
 			SELECT family, key, counter, running::TEXT, expected::TEXT FROM ledger_running_diff_chain_token()
 			UNION ALL
 			SELECT family, key, counter, running::TEXT, expected::TEXT FROM ledger_running_diff_address($1)`, bucket)
-		if err != nil || !repair {
-			return err
-		}
+		return err
+	})
+	if err != nil || !repair || len(drifts) == 0 {
+		return drifts, err
+	}
+	return drifts, d.repairDrifts(ctx, drifts)
+}
+
+func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
+	var addresses []string
+	seen := map[string]bool{}
+	if err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		for _, dr := range drifts {
-			if err := repairRunning(ctx, tx, dr); err != nil {
+			apply, err := recordRepair(ctx, tx, dr)
+			if err != nil || !apply {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if dr.Family == "address" {
+				if !seen[dr.Key] {
+					seen[dr.Key] = true
+					addresses = append(addresses, dr.Key)
+				}
+				continue
+			}
+			if err := applyRunning(ctx, tx, dr); err != nil {
 				return err
 			}
 		}
 		return nil
-	})
-	return drifts, err
+	}); err != nil || len(addresses) == 0 {
+		return err
+	}
+	r, err := d.RebaseAddresses(ctx, addresses, addresses)
+	if err != nil {
+		return err
+	}
+	return d.recountDaysIfMoved(ctx, r)
 }
 
-func repairRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
+// recordRepair logs a drift and says whether to repair it: a key that drifted again after a repair is quarantined.
+func recordRepair(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
 	log.Warn("ledger: running counter drifted", "family", dr.Family, "key", dr.Key, "counter", dr.Counter,
 		"running", deref(dr.Stored), "expected", deref(dr.Recount))
 	var quarantined, repairedBefore bool
@@ -228,22 +262,20 @@ func repairRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 		SELECT EXISTS (SELECT 1 FROM ledger_quarantine WHERE family = $1 AND key = $2),
 		       EXISTS (SELECT 1 FROM ledger_repairs WHERE lo IS NULL AND family = $1 AND key = $2 AND counter = $3)`,
 		dr.Family, dr.Key, dr.Counter).Scan(&quarantined, &repairedBefore); err != nil {
-		return err
+		return false, err
 	}
 	if quarantined {
-		return nil
+		return false, nil
 	}
 	if repairedBefore {
 		log.Error("ledger: running counter drifted again after a repair; quarantined", "family", dr.Family, "key", dr.Key, "counter", dr.Counter)
 		_, err := tx.Exec(ctx, `INSERT INTO ledger_quarantine (family, key) VALUES ($1, $2) ON CONFLICT DO NOTHING`, dr.Family, dr.Key)
-		return err
+		return false, err
 	}
-	if _, err := tx.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 		INSERT INTO ledger_repairs (family, key, counter, stored, repaired) VALUES ($1, $2, $3, $4::NUMERIC, $5::NUMERIC)`,
-		dr.Family, dr.Key, dr.Counter, dr.Stored, dr.Recount); err != nil {
-		return err
-	}
-	return applyRunning(ctx, tx, dr)
+		dr.Family, dr.Key, dr.Counter, dr.Stored, dr.Recount)
+	return err == nil, err
 }
 
 func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
@@ -251,19 +283,6 @@ func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	if expected == nil {
 		zero := "0"
 		expected = &zero
-	}
-	switch {
-	case dr.Family == "address" && (dr.Counter == "first_seen" || dr.Counter == "last_seen"):
-		if err := ensureAddressRow(ctx, tx, dr.Key); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE address_stats SET %s = $2::BIGINT WHERE address = $1`, pgx.Identifier{dr.Counter}.Sanitize()),
-			dr.Key, dr.Recount)
-		return err
-	case dr.Family == "address":
-		if err := ensureAddressRow(ctx, tx, dr.Key); err != nil {
-			return err
-		}
 	}
 	column, ok := runningColumns[dr.Family][dr.Counter]
 	if !ok {
@@ -273,17 +292,6 @@ func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	col := pgx.Identifier{column}.Sanitize()
 	_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET %s = COALESCE(%s, 0) + ($2::NUMERIC - COALESCE($3::NUMERIC, 0)) WHERE %s = $1`,
 		t.table, col, col, t.key), dr.Key, *expected, dr.Stored)
-	return err
-}
-
-func ensureAddressRow(ctx context.Context, tx pgx.Tx, address string) error {
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO address_stats (address, is_contract) VALUES ($1, EXISTS (SELECT 1 FROM contracts WHERE address = $1))
-		ON CONFLICT DO NOTHING`, address)
-	if err != nil || tag.RowsAffected() == 0 {
-		return err
-	}
-	_, err = tx.Exec(ctx, `UPDATE chain_counters SET count = count + 1 WHERE name = 'addresses_total'`)
 	return err
 }
 

@@ -17,13 +17,18 @@ on any drift. The ledger and the checks run with retention on or off.
   watermark; `prune_offsets` is their sum.
 - The hot path keeps adding to the running counters. They must equal the closed ledger rows plus the open spans'
   history rows.
+- **address_stats is derived from the ledger**: when a span closes, every address
+  with a row in it, and every address of a block reverted since the last close, is set to that count, in batches of
+  1,000 that lock their rows before counting (an address with over 10,000 transactions in the span gets a batch of
+  its own). An error in an address's running counters is gone one span after it happened. A restart resumes at the
+  first span not rebased (`ledger_spans.rebased_at`).
 
 ## Checks
 
 | check | what it compares | repairs |
 |---|---|---|
 | `recount` | One closed retained span per tick: its ledger rows against a recount of its history rows. | Replaces the span's ledger rows. |
-| `running` | The running chain and token counters, and the address counters of one of 256 address buckets per tick, against the closed ledger rows plus the open rows, in one snapshot. | Moves each drifted running counter to the expected value. |
+| `running` | The running chain and token counters, and the address counters of one of 256 address buckets per tick, against the closed ledger rows plus the open rows, in one snapshot. | After the snapshot: moves a chain or token counter by its drift; sets a drifted address to the ledger's count, as the span rebase does. |
 | `node` | One pruned span at a time, oldest-checked first: its ledger rows against the span recounted from the node with the ingest block builder. | Replaces the span's ledger rows; the `running` check then repairs any running counter they imply. |
 | `chain_blocks` | `blocks_total` against the stored head + 1 − `START_BLOCK`, while no missing range is open. | Alert only. |
 | `chain_supply` | One token per pass: `total_supply` against `totalSupply()` at the stored head. A token minted or burned without Transfer events differs legitimately. | Alert only. |
@@ -34,15 +39,17 @@ on any drift. The ledger and the checks run with retention on or off.
 - The `running` check, and the one-off address reconciliation below, wait until the open tail (stored blocks above
   the closed spans) is at most 3 × `LEDGER_SPAN_BLOCKS`: before the closer has caught up they would read most of
   history every pass.
-- **Address reconciliation** (once per database, after migration 030): with repair on, every address bucket is
-  repaired against the closed ledger rows plus the open tail, one bucket per transaction (row locks only), its
-  progress recorded in the same transaction so a restart resumes at the next bucket. It repairs address_stats left
-  short by a catch-up that did not write it (retention off, before catch-up wrote address_stats in every mode),
-  without a rebuild.
+- **Address reconciliation** (once per database, after migration 030): with repair on, the drifted addresses of every
+  bucket are set to the closed ledger rows plus the open tail, as the span rebase sets them, and the bucket is then
+  recorded done, so a restart resumes at the next bucket. It repairs address_stats left short by a catch-up that did
+  not write it (retention off, before catch-up wrote address_stats in every mode), without a rebuild.
 - Every repair is logged per key in `ledger_repairs`.
 - A span, or a running key, that drifts again after its repair is **quarantined**: it is no longer repaired, and
   `indexer_verify_quarantined` alerts.
-- A repair is one transaction. A repair killed mid-way leaves nothing behind, and the next pass does it once.
+- Repairs run in READ COMMITTED and never retry for a conflict with ingest: under REPEATABLE READ a row ingest wrote
+  after the snapshot failed the repair, and a busy address always had one. A repair killed mid-way leaves each batch
+  either done or not, and the next pass changes nothing a done batch set.
+- The span rebase is not a repair: it is not logged in `ledger_repairs` and never quarantines.
 
 ## Knobs (one budget per job)
 

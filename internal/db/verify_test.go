@@ -127,7 +127,11 @@ func TestRunningCheckRepairsDriftedCountersOnceThenQuarantines(t *testing.T) {
 	tx, err := d.pool.Begin(ctx)
 	require.NoError(t, err)
 	for _, dr := range found {
-		require.NoError(t, repairRunning(ctx, tx, dr))
+		apply, err := recordRepair(ctx, tx, dr)
+		require.NoError(t, err)
+		if apply && dr.Family != "address" {
+			require.NoError(t, applyRunning(ctx, tx, dr))
+		}
 	}
 	require.NoError(t, tx.Rollback(ctx), "killed mid-repair")
 
@@ -188,10 +192,7 @@ func TestRunningRepairKeepsADeltaCommittedAfterTheCheck(t *testing.T) {
 	_, err = d.pool.Exec(ctx, `UPDATE chain_counters SET count = count + 1 WHERE name = 'transactions_total'`)
 	require.NoError(t, err)
 
-	tx, err := d.pool.Begin(ctx)
-	require.NoError(t, err)
-	require.NoError(t, repairRunning(ctx, tx, *drift))
-	require.NoError(t, tx.Commit(ctx))
+	require.NoError(t, d.repairDrifts(ctx, []Drift{*drift}))
 	var counter, rows int64
 	require.NoError(t, d.pool.QueryRow(ctx, `
 		SELECT (SELECT count FROM chain_counters WHERE name = 'transactions_total'), (SELECT count(*) FROM transactions)`).Scan(&counter, &rows))
