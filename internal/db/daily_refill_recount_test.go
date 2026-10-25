@@ -66,9 +66,8 @@ func TestRefillRecountsEveryDaysAddressColumns(t *testing.T) {
 	require.Equal(t, 5, recorded, "the inferred first blocks are recorded for later advances")
 }
 
-// Migration 021 counts each stored day's new and cumulative addresses from the address_stats it finds, and
-// the rebuild after the initial catch-up then rewrites address_stats. The days follow the rebuilt address_stats, so
-// every upgrade route ends with the same days.
+// The days' address columns follow address_stats when it is rebuilt. Here the rebuild fills an empty
+// table, the only one it accepts (catch-up writes address_stats itself; the ledger reconciliation repairs it).
 func TestAddressStatsRebuildRecountsTheDaysAddressColumns(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -84,8 +83,6 @@ func TestAddressStatsRebuildRecountsTheDaysAddressColumns(t *testing.T) {
 		_, err := d.pool.Exec(ctx, `
 			INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
 			VALUES ($1, $2, 0, $3, $3, 0, 21000, 1, '0x', 1, 0)`, fmt.Sprintf("0xt%d", k), b, addr)
-		require.NoError(t, err)
-		_, err = d.pool.Exec(ctx, `INSERT INTO address_stats (address, tx_count, first_seen, last_seen) VALUES ($1, 1, 1, 1)`, addr)
 		require.NoError(t, err)
 	}
 	for i := 0; i < 3; i++ {
