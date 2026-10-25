@@ -12,9 +12,9 @@ import (
 // lateDays remembers the days that may hold a block stored below the daily_stats watermark (migration 012), which
 // daily_stats_advance never reaches: on a fresh sync realtime stores the head first and the first advance starts at
 // the head's day, and catch-up stores the earlier blocks afterwards; an invalidated day restarts at its first stored
-// block. Every block write notes its day, and the next day for its block-time pair, unless the block is above the
-// watermark the last advance returned, where the advance itself counts it. A restart forgets the notes, so the first
-// advance after one looks for such days in the stored blocks instead.
+// block. Every block write notes its day, unless the block is above the watermark the last advance returned, where
+// the advance itself counts it. A restart forgets the notes, so the first advance after one looks for such days in
+// the stored blocks instead.
 type lateDays struct {
 	mu        sync.Mutex
 	watermark *int64
@@ -31,9 +31,7 @@ func (l *lateDays) noteBlock(number, timestamp uint64) {
 	if l.days == nil {
 		l.days = map[int64]struct{}{}
 	}
-	day := int64(timestamp) / 86400
-	l.days[day] = struct{}{}
-	l.days[day+1] = struct{}{}
+	l.days[int64(timestamp)/86400] = struct{}{}
 }
 
 func (l *lateDays) take() (days []int64, search bool) {
@@ -149,11 +147,32 @@ func searchLateDays(ctx context.Context, tx pgx.Tx, watermark int64) ([]int64, e
 
 // recountDays rewrites each given day's aggregate from its stored blocks up to the watermark, the sums
 // daily_stats_advance would have built had every block arrived in order, and its address set, and returns the
-// earliest day. A day older than every aggregated day takes the days up to the first aggregated one with it, so that
-// each day's count of earlier transactions follows from the aggregated day before it.
+// earliest day. The day of the block after each day's last is recounted with it, for the block-time pair across the
+// boundary, wherever that block falls. A day older than every aggregated day takes the days up to the first
+// aggregated one with it, so that each day's count of earlier transactions follows from the aggregated day before it.
 func recountDays(ctx context.Context, tx pgx.Tx, watermark int64, days []int64) (*int64, error) {
 	if len(days) == 0 {
 		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT (SELECT timestamp / 86400 FROM blocks WHERE number = s.hi + 1)
+		FROM unnest($1::BIGINT[]) d(day)
+		CROSS JOIN LATERAL (
+			SELECT max(number) AS hi FROM blocks
+			WHERE timestamp >= d.day * 86400 AND timestamp < (d.day + 1) * 86400 AND number <= $2
+		) s
+		WHERE s.hi IS NOT NULL`, days, watermark)
+	if err != nil {
+		return nil, err
+	}
+	next, err := pgx.CollectRows(rows, pgx.RowTo[*int64])
+	if err != nil {
+		return nil, err
+	}
+	for _, day := range next {
+		if day != nil {
+			days = append(days, *day)
+		}
 	}
 	sort.Slice(days, func(i, j int) bool { return days[i] < days[j] })
 	var firstAggregated *int64

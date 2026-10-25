@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -219,4 +220,51 @@ func TestDailyStatsCumulativeTransactionsWhenOneAdvanceCrossesSeveralDays(t *tes
 	require.NoError(t, err)
 	require.EqualValues(t, lateBlocksTotal, upto, "one advance over three days")
 	requireDaysEqualRecompute(t, d, "after one advance over three days")
+}
+
+// requireStoredDaysEqualRecompute compares every day that holds a stored block with ComputeDailyStats, on the
+// columns blocks and transactions determine.
+func requireStoredDaysEqualRecompute(t *testing.T, d *DB, label string) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := d.pool.Query(ctx, `SELECT DISTINCT timestamp / 86400 FROM blocks ORDER BY 1`)
+	require.NoError(t, err)
+	days, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	require.NoError(t, err)
+	for _, day := range days {
+		date := time.Unix(day*86400, 0).UTC()
+		want, err := d.ComputeDailyStats(ctx, date)
+		require.NoError(t, err)
+		got, err := d.GetDailyStatsForDate(ctx, date)
+		require.NoError(t, err)
+		require.NotNil(t, got, "%s: no row for %s", label, want.Date)
+		want.NewAddresses, want.NewContracts, want.CumulativeAddresses, want.CumulativeContracts = 0, 0, 0, 0
+		got.NewAddresses, got.NewContracts, got.CumulativeAddresses, got.CumulativeContracts = 0, 0, 0, 0
+		require.Equal(t, *want, *got, "%s: %s", label, want.Date)
+	}
+}
+
+// The block-time pair of a late block's successor belongs to the successor's day, which need not be the
+// next day: after an empty day it was never recounted, and kept the pair it had missed.
+func TestDailyStatsRecountsTheSuccessorsDayAcrossAnEmptyDay(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	block := func(n int) *BlockData {
+		ts := uint64(lateBlocksMidnight - 86400 + int64(n)*600)
+		if n > 20 {
+			ts = uint64(lateBlocksMidnight + 86400 + int64(n-20)*600)
+		}
+		return &BlockData{Block: &types.Block{Number: uint64(n), Hash: fmt.Sprintf("0xgap%060x", n),
+			ParentHash: fmt.Sprintf("0xgap%060x", n-1), Timestamp: ts, GasUsed: 21000, GasLimit: 30_000_000}, SkipAddressStats: true}
+	}
+	for n := 21; n <= 40; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, block(n)))
+	}
+	advanceUntilStable(t, d)
+	for n := 1; n <= 20; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, block(n)))
+	}
+	advanceUntilStable(t, d)
+	requireStoredDaysEqualRecompute(t, d, "a late day, an empty day, then the head's day")
 }
