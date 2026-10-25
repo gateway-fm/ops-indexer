@@ -77,7 +77,16 @@ func closedBy019(t *testing.T, selfTransfers int) []string {
 	require.NoError(t, m.MigrateTo(context.Background(), 21))
 	release()
 	seedLedgerEdgeCases(t, d, selfTransfers)
-	closeLedger(t, d)
+	ctx := context.Background()
+	for {
+		var lo, hi int64
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT lo, hi FROM ledger_next_span($1, 0)`, int64(testLedger.SpanBlocks)).Scan(&lo, &hi))
+		var ok bool
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT ledger_close_span($1, $2)`, lo, hi).Scan(&ok), "019's close at schema 21")
+		if !ok {
+			break
+		}
+	}
 	return ledgerRows(t, d)
 }
 

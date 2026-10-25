@@ -46,9 +46,13 @@ const defaultLedgerGateWait = time.Minute
 var errLedgerGateBusy = errors.New("the history-DDL gate is held by retention")
 
 // CloseLedgerSpans closes up to max spans after the closed prefix, stopping at the first that is not final and
-// complete; it returns how many it closed.
+// complete; it returns how many it closed. After each close, and first for any span a restart left, it sets the
+// span's addresses in address_stats to the ledger's count.
 func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (int, error) {
 	closed := 0
+	if err := d.rebasePendingSpans(ctx); err != nil {
+		return closed, err
+	}
 	for closed < max {
 		var lo, hi int64
 		if err := d.pool.QueryRow(ctx, `SELECT lo, hi FROM ledger_next_span($1, $2)`, int64(cfg.SpanBlocks), int64(cfg.FirstBlock)).Scan(&lo, &hi); err != nil {
@@ -75,6 +79,9 @@ func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (i
 		closed++
 		metrics.ObserveLedgerClose(time.Since(start))
 		metrics.SetLedgerClosedThrough(uint64(hi - 1))
+		if err := d.rebasePendingSpans(ctx); err != nil {
+			return closed, err
+		}
 	}
 	return closed, nil
 }
