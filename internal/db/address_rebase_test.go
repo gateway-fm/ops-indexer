@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -312,4 +313,41 @@ func TestRebaseTakesItsRowsInIngestsOrder(t *testing.T) {
 	require.NoError(t, err, "ingest writes the next address in its order")
 	require.NoError(t, ingest.Commit(ctx))
 	require.NoError(t, <-rebased, "no deadlock")
+}
+
+// An address a batch may create has its row taken through the insert's conflict, and that lock must hold
+// until the batch commits, as FOR UPDATE does: a block written while the truth is counted waits, and is counted once.
+// (The count is slowed inside the rebase's snapshot, so the write lands mid-count.)
+func TestRebaseHoldsACreatableRowUntilItCommits(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 5; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = $1`, rebaseHot)
+	require.NoError(t, err, "a tail error, so the rebase writes the row")
+	var def string
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT pg_get_functiondef('ledger_address_truth(text[])'::regprocedure)`).Scan(&def))
+	body := strings.Index(def, "AS $")
+	require.Positive(t, body)
+	open := body + 4 + strings.Index(def[body+4:], "$") + 1
+	_, err = d.pool.Exec(ctx, def[:open]+"\n    SELECT pg_sleep(2);"+def[open:])
+	require.NoError(t, err)
+
+	rebased := make(chan error, 1)
+	go func() {
+		_, err := d.RebaseAddresses(ctx, []string{rebaseHot}, []string{rebaseHot})
+		rebased <- err
+	}()
+	require.Eventually(t, func() bool {
+		var counting bool
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep')`).Scan(&counting))
+		return counting
+	}, 10*time.Second, 10*time.Millisecond, "the rebase holds its rows and counts")
+	wrote := make(chan error, 1)
+	go func() { wrote <- d.InsertBlockDataBatch(ctx, rebaseBlock(6)) }()
+	require.NoError(t, <-rebased)
+	require.NoError(t, <-wrote)
+	requireAddressStatsIsTheTruth(t, d)
 }
