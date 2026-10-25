@@ -242,3 +242,36 @@ func TestClosingASpanRebasesItsAddresses(t *testing.T) {
 		rebaseNewAddress(300)).Scan(&forkOnly))
 	require.False(t, forkOnly, "seen only on the reverted fork")
 }
+
+// When a rebase moves a first_seen, the days' address columns are recounted, and a recount that fails is
+// redone by the next close, though every span is marked rebased by then.
+func TestDaysRecountSurvivesAFailedFirstAttempt(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 600; n++ {
+		data := rebaseBlock(n)
+		data.SkipAddressStats = n == 20
+		require.NoError(t, d.InsertBlockDataBatch(ctx, data))
+	}
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(601, 14000) g`)
+	require.NoError(t, err)
+	advanceUntilStable(t, d)
+	cfg := LedgerConfig{SpanBlocks: 500, FirstBlock: 1, WorkMem: "64MB"}
+
+	held, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = held.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`)
+	require.NoError(t, err)
+	short, cancel := context.WithTimeout(ctx, 3*time.Second)
+	_, err = d.CloseLedgerSpans(short, cfg, 1)
+	cancel()
+	require.Error(t, err, "the days' recount waits for daily_stats_advance's lock past the deadline")
+	require.NoError(t, held.Rollback(ctx))
+
+	_, err = d.CloseLedgerSpans(ctx, cfg, 1)
+	require.NoError(t, err)
+	requireAddressColumnsFollowTheBlocks(t, d)
+}

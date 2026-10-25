@@ -8,6 +8,9 @@ UPDATE ledger_spans SET rebased_at = now();
 
 CREATE TABLE ledger_reverted_address (address TEXT PRIMARY KEY);
 
+-- Rebases since the days' address columns were last recounted that moved a first_seen; 0 when none is pending.
+INSERT INTO ledger_verify_state (name, value) VALUES ('address_days_recount', 0) ON CONFLICT (name) DO NOTHING;
+
 -- ledger_address_contributions from block p_lo up, for the given addresses only, through each table's address index.
 CREATE FUNCTION ledger_address_contributions_of(p_lo BIGINT, p_addresses TEXT[])
 RETURNS TABLE (address TEXT, tx TEXT, block BIGINT, sent INT, internal INT, transfers INT) LANGUAGE sql STABLE AS $f$
@@ -71,5 +74,6 @@ $f$;
 DROP FUNCTION ledger_address_seen(TEXT[]);
 DROP FUNCTION ledger_address_truth(TEXT[]);
 DROP FUNCTION ledger_address_contributions_of(BIGINT, TEXT[]);
+DELETE FROM ledger_verify_state WHERE name = 'address_days_recount';
 DROP TABLE ledger_reverted_address;
 ALTER TABLE ledger_spans DROP COLUMN rebased_at;

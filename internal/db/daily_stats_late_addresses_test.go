@@ -132,7 +132,9 @@ func requireAddressColumnsFollowTheBlocks(t *testing.T, d *DB) {
 		days++
 	}
 	require.NoError(t, rows.Err())
-	require.Equal(t, 4, days)
+	var stored int
+	require.NoError(t, d.pool.QueryRow(context.Background(), `SELECT count(DISTINCT daily_stats_day(timestamp)) FROM blocks`).Scan(&stored))
+	require.Equal(t, stored, days, "every day with a block")
 }
 
 // With no rebuild after catch-up, repair-address-stats is what corrects address_stats a skipped catch-up

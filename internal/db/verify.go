@@ -68,7 +68,7 @@ func (d *DB) ReconcileAddressBucket(ctx context.Context) (bucket, drifted int, d
 	}
 	r, err := d.RebaseAddresses(ctx, addresses, addresses)
 	if err == nil {
-		err = d.recountDaysIfMoved(ctx, r)
+		err = d.recountPendingDays(ctx)
 	}
 	if err != nil {
 		return bucket, r.Changed, false, err
@@ -246,11 +246,10 @@ func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
 	}); err != nil || len(addresses) == 0 {
 		return err
 	}
-	r, err := d.RebaseAddresses(ctx, addresses, addresses)
-	if err != nil {
+	if _, err := d.RebaseAddresses(ctx, addresses, addresses); err != nil {
 		return err
 	}
-	return d.recountDaysIfMoved(ctx, r)
+	return d.recountPendingDays(ctx)
 }
 
 // recordRepair logs a drift and says whether to repair it: a key that drifted again after a repair is quarantined.

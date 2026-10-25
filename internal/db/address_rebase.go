@@ -113,6 +113,11 @@ func rebaseAddressBatch(ctx context.Context, tx pgx.Tx, batch, create []string) 
 			return r, err
 		}
 	}
+	if r.FirstSeenFrom != nil {
+		if _, err := tx.Exec(ctx, `UPDATE ledger_verify_state SET value = value + 1 WHERE name = 'address_days_recount'`); err != nil {
+			return r, err
+		}
+	}
 	// Last, holding the rows: a revert of one of these addresses either committed before the lock, and is in the
 	// truth, or waits for it and records the address again.
 	_, err := tx.Exec(ctx, `DELETE FROM ledger_reverted_address WHERE address = ANY ($1::TEXT[])`, batch)
@@ -135,6 +140,9 @@ func hotBatches(hot []string) [][]string {
 }
 
 func (d *DB) rebasePendingSpans(ctx context.Context) error {
+	if err := d.recountPendingDays(ctx); err != nil {
+		return err
+	}
 	rows, err := d.pool.Query(ctx, `SELECT lo FROM ledger_spans WHERE rebased_at IS NULL AND source <> 'merged' ORDER BY lo`)
 	if err != nil {
 		return err
@@ -191,19 +199,29 @@ func (d *DB) rebasePendingSpans(ctx context.Context) error {
 		log.Info("ledger: span's addresses rebased", "lo", lo, "addresses", len(members), "hot", len(hot),
 			"changed", spanResult.Changed, "created", spanResult.Created, "removed", spanResult.Removed)
 	}
-	return d.recountDaysIfMoved(ctx, total)
+	return d.recountPendingDays(ctx)
 }
 
-// recountDaysIfMoved recounts the days' address columns from address_stats when a rebase moved a first_seen, under
-// daily_stats_advance's lock and holding no address_stats row.
-func (d *DB) recountDaysIfMoved(ctx context.Context, r RebaseResult) error {
-	if r.FirstSeenFrom == nil {
+// recountPendingDays recounts the days' address columns from address_stats if a rebase has moved a first_seen since
+// the last recount, under daily_stats_advance's lock and holding no address_stats row. A batch that moves one counts
+// it in ledger_verify_state in its own transaction, and the recount clears only the count it read, so a recount that
+// fails, or a rebase that commits while it runs, leaves it pending for the next.
+func (d *DB) recountPendingDays(ctx context.Context) error {
+	var pending int64
+	if err := d.pool.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_days_recount'`).Scan(&pending); err != nil {
+		return err
+	}
+	if pending == 0 {
 		return nil
 	}
 	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
 			return err
 		}
-		return recountDailyAddressColumns(ctx, tx)
+		if err := recountDailyAddressColumns(ctx, tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE ledger_verify_state SET value = 0 WHERE name = 'address_days_recount' AND value = $1`, pending)
+		return err
 	})
 }
