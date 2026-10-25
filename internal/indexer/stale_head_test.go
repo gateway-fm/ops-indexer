@@ -104,7 +104,6 @@ func TestStartWipesAStaleForkDeeperThanAnyReorgWithForceReindex(t *testing.T) {
 		mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
 		mockDB.On("WipeAllData", mock.Anything).Return(nil).Maybe()
 		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-		mockDB.On("BackfillDailyStats", mock.Anything).Return(nil).Maybe()
 		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(305), nil)
 		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
 		idx := NewWithConfig(mockDB, mockRPC, time.Second, 0, &Config{RPCWorkers: 4, RPCRateLimit: 100, DBBatchSize: 100})

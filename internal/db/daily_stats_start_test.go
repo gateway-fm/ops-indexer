@@ -114,7 +114,8 @@ func TestDailyStatsReorgOnADayWhoseStartIsNotStored(t *testing.T) {
 }
 
 // When the reorged day is the earliest aggregated one, the day before was never aggregated: lowering the watermark
-// into it would give it a partial row. The watermark stays (refill-daily-stats recounts the day).
+// into it would give it a partial row. The watermark stays, and the day before, whose blocks are stored below it, is
+// counted whole from them.
 func TestDailyStatsReorgNeverStartsADayThatWasNotAggregated(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -140,7 +141,7 @@ func TestDailyStatsReorgNeverStartsADayThatWasNotAggregated(t *testing.T) {
 	_, err = d.AdvanceDailyStats(ctx)
 	require.NoError(t, err)
 
-	var yesterdayRows int
-	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM daily_stats WHERE date = DATE '1970-01-01' + $1::int - 1`, dayStart/86_400).Scan(&yesterdayRows))
-	require.Zero(t, yesterdayRows, "no partial row for a day that was never aggregated")
+	var yesterday int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT total_blocks FROM daily_stats WHERE date = DATE '1970-01-01' + $1::int - 1`, dayStart/86_400).Scan(&yesterday))
+	require.Equal(t, firstToday-1, yesterday, "the day before counts every one of its blocks, not a part")
 }

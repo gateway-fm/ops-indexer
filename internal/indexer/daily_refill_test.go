@@ -200,6 +200,10 @@ func TestRefilledDaysEqualAFullSync(t *testing.T) {
 	advanceAll(t, lossy)
 	chain.store(t, lossy, func(n uint64) bool { return n < firstOfDay3 })
 	advanceAll(t, lossy)
+	for _, q := range []string{`DELETE FROM daily_stats WHERE date < $1`, `DELETE FROM daily_stats_acc WHERE date < $1`} {
+		_, err := pool.Exec(ctx, q, day3)
+		require.NoError(t, err, "days 1 and 2 lost, as blocks stored below the watermark were before late blocks were counted")
+	}
 	for _, q := range []string{`DELETE FROM token_transfers WHERE block_number < $1`, `DELETE FROM transactions WHERE block_number < $1`,
 		`DELETE FROM blocks WHERE number < $1`} {
 		_, err := pool.Exec(ctx, q, int64(firstOfDay3))
