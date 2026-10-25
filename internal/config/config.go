@@ -19,7 +19,6 @@ type Config struct {
 	// Minimum interval between recomputations of the current day's daily_stats
 	// row (PRST-4669). 0 = every 100 blocks (legacy).
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
-	DailyStatsLegacy      bool          `mapstructure:"daily_stats_legacy"`
 	CommitPipelineDepth   int           `mapstructure:"commit_pipeline"`
 	BalanceDedupWindow    time.Duration `mapstructure:"balance_dedup_window"`
 	BalanceReaderBatch    int           `mapstructure:"balance_reader_batch"`
@@ -165,7 +164,6 @@ func Load() (*Config, error) {
 	cfg.APIPort = v.GetInt("api_port")
 	cfg.PollInterval = v.GetDuration("poll_interval")
 	cfg.DailyStatsMinInterval = v.GetDuration("daily_stats_min_interval")
-	cfg.DailyStatsLegacy = v.GetBool("daily_stats_legacy")
 	cfg.CommitPipelineDepth = v.GetInt("commit_pipeline")
 	cfg.BalanceDedupWindow = v.GetDuration("balance_dedup_window")
 	cfg.BalanceReaderBatch = v.GetInt("balance_reader_batch")

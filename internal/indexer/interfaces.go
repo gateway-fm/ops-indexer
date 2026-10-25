@@ -3,7 +3,6 @@ package indexer
 import (
 	"context"
 	"math/big"
-	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
@@ -51,10 +50,7 @@ type Database interface {
 	InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error
 	RefreshTokenStats(ctx context.Context, tokenAddress string) error
 
-	ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error)
 	AdvanceDailyStats(ctx context.Context) (uint64, error)
-	UpsertDailyStats(ctx context.Context, stats *types.DailyStats) error
-	BackfillDailyStats(ctx context.Context) error
 
 	WipeAllData(ctx context.Context) error
 }

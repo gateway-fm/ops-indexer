@@ -52,9 +52,6 @@ type Config struct {
 	// 100th block). See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
 
-	// DailyStatsLegacy recomputes the current day from base tables on each run instead of advancing the
-	// incremental aggregate (migration 012).
-	DailyStatsLegacy bool
 	// CommitPipelineDepth is how many blocks the standard loop writes at once (the pipelined
 	// commit). 1 is the sequential committer. See indexPipelined.
 	CommitPipelineDepth int
@@ -457,16 +454,6 @@ func (i *Indexer) Start(ctx context.Context) error {
 				latestOnChain, lastIndexed)
 		}
 	}
-
-	// Backfill daily stats in background
-	go func() {
-		log.Info("starting daily stats backfill")
-		if err := i.db.BackfillDailyStats(ctx); err != nil {
-			log.Warn("daily stats backfill failed", "error", err)
-		} else {
-			log.Info("daily stats backfill completed")
-		}
-	}()
 
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 	catchupThreshold := uint64(100)
@@ -1269,17 +1256,8 @@ func (i *Indexer) afterCommit(ctx context.Context, b *builtBlock) {
 			"elapsed", elapsed)
 	}
 
-	// Recompute the day's daily_stats row, throttled.
-	//
-	// ComputeDailyStats re-aggregates the WHOLE day from base tables: six
-	// queries, the largest a COUNT(DISTINCT from/to address) over every
-	// transaction of the day. That cost grows with the day's volume: 1.9 s
-	// per call at 2.1M transactions on the PRST-4669 rig, ~2.7 s for the six
-	// together, and it was fired every 100 blocks -- every 10-14 s at 500 tx/s
-	// -- so it was 21.5% of all database time once holder_count stopped
-	// dominating, and on course to saturate a core by mid-day. The row it
-	// maintains is a dashboard aggregate: a day's row may lag its blocks by up to
-	// one interval plus one run. Same queries, fewer runs.
+	// Advance daily_stats, throttled. The row is a dashboard aggregate: a day's
+	// row may lag its blocks by up to one interval plus one run.
 	i.scheduleDailyStats(ctx, blockNumber, blockDay(blockTimestamp))
 }
 
@@ -1299,8 +1277,8 @@ func (i *Indexer) scheduleDailyStats(ctx context.Context, blockNumber uint64, da
 	go func() {
 		defer i.scheduleDeferredDailyStats(ctx)
 		defer i.dailyStats.done()
-		for _, d := range days {
-			if !i.updateDailyStatsForDate(ctx, d) {
+		if !i.advanceDailyStats(ctx) {
+			for _, d := range days {
 				i.dailyStats.markDirty(d)
 			}
 		}
@@ -1334,21 +1312,9 @@ func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta
 	}
 }
 
-func (i *Indexer) updateDailyStatsForDate(ctx context.Context, date time.Time) bool {
-	if !i.config.DailyStatsLegacy {
-		if _, err := i.db.AdvanceDailyStats(ctx); err != nil {
-			log.Warn("failed to advance daily stats; will retry", "error", err)
-			return false
-		}
-		return true
-	}
-	stats, err := i.db.ComputeDailyStats(ctx, date)
-	if err != nil {
-		log.Warn("failed to compute daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)
-		return false
-	}
-	if err := i.db.UpsertDailyStats(ctx, stats); err != nil {
-		log.Warn("failed to upsert daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)
+func (i *Indexer) advanceDailyStats(ctx context.Context) bool {
+	if _, err := i.db.AdvanceDailyStats(ctx); err != nil {
+		log.Warn("failed to advance daily stats; will retry", "error", err)
 		return false
 	}
 	return true

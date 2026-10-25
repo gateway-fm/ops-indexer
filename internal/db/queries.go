@@ -2158,37 +2158,3 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 	}
 	return nil
 }
-
-func (d *DB) BackfillDailyStats(ctx context.Context) error {
-	// Find earliest and latest block dates
-	var minTimestamp, maxTimestamp *int64
-	err := d.pool.QueryRow(ctx, `SELECT MIN(timestamp), MAX(timestamp) FROM blocks`).Scan(&minTimestamp, &maxTimestamp)
-	if err != nil || minTimestamp == nil || maxTimestamp == nil {
-		return err
-	}
-
-	startDate := time.Unix(*minTimestamp, 0).UTC().Truncate(24 * time.Hour)
-	endDate := time.Unix(*maxTimestamp, 0).UTC().Truncate(24 * time.Hour)
-
-	for d_ := startDate; !d_.After(endDate); d_ = d_.AddDate(0, 0, 1) {
-		// Skip dates that already exist
-		existing, err := d.GetDailyStatsForDate(ctx, d_)
-		if err != nil {
-			return fmt.Errorf("check existing stats for %s: %w", d_.Format("2006-01-02"), err)
-		}
-		if existing != nil {
-			continue
-		}
-
-		stats, err := d.ComputeDailyStats(ctx, d_)
-		if err != nil {
-			return fmt.Errorf("compute stats for %s: %w", d_.Format("2006-01-02"), err)
-		}
-
-		if err := d.UpsertDailyStats(ctx, stats); err != nil {
-			return fmt.Errorf("upsert stats for %s: %w", d_.Format("2006-01-02"), err)
-		}
-	}
-
-	return nil
-}

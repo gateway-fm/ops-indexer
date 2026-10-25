@@ -107,7 +107,6 @@ func main() {
 		CatchupQueueSize:      cfg.CatchupQueueSize,
 		SkipReceiptTxTypes:    skipReceipts,
 		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
-		DailyStatsLegacy:      cfg.DailyStatsLegacy,
 		CommitPipelineDepth:   cfg.CommitPipelineDepth,
 		BalanceDedupWindow:    cfg.BalanceDedupWindow,
 		BalanceReaderBatch:    cfg.BalanceReaderBatch,

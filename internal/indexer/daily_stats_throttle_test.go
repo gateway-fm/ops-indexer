@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -126,37 +125,31 @@ func TestDailyStatsThrottleRetriesAFailedDay(t *testing.T) {
 }
 
 // The last blocks before a quiet period have no later block to start their run,
-// so a timer recomputes their day once the interval has passed.
-func TestDailyStatsRecomputedAfterQuietPeriod(t *testing.T) {
+// so a timer advances daily_stats once the interval has passed.
+func TestDailyStatsAdvancedAfterQuietPeriod(t *testing.T) {
 	db := new(MockDatabase)
-	computed := make(chan time.Time, 4)
-	db.On("ComputeDailyStats", mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) { computed <- args.Get(1).(time.Time) }).
-		Return(&types.DailyStats{}, nil)
-	db.On("UpsertDailyStats", mock.Anything, mock.Anything).Return(nil)
-	idx := NewWithConfig(db, nil, time.Second, 0, &Config{DailyStatsMinInterval: 50 * time.Millisecond, DailyStatsLegacy: true})
+	advanced := make(chan struct{}, 4)
+	db.On("AdvanceDailyStats", mock.Anything).
+		Run(func(mock.Arguments) { advanced <- struct{}{} }).
+		Return(0, nil)
+	idx := NewWithConfig(db, nil, time.Second, 0, &Config{DailyStatsMinInterval: 50 * time.Millisecond})
 
 	idx.scheduleDailyStats(t.Context(), 1, day1)
-	if d := <-computed; !d.Equal(day1) {
-		t.Fatalf("first block: recomputed %v, want day1", d)
-	}
+	<-advanced
 	idx.scheduleDailyStats(t.Context(), 2, day2)
-	awaitRecompute(t, computed, day2)
+	awaitAdvance(t, advanced, "day2")
 
 	day3 := day2.Add(24 * time.Hour)
 	idx.dailyStats.markDirty(day3)
 	idx.scheduleDeferredDailyStats(t.Context())
-	awaitRecompute(t, computed, day3)
+	awaitAdvance(t, advanced, "day3")
 }
 
-func awaitRecompute(t *testing.T, computed <-chan time.Time, want time.Time) {
+func awaitAdvance(t *testing.T, advanced <-chan struct{}, what string) {
 	t.Helper()
 	select {
-	case d := <-computed:
-		if !d.Equal(want) {
-			t.Fatalf("after the quiet period: recomputed %v, want %v", d, want)
-		}
+	case <-advanced:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("%v was never recomputed: no later block arrived to start its run", want)
+		t.Fatalf("%s was never advanced: no later block arrived to start its run", what)
 	}
 }

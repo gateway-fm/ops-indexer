@@ -207,24 +207,6 @@ func (m *MockDatabase) RefreshTokenStats(ctx context.Context, tokenAddress strin
 	return args.Error(0)
 }
 
-func (m *MockDatabase) ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error) {
-	args := m.Called(ctx, date)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-	return args.Get(0).(*types.DailyStats), args.Error(1)
-}
-
-func (m *MockDatabase) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) error {
-	args := m.Called(ctx, stats)
-	return args.Error(0)
-}
-
-func (m *MockDatabase) BackfillDailyStats(ctx context.Context) error {
-	args := m.Called(ctx)
-	return args.Error(0)
-}
-
 func (m *MockDatabase) WipeAllData(ctx context.Context) error {
 	args := m.Called(ctx)
 	return args.Error(0)
@@ -617,7 +599,6 @@ func TestChainResetDetection(t *testing.T) {
 		// After wipe, lastIndexed becomes 0, blocksToSync is 5 < catchupThreshold (100),
 		// so it goes into startStandardMode. We need UpdateSyncStatus and the poll loop.
 		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-		mockDB.On("BackfillDailyStats", mock.Anything).Return(nil).Maybe()
 
 		// Standard mode will poll; we just need to let it run briefly and cancel.
 		mockRPC.On("SubscribeNewHead", mock.Anything, mock.Anything).Return(newMockSubscription(), nil).Maybe()
@@ -660,7 +641,6 @@ func TestChainResetDetection(t *testing.T) {
 		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
 		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
 		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-		mockDB.On("BackfillDailyStats", mock.Anything).Return(nil).Maybe()
 
 		os.Unsetenv("FORCE_REINDEX")
 
