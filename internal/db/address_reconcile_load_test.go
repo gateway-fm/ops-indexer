@@ -2,10 +2,12 @@ package db
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,4 +79,27 @@ func TestARunningRepairWhoseRebaseFailsIsDoneByTheNextCheck(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, n, "repaired, not quarantined")
 	requireAddressStatsIsTheTruth(t, d)
+}
+
+// The running diff of one address bucket read every row above the closed spans and kept the bucket's 1/256
+// after the union (10 minutes a bucket on a 6.4M-transaction tail), and read ledger_address from the bucket
+// to the end. The bucket's range now bounds each history table's address index scan, and ledger_address's.
+func TestRunningDiffOfABucketReadsOnlyItsAddresses(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	tx, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off`)
+	require.NoError(t, err)
+	rows, err := tx.Query(ctx, `EXPLAIN SELECT * FROM ledger_running_diff_address(3)`)
+	require.NoError(t, err)
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	text := strings.Join(plan, "\n")
+	require.Regexp(t, `Index Cond: \(\(from_address >= '0x03'::text\) AND \(from_address < '0x04'::text\)`, text,
+		"the bucket bounds the transactions' address index")
+	require.Regexp(t, `Index Cond: \(\(address >= '0x03'::text\) AND \(address < '0x04'::text\)\)`, text,
+		"and ledger_address's, at both ends")
 }
