@@ -176,3 +176,47 @@ func TestDailyStatsCountsEveryBlockOnceWithConcurrentWritersAndAdvances(t *testi
 	advanceUntilStable(t, d)
 	requireDaysEqualRecompute(t, d, "concurrent writers")
 }
+
+// A reorg that reverts blocks which arrived below the watermark subtracts them, and their replacements count once.
+func TestDailyStatsRevertsLateBlocks(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := lateBlocksTotal - 1; n <= lateBlocksTotal; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+	}
+	advanceUntilStable(t, d)
+	for n := 1; n < lateBlocksTotal-1; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+	}
+	advanceUntilStable(t, d)
+	for n := lateBlocksTotal; n >= 50; n-- {
+		require.NoError(t, d.DeleteBlock(ctx, uint64(n)))
+	}
+	advanceUntilStable(t, d)
+	for n := 50; n <= lateBlocksTotal; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+	}
+	advanceUntilStable(t, d)
+	requireDaysEqualRecompute(t, d, "after reverting and re-indexing 50..120")
+}
+
+// 012 sets a new day's count of earlier transactions from the day before only if that day had one before
+// the advance, so when one advance creates several days, every day after the first missed the transactions of the
+// days before it in cumulative_transactions.
+func TestDailyStatsCumulativeTransactionsWhenOneAdvanceCrossesSeveralDays(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 10; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+	}
+	advanceUntilStable(t, d)
+	for n := 11; n <= lateBlocksTotal; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+	}
+	upto, err := d.AdvanceDailyStats(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, lateBlocksTotal, upto, "one advance over three days")
+	requireDaysEqualRecompute(t, d, "after one advance over three days")
+}

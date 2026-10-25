@@ -77,6 +77,12 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	days, search := d.lateDays.take()
 	var upto *int64
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var before *int64
+		if err := tx.QueryRow(ctx, `
+			SELECT (SELECT last_block FROM daily_stats_watermark WHERE id = 1)
+			FROM pg_advisory_xact_lock(4670, 1)`).Scan(&before); err != nil {
+			return err
+		}
 		if err := tx.QueryRow(ctx, `SELECT daily_stats_advance()`).Scan(&upto); err != nil {
 			return err
 		}
@@ -93,6 +99,15 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 		from, err := recountDays(ctx, tx, *upto, days)
 		if err != nil {
 			return err
+		}
+		if before != nil && *upto > *before {
+			spanned, err := firstOfSeveralDays(ctx, tx, *before+1, *upto)
+			if err != nil {
+				return err
+			}
+			if spanned != nil && (from == nil || *spanned < *from) {
+				from = spanned
+			}
 		}
 		if from == nil {
 			return nil
@@ -161,6 +176,22 @@ func recountDays(ctx context.Context, tx pgx.Tx, watermark int64, days []int64) 
 		}
 	}
 	return &days[0], nil
+}
+
+// firstOfSeveralDays is the day of block first when blocks first to last span more than one day: 012 sets a new
+// day's count of earlier transactions from the day before only if that day had one before the advance, so the second
+// of two days one advance creates misses the first's transactions.
+func firstOfSeveralDays(ctx context.Context, tx pgx.Tx, first, last int64) (*int64, error) {
+	var firstDay, lastDay *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT (SELECT timestamp / 86400 FROM blocks WHERE number = $1), (SELECT timestamp / 86400 FROM blocks WHERE number = $2)`,
+		first, last).Scan(&firstDay, &lastDay); err != nil {
+		return nil, err
+	}
+	if firstDay == nil || lastDay == nil || *firstDay == *lastDay {
+		return nil, nil
+	}
+	return firstDay, nil
 }
 
 // rewriteFrom recounts each aggregated day's transactions before it from the first given day on, and rewrites those
