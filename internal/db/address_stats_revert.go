@@ -27,7 +27,7 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 			SELECT address, count(DISTINCT tx) AS txs, sum(sent) AS sent, sum(internal) AS internal, sum(transfers) AS transfers
 			FROM ledger_address_contributions($1::BIGINT, $2::BIGINT) GROUP BY address
 		) c
-		ORDER BY c.address`, int64(number), int64(number)+1)
+		ORDER BY c.address COLLATE "C"`, int64(number), int64(number)+1)
 	if err != nil {
 		return 0, err
 	}

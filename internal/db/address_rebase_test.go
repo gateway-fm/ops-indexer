@@ -232,6 +232,11 @@ func TestClosingASpanRebasesItsAddresses(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, closed, "blocks 1-999 closed; every error above is in them")
 	requireAddressStatsIsTheTruth(t, d)
+	var missing int
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT count(*) FROM (SELECT DISTINCT address FROM ledger_address) l
+		WHERE NOT EXISTS (SELECT 1 FROM address_stats a WHERE a.address = l.address)`).Scan(&missing))
+	require.Zero(t, missing, "block 20's new address, written without its deltas, has a row")
 	var forkOnly bool
 	require.NoError(t, d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM address_stats WHERE address = $1)`,
 		rebaseNewAddress(300)).Scan(&forkOnly))
