@@ -184,14 +184,26 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 			}
 			continue
 		case v.present && v.differs():
+			if !sameBlock(v.firstSeen, v.wantFirst) || !sameBlock(v.lastSeen, v.wantLast) {
+				// A first_seen or last_seen this sets may meet a block catch-up stored since the snapshot that ingest's
+				// LEAST/GREATEST did not show (it was not past the wrong value): it is counted again under the row's
+				// lock, which this takes first, so the next statement's snapshot follows any write that held it.
+				// Only rows whose first or last block this corrects pay for it.
+				writes.Queue(`SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, v.address)
+				kinds = append(kinds, rebaseCorrect)
+			}
 			kinds = append(kinds, rebaseCorrect)
 			writes.Queue(`
 				UPDATE address_stats SET
 					tx_count = COALESCE(tx_count, 0) + $2, sent_count = COALESCE(sent_count, 0) + $3,
 					internal_tx_count = COALESCE(internal_tx_count, 0) + $4,
 					token_transfer_count = COALESCE(token_transfer_count, 0) + $5,
-					first_seen = CASE WHEN first_seen IS NOT DISTINCT FROM $6 THEN $7 ELSE LEAST(first_seen, $7) END,
-					last_seen = CASE WHEN last_seen IS NOT DISTINCT FROM $8 THEN $9 ELSE GREATEST(last_seen, $9) END,
+					first_seen = CASE WHEN first_seen IS DISTINCT FROM $6 THEN LEAST(first_seen, $7)
+					                  WHEN $7 IS NOT DISTINCT FROM $6 THEN first_seen
+					                  ELSE (SELECT t.first_seen FROM ledger_address_truth(ARRAY[$1]) t) END,
+					last_seen = CASE WHEN last_seen IS DISTINCT FROM $8 THEN GREATEST(last_seen, $9)
+					                 WHEN $9 IS NOT DISTINCT FROM $8 THEN last_seen
+					                 ELSE (SELECT t.last_seen FROM ledger_address_truth(ARRAY[$1]) t) END,
 					updated_at = NOW()
 				WHERE address = $1`, v.address, v.wantTxs-v.txs, v.wantSent-v.sent, v.wantInternal-v.internal,
 				v.wantTransf-v.transfers, v.firstSeen, v.wantFirst, v.lastSeen, v.wantLast)

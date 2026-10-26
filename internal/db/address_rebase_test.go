@@ -418,3 +418,32 @@ func TestRepairAddressStatsStagesAgainAfterARebase(t *testing.T) {
 	}
 	requireAddressStatsIsTheTruth(t, d)
 }
+
+// A first_seen already too low (1, against a first block of 4) stays put when catch-up stores the address's
+// block 2 during the count, since ingest only lowers it; the rebase then wrote the truth it had counted, 4, though the
+// truth was 2 by then. A first_seen the rebase corrects is now counted again, under the row's lock.
+func TestRebaseCorrectsFirstSeenWhenAnOlderBlockArrivesDuringTheCount(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 4; n <= 6; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET first_seen = 1 WHERE address = $1`, rebaseHot)
+	require.NoError(t, err, "first_seen too low")
+	slowTruth(t, d, 2)
+
+	rebased := make(chan error, 1)
+	go func() {
+		_, err := d.RebaseAddresses(ctx, []string{rebaseHot}, nil)
+		rebased <- err
+	}()
+	require.Eventually(t, func() bool {
+		var counting bool
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep')`).Scan(&counting))
+		return counting
+	}, 10*time.Second, 10*time.Millisecond, "the rebase is counting")
+	require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(2)), "catch-up stores an older block")
+	require.NoError(t, <-rebased)
+	requireAddressStatsIsTheTruth(t, d)
+}
