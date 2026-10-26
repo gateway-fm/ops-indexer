@@ -352,3 +352,69 @@ func TestRebaseCountsWithoutHoldingItsRows(t *testing.T) {
 	require.NoError(t, <-rebased)
 	requireAddressStatsIsTheTruth(t, d)
 }
+
+// slowTruth makes ledger_address_truth sleep for the given seconds first, inside the caller's snapshot, so a test can
+// act while a rebase counts.
+func slowTruth(t *testing.T, d *DB, seconds int) {
+	t.Helper()
+	ctx := context.Background()
+	var def string
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT pg_get_functiondef('ledger_address_truth(text[])'::regprocedure)`).Scan(&def))
+	body := strings.Index(def, "AS $")
+	require.Positive(t, body)
+	open := body + 4 + strings.Index(def[body+4:], "$") + 1
+	_, err := d.pool.Exec(ctx, def[:open]+fmt.Sprintf("\n    SELECT pg_sleep(%d);", seconds)+def[open:])
+	require.NoError(t, err)
+}
+
+// Two rebases of one address that both read before either applied (the closer's and the running check's,
+// which run apart) each added the same correction, and left the inverse error. Rebases now take a lock of their own
+// around read and apply, so the second reads after the first applied.
+func TestTwoRebasesOfOneAddressCorrectItOnce(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 5; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = $1`, rebaseHot)
+	require.NoError(t, err, "15 against a truth of 10")
+	slowTruth(t, d, 2)
+
+	rebased := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := d.RebaseAddresses(ctx, []string{rebaseHot}, nil)
+			rebased <- err
+		}()
+	}
+	require.NoError(t, <-rebased)
+	require.NoError(t, <-rebased)
+	requireAddressStatsIsTheTruth(t, d)
+}
+
+// repair-address-stats: its corrections are staged at one snapshot and applied by later runs, and in this
+// version rebases run in between, so a stage left by an earlier run may hold corrections a rebase has applied since.
+// A new run stages again instead of applying it.
+func TestRepairAddressStatsStagesAgainAfterARebase(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 5; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = $1`, rebaseHot)
+	require.NoError(t, err)
+	_, err = d.StageAddressStatsRepair(ctx, false)
+	require.NoError(t, err, "an earlier run staged the correction and stopped")
+	_, err = d.RebaseAddresses(ctx, []string{rebaseHot}, nil)
+	require.NoError(t, err, "a span close corrected the row since")
+
+	_, err = d.StageAddressStatsRepair(ctx, false)
+	require.NoError(t, err, "the next run stages again")
+	for done := false; !done; {
+		_, _, done, err = d.ApplyAddressStatsRepairBatch(ctx, 100)
+		require.NoError(t, err)
+	}
+	requireAddressStatsIsTheTruth(t, d)
+}

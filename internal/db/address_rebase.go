@@ -9,8 +9,11 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/log"
 )
 
-// rebaseBatch is how many addresses one rebase transaction locks and recounts.
+// rebaseBatch is how many addresses one rebase transaction recounts.
 const rebaseBatch = 1000
+
+// rebaseLock serializes rebases, and repair-address-stats, among themselves (advisory lock key).
+const rebaseLock = 4674
 
 // RebaseResult is what a rebase changed: rows set to a different value, rows it created, rows it removed, and the
 // earliest first_seen block, old or new, of a row whose first_seen moved or that was removed (nil when none did).
@@ -97,7 +100,7 @@ func sameBlock(a, b *int64) bool {
 // rebaseAddressBatch sets one batch's rows to their truth without holding them while it counts. It reads every row and
 // its truth in one statement, so in one snapshot, and takes the correction truth - row from it. A delta ingest commits
 // afterwards moves the row and the truth alike, so adding the correction later sets the row to the truth then: the
-// correction is applied additively, in a short transaction that takes the rows in byte order (ingest's order).
+// correction is applied additively, taking the rows in byte order (ingest's order) only for the writes.
 // first_seen and last_seen become the truth's unless ingest moved them since the snapshot, in which case the lower or
 // higher of the two. A row missing at the snapshot is inserted with the correction, added to any row ingest created
 // since. A row whose address had no truth at the snapshot is taken and its truth counted again: it is removed if the
@@ -106,11 +109,27 @@ func sameBlock(a, b *int64) bool {
 func rebaseAddressBatch(ctx context.Context, d *DB, batch, create []string,
 	inBatch func(ctx context.Context, tx pgx.Tx, batch []string) error) (RebaseResult, error) {
 	var r RebaseResult
+	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		// Rebases one at a time: two that both read before either applied would each add the same correction.
+		// Ingest never takes this lock. The read is a later statement, so its snapshot follows the lock.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, 1)`, rebaseLock); err != nil {
+			return err
+		}
+		var err error
+		r, err = rebaseAddressBatchLocked(ctx, tx, batch, create, inBatch)
+		return err
+	})
+	return r, err
+}
+
+func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []string,
+	inBatch func(ctx context.Context, tx pgx.Tx, batch []string) error) (RebaseResult, error) {
+	var r RebaseResult
 	creatable := make(map[string]bool, len(create))
 	for _, a := range create {
 		creatable[a] = true
 	}
-	rows, err := d.pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT a, s.address IS NOT NULL, t.address IS NOT NULL,
 		       COALESCE(s.tx_count, 0), COALESCE(s.sent_count, 0), COALESCE(s.internal_tx_count, 0),
 		       COALESCE(s.token_transfer_count, 0), s.first_seen, s.last_seen,
@@ -206,8 +225,7 @@ func rebaseAddressBatch(ctx context.Context, d *DB, batch, create []string,
 	if writes.Len() == 0 && len(revertedAddresses) == 0 && inBatch == nil {
 		return r, nil
 	}
-	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
-		r.Created, r.Removed = 0, 0
+	err = func() error {
 		if writes.Len() > 0 {
 			results := tx.SendBatch(ctx, writes)
 			for _, kind := range kinds {
@@ -259,7 +277,7 @@ func rebaseAddressBatch(ctx context.Context, d *DB, batch, create []string,
 			return inBatch(ctx, tx, batch)
 		}
 		return nil
-	})
+	}()
 	return r, err
 }
 
@@ -270,6 +288,24 @@ const hotTxs = 10_000
 // rebasePendingSpans rebases the addresses of every closed span not rebased yet, oldest first, together with the
 // addresses of blocks reverted since the last rebase, and then recounts the days' address columns if a first_seen
 // moved. A span is marked rebased once its addresses are; a restart resumes at the first one that is not.
+// HoldRebaseLock takes the rebase lock for the caller's whole run, on a connection of its own, and returns its
+// release: repair-address-stats stages corrections at one snapshot and applies them batch by batch afterwards, so a
+// rebase in between would correct the same rows again.
+func (d *DB) HoldRebaseLock(ctx context.Context) (release func(), err error) {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, rebaseLock); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	return func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, 1)`, rebaseLock)
+		conn.Release()
+	}, nil
+}
+
 func hotBatches(hot []string) [][]string {
 	batches := make([][]string, 0, len(hot))
 	for _, a := range hot {

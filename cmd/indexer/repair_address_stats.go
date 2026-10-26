@@ -29,12 +29,17 @@ func runRepairAddressStats(args []string, database *db.DB) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	release, err := database.HoldRebaseLock(ctx)
+	if err != nil {
+		log.Error("repair-address-stats: could not take the rebase lock", "error", err)
+		return 1
+	}
+	defer release()
+
 	var applied, created, batches, stale int
 	for restaged := 0; ; restaged++ {
 		stage, err := database.StageAddressStatsRepair(ctx, *dry)
 		switch {
-		case errors.Is(err, db.ErrAddressStatsRepairPending):
-			log.Info("repair-address-stats: resuming a staged repair")
 		case err != nil:
 			log.Error("repair-address-stats: staging failed", "error", err)
 			return 1

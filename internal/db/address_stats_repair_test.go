@@ -194,8 +194,9 @@ func TestAddressStatsRepairRestoresBothErrorsFromTheLedger(t *testing.T) {
 	stage, err := d.StageAddressStatsRepair(ctx, false)
 	require.NoError(t, err)
 	require.EqualValues(t, 35, stage.Changes)
-	_, err = d.StageAddressStatsRepair(ctx, false)
-	require.ErrorIs(t, err, ErrAddressStatsRepairPending, "a staged repair is never restaged over")
+	stage, err = d.StageAddressStatsRepair(ctx, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 35, stage.Changes, "an earlier run's stage is staged again, the same while nothing applied it")
 
 	seedVariedHistory(t, d, 80_002, 80_002)
 	ingested := countsFromRows(t, d, 80_002, 80_003)

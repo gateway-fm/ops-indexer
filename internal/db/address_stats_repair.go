@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/gateway-fm/chain-indexer/internal/log"
 )
 
 // ledgerAddressRowsSQL is ledger_close_span's per-address statement (migration 022) over the rows of [$1, $2), with
@@ -53,9 +55,6 @@ const AddressStatsRepairTable = "address_stats_repair"
 // only when every staged correction was applied.
 const addressStatsRepairTotalTable = "address_stats_repair_total"
 
-// ErrAddressStatsRepairPending: corrections are staged and not all applied; apply them before staging again.
-var ErrAddressStatsRepairPending = errors.New("a staged address_stats repair is not applied yet")
-
 // addressStatsRevertsCounter is the chain_counters row every reorg revert of address_stats adds one to. A stage
 // records it; a batch that finds it moved knows a revert ran since the stage.
 const addressStatsRevertsCounter = "address_stats_reverts"
@@ -89,7 +88,8 @@ type AddressStatsCorrection struct {
 // StageAddressStatsRepair computes, in one snapshot, what every address's counters should be (its closed ledger rows
 // plus the retained rows above the ledger, counted as ingest counts them) against what address_stats holds, and
 // keeps only the differences. Dry, it reports them and keeps nothing. Otherwise they go to AddressStatsRepairTable
-// for ApplyAddressStatsRepairBatch; a table that still holds unapplied corrections is never restaged over.
+// for ApplyAddressStatsRepairBatch; a stage an earlier run left is dropped and staged again, since span rebases may
+// have applied its corrections since (repair-address-stats holds the rebase lock for its own run).
 //
 // The corrections are additive: expected minus actual at the snapshot. Ingest only ever adds deltas, for blocks
 // above the snapshot, so a correction stays right whatever ingest commits before or while it is applied. A reorg's
@@ -109,13 +109,17 @@ func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressSta
 			return err
 		}
 		if !dry {
+			// A stage an earlier run left is not resumed: span rebases may have applied its corrections since.
 			var pending bool
 			if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL OR to_regclass($2) IS NOT NULL`,
 				table, addressStatsRepairTotalTable).Scan(&pending); err != nil {
 				return err
 			}
 			if pending {
-				return ErrAddressStatsRepairPending
+				log.Warn("repair-address-stats: an earlier run's stage is staged again; rebases may have applied it since")
+				if _, err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+table+`, `+addressStatsRepairTotalTable); err != nil {
+					return err
+				}
 			}
 		}
 		var reverts int64
