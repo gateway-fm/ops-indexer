@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
@@ -445,5 +446,83 @@ func TestRebaseCorrectsFirstSeenWhenAnOlderBlockArrivesDuringTheCount(t *testing
 	}, 10*time.Second, 10*time.Millisecond, "the rebase is counting")
 	require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(2)), "catch-up stores an older block")
 	require.NoError(t, <-rebased)
+	requireAddressStatsIsTheTruth(t, d)
+}
+
+// queryCounter counts the statements whose SQL contains match.
+type queryCounter struct {
+	match string
+	n     atomic.Int64
+}
+
+func (c *queryCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, c.match) {
+		c.n.Add(1)
+	}
+	return ctx
+}
+
+func (c *queryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// A span's rebase counted its addresses' truth batch by batch through each table's address index, ~0.1 s
+// an address on a large database, so a span of a million addresses took about a day and held up every later close. A span is
+// now counted in one set-based statement: no batch reads the truth address by address, and the error is still set
+// right.
+func TestClosingASpanCountsItsTruthInOneStatement(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 600; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = $1`, rebaseHot)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(601, 14000) g`)
+	require.NoError(t, err)
+
+	counter := &queryCounter{match: "ledger_address_truth($1::TEXT[])"}
+	cfg := d.pool.Config()
+	cfg.ConnConfig.Tracer = counter
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer traced.Close()
+	closed, err := (&DB{pool: traced}).CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 500, FirstBlock: 1, WorkMem: "64MB"}, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, closed)
+	require.Zero(t, counter.n.Load(), "no batch counted the truth address by address")
+	requireAddressStatsIsTheTruth(t, d)
+}
+
+// A row with zero counts whose address no canonical block has seen (one an older build's rebase left), recorded by a
+// revert, equals an empty truth column by column; the span rebase stages it with the reverted addresses and removes it.
+func TestClosingASpanRemovesAZeroRowWithNoTruth(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 10; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	stray := rebaseNewAddress(99)
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, is_contract, updated_at)
+		VALUES ($1, 0, 0, 0, 0, false, NOW())`, stray)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `UPDATE chain_counters SET count = count + 1 WHERE name = 'addresses_total'`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `INSERT INTO ledger_reverted_address (address) VALUES ($1)`, stray)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(11, 14000) g`)
+	require.NoError(t, err, "empty blocks, so the first span is final")
+
+	closed, err := d.CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 500, FirstBlock: 1, WorkMem: "64MB"}, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, closed)
+	var exists bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM address_stats WHERE address = $1)`, stray).Scan(&exists))
+	require.False(t, exists, "no canonical block has seen it")
 	requireAddressStatsIsTheTruth(t, d)
 }

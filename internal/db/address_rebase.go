@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -71,7 +72,7 @@ func (d *DB) rebaseAddresses(ctx context.Context, addresses, create []string,
 // ledger_reverted_address entry, if any.
 type rebaseRow struct {
 	address                                     string
-	present, seen                               bool
+	creatable, present, seen                    bool
 	txs, sent, internal, transfers              int64
 	firstSeen, lastSeen                         *int64
 	wantTxs, wantSent, wantInternal, wantTransf int64
@@ -124,7 +125,6 @@ func rebaseAddressBatch(ctx context.Context, d *DB, batch, create []string,
 
 func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []string,
 	inBatch func(ctx context.Context, tx pgx.Tx, batch []string) error) (RebaseResult, error) {
-	var r RebaseResult
 	creatable := make(map[string]bool, len(create))
 	for _, a := range create {
 		creatable[a] = true
@@ -140,16 +140,30 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 		LEFT JOIN address_stats s ON s.address = a
 		LEFT JOIN ledger_address_truth($1::TEXT[]) t ON t.address = a`, batch)
 	if err != nil {
-		return r, err
+		return RebaseResult{}, err
 	}
 	read, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (rebaseRow, error) {
 		var v rebaseRow
-		return v, row.Scan(&v.address, &v.present, &v.seen, &v.txs, &v.sent, &v.internal, &v.transfers, &v.firstSeen, &v.lastSeen,
+		err := row.Scan(&v.address, &v.present, &v.seen, &v.txs, &v.sent, &v.internal, &v.transfers, &v.firstSeen, &v.lastSeen,
 			&v.wantTxs, &v.wantSent, &v.wantInternal, &v.wantTransf, &v.wantFirst, &v.wantLast, &v.reverted)
+		v.creatable = creatable[v.address]
+		return v, err
 	})
 	if err != nil {
-		return r, err
+		return RebaseResult{}, err
 	}
+	return applyRebaseRows(ctx, tx, read, func(ctx context.Context, tx pgx.Tx) error {
+		if inBatch == nil {
+			return nil
+		}
+		return inBatch(ctx, tx, batch)
+	})
+}
+
+// applyRebaseRows applies the corrections of rows read in one snapshot, in one transaction, taking the rows in byte
+// order (ingest's order); after, if not nil, runs in the same transaction.
+func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after func(ctx context.Context, tx pgx.Tx) error) (RebaseResult, error) {
+	var r RebaseResult
 	sort.Slice(read, func(i, j int) bool { return read[i].address < read[j].address })
 	writes := &pgx.Batch{}
 	var kinds []rebaseWrite
@@ -207,7 +221,7 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 					updated_at = NOW()
 				WHERE address = $1`, v.address, v.wantTxs-v.txs, v.wantSent-v.sent, v.wantInternal-v.internal,
 				v.wantTransf-v.transfers, v.firstSeen, v.wantFirst, v.lastSeen, v.wantLast)
-		case !v.present && v.seen && creatable[v.address] && v.differs():
+		case !v.present && v.seen && v.creatable && v.differs():
 			kinds = append(kinds, rebaseCreate)
 			writes.Queue(`
 				INSERT INTO address_stats AS s (address, tx_count, sent_count, internal_tx_count, token_transfer_count,
@@ -234,10 +248,10 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 			}
 		}
 	}
-	if writes.Len() == 0 && len(revertedAddresses) == 0 && inBatch == nil {
+	if writes.Len() == 0 && len(revertedAddresses) == 0 && after == nil {
 		return r, nil
 	}
-	err = func() error {
+	err := func() error {
 		if writes.Len() > 0 {
 			results := tx.SendBatch(ctx, writes)
 			for _, kind := range kinds {
@@ -285,21 +299,14 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 				return err
 			}
 		}
-		if inBatch != nil {
-			return inBatch(ctx, tx, batch)
+		if after != nil {
+			return after(ctx, tx)
 		}
 		return nil
 	}()
 	return r, err
 }
 
-// hotTxs is the transactions in one span above which an address is rebased in a batch of its own: its row stays
-// locked while its own rows above the closed spans are counted, and no other address waits with it.
-const hotTxs = 10_000
-
-// rebasePendingSpans rebases the addresses of every closed span not rebased yet, oldest first, together with the
-// addresses of blocks reverted since the last rebase, and then recounts the days' address columns if a first_seen
-// moved. A span is marked rebased once its addresses are; a restart resumes at the first one that is not.
 // HoldRebaseLock takes the rebase lock for the caller's whole run, on a connection of its own, and returns its
 // release: repair-address-stats stages corrections at one snapshot and applies them batch by batch afterwards, so a
 // rebase in between would correct the same rows again.
@@ -318,14 +325,16 @@ func (d *DB) HoldRebaseLock(ctx context.Context) (release func(), err error) {
 	}, nil
 }
 
-func hotBatches(hot []string) [][]string {
-	batches := make([][]string, 0, len(hot))
-	for _, a := range hot {
-		batches = append(batches, []string{a})
-	}
-	return batches
-}
-
+// rebasePendingSpans rebases the addresses of every closed span not rebased yet, oldest first, together with the
+// addresses of blocks reverted since the last rebase, and then recounts the days' address columns if a first_seen
+// moved. A span is marked rebased once its addresses are; a restart resumes at the first one that is not.
+//
+// A span holds up to millions of addresses, so its truth is counted for all of them at once: one statement, so one
+// snapshot, joins them with the closed ledger rows and with one pass over the rows above the closed spans, reads
+// their address_stats rows, and stages the rows whose correction is not zero (address_rebase_stage). The
+// corrections are then applied in short byte-ordered batches. Counted address by address through the indexes, a
+// span of a million addresses took about a day. The whole span runs under the rebase lock, held on one
+// connection; a stage left by a crash is counted again, since another rebase may have applied it since.
 func (d *DB) rebasePendingSpans(ctx context.Context) error {
 	if err := d.recountPendingDays(ctx); err != nil {
 		return err
@@ -335,58 +344,122 @@ func (d *DB) rebasePendingSpans(ctx context.Context) error {
 		return err
 	}
 	los, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil || len(los) == 0 {
+		return err
+	}
+	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
-	type member struct {
-		address     string
-		inSpan, hot bool
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, rebaseLock); err != nil {
+		return err
 	}
-	var total RebaseResult
+	defer func() { _, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, 1)`, rebaseLock) }()
 	for _, lo := range los {
-		rows, err := d.pool.Query(ctx, `
-			SELECT address, true, txs > $2 FROM ledger_address
-			WHERE lo = $1 AND address <> '0x0000000000000000000000000000000000000000'
-			UNION ALL
-			SELECT address, false, false FROM ledger_reverted_address
-			WHERE address NOT IN (SELECT address FROM ledger_address WHERE lo = $1)`, lo, hotTxs)
+		start := time.Now()
+		staged, err := stageSpanRebase(ctx, conn.Conn(), lo)
 		if err != nil {
 			return err
 		}
-		members, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (member, error) {
-			var m member
-			return m, r.Scan(&m.address, &m.inSpan, &m.hot)
-		})
-		if err != nil {
-			return err
-		}
-		var span, hot, rest []string
-		for _, m := range members {
-			if m.inSpan {
-				span = append(span, m.address)
-			}
-			if m.hot {
-				hot = append(hot, m.address)
-			} else {
-				rest = append(rest, m.address)
-			}
-		}
-		var spanResult RebaseResult
-		for _, batch := range append(hotBatches(hot), rest) {
-			r, err := d.RebaseAddresses(ctx, batch, span)
-			if err != nil {
+		var result RebaseResult
+		for {
+			var batch []rebaseRow
+			if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+				rows, err := tx.Query(ctx, `
+					DELETE FROM address_rebase_stage
+					WHERE address IN (SELECT address FROM address_rebase_stage ORDER BY address LIMIT $1)
+					RETURNING address, creatable, present, seen, txs, sent, internal, transfers, first_seen, last_seen,
+					          want_txs, want_sent, want_internal, want_transfers, want_first, want_last, reverted`, rebaseBatch)
+				if err != nil {
+					return err
+				}
+				batch, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (rebaseRow, error) {
+					var v rebaseRow
+					return v, row.Scan(&v.address, &v.creatable, &v.present, &v.seen, &v.txs, &v.sent, &v.internal, &v.transfers,
+						&v.firstSeen, &v.lastSeen, &v.wantTxs, &v.wantSent, &v.wantInternal, &v.wantTransf, &v.wantFirst,
+						&v.wantLast, &v.reverted)
+				})
+				if err != nil || len(batch) == 0 {
+					return err
+				}
+				r, err := applyRebaseRows(ctx, tx, batch, nil)
+				result.add(r)
+				return err
+			}); err != nil {
 				return err
 			}
-			spanResult.add(r)
+			if len(batch) == 0 {
+				break
+			}
 		}
-		total.add(spanResult)
-		if _, err := d.pool.Exec(ctx, `UPDATE ledger_spans SET rebased_at = now() WHERE lo = $1`, lo); err != nil {
+		if _, err := conn.Exec(ctx, `UPDATE ledger_spans SET rebased_at = now() WHERE lo = $1`, lo); err != nil {
 			return err
 		}
-		log.Info("ledger: span's addresses rebased", "lo", lo, "addresses", len(members), "hot", len(hot),
-			"changed", spanResult.Changed, "created", spanResult.Created, "removed", spanResult.Removed)
+		if _, err := conn.Exec(ctx, `DROP TABLE address_rebase_stage`); err != nil {
+			return err
+		}
+		log.Info("ledger: span's addresses rebased", "lo", lo, "staged", staged, "changed", result.Changed,
+			"created", result.Created, "removed", result.Removed, "elapsed", time.Since(start).Round(time.Millisecond))
 	}
 	return d.recountPendingDays(ctx)
+}
+
+// stageSpanRebase stages, in one statement, the addresses of span lo and of blocks reverted since the last rebase whose
+// row differs from their truth, with the row and the truth it read, and returns how many.
+func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (int64, error) {
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
+		return 0, err
+	}
+	tag, err := conn.Exec(ctx, `
+		CREATE UNLOGGED TABLE address_rebase_stage AS
+		WITH addresses AS (
+			SELECT address, true AS creatable FROM ledger_address
+			WHERE lo = $1 AND address <> '0x0000000000000000000000000000000000000000'
+			UNION ALL
+			SELECT address, false FROM ledger_reverted_address
+			WHERE address NOT IN (SELECT address FROM ledger_address WHERE lo = $1)
+		),
+		parts AS (
+			SELECT l.address, sum(l.txs) AS txs, sum(l.sent) AS sent, sum(l.internal) AS internal,
+			       sum(l.transfers) AS transfers, min(l.first_seen) AS first_seen, max(l.last_seen) AS last_seen
+			FROM ledger_address l JOIN addresses a USING (address) GROUP BY l.address
+			UNION ALL
+			SELECT l.address, l.txs, l.sent, l.internal, l.transfers, l.first_seen, l.last_seen
+			FROM ledger_stage_address l JOIN addresses a USING (address) WHERE l.lo = stats_backfill_open_span()
+			UNION ALL
+			SELECT x.address, count(DISTINCT x.tx), sum(x.sent), sum(x.internal), sum(x.transfers), min(x.block), max(x.block)
+			FROM ledger_address_contributions(ledger_closed_through(), 9223372036854775807) x JOIN addresses a USING (address)
+			GROUP BY x.address
+		),
+		truth AS (
+			SELECT address, sum(txs)::BIGINT AS txs, sum(sent)::BIGINT AS sent, sum(internal)::BIGINT AS internal,
+			       sum(transfers)::BIGINT AS transfers, min(first_seen) AS first_seen, max(last_seen) AS last_seen
+			FROM parts GROUP BY address
+		)
+		SELECT a.address, a.creatable, s.address IS NOT NULL AS present, t.address IS NOT NULL AS seen,
+		       COALESCE(s.tx_count, 0) AS txs, COALESCE(s.sent_count, 0) AS sent, COALESCE(s.internal_tx_count, 0) AS internal,
+		       COALESCE(s.token_transfer_count, 0) AS transfers, s.first_seen, s.last_seen,
+		       COALESCE(t.txs, 0) AS want_txs, COALESCE(t.sent, 0) AS want_sent, COALESCE(t.internal, 0) AS want_internal,
+		       COALESCE(t.transfers, 0) AS want_transfers, t.first_seen AS want_first, t.last_seen AS want_last,
+		       (SELECT r.xmin::TEXT FROM ledger_reverted_address r WHERE r.address = a.address) AS reverted
+		FROM addresses a
+		LEFT JOIN address_stats s ON s.address = a.address
+		LEFT JOIN truth t ON t.address = a.address
+		WHERE (s.address IS NOT NULL
+		       AND (COALESCE(s.tx_count, 0), COALESCE(s.sent_count, 0), COALESCE(s.internal_tx_count, 0),
+		            COALESCE(s.token_transfer_count, 0), s.first_seen, s.last_seen)
+		           IS DISTINCT FROM (COALESCE(t.txs, 0), COALESCE(t.sent, 0), COALESCE(t.internal, 0), COALESCE(t.transfers, 0),
+		                             t.first_seen, t.last_seen))
+		   OR (s.address IS NULL AND a.creatable AND t.address IS NOT NULL)
+		   OR EXISTS (SELECT 1 FROM ledger_reverted_address r WHERE r.address = a.address)`, lo)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := conn.Exec(ctx, `ALTER TABLE address_rebase_stage ADD PRIMARY KEY (address)`); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // recountPendingDays recounts the days' address columns from address_stats if a rebase has moved a first_seen since

@@ -18,11 +18,12 @@ on any drift. The ledger and the checks run with retention on or off.
 - The hot path keeps adding to the running counters. They must equal the closed ledger rows plus the open spans'
   history rows.
 - **address_stats is derived from the ledger**: when a span closes, every address
-  with a row in it, and every address of a block reverted since the last close, is set to that count, in batches of
-  1,000 that count each address's truth and its row in one snapshot, without holding the row, and add the
-  difference in a short transaction (an address with over 10,000 transactions in the span gets a batch of
-  its own). An error in an address's running counters is gone one span after it happened. A restart resumes at the
-  first span not rebased (`ledger_spans.rebased_at`).
+  with a row in it, and every address of a block reverted since the last close, is set to that count. One statement
+  counts the truth of all of them at once (one join with the closed ledger rows, one pass over the rows above the
+  closed spans) and stages the rows that differ; the corrections are then added in short batches of 1,000, so no row
+  is held while the truth is counted. An error in an address's running counters is gone one span after it happened.
+  A restart resumes at the first span not rebased (`ledger_spans.rebased_at`); the log line `ledger: span's
+  addresses rebased` gives the rows staged, changed and created.
 
 ## Checks
 
