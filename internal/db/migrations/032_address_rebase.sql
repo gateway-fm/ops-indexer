@@ -59,19 +59,8 @@ LANGUAGE sql STABLE AS $f$
     GROUP BY address
 $f$;
 
--- The given addresses ledger_address_truth has a row for, by index probes alone: the addresses some canonical block
--- has seen.
-CREATE FUNCTION ledger_address_seen(p_addresses TEXT[])
-RETURNS SETOF TEXT LANGUAGE sql STABLE AS $f$
-    SELECT a FROM unnest(p_addresses) a
-    WHERE EXISTS (SELECT 1 FROM ledger_address l WHERE l.address = a)
-       OR EXISTS (SELECT 1 FROM ledger_stage_address l WHERE l.lo = stats_backfill_open_span() AND l.address = a)
-       OR EXISTS (SELECT 1 FROM ledger_address_contributions_of(ledger_closed_through(), ARRAY[a]))
-$f$;
-
 ---- create above / drop below ----
 
-DROP FUNCTION ledger_address_seen(TEXT[]);
 DROP FUNCTION ledger_address_truth(TEXT[]);
 DROP FUNCTION ledger_address_contributions_of(BIGINT, TEXT[]);
 DELETE FROM ledger_verify_state WHERE name = 'address_days_recount';

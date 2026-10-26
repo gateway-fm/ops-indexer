@@ -19,7 +19,8 @@ on any drift. The ledger and the checks run with retention on or off.
   history rows.
 - **address_stats is derived from the ledger**: when a span closes, every address
   with a row in it, and every address of a block reverted since the last close, is set to that count, in batches of
-  1,000 that lock their rows before counting (an address with over 10,000 transactions in the span gets a batch of
+  1,000 that count each address's truth and its row in one snapshot, without holding the row, and add the
+  difference in a short transaction (an address with over 10,000 transactions in the span gets a batch of
   its own). An error in an address's running counters is gone one span after it happened. A restart resumes at the
   first span not rebased (`ledger_spans.rebased_at`).
 

@@ -11,7 +11,8 @@ import (
 // first_seen and last_seen that point into the block move to the address's remaining rows (the closed ledger when
 // only pruned history remains), is_contract follows the remaining contract creations, and an address no remaining
 // block has seen loses its row. Every address is recorded for the next span rebase, which corrects whatever the
-// subtraction could not. It returns the number of rows removed.
+// subtraction could not; an address already recorded is recorded again, as a new row version, so a rebase that read the
+// earlier one does not clear it. It returns the number of rows removed.
 // It first adds one to the address_stats_reverts counter, before any address_stats row, which makes a staged repair
 // stale (ApplyAddressStatsRepairBatch).
 func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, error) {
@@ -108,6 +109,6 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO ledger_reverted_address (address) SELECT a FROM unnest($1::TEXT[]) a ORDER BY a COLLATE "C"
-		ON CONFLICT DO NOTHING`, addresses)
+		ON CONFLICT (address) DO UPDATE SET address = EXCLUDED.address`, addresses)
 	return forgotten, err
 }

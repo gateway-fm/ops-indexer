@@ -162,9 +162,9 @@ func addressesTotal(t *testing.T, d *DB) int64 {
 	return n
 }
 
-// The rebase locks its rows before it counts the truth: when it corrects a row a block write holds, the write commits
-// first and is counted once, not overwritten by a truth counted without it.
-func TestRebaseCountsTheTruthAfterTakingTheRows(t *testing.T) {
+// A rebase that corrects a row a block write holds, uncommitted, counts without that block, waits for the write to
+// apply, and adds its correction on top: the block is counted once, not overwritten by a truth counted without it.
+func TestRebaseCorrectsARowAWriteHolds(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -190,7 +190,7 @@ func TestRebaseCountsTheTruthAfterTakingTheRows(t *testing.T) {
 			SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%address_stats%')`).
 			Scan(&waiting))
 		return waiting
-	}, 10*time.Second, 10*time.Millisecond, "the rebase waits for the block write's row")
+	}, 10*time.Second, 10*time.Millisecond, "the rebase's apply waits for the block write's row")
 	require.NoError(t, w.tx.Commit(ctx))
 	require.NoError(t, <-rebased)
 	requireAddressStatsIsTheTruth(t, d)
@@ -278,9 +278,9 @@ func TestDaysRecountSurvivesAFailedFirstAttempt(t *testing.T) {
 	requireAddressColumnsFollowTheBlocks(t, d)
 }
 
-// A batch inserted its missing rows before it locked the others, so an existing row it only corrects (an
-// address of a reverted block) that sorts before a missing one inverted the order ingest locks them in, and the two
-// deadlocked. Every row is now taken in one pass in byte order.
+// A batch's writes take its rows in byte order, ingest's, inserting a missing row in its turn: an existing
+// row ingest holds, sorting before a missing one, is waited for, and the missing one is then added to, not deadlocked
+// over.
 func TestRebaseTakesItsRowsInIngestsOrder(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -315,10 +315,11 @@ func TestRebaseTakesItsRowsInIngestsOrder(t *testing.T) {
 	require.NoError(t, <-rebased, "no deadlock")
 }
 
-// An address a batch may create has its row taken through the insert's conflict, and that lock must hold
-// until the batch commits, as FOR UPDATE does: a block written while the truth is counted waits, and is counted once.
-// (The count is slowed inside the rebase's snapshot, so the write lands mid-count.)
-func TestRebaseHoldsACreatableRowUntilItCommits(t *testing.T) {
+// A batch counted its truth holding its rows, so on a large database, where a count over the open tail took ~100 s,
+// every block that touched one of the batch's addresses waited for it and ingest stopped. The count no longer holds a
+// row: a block written meanwhile commits at once, and is still counted once, for the hot address it corrects and for
+// the address it creates.
+func TestRebaseCountsWithoutHoldingItsRows(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -326,7 +327,7 @@ func TestRebaseHoldsACreatableRowUntilItCommits(t *testing.T) {
 		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
 	}
 	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = $1`, rebaseHot)
-	require.NoError(t, err, "a tail error, so the rebase writes the row")
+	require.NoError(t, err, "a tail error for the rebase to correct")
 	var def string
 	require.NoError(t, d.pool.QueryRow(ctx, `SELECT pg_get_functiondef('ledger_address_truth(text[])'::regprocedure)`).Scan(&def))
 	body := strings.Index(def, "AS $")
@@ -337,17 +338,17 @@ func TestRebaseHoldsACreatableRowUntilItCommits(t *testing.T) {
 
 	rebased := make(chan error, 1)
 	go func() {
-		_, err := d.RebaseAddresses(ctx, []string{rebaseHot}, []string{rebaseHot})
+		_, err := d.RebaseAddresses(ctx, []string{rebaseHot, rebaseNewAddress(6)}, []string{rebaseHot, rebaseNewAddress(6)})
 		rebased <- err
 	}()
 	require.Eventually(t, func() bool {
 		var counting bool
 		require.NoError(t, d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep')`).Scan(&counting))
 		return counting
-	}, 10*time.Second, 10*time.Millisecond, "the rebase holds its rows and counts")
-	wrote := make(chan error, 1)
-	go func() { wrote <- d.InsertBlockDataBatch(ctx, rebaseBlock(6)) }()
+	}, 10*time.Second, 10*time.Millisecond, "the rebase is counting")
+	began := time.Now()
+	require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(6)))
+	require.Less(t, time.Since(began), time.Second, "the block's write did not wait for the count")
 	require.NoError(t, <-rebased)
-	require.NoError(t, <-wrote)
 	requireAddressStatsIsTheTruth(t, d)
 }
