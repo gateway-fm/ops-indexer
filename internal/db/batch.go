@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/big"
@@ -155,6 +156,61 @@ func (w *BlockWrite) Rollback(ctx context.Context) {
 	_ = w.tx.Rollback(ctx)
 }
 
+// ErrLogIndexPerTransaction stops ingest at a block whose RPC gave two different logs the same logIndex.
+var ErrLogIndexPerTransaction = errors.New("the chain's RPC numbers logIndex per transaction, not per block, " +
+	"which this indexer does not support")
+
+// logKey is where a log or a transfer is stored, (block_number, log_index), and the transaction it came from.
+type logKey struct {
+	block  uint64
+	index  int
+	txHash string
+}
+
+// checkLogConflicts tells apart the two reasons an insert into logs or token_transfers found its (block_number,
+// log_index) taken. The same log written again -- realtime and catch-up both writing a block -- has the same
+// transaction, and stays a no-op. A different transaction's log at that index means the chain numbers logIndex per
+// transaction: every transaction's first log is 0, so two transactions of a block collide. Keeping the first row
+// would drop the second log without a trace, so the block's write fails instead. Only the conflicting keys are read,
+// so a block without a conflict costs nothing more.
+func checkLogConflicts(ctx context.Context, tx pgx.Tx, table string, conflicts []logKey) error {
+	if len(conflicts) == 0 {
+		return nil
+	}
+	blocks := make([]int64, len(conflicts))
+	indexes := make([]int64, len(conflicts))
+	for i, c := range conflicts {
+		blocks[i], indexes[i] = int64(c.block), int64(c.index)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT t.block_number, t.log_index, t.tx_hash
+		FROM `+table+` t JOIN unnest($1::BIGINT[], $2::BIGINT[]) k (block_number, log_index)
+		  ON t.block_number = k.block_number AND t.log_index = k.log_index`, blocks, indexes)
+	if err != nil {
+		return err
+	}
+	stored := map[[2]int64]string{}
+	for rows.Next() {
+		var block, index int64
+		var txHash string
+		if err := rows.Scan(&block, &index, &txHash); err != nil {
+			rows.Close()
+			return err
+		}
+		stored[[2]int64{block, index}] = txHash
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range conflicts {
+		if txHash, ok := stored[[2]int64{int64(c.block), int64(c.index)}]; ok && !strings.EqualFold(txHash, c.txHash) {
+			return fmt.Errorf("%w: block %d, log_index %d: %s holds the log of tx %s, and tx %s has a log at the same index "+
+				"(or a row of another fork was left behind)", ErrLogIndexPerTransaction, c.block, c.index, table, txHash, c.txHash)
+		}
+	}
+	return nil
+}
+
 func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite, err error) {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
@@ -247,7 +303,21 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				l.TxHash, l.LogIndex, l.Address, l.Topic0, l.Topic1, l.Topic2, l.Topic3, l.Data, l.BlockNumber, l.Timestamp, l.Removed)
 		}
 		br := tx.SendBatch(ctx, batch)
+		var conflicts []logKey
+		for _, l := range data.Logs {
+			ct, err := br.Exec()
+			if err != nil {
+				_ = br.Close()
+				return nil, err
+			}
+			if ct.RowsAffected() == 0 {
+				conflicts = append(conflicts, logKey{block: l.BlockNumber, index: l.LogIndex, txHash: l.TxHash})
+			}
+		}
 		if err := br.Close(); err != nil {
+			return nil, err
+		}
+		if err := checkLogConflicts(ctx, tx, "logs", conflicts); err != nil {
 			return nil, err
 		}
 	}
@@ -264,6 +334,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				t.BlockNumber, t.Timestamp, t.TransferType, t.TokenType, t.TokenID, t.IsInternal)
 		}
 		br := tx.SendBatch(ctx, batch)
+		var conflicts []logKey
 		// Results come back in queue order, so the i-th result belongs to the
 		// i-th transfer -- which is what lets a row be attributed to its token.
 		for _, t := range data.Transfers {
@@ -274,6 +345,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			}
 			// ON CONFLICT DO NOTHING ⇒ only genuinely new rows count toward the total.
 			if ct.RowsAffected() == 0 {
+				conflicts = append(conflicts, logKey{block: t.BlockNumber, index: t.LogIndex, txHash: t.TxHash})
 				continue
 			}
 			deltaTransfers += ct.RowsAffected()
@@ -307,6 +379,9 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			}
 		}
 		if err := br.Close(); err != nil {
+			return nil, err
+		}
+		if err := checkLogConflicts(ctx, tx, "token_transfers", conflicts); err != nil {
 			return nil, err
 		}
 	}
