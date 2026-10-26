@@ -460,6 +460,8 @@ drain:
 		hs := holders[token]
 		values, ok, err := p.balancesReader.BalancesOf(p.ctx, token, hs, p.readerSkipL1)
 		if err != nil {
+			log.Warn("balance reader: batched balance call failed; these balances stay stale until their next transfer",
+				"token", token.Hex(), "holders", len(hs), "error", err)
 			failed += len(hs)
 			continue
 		}

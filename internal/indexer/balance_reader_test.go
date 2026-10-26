@@ -1,11 +1,15 @@
 package indexer
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 )
 
@@ -64,5 +68,25 @@ func TestFetchReaderGroupsByTokenFoldsRepeatsAndSkipsFailures(t *testing.T) {
 	}
 	if len(got) != 2 || got[a.Hex()] != 9 || got[c.Hex()] != 7 {
 		t.Fatalf("written %v, want a at 9 and c at 7 (b failed, d's call failed)", got)
+	}
+}
+
+// A batched call the node rejects, as a node without eth_call state overrides rejects every one, is logged with its
+// token, not only counted: its balances stay stale until their next transfer.
+func TestFetchReaderLogsAFailedCall(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Default()
+	log.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer log.SetDefault(prev)
+
+	tokErr, d := common.HexToAddress("0x03"), common.HexToAddress("0xd")
+	rpc := &readerRPC{MockRPCClient: &MockRPCClient{}, errTok: tokErr}
+	p := NewBalanceWorkerPool(nil, rpc, 0, 0)
+	p.SetReaderBatch(100, false)
+	if out := p.fetchReader(BalanceWork{Address: d, TokenAddress: tokErr, BlockNumber: 7}, make(chan BalanceWork)); len(out) != 0 {
+		t.Fatalf("written %v, want nothing", out)
+	}
+	if got := buf.String(); !strings.Contains(got, "batched balance call failed") || !strings.Contains(got, tokErr.Hex()) {
+		t.Fatalf("log %q, want the failed call with its token", got)
 	}
 }
