@@ -414,15 +414,9 @@ type spanCorrections struct {
 	Staged, Txs, Sent, Internal, Transfers, FirstSeen, LastSeen, Created, NoTruth int64
 }
 
-// stageSpanRebase stages, in one statement, the addresses of span lo and of blocks reverted since the last rebase whose
-// row differs from their truth, with the row and the truth it read, and counts them by column.
-func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrections, error) {
-	var c spanCorrections
-	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
-		return c, err
-	}
-	if _, err := conn.Exec(ctx, `
-		CREATE UNLOGGED TABLE address_rebase_stage AS
+// stageSpanSelect selects the rows address_rebase_stage holds for span $1, counting the rows at or above $2, the end of
+// the closed spans, in one pass over each table.
+const stageSpanSelect = `
 		WITH addresses AS (
 			SELECT address, true AS creatable FROM ledger_address
 			WHERE lo = $1 AND address <> '0x0000000000000000000000000000000000000000'
@@ -438,9 +432,33 @@ func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrect
 			SELECT l.address, l.txs, l.sent, l.internal, l.transfers, l.first_seen, l.last_seen
 			FROM ledger_stage_address l JOIN addresses a USING (address) WHERE l.lo = stats_backfill_open_span()
 			UNION ALL
-			SELECT x.address, count(DISTINCT x.tx), sum(x.sent), sum(x.internal), sum(x.transfers), min(x.block), max(x.block)
-			FROM ledger_address_contributions(ledger_closed_through(), 9223372036854775807) x JOIN addresses a USING (address)
-			GROUP BY x.address
+			SELECT y.address, count(y.tx), sum(y.sent), sum(y.internal), sum(y.transfers), min(y.first_block), max(y.last_block)
+			FROM (
+				SELECT x.address, x.tx, sum(x.sent) AS sent, sum(x.internal) AS internal, sum(x.transfers) AS transfers,
+				       min(x.block) AS first_block, max(x.block) AS last_block
+				FROM (
+					SELECT v.address, t.hash AS tx, t.block_number AS block, v.sent, 0 AS internal, 0 AS transfers
+					FROM transactions t
+					CROSS JOIN LATERAL (VALUES (t.from_address, CASE WHEN t.tx_type BETWEEN 0 AND 4 THEN 1 ELSE 0 END),
+					                           (t.to_address, 0)) v(address, sent)
+					WHERE t.block_number >= $2 AND v.address IS NOT NULL
+					UNION ALL
+					SELECT v.address, t.tx_hash, t.block_number, 0, 0, 1
+					FROM token_transfers t
+					CROSS JOIN LATERAL (VALUES (t.from_address), (NULLIF(t.to_address, t.from_address))) v(address)
+					WHERE t.block_number >= $2 AND v.address IS NOT NULL
+					  AND v.address <> '0x0000000000000000000000000000000000000000'
+					UNION ALL
+					SELECT v.address, NULL, t.block_number, 0, 1, 0
+					FROM internal_transactions t
+					CROSS JOIN LATERAL (VALUES (t.from_address), (NULLIF(t.to_address, t.from_address))) v(address)
+					WHERE t.block_number >= $2 AND v.address IS NOT NULL
+					UNION ALL
+					SELECT address, NULL, block_number, 0, 0, 0 FROM contracts WHERE block_number >= $2
+				) x JOIN addresses a USING (address)
+				GROUP BY x.address, x.tx
+			) y
+			GROUP BY y.address
 		),
 		truth AS (
 			SELECT address, sum(txs)::BIGINT AS txs, sum(sent)::BIGINT AS sent, sum(internal)::BIGINT AS internal,
@@ -462,7 +480,26 @@ func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrect
 		           IS DISTINCT FROM (COALESCE(t.txs, 0), COALESCE(t.sent, 0), COALESCE(t.internal, 0), COALESCE(t.transfers, 0),
 		                             t.first_seen, t.last_seen))
 		   OR (s.address IS NULL AND a.creatable AND t.address IS NOT NULL)
-		   OR EXISTS (SELECT 1 FROM ledger_reverted_address r WHERE r.address = a.address)`, lo); err != nil {
+		   OR EXISTS (SELECT 1 FROM ledger_reverted_address r WHERE r.address = a.address)`
+
+// stageSpanRebase stages, in one statement, the addresses of span lo and of blocks reverted since the last rebase whose
+// row differs from their truth, with the row and the truth it read, and counts them by column.
+func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrections, error) {
+	var c spanCorrections
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
+		return c, err
+	}
+	if _, err := conn.Exec(ctx, `ANALYZE ledger_address`); err != nil {
+		return c, err
+	}
+	if err := pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+		var closed int64
+		if err := tx.QueryRow(ctx, `SELECT ledger_closed_through()`).Scan(&closed); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `CREATE UNLOGGED TABLE address_rebase_stage AS `+stageSpanSelect, lo, closed)
+		return err
+	}); err != nil {
 		return c, err
 	}
 	if _, err := conn.Exec(ctx, `ALTER TABLE address_rebase_stage ADD PRIMARY KEY (address)`); err != nil {

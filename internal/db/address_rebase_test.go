@@ -558,3 +558,87 @@ func TestSpanRebaseCountsItsCorrectionsByColumn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, spanCorrections{Staged: 2, Txs: 1, Sent: 2, NoTruth: 1}, staged)
 }
+
+// A span's staging reads each history table above the closed spans once: under load the tail is the open partition,
+// and reading transactions twice through its block_number index cost seven of the statement's thirteen minutes.
+func TestSpanStagingReadsEachTailTableOnce(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 600; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	var plan []map[string]any
+	require.NoError(t, d.pool.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+stageSpanSelect, int64(1), int64(500)).Scan(&plan))
+	scans := map[string]int{}
+	var walk func(node map[string]any)
+	walk = func(node map[string]any) {
+		if rel, ok := node["Relation Name"].(string); ok {
+			scans[rel]++
+		}
+		children, _ := node["Plans"].([]any)
+		for _, child := range children {
+			walk(child.(map[string]any))
+		}
+	}
+	walk(plan[0]["Plan"].(map[string]any))
+	for _, table := range []string{"transactions", "token_transfers", "internal_transactions"} {
+		read := false
+		for rel, n := range scans {
+			if strings.HasPrefix(rel, table+"_") || rel == table {
+				read = true
+				require.Equal(t, 1, n, "scans of %s", rel)
+			}
+		}
+		require.True(t, read, "the tail reads %s", table)
+	}
+}
+
+// A span's staging counts the rows above the closed spans as ledger_address_truth does: self-sends, self-transfers,
+// mints from the zero address, internal calls and contract creations in the tail.
+func TestSpanStagingCountsTheTailAsTheTruthDoes(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 600; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(601, 14000) g`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `SELECT ledger_close_span(1, 500)`)
+	require.NoError(t, err)
+	a, b, c := rebaseNewAddress(10), rebaseNewAddress(20), rebaseNewAddress(30)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
+		VALUES ('tail1', 550, 1700000550, 5, '`+a+`', '`+a+`', '0', 0, 0, '0x', 1, 2),
+		       ('tail2', 551, 1700000551, 5, '`+a+`', '`+b+`', '0', 0, 0, '0x', 1, 106),
+		       ('tail3', 552, 1700000552, 5, '`+c+`', NULL, '0', 0, 0, '0x', 1, 0);
+		INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value, block_number, timestamp)
+		VALUES ('tail1', 10, '0x70c1', '`+a+`', '`+a+`', 1, 550, 1700000550),
+		       ('tail1', 11, '0x70c1', '`+b+`', '`+c+`', 1, 550, 1700000550),
+		       ('tail2', 12, '0x70c1', '`+c+`', '`+a+`', 1, 551, 1700000551),
+		       ('tail2', 13, '0x70c1', '0x0000000000000000000000000000000000000000', '`+b+`', 1, 551, 1700000551);
+		INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value, call_type)
+		VALUES ('tail1', 550, '0', '`+a+`', '`+a+`', '0', 'call'),
+		       ('tail2', 551, '0', '`+a+`', '`+b+`', '0', 'call'),
+		       ('tail3', 552, '0', '`+c+`', NULL, '0', 'create');
+		INSERT INTO contracts (address, bytecode, creator, creation_tx, block_number)
+		VALUES ('`+b+`', '00', '`+c+`', 'tail3', 552)`)
+	require.NoError(t, err)
+
+	conn, err := d.pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+	staged, err := stageSpanRebase(ctx, conn.Conn(), 1)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, staged.Staged)
+	var wrong int
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT count(*) FROM address_rebase_stage s
+		FULL JOIN ledger_address_truth(ARRAY[$1, $2, $3]) t USING (address)
+		WHERE (s.want_txs, s.want_sent, s.want_internal, s.want_transfers, s.want_first, s.want_last)
+		      IS DISTINCT FROM (t.txs, t.sent, t.internal, t.transfers, t.first_seen, t.last_seen)`, a, b, c).Scan(&wrong))
+	require.Zero(t, wrong)
+}
