@@ -195,7 +195,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		database.RunVerify(ctx, db.VerifyConfig{RecountInterval: cfg.VerifyRecountInterval, Repair: cfg.VerifyRepair,
-			WorkMem: cfg.LedgerWorkMem, MaxOpenTail: 3 * int64(cfg.LedgerSpanBlocks)})
+			WorkMem: cfg.LedgerWorkMem, MaxOpenTail: db.MaxOpenTail(cfg.LedgerSpanBlocks)})
 	}()
 
 	reconciled := make(chan struct{})

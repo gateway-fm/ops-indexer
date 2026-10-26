@@ -39,8 +39,9 @@ on any drift. The ledger and the checks run with retention on or off.
 | `chain_span_txs` | One closed span per pass, retained or pruned: its ledger transaction total against the sum of `eth_getBlockTransactionCountByNumber`. | Alert only (`node` repairs the span). |
 
 - The `running` check, and the one-off address reconciliation below, wait until the open tail (stored blocks above
-  the closed spans) is at most 3 × `LEDGER_SPAN_BLOCKS`: before the closer has caught up they would read most of
-  history every pass.
+  the closed spans) is at most 12,800 + 3 × `LEDGER_SPAN_BLOCKS`: before the closer has caught up they would read
+  most of history every pass. A span closes only once it is 12,800 blocks (the prune floor gap) below the head, so
+  the tail never falls below that.
 - **Address reconciliation** (once per database, after migration 030): with repair on, the drifted addresses of every
   bucket are set to the closed ledger rows plus the open tail, as the span rebase sets them, and the bucket is then
   recorded done, so a restart resumes at the next bucket. It repairs address_stats left short by a catch-up that did

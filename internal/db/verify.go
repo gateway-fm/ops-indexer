@@ -26,6 +26,13 @@ type VerifyConfig struct {
 	MaxOpenTail int64
 }
 
+// MaxOpenTail is the open tail up to which the running check and the address reconciliation run for spans of
+// spanBlocks: three spans above the PruneFloorGap blocks a close always leaves open, since a span closes only that far
+// below the head.
+func MaxOpenTail(spanBlocks uint64) int64 {
+	return PruneFloorGap + 3*int64(spanBlocks)
+}
+
 // OpenTail is how many stored blocks lie above the ledger's closed spans.
 func (d *DB) OpenTail(ctx context.Context) (int64, error) {
 	var n int64

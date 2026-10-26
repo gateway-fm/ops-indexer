@@ -91,6 +91,19 @@ func TestAddressReconciliationWaitsForAShortOpenTail(t *testing.T) {
 	require.Zero(t, next, "nothing reconciled")
 }
 
+// A close leaves PruneFloorGap blocks open, so with short spans the tail is never as short as three spans; the check
+// and the reconciliation must still run once the closer has caught up.
+func TestTheOpenTailACloseLeavesIsShortEnoughForTheCheck(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 14_000, 1)
+	closed, err := d.CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 1_000}, 100)
+	require.NoError(t, err)
+	require.Equal(t, 1, closed, "only [0, 1000) is PruneFloorGap below the head")
+	require.True(t, d.tailShort(ctx, VerifyConfig{MaxOpenTail: MaxOpenTail(1_000)}))
+}
+
 func TestRebuildAddressStatsRefusesALiveTable(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
