@@ -50,7 +50,7 @@ var errLedgerGateBusy = errors.New("the history-DDL gate is held by retention")
 // span's addresses in address_stats to the ledger's count.
 func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (int, error) {
 	closed := 0
-	if err := d.rebasePendingSpans(ctx); err != nil {
+	if err := d.rebasePendingSpans(ctx, cfg.WorkMem); err != nil {
 		return closed, err
 	}
 	for closed < max {
@@ -79,7 +79,7 @@ func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (i
 		closed++
 		metrics.ObserveLedgerClose(time.Since(start))
 		metrics.SetLedgerClosedThrough(uint64(hi - 1))
-		if err := d.rebasePendingSpans(ctx); err != nil {
+		if err := d.rebasePendingSpans(ctx, cfg.WorkMem); err != nil {
 			return closed, err
 		}
 	}

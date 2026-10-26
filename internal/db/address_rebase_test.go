@@ -554,7 +554,7 @@ func TestSpanRebaseCountsItsCorrectionsByColumn(t *testing.T) {
 	conn, err := d.pool.Acquire(ctx)
 	require.NoError(t, err)
 	defer conn.Release()
-	staged, err := stageSpanRebase(ctx, conn.Conn(), 1)
+	staged, err := stageSpanRebase(ctx, conn.Conn(), 1, "")
 	require.NoError(t, err)
 	require.Equal(t, spanCorrections{Staged: 2, Txs: 1, Sent: 2, NoTruth: 1}, staged)
 }
@@ -631,7 +631,7 @@ func TestSpanStagingCountsTheTailAsTheTruthDoes(t *testing.T) {
 	conn, err := d.pool.Acquire(ctx)
 	require.NoError(t, err)
 	defer conn.Release()
-	staged, err := stageSpanRebase(ctx, conn.Conn(), 1)
+	staged, err := stageSpanRebase(ctx, conn.Conn(), 1, "")
 	require.NoError(t, err)
 	require.EqualValues(t, 3, staged.Staged)
 	var wrong int
@@ -641,4 +641,19 @@ func TestSpanStagingCountsTheTailAsTheTruthDoes(t *testing.T) {
 		WHERE (s.want_txs, s.want_sent, s.want_internal, s.want_transfers, s.want_first, s.want_last)
 		      IS DISTINCT FROM (t.txs, t.sent, t.internal, t.transfers, t.first_seen, t.last_seen)`, a, b, c).Scan(&wrong))
 	require.Zero(t, wrong)
+}
+
+// A span's staging runs with the ledger's work_mem: with the session's its grouping spilled ~27 GB.
+func TestSpanStagingUsesTheLedgerWorkMem(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	require.NoError(t, pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		require.NoError(t, stageSpanSettings(ctx, tx, "77MB"))
+		var plan []map[string]any
+		require.NoError(t, tx.QueryRow(ctx, `EXPLAIN (FORMAT JSON, SETTINGS) `+stageSpanSelect, int64(1), int64(500)).Scan(&plan))
+		settings, _ := plan[0]["Settings"].(map[string]any)
+		require.Equal(t, "77MB", settings["work_mem"])
+		return nil
+	}))
 }

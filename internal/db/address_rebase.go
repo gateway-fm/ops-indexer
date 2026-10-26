@@ -335,7 +335,7 @@ func (d *DB) HoldRebaseLock(ctx context.Context) (release func(), err error) {
 // corrections are then applied in short byte-ordered batches. Counted address by address through the indexes, a
 // span of a million addresses took about a day. The whole span runs under the rebase lock, held on one
 // connection; a stage left by a crash is counted again, since another rebase may have applied it since.
-func (d *DB) rebasePendingSpans(ctx context.Context) error {
+func (d *DB) rebasePendingSpans(ctx context.Context, workMem string) error {
 	if err := d.recountPendingDays(ctx); err != nil {
 		return err
 	}
@@ -358,7 +358,7 @@ func (d *DB) rebasePendingSpans(ctx context.Context) error {
 	defer func() { _, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, 1)`, rebaseLock) }()
 	for _, lo := range los {
 		start := time.Now()
-		staged, err := stageSpanRebase(ctx, conn.Conn(), lo)
+		staged, err := stageSpanRebase(ctx, conn.Conn(), lo, workMem)
 		if err != nil {
 			return err
 		}
@@ -482,9 +482,18 @@ const stageSpanSelect = `
 		   OR (s.address IS NULL AND a.creatable AND t.address IS NOT NULL)
 		   OR EXISTS (SELECT 1 FROM ledger_reverted_address r WHERE r.address = a.address)`
 
+// stageSpanSettings sets the staging transaction's work_mem, the closing transaction's ("" keeps the server's).
+func stageSpanSettings(ctx context.Context, tx pgx.Tx, workMem string) error {
+	if workMem == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `SELECT set_config('work_mem', $1, true)`, workMem)
+	return err
+}
+
 // stageSpanRebase stages, in one statement, the addresses of span lo and of blocks reverted since the last rebase whose
 // row differs from their truth, with the row and the truth it read, and counts them by column.
-func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrections, error) {
+func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64, workMem string) (spanCorrections, error) {
 	var c spanCorrections
 	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
 		return c, err
@@ -493,6 +502,9 @@ func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrect
 		return c, err
 	}
 	if err := pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+		if err := stageSpanSettings(ctx, tx, workMem); err != nil {
+			return err
+		}
 		var closed int64
 		if err := tx.QueryRow(ctx, `SELECT ledger_closed_through()`).Scan(&closed); err != nil {
 			return err
