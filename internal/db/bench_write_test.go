@@ -236,11 +236,13 @@ func makeBenchBlockData(blockNum uint64, shape blockShape, poolSize int) *BlockD
 			Status:         1,
 		})
 
+		// A block numbers its logs from 0 across all of its transactions, as the RPC returns them; logs and
+		// token_transfers are keyed by (block_number, log_index), so numbering per transaction would collide.
 		for j := 0; j < shape.logsPerTx; j++ {
 			t1, t2 := from, to
 			data.Logs = append(data.Logs, &types.Log{
 				TxHash:      hash,
-				LogIndex:    j,
+				LogIndex:    i*shape.logsPerTx + j,
 				Address:     token,
 				Topic0:      &topic0,
 				Topic1:      &t1,
@@ -254,7 +256,7 @@ func makeBenchBlockData(blockNum uint64, shape blockShape, poolSize int) *BlockD
 		for j := 0; j < shape.transfersPerTx; j++ {
 			data.Transfers = append(data.Transfers, &types.TokenTransfer{
 				TxHash:       hash,
-				LogIndex:     j,
+				LogIndex:     i*shape.transfersPerTx + j,
 				TokenAddress: token,
 				From:         from,
 				To:           to,
