@@ -399,19 +399,29 @@ func (d *DB) rebasePendingSpans(ctx context.Context) error {
 		if _, err := conn.Exec(ctx, `DROP TABLE address_rebase_stage`); err != nil {
 			return err
 		}
-		log.Info("ledger: span's addresses rebased", "lo", lo, "staged", staged, "changed", result.Changed,
-			"created", result.Created, "removed", result.Removed, "elapsed", time.Since(start).Round(time.Millisecond))
+		log.Info("ledger: span's addresses rebased", "lo", lo, "staged", staged.Staged, "changed", result.Changed,
+			"created", result.Created, "removed", result.Removed, "elapsed", time.Since(start).Round(time.Millisecond),
+			"wrong_txs", staged.Txs, "wrong_sent", staged.Sent, "wrong_internal", staged.Internal,
+			"wrong_transfers", staged.Transfers, "wrong_first_seen", staged.FirstSeen, "wrong_last_seen", staged.LastSeen,
+			"missing", staged.Created, "no_truth", staged.NoTruth)
 	}
 	return d.recountPendingDays(ctx)
 }
 
+// spanCorrections counts what a span's rebase staged: rows, and the rows whose each column differs from the truth,
+// that are missing (Created), or whose address has no truth (NoTruth, removed).
+type spanCorrections struct {
+	Staged, Txs, Sent, Internal, Transfers, FirstSeen, LastSeen, Created, NoTruth int64
+}
+
 // stageSpanRebase stages, in one statement, the addresses of span lo and of blocks reverted since the last rebase whose
-// row differs from their truth, with the row and the truth it read, and returns how many.
-func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (int64, error) {
+// row differs from their truth, with the row and the truth it read, and counts them by column.
+func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (spanCorrections, error) {
+	var c spanCorrections
 	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
-		return 0, err
+		return c, err
 	}
-	tag, err := conn.Exec(ctx, `
+	if _, err := conn.Exec(ctx, `
 		CREATE UNLOGGED TABLE address_rebase_stage AS
 		WITH addresses AS (
 			SELECT address, true AS creatable FROM ledger_address
@@ -452,14 +462,22 @@ func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64) (int64, erro
 		           IS DISTINCT FROM (COALESCE(t.txs, 0), COALESCE(t.sent, 0), COALESCE(t.internal, 0), COALESCE(t.transfers, 0),
 		                             t.first_seen, t.last_seen))
 		   OR (s.address IS NULL AND a.creatable AND t.address IS NOT NULL)
-		   OR EXISTS (SELECT 1 FROM ledger_reverted_address r WHERE r.address = a.address)`, lo)
-	if err != nil {
-		return 0, err
+		   OR EXISTS (SELECT 1 FROM ledger_reverted_address r WHERE r.address = a.address)`, lo); err != nil {
+		return c, err
 	}
 	if _, err := conn.Exec(ctx, `ALTER TABLE address_rebase_stage ADD PRIMARY KEY (address)`); err != nil {
-		return 0, err
+		return c, err
 	}
-	return tag.RowsAffected(), nil
+	err := conn.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE present AND txs <> want_txs), count(*) FILTER (WHERE present AND sent <> want_sent),
+		       count(*) FILTER (WHERE present AND internal <> want_internal),
+		       count(*) FILTER (WHERE present AND transfers <> want_transfers),
+		       count(*) FILTER (WHERE present AND first_seen IS DISTINCT FROM want_first),
+		       count(*) FILTER (WHERE present AND last_seen IS DISTINCT FROM want_last),
+		       count(*) FILTER (WHERE NOT present AND creatable AND seen), count(*) FILTER (WHERE present AND NOT seen)
+		FROM address_rebase_stage`).Scan(&c.Staged, &c.Txs, &c.Sent, &c.Internal, &c.Transfers, &c.FirstSeen, &c.LastSeen, &c.Created,
+		&c.NoTruth)
+	return c, err
 }
 
 // recountPendingDays recounts the days' address columns from address_stats if a rebase has moved a first_seen since

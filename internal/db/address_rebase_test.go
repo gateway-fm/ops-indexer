@@ -526,3 +526,35 @@ func TestClosingASpanRemovesAZeroRowWithNoTruth(t *testing.T) {
 	require.False(t, exists, "no canonical block has seen it")
 	requireAddressStatsIsTheTruth(t, d)
 }
+
+// A span's rebase counts, per column, the corrections it staged, so its log line says what was wrong.
+func TestSpanRebaseCountsItsCorrectionsByColumn(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	for n := 1; n <= 600; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET sent_count = 0 WHERE address = $1`, rebaseNewAddress(10))
+	require.NoError(t, err, "a sender whose sent_count was never counted")
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(601, 14000) g`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `SELECT ledger_close_span(1, 500)`)
+	require.NoError(t, err)
+
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, is_contract, updated_at)
+		VALUES ($1, 2, 0, 0, 1, false, NOW())`, rebaseNewAddress(9999))
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `INSERT INTO ledger_reverted_address (address) VALUES ($1)`, rebaseNewAddress(9999))
+	require.NoError(t, err, "a row no canonical block has seen, recorded by a revert")
+
+	conn, err := d.pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+	staged, err := stageSpanRebase(ctx, conn.Conn(), 1)
+	require.NoError(t, err)
+	require.Equal(t, spanCorrections{Staged: 2, Txs: 1, Sent: 2, NoTruth: 1}, staged)
+}
