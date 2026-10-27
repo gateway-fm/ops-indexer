@@ -137,10 +137,11 @@ func (d *DB) Migrate() error {
 		return err
 	}
 
-	// holder_count is delta-maintained by InsertBalancesBatch (PRST-4669) and
-	// re-seeded here for the same reason the counters above are: a build
-	// without the writer, or a crash between a current-row write and its
-	// counter, leaves it wrong until something absolute repairs it.
+	// holder_count is delta-maintained by InsertBalancesBatch (PRST-4669), in
+	// the transaction that writes the current balances, so no crash separates
+	// the two. It is re-seeded here for databases a build without that writer
+	// wrote: every database upgraded from 0.4.0, and one that ran an older
+	// build again after a rollback.
 	if err := d.ReseedHolderCounts(ctx); err != nil {
 		return err
 	}

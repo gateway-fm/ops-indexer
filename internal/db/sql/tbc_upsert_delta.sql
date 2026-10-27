@@ -14,12 +14,9 @@
 -- The guard is the one PRST-4508 settled on: highest block_number wins, >= so a
 -- re-delivery of the same block is last-write-wins like the balances insert beside it.
 --
--- Was one INSERT per key (0.06 ms x ~97 per block on the PRST-4669 rig, 12.9% of database
--- time after perf.4). Row locks are taken in unnest order = the caller's sort order, the
+-- Was one INSERT per key (0.06 ms x ~97 per block under a 500 tx/s load, 12.9% of database
+-- time once holder_count was incremental). Row locks are taken in unnest order = the caller's sort order, the
 -- same total order every writer uses (see InsertBalancesBatch).
---
--- go:embed-ed by holder_count.go AND executed verbatim by tools/gates.sh (functional gate,
--- with one-element arrays): the text the binary runs is the text the gate tests.
 WITH src AS (
     SELECT LOWER(t) AS token_address, LOWER(a) AS address, v AS balance, b AS block_number, o AS old_pos
     FROM unnest($1::text[], $2::text[], $3::numeric[], $4::bigint[], $5::int[]) AS r(t, a, v, b, o)

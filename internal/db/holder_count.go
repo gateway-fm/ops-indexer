@@ -23,8 +23,7 @@ import (
 // The incremental form costs one row read and one row write per flushed key
 // regardless of how many holders the token has.
 //
-// The statements live in sql/*.sql so an external check can execute the
-// exact text the binary runs against a live database.
+// The statements live in sql/*.sql, embedded below.
 var (
 	//go:embed sql/tbc_lock_keys.sql
 	tbcLockKeysSQL string
@@ -80,9 +79,8 @@ func (d *DB) ReseedHolderCounts(ctx context.Context) error {
 }
 
 // countTokenHolders is the absolute form of holder_count: addresses whose
-// current balance of the token is positive. It is no longer on any ingest
-// path; the startup re-seed and the tests use it as the reference the
-// incremental counter must agree with.
+// current balance of the token is positive. Only tests use it, as the
+// reference the incremental counter must agree with.
 func (d *DB) countTokenHolders(ctx context.Context, lowercasedToken string) (int64, error) {
 	var holderCount int64
 	if err := d.pool.QueryRow(ctx, `

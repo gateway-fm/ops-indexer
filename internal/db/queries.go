@@ -122,9 +122,10 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 // DeleteBlock removes one block and everything that hangs off it. Used to
 // revert a reorg, one block at a time from the head down.
 //
-// The delete cascades: transactions.block_number REFERENCES blocks(number) ON
-// DELETE CASCADE, and token_transfers.tx_hash REFERENCES transactions(hash) ON
-// DELETE CASCADE, so the block's token_transfers rows physically go with it.
+// The block's token_transfers and logs are deleted here by block_number:
+// migration 013 dropped their foreign keys to transactions, so no cascade
+// reaches them. Its transactions go with the block, through
+// transactions.block_number REFERENCES blocks(number) ON DELETE CASCADE.
 // That makes this a writer of token_transfers, and every writer has to maintain
 // tokens.transfer_count and tokens.total_supply -- nothing recomputes them from
 // history per block any more.

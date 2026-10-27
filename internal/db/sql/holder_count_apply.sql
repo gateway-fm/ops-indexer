@@ -10,7 +10,7 @@
 --
 -- Floors at zero like transfer_count does: a negative holder count is an
 -- accounting error made nonsensical; zero is the same error made visible and
--- sane. The gates compare exactly, so the floor cannot hide drift from them.
+-- sane.
 UPDATE tokens
 SET holder_count = GREATEST(COALESCE(holder_count, 0) + $2::int, 0)
 WHERE address = $1
