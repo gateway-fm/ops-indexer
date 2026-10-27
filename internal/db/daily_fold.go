@@ -127,6 +127,7 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	}
 	d.lateDays.giveBack(pending, search && !searched)
 	d.lateDays.advanced(*upto, searched)
+	d.reportDailyStatsGap(ctx, *upto)
 	return uint64(*upto), nil
 }
 

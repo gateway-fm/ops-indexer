@@ -24,6 +24,7 @@ type DB struct {
 	// Empty falls back to a safe default. Set via REBUILD_WORK_MEM env var.
 	RebuildWorkMem string
 	lateDays       lateDays
+	statsGap       statsGap
 }
 
 func New(databaseURL string) (*DB, error) {

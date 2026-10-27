@@ -35,6 +35,11 @@ var (
 		Help: "Blocks below the chain head absent from the database.",
 	})
 
+	dailyStatsLag = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_daily_stats_watermark_lag_blocks",
+		Help: "Highest stored block minus the daily statistics watermark. It stays high while a missing block holds daily_stats for every later day.",
+	})
+
 	blocksIndexed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "indexer_blocks_indexed_total",
 		Help: "Blocks written to the database since process start.",
@@ -130,6 +135,8 @@ func SetChainHead(block uint64) { chainHeadBlock.Set(float64(block)) }
 func SetLastIndexed(block uint64) { lastIndexedBlock.Set(float64(block)) }
 
 func SetMissingBlocks(n int64) { missingBlocks.Set(float64(n)) }
+
+func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
 
 func BlockIndexed(txCount int, gasUsed uint64) {
 	blocksIndexed.Inc()
