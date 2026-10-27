@@ -47,9 +47,8 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
-	// DailyStatsMinInterval is the minimum time between two recomputations of
-	// the current day's daily_stats row. Zero keeps the old behaviour (every
-	// 100th block). See dailyStatsThrottle.
+	// DailyStatsMinInterval is the minimum time between two daily_stats
+	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
 
 	// CommitPipelineDepth is how many blocks the standard loop writes at once (the pipelined
