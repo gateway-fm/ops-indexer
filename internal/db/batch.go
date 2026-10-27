@@ -541,6 +541,12 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	// transfers are added on top below. Absolute recompute made the old code immune to this
 	// by accident; the deltas have to say it out loud.
 	//
+	// A balance flush that commits after this seed's snapshot is not in the
+	// count; it applies its own holder_count delta to this row, and it waits on
+	// the token's advisory key, held here since the pass above, so the row it
+	// updates is this transaction's committed one rather than an uncommitted
+	// row its UPDATE cannot see.
+	//
 	// This runs once per token over that token's own index range, and for a
 	// token discovered on its first transfer it aggregates zero rows.
 	if len(seedTokens) > 0 {
@@ -876,10 +882,13 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	// under a per-key advisory lock taken as the FIRST thing this transaction
 	// does, so two flushes racing on a key not yet in the table cannot both
 	// read "absent" and both count +1. Lock phases, every writer in this order:
-	// advisory keys (sorted) -> balances rows (sorted) -> current rows (sorted)
-	// -> tokens rows (sorted). A transaction waiting in one phase holds locks
-	// only from earlier phases, and within a phase everyone agrees on the
-	// order, so no cycle is possible.
+	// balance-key advisory locks (sorted) -> balances rows (sorted) -> current
+	// rows (sorted) -> token advisory keys (sorted by key) -> tokens rows
+	// (sorted). A transaction waiting in one phase holds locks only from
+	// earlier phases, and within a phase everyone agrees on the order, so no
+	// cycle is possible. Block writes take only the last two phases, and
+	// DeleteBlock only the last one, so neither ever waits on a lock a flush
+	// takes before its token keys.
 	histAddr := make([]string, 0, len(ordered))
 	histTok := make([]string, 0, len(ordered))
 	histBlk := make([]int64, 0, len(ordered))
@@ -979,6 +988,15 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	}
 	if len(tokensTouched) > 0 {
 		sort.Strings(tokensTouched)
+		// The token's advisory key, which a block write holds from before it creates the tokens row
+		// until it commits. Without it, a delta applied while that row is still uncommitted matches
+		// nothing, and the block write's seed, whose snapshot predates this commit, does not count
+		// the holder either.
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k`,
+			tokenLockKeys(tokensTouched)); err != nil {
+			return fmt.Errorf("lock tokens: %w", err)
+		}
 		apply := &pgx.Batch{}
 		for _, t := range tokensTouched {
 			apply.Queue(holderCountApplySQL, t, holderDelta[t])
