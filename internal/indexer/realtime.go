@@ -245,6 +245,9 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBloc
 			r.SetLastProcessedBlock(lastProcessed - depth)
 			return
 		}
+		// No fork under the cursor: a revert that failed earlier left nothing to revert (its delete committed and
+		// only the acknowledgement was lost, or the node went back to the stored fork).
+		r.revertPending.Store(false)
 	}
 	idx := r.blockIndexer()
 	idx.indexRequests = r.indexRequests
