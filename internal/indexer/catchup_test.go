@@ -545,6 +545,8 @@ func TestRealtimeIndexer_ReorgError_DoesNotDeleteBlocks(t *testing.T) {
 		Hash:   "0xstoredblock4hash",
 	}, nil)
 	mockRPC.On("RawBlockHash", mock.Anything, uint64(4)).Return("", fmt.Errorf("RPC unavailable")).Once()
+	mockRPC.On("RawBlockHash", mock.Anything, uint64(4)).Return("0xstoredblock4hash", nil)
+	mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil)
 
 	rawBlock5 := makeRawBlock(5)
 

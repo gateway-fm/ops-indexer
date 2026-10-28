@@ -101,6 +101,7 @@ type reorgStore struct {
 	tick      func() int
 	deleteErr error
 	keepBelow uint64
+	getErr    map[uint64]bool
 }
 
 func newReorgStore(storedHead uint64, tick func() int) *reorgStore {
@@ -108,12 +109,15 @@ func newReorgStore(storedHead uint64, tick func() int) *reorgStore {
 	for n := uint64(1); n <= storedHead; n++ {
 		blocks[n] = oldHash(n).Hex()
 	}
-	return &reorgStore{MockDatabase: new(MockDatabase), blocks: blocks, tick: tick}
+	return &reorgStore{MockDatabase: new(MockDatabase), blocks: blocks, tick: tick, getErr: map[uint64]bool{}}
 }
 
 func (s *reorgStore) GetBlock(_ context.Context, n uint64) (*types.Block, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getErr[n] {
+		return nil, errors.New("connection reset")
+	}
 	if h, ok := s.blocks[n]; ok {
 		return &types.Block{Number: n, Hash: h}, nil
 	}
@@ -313,5 +317,89 @@ func TestStandardReorgThatCannotBeRevertedWritesNothingPastTheFork(t *testing.T)
 
 	if got := writtenNumbers(store.written()); len(got) != 0 {
 		t.Fatalf("written %v, want nothing while the stale blocks 98 and 99 cannot be reverted", got)
+	}
+}
+
+// A detection walk that finds stale blocks and then fails deeper down reports what it found together with the error.
+func TestDetectReorgKeepsTheMismatchFoundBeforeAnError(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		fail func(*reorgNode, *reorgStore)
+	}{
+		{"node", func(n *reorgNode, _ *reorgStore) { n.hashErr[99] = 1 }},
+		{"store", func(_ *reorgNode, s *reorgStore) { s.getErr[99] = true }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			detectors := map[string]func(*reorgStore, *reorgNode) (uint64, error){
+				"indexer": func(s *reorgStore, n *reorgNode) (uint64, error) {
+					return newReorgStandard(s, n).detectReorg(context.Background(), 100)
+				},
+				"realtime": func(s *reorgStore, n *reorgNode) (uint64, error) {
+					return newReorgRealtime(s, n, 100).detectReorg(context.Background(), 100)
+				},
+			}
+			for name, detect := range detectors {
+				node := newReorgNode(98, 103)
+				store := newReorgStore(100, node.tick)
+				c.fail(node, store)
+				depth, err := detect(store, node)
+				if err == nil || depth != 1 {
+					t.Fatalf("%s: depth %d, error %v; want depth 1 (block 100 is stale) and the error from block 99", name, depth, err)
+				}
+			}
+		})
+	}
+}
+
+// A reorg check that fails ends the tick before any block is indexed; the next tick, with the node healthy, reverts
+// the stale blocks and indexes the new chain.
+func TestReorgCheckErrorEndsTheTick(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		forkAt uint64
+		want   []uint64
+	}{
+		{"stale head", 98, []uint64{98, 99, 100, 101, 102}},
+		{"no mismatch", 200, []uint64{101, 102}},
+	} {
+		for _, mode := range []struct {
+			name         string
+			subscription bool
+		}{{"polling", false}, {"subscription", true}} {
+			t.Run(c.name+"/realtime/"+mode.name, func(t *testing.T) {
+				node := newReorgNode(c.forkAt, 103)
+				node.hashErr[99] = 1
+				store := newReorgStore(100, node.tick)
+				rt := newReorgRealtime(store, node, 100)
+
+				runRealtime(t, rt, node, mode.subscription, 2, func() bool { return len(store.written()) >= len(c.want) })
+
+				assertWrittenInTick(t, store, node, c.want, 2)
+			})
+		}
+		t.Run(c.name+"/standard", func(t *testing.T) {
+			node := newReorgNode(c.forkAt, 103)
+			node.hashErr[99] = 1
+			store := newReorgStore(100, node.tick)
+			want := append(append([]uint64(nil), c.want...), 103)
+
+			runStandard(t, newReorgStandard(store, node), node, 100, 2, func() bool { return len(store.written()) >= len(want) })
+
+			assertWrittenInTick(t, store, node, want, 2)
+		})
+	}
+}
+
+func assertWrittenInTick(t *testing.T, store *reorgStore, node *reorgNode, want []uint64, tick int) {
+	t.Helper()
+	ws := store.written()
+	if len(ws) != len(want) {
+		t.Fatalf("written %v, want %v in tick %d", writtenNumbers(ws), want, tick)
+	}
+	for i, w := range ws {
+		if w.number != want[i] || w.hash != node.chain[w.number].Hash.Hex() || w.tick != tick {
+			t.Fatalf("write %d = block %d hash %s in tick %d, want block %d from the chain in tick %d (all writes %v)",
+				i, w.number, w.hash, w.tick, want[i], tick, writtenNumbers(ws))
+		}
 	}
 }

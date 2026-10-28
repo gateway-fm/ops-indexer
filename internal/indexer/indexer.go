@@ -644,8 +644,10 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 			if lastIndexed > 0 {
 				reorgDepth, err := i.detectReorg(ctx, lastIndexed)
 				if err != nil {
-					log.Error("failed to check for reorg", "error", err)
-				} else if reorgDepth > 0 {
+					log.Error("failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+					continue
+				}
+				if reorgDepth > 0 {
 					log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
 					if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
 						log.Error("failed to handle reorg", "error", err)
@@ -676,6 +678,9 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 // chain beneath a matching head (a corrupted or partially reverted database)
 // is reverted too rather than kept. The window was always scanned in full in
 // the no-reorg case, so the cost per poll tick is unchanged.
+//
+// A read that fails part way returns the error with the depth found so far.
+// The caller indexes nothing on that tick and walks again on the next one.
 func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, error) {
 	maxReorgCheck := uint64(10)
 	var deepest uint64
@@ -683,13 +688,16 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 		checkBlock := blockNumber - depth
 
 		storedBlock, err := i.db.GetBlock(ctx, checkBlock)
-		if err != nil || storedBlock == nil {
+		if err != nil {
+			return deepest, err
+		}
+		if storedBlock == nil {
 			continue
 		}
 
 		chainHash, err := i.rpc.RawBlockHash(ctx, checkBlock)
 		if err != nil {
-			return 0, err
+			return deepest, err
 		}
 
 		if storedBlock.Hash == chainHash {

@@ -215,8 +215,10 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
 		if blockNum > 0 {
 			reorgDepth, err := r.detectReorg(ctx, blockNum-1)
 			if err != nil {
-				log.Error("realtime: failed to check for reorg", "error", err)
-			} else if reorgDepth > 0 {
+				log.Error("realtime: failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+				return
+			}
+			if reorgDepth > 0 {
 				if reverted {
 					return
 				}
@@ -280,13 +282,16 @@ func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (
 		checkBlock := blockNumber - depth
 
 		storedBlock, err := r.db.GetBlock(ctx, checkBlock)
-		if err != nil || storedBlock == nil {
+		if err != nil {
+			return deepest, err
+		}
+		if storedBlock == nil {
 			continue
 		}
 
 		chainHash, err := r.rpc.RawBlockHash(ctx, checkBlock)
 		if err != nil {
-			return 0, err
+			return deepest, err
 		}
 
 		if storedBlock.Hash == chainHash {
