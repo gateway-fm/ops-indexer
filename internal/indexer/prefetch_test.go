@@ -304,3 +304,98 @@ func TestPrefetchContinuesAfterABlockSkippedAtTheEndOfATick(t *testing.T) {
 		t.Fatalf("written %v, want [7 8]", got)
 	}
 }
+
+// skipThenReorg skips block 100 for its receipts (the chain's old block, which has a transaction), then replaces
+// 100 with a new block that 101 and 102 extend, as a reorg at the skipped block does.
+func skipThenReorg(t *testing.T, pipelined bool) (*reorgNode, *reorgStore, *Indexer, *receiptSkip, func(last, latest uint64) uint64) {
+	t.Helper()
+	node := newReorgNode(1000, 100)
+	node.chain[100].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{100})}}
+	store := newReorgStore(99, node.tick)
+	store.MockDatabase.On("RequeueMissingBlock", mock.Anything, uint64(100)).Return(nil)
+	idx := NewWithConfig(store, receiptlessNode{node}, 10*time.Millisecond, 0, &Config{RPCWorkers: 1, RPCRateLimit: 100})
+	skip := &receiptSkip{}
+	tick := func(last, latest uint64) uint64 {
+		if pipelined {
+			return idx.indexPipelined(context.Background(), last, latest, 2, skip)
+		}
+		return idx.indexPrefetched(context.Background(), last, latest, skip)
+	}
+	last := uint64(99)
+	for attempt := 0; attempt < maxReceiptAttempts; attempt++ {
+		last = tick(last, 100)
+	}
+	if last != 100 || skip.skipped != 100 {
+		t.Fatalf("setup: last %d, skipped %d; want block 100 skipped", last, skip.skipped)
+	}
+	node.mu.Lock()
+	for n := uint64(100); n <= 102; n++ {
+		node.chain[n] = &rpc.RawBlock{Number: node.chain[99].Number, Hash: newHash(n), ParentHash: newHash(n - 1)}
+		node.chain[n].Number = (*hexutil.Big)(new(big.Int).SetUint64(n))
+	}
+	node.chain[100].ParentHash = oldHash(99)
+	node.head = 102
+	node.mu.Unlock()
+	return node, store, idx, skip, tick
+}
+
+// The hash remembered for a block skipped for its receipts is what the chain had then. When the chain replaces that
+// block, the next block does not extend the remembered hash; the loop re-reads the skipped block from the node, drops
+// the stale hash and indexes the new chain from the highest stored block, instead of stopping at it forever.
+func TestARememberedSkipThatTheChainReplacedIsCheckedAgain(t *testing.T) {
+	for _, pipelined := range []bool{false, true} {
+		t.Run(map[bool]string{false: "serial", true: "pipelined"}[pipelined], func(t *testing.T) {
+			node, store, _, _, tick := skipThenReorg(t, pipelined)
+			last := uint64(100)
+			for i := 0; i < 3 && last < 102; i++ {
+				last = tick(last, 102)
+			}
+			if last != 102 {
+				t.Fatalf("last indexed %d after 3 ticks, want 102", last)
+			}
+			for n, h := range store.hashes(100, 102) {
+				if h != node.chain[n].Hash.Hex() {
+					t.Fatalf("block %d stored as %q, want the new chain's %s", n, h, node.chain[n].Hash.Hex())
+				}
+			}
+		})
+	}
+}
+
+// When the node still has the remembered block, a next block that does not extend it is a real mismatch: the loop
+// stops there, as for any block that does not extend the one before it.
+func TestARememberedSkipTheChainStillHasStopsAMismatchingBlock(t *testing.T) {
+	node, store, _, skip, tick := skipThenReorg(t, false)
+	node.mu.Lock()
+	node.chain[100] = &rpc.RawBlock{Number: node.chain[100].Number, Hash: skip.skippedHash, ParentHash: oldHash(99)}
+	node.mu.Unlock()
+	if last := tick(100, 102); last != 100 {
+		t.Fatalf("last indexed %d, want 100: 101 does not extend the skipped block the node still has", last)
+	}
+	if w := writtenNumbers(store.written()); len(w) != 0 {
+		t.Fatalf("written %v, want nothing", w)
+	}
+}
+
+// After a revert whose last delete committed but reported an error, the standard loop indexes the deleted blocks
+// again at once, even when the chain has not grown past them.
+func TestFailedRevertReplaysWithoutWaitingForANewBlock(t *testing.T) {
+	node := newReorgNode(98, 100)
+	store := newReorgStore(100, node.tick)
+	store.faults = map[uint64]string{98: "ack"}
+	idx := newReorgStandard(store, node)
+
+	runUntil(t, func(ctx context.Context) { _ = idx.startStandardMode(ctx, 100) }, node.tick, 1, func() bool {
+		for n, h := range store.hashes(98, 100) {
+			if h != node.chain[n].Hash.Hex() {
+				return false
+			}
+		}
+		return true
+	})
+	for n, h := range store.hashes(98, 100) {
+		if h != node.chain[n].Hash.Hex() {
+			t.Fatalf("block %d stored as %q, want the new chain's: replayed while the head stays at 100", n, h)
+		}
+	}
+}

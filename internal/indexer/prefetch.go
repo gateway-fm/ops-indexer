@@ -67,33 +67,51 @@ func (i *Indexer) prefetchBlocks(ctx context.Context, from, to uint64, depth int
 // stored, or a block receipts skipped (not stored) at lastIndexed. When lastIndexed is neither, as after a revert whose
 // delete committed but reported an error, the tick starts after the highest stored block below it, so the deleted
 // blocks are fetched again and the check is never skipped. Block 0, or nothing stored at or below lastIndexed, has
-// no hash to check against. ok is false when the store cannot be read; the tick then ends.
-func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) (from uint64, hash common.Hash, ok bool) {
+// no hash to check against. A remembered hash the cursor has moved below is dropped. remembered reports that hash
+// is the remembered one (see recheckSkipped). ok is false when the store cannot be read; the tick then ends.
+func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) (from uint64, hash common.Hash, remembered, ok bool) {
+	if receipts.skipped > lastIndexed {
+		receipts.skipped, receipts.skippedHash = 0, common.Hash{}
+	}
 	if lastIndexed == 0 {
-		return 0, common.Hash{}, true
+		return 0, common.Hash{}, false, true
 	}
 	b, err := i.db.GetBlock(ctx, lastIndexed)
 	if err != nil {
 		log.Error("failed to read the block before this tick, retrying on the next tick", "block", lastIndexed, "error", err)
-		return lastIndexed, common.Hash{}, false
+		return lastIndexed, common.Hash{}, false, false
 	}
 	if b != nil {
-		return lastIndexed, common.HexToHash(b.Hash), true
+		return lastIndexed, common.HexToHash(b.Hash), false, true
 	}
 	if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
-		return lastIndexed, receipts.skippedHash, true
+		return lastIndexed, receipts.skippedHash, true, true
 	}
 	below, err := i.db.HighestBlockAtOrBelow(ctx, lastIndexed)
 	if err != nil {
 		log.Error("failed to read the highest stored block, retrying on the next tick", "below", lastIndexed, "error", err)
-		return lastIndexed, common.Hash{}, false
+		return lastIndexed, common.Hash{}, false, false
 	}
 	if below == nil {
-		return lastIndexed, common.Hash{}, true
+		return lastIndexed, common.Hash{}, false, true
 	}
 	log.Warn("the block before this tick is not stored; indexing again from the highest stored block below it",
 		"block", lastIndexed, "from", below.Number)
-	return below.Number, common.HexToHash(below.Hash), true
+	return below.Number, common.HexToHash(below.Hash), false, true
+}
+
+// recheckSkipped is called when the tick's first block does not extend the remembered hash of the block skipped for
+// its receipts. That hash is what the chain had when the block was skipped; the block is not stored, so the reorg
+// check never compares it. When the node now has a different block there, or none, the hash is dropped and the next
+// tick starts again from the highest stored block below it. When the node still has it, the mismatch is real.
+func (i *Indexer) recheckSkipped(ctx context.Context, receipts *receiptSkip) {
+	hash, err := i.rpc.RawBlockHash(ctx, receipts.skipped)
+	if err == nil && common.HexToHash(hash) == receipts.skippedHash {
+		return
+	}
+	log.Warn("the block skipped for its receipts is no longer on the chain; checking again from the stored blocks",
+		"block", receipts.skipped, "error", err)
+	receipts.skipped, receipts.skippedHash = 0, common.Hash{}
 }
 
 // indexPrefetched indexes lastIndexed+1..latest in order and returns the new last indexed block.
@@ -103,11 +121,8 @@ func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *rece
 // A block whose receipts never come is moved past once receipts records it as missing (receipt_skip.go), and only
 // if it extends the block before it.
 func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint64, receipts *receiptSkip) uint64 {
-	if latest <= lastIndexed {
-		return lastIndexed
-	}
-	lastIndexed, prevHash, ok := i.anchor(ctx, lastIndexed, receipts)
-	if !ok {
+	lastIndexed, prevHash, remembered, ok := i.anchor(ctx, lastIndexed, receipts)
+	if !ok || latest <= lastIndexed {
 		return lastIndexed
 	}
 	fetchCtx, cancel := context.WithCancel(ctx)
@@ -124,8 +139,12 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 		if b.raw != nil && prevHash != (common.Hash{}) && b.raw.ParentHash != prevHash {
 			log.Warn("prefetched block does not extend the block just indexed, refetching on the next tick",
 				"block", b.number, "parent", b.raw.ParentHash.Hex(), "previous", prevHash.Hex())
+			if remembered {
+				i.recheckSkipped(ctx, receipts)
+			}
 			return lastIndexed
 		}
+		remembered = false
 		if b.err != nil {
 			log.Error("failed to process block", "block", b.number, "error", b.err)
 			if b.raw == nil || !receipts.skip(ctx, i.db, b.number, b.err) {
@@ -174,9 +193,6 @@ type beginResult struct {
 // the committed blocks stay a prefix of the chain. On the first failure every later open
 // transaction is rolled back and the loop returns the last block it committed.
 func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64, depth int, receipts *receiptSkip) uint64 {
-	if latest <= lastIndexed {
-		return lastIndexed
-	}
 	fetchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -221,9 +237,9 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		return true
 	}
 
-	from, prevHash, ok := i.anchor(ctx, lastIndexed, receipts)
-	if !ok {
-		return lastIndexed
+	from, prevHash, remembered, ok := i.anchor(ctx, lastIndexed, receipts)
+	if !ok || latest <= from {
+		return from
 	}
 	lastIndexed = from
 	for slot := range i.prefetchBlocks(fetchCtx, lastIndexed+1, latest, blockPrefetchDepth+depth) {
@@ -243,8 +259,12 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		if b.raw != nil && prevHash != (common.Hash{}) && b.raw.ParentHash != prevHash {
 			log.Warn("prefetched block does not extend the block before it, refetching on the next tick",
 				"block", b.number, "parent", b.raw.ParentHash.Hex(), "previous", prevHash.Hex())
+			if remembered {
+				i.recheckSkipped(ctx, receipts)
+			}
 			break
 		}
+		remembered = false
 		if b.err != nil {
 			log.Error("failed to process block", "block", b.number, "error", b.err)
 			// A block whose receipts never come is moved past once recorded as missing (receipt_skip.go), after
