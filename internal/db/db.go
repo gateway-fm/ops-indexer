@@ -108,7 +108,13 @@ func (d *DB) MigrateSchema() error {
 // the history tables. It must run before ingest starts: its absolute writes
 // would otherwise overwrite deltas that committed while it was counting.
 func (d *DB) Reconcile(ctx context.Context) error {
+	if err := d.ResumeInterruptedWipe(ctx); err != nil {
+		return err
+	}
 	if err := d.ReleaseAbandonedCut(ctx); err != nil {
+		return err
+	}
+	if err := d.repairHistoryCoverage(ctx); err != nil {
 		return err
 	}
 	if err := reseedCounters(ctx, d.pool); err != nil {

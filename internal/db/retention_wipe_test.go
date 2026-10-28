@@ -93,3 +93,37 @@ func TestAStartFillsThePartitionsAnInterruptedWipeLeftOut(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, made, "a second ensure finds no gap")
 }
+
+// A wipe stopped after it truncated blocks leaves nothing for the next start to detect a reset by. The mark it
+// set first is still there, so the start's Reconcile finishes the wipe: the watermark goes to 0, partitions cover
+// the new chain from block 0, and the mark is cleared.
+func TestTheStartFinishesAnInterruptedWipe(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := legacyPastTheWatermark(t, d)
+	finished, err := d.finishDetached(ctx, cfg)
+	require.NoError(t, err)
+	require.True(t, finished)
+	var lowest uint64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT min(lo) FROM history_partitions WHERE state = 'attached'`).Scan(&lowest))
+
+	// The state a wipe stopped right after truncating blocks leaves: marked, blocks empty, the rest untouched.
+	_, err = d.pool.Exec(ctx, `CREATE TABLE `+WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `TRUNCATE TABLE blocks CASCADE`)
+	require.NoError(t, err)
+
+	require.NoError(t, d.Reconcile(ctx), "the start")
+	through, _, err := d.PrunedThrough(ctx)
+	require.NoError(t, err)
+	require.Zero(t, through, "nothing of the new chain is pruned")
+	var spans int64
+	var mark *string
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM ledger_spans), to_regclass($1)::text`, WipeMarkTable).Scan(&spans, &mark))
+	require.Zero(t, spans, "no old-chain span is closed")
+	require.Nil(t, mark, "the finished wipe clears its mark")
+	for _, n := range []uint64{0, 1, cfg.PartitionBlocks, lowest - 1, lowest} {
+		require.NoError(t, insertCutTestBlock(d, n), "the new chain's block %d can be stored", n)
+	}
+}

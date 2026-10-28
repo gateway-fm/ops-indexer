@@ -91,6 +91,14 @@ func (d *DB) EnsurePartitionsAhead(ctx context.Context, head, partitionBlocks ui
 	return filled + made, err
 }
 
+// repairHistoryCoverage fills the gaps in partition coverage above the watermark at the start, before ingest.
+func (d *DB) repairHistoryCoverage(ctx context.Context) error {
+	d.ensureMu.Lock()
+	defer d.ensureMu.Unlock()
+	_, err := d.fillHistoryGaps(ctx)
+	return err
+}
+
 // fillHistoryGaps creates the partitions missing between the first retained block (history_from) and the highest
 // partition, in ranges of the newest partition's size, each in its own transaction; the caller holds ensureMu.
 // Below the watermark ranges are dropped on purpose, but above it every block needs a partition: a wipe that

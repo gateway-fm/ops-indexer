@@ -2216,14 +2216,23 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 	return s, nil
 }
 
+// WipeMarkTable exists while a wipe is in progress: created before the first truncate, dropped as the wipe's last
+// step. A wipe stopped part way leaves blocks empty, so the next start sees no reset and would not wipe again; it
+// finds the mark instead and finishes the wipe (ResumeInterruptedWipe).
+const WipeMarkTable = "wipe_in_progress"
+
 // WipeAllData truncates all indexed tables, used for chain reset recovery. It holds the history-DDL gate, so no
-// span closes and no range is detached or dropped while it runs.
+// span closes and no range is detached or dropped while it runs. Every step can run again, so a wipe stopped
+// anywhere is finished by running it again from the start.
 func (d *DB) WipeAllData(ctx context.Context) error {
 	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
 	if err != nil {
 		return err
 	}
 	defer release()
+	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		return fmt.Errorf("failed to mark the wipe as in progress: %w", err)
+	}
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we
 	// list child tables first for clarity.
@@ -2292,5 +2301,24 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable); err != nil {
 		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
 	}
-	return d.coverHistoryFromZero(ctx)
+	if err := d.coverHistoryFromZero(ctx); err != nil {
+		return err
+	}
+	if _, err := d.pool.Exec(ctx, `DROP TABLE IF EXISTS `+WipeMarkTable); err != nil {
+		return fmt.Errorf("failed to clear the wipe's mark: %w", err)
+	}
+	return nil
+}
+
+// ResumeInterruptedWipe finishes a wipe that was stopped part way, before anything reads the indexed tables.
+func (d *DB) ResumeInterruptedWipe(ctx context.Context) error {
+	var marked bool
+	if err := d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, WipeMarkTable).Scan(&marked); err != nil {
+		return err
+	}
+	if !marked {
+		return nil
+	}
+	log.Warn("a FORCE_REINDEX wipe was stopped part way; finishing it before the start")
+	return d.WipeAllData(ctx)
 }
