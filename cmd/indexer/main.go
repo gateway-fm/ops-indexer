@@ -90,6 +90,7 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to create rpc client", "error", err)
 	}
+	rpcClient.LimitReceipts(cfg.RPCWorkers, cfg.RPCRateLimit)
 
 	idxCfg := &indexer.Config{
 		RPCWorkers:            cfg.RPCWorkers,

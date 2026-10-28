@@ -37,7 +37,8 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type Client struct {
-	raw *rpclient.Client
+	raw      *rpclient.Client
+	receipts *callBudget
 }
 
 // newTransport is the HTTP transport for every JSON-RPC call the indexer makes. It used to be
@@ -62,6 +63,12 @@ func New(url string) (*Client, error) {
 
 	raw := rpclient.New(url, httpClient)
 	return &Client{raw: raw}, nil
+}
+
+// LimitReceipts sets the budget every per-transaction receipt call shares, however many blocks fetch receipts at
+// once: at most workers calls in flight and perSecond calls a second.
+func (c *Client) LimitReceipts(workers, perSecond int) {
+	c.receipts = newCallBudget(workers, perSecond)
 }
 
 func (c *Client) Raw() *rpclient.Client {
@@ -298,8 +305,11 @@ func (c *Client) FetchReceiptsBatch(ctx context.Context, txHashes []common.Hash,
 			if err := limiter.Wait(ctx); err != nil {
 				return err
 			}
-
+			if err := c.receipts.acquire(ctx); err != nil {
+				return err
+			}
 			receipt, err := c.raw.TransactionReceipt(ctx, hash)
+			c.receipts.release()
 			if err != nil {
 				return fmt.Errorf("receipt for tx %s: %w", hash.Hex(), err)
 			}
@@ -554,4 +564,39 @@ func (c *Client) GetTotalDifficulty(ctx context.Context, blockNumber uint64) str
 
 func toHex(n uint64) string {
 	return "0x" + new(big.Int).SetUint64(n).Text(16)
+}
+
+type callBudget struct {
+	slots   chan struct{}
+	limiter *rate.Limiter
+}
+
+func newCallBudget(workers, perSecond int) *callBudget {
+	return &callBudget{
+		slots:   make(chan struct{}, workers),
+		limiter: rate.NewLimiter(rate.Limit(perSecond), perSecond/10+1),
+	}
+}
+
+// acquire waits for a free slot and the rate, and release frees the slot. A nil budget does not limit.
+func (b *callBudget) acquire(ctx context.Context) error {
+	if b == nil {
+		return nil
+	}
+	select {
+	case b.slots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := b.limiter.Wait(ctx); err != nil {
+		<-b.slots
+		return err
+	}
+	return nil
+}
+
+func (b *callBudget) release() {
+	if b != nil {
+		<-b.slots
+	}
 }
