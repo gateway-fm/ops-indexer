@@ -602,11 +602,14 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 				INSERT INTO nft_tokens (token_address, token_id, owner, token_uri, block_number)
 				VALUES ($1, $2, $3, $4, $5)
 				ON CONFLICT (token_address, token_id) DO UPDATE SET
-					owner = EXCLUDED.owner,
+					-- The owner is the latest block's: a block written after a later one (catch-up filling a gap
+					-- out of order, the standard loop retrying a recorded block) does not move it back. The same
+					-- block again (>=) is a later move within the block, or the block written anew after a reorg.
+					owner = CASE WHEN EXCLUDED.block_number >= nft_tokens.block_number THEN EXCLUDED.owner ELSE nft_tokens.owner END,
 					-- tokenURI is captured once at mint; a later transfer carries
 					-- no URI, so keep the existing value rather than nulling it.
 					token_uri = COALESCE(nft_tokens.token_uri, EXCLUDED.token_uri),
-					block_number = EXCLUDED.block_number,
+					block_number = GREATEST(nft_tokens.block_number, EXCLUDED.block_number),
 					updated_at = NOW()`,
 				n.TokenAddress, n.TokenID, n.Owner, n.TokenURI, n.BlockNumber)
 		}
