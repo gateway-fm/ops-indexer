@@ -54,3 +54,27 @@ func TestPartitionsAreKeptAheadOfTheNodeHead(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	require.NoError(t, insertCutTestBlock(d, node), "a block at the node head has a partition")
 }
+
+// After an outage with small partitions the head is hundreds of ranges past the newest partition. Keeping
+// partitions ahead creates them a bounded number per step, each in its own transaction, so no step needs more
+// locks than max_locks_per_transaction allows, and successive steps reach the head.
+func TestPartitionsCatchUpOnAFarHeadWithinTheLockTable(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 40_001, 1)
+	cfg := RetentionConfig{RetainBlocks: 12_800, PartitionBlocks: 1_280}
+	require.NoError(t, d.cutHistory(ctx, cfg))
+
+	head := uint64(40_001 + 345_600)
+	steps := 0
+	for ; steps < 100; steps++ {
+		made, err := d.EnsurePartitionsAhead(ctx, head, cfg.PartitionBlocks)
+		require.NoError(t, err, "step %d", steps)
+		if made == 0 {
+			break
+		}
+	}
+	require.Greater(t, steps, 1, "the ranges are created over several steps")
+	require.NoError(t, insertCutTestBlock(d, head+cfg.PartitionBlocks), "partitions reach past the head")
+}

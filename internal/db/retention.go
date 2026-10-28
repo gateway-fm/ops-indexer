@@ -82,15 +82,38 @@ func (d *DB) EnsurePartitionsAhead(ctx context.Context, head, partitionBlocks ui
 	return d.EnsureHistoryPartitions(ctx, head+2*size, size)
 }
 
-// EnsureHistoryPartitions creates partitions of sizeBlocks up to at least upto; a no-op before the cut.
+// maxPartitionsPerEnsure bounds the partitions one ensure creates. After an outage the head can be hundreds of
+// ranges past the newest partition; the rest are created by the next calls, a step apart.
+const maxPartitionsPerEnsure = 32
+
+// EnsureHistoryPartitions creates partitions of sizeBlocks towards upto, lowest first, at most
+// maxPartitionsPerEnsure per call; a no-op before the cut. Each partition is created in its own transaction:
+// one transaction creating them all takes locks on every new table and index, and enough of them exhaust the
+// lock table (max_locks_per_transaction).
 func (d *DB) EnsureHistoryPartitions(ctx context.Context, upto, sizeBlocks uint64) (int, error) {
 	start := time.Now()
-	var made int
-	err := d.pool.QueryRow(ctx, `SELECT history_partitions_ensure($1, $2)`, int64(upto), int64(sizeBlocks)).Scan(&made)
-	if err == nil && made > 0 {
+	made := 0
+	for made < maxPartitionsPerEnsure {
+		var top *int64
+		if err := d.pool.QueryRow(ctx, `SELECT max(hi) FROM history_partitions`).Scan(&top); err != nil {
+			return made, err
+		}
+		if top == nil || uint64(*top) > upto {
+			break
+		}
+		var n int
+		if err := d.pool.QueryRow(ctx, `SELECT history_partitions_ensure($1, $2)`, *top, int64(sizeBlocks)).Scan(&n); err != nil {
+			return made, err
+		}
+		if n == 0 {
+			break
+		}
+		made += n
+	}
+	if made > 0 {
 		metrics.ObserveRetentionStep("ensure", time.Since(start))
 	}
-	return made, err
+	return made, nil
 }
 
 // RunRetention keeps partitions ahead of the head once the history is cut and, with a window, cuts it and drops
