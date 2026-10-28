@@ -292,15 +292,20 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		}
 	}
 
+	// address_stats before chain_counters, the writer's lock order.
+	forgotten, err := revertAddressStats(ctx, tx, number)
+	if err != nil {
+		return err
+	}
+
 	// chain_counters is maintained by the same delta discipline on the insert
 	// side and had the same gap on this path. All three counters the cascade
 	// invalidates are reverted together: compensating only transfers_total left
 	// blocks_total and transactions_total drifting, which is the same
 	// fix-one-site mistake one level up.
 	//
-	// addresses_total is untouched because address_stats has no foreign key
-	// into transactions, so the cascade does not reach it -- an address seen in
-	// a reverted block has still been seen.
+	// addresses_total drops by the address_stats rows the revert removed:
+	// addresses no remaining block has seen.
 	//
 	// tokens_total is not reverted: the tokens row outlives its creating
 	// block (migration 014 dropped tokens.creation_tx's cascade), so a token
@@ -325,15 +330,16 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		revertedBlocks = 1
 	}
 
-	if revertedBlocks|revertedTxs|revertedTransfers != 0 {
+	if revertedBlocks|revertedTxs|revertedTransfers|forgotten != 0 {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chain_counters (name, count, updated_at) VALUES
 				('blocks_total',       $1, NOW()),
 				('transactions_total', $2, NOW()),
-				('transfers_total',    $3, NOW())
+				('transfers_total',    $3, NOW()),
+				('addresses_total',    $4, NOW())
 			ON CONFLICT (name) DO UPDATE
 				SET count = GREATEST(chain_counters.count + EXCLUDED.count, 0), updated_at = NOW()`,
-			-revertedBlocks, -revertedTxs, -revertedTransfers); err != nil {
+			-revertedBlocks, -revertedTxs, -revertedTransfers, -forgotten); err != nil {
 			return err
 		}
 	}
