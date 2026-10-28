@@ -1014,7 +1014,7 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 }
 
 // CountTransfersByAddress returns address_stats.token_transfer_count: every transfer the address sent or received,
-// pruned history included. A self-transfer counts twice, once per side.
+// pruned history included. A self-transfer counts once, as migration 017 and the writer count it.
 func (d *DB) CountTransfersByAddress(ctx context.Context, address string) (int64, error) {
 	var total int64
 	err := d.pool.QueryRow(ctx, `

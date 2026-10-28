@@ -157,6 +157,12 @@ entity from one that never existed; while anything is pruned, the message ends w
 
 Lists that run into the watermark while paging (the feeds, `by_address` lists, deep offset pages) just end: no error.
 
+**With `PRUNED_LOOKUP=true`** a pruned target is served from the node instead: `GetBlock` by number or hash,
+`GetTransaction`, and `ListTransactions` `by_block` by number or hash, at or below the watermark, answer with the
+node's block or transaction, and the response carries the header `x-indexer-source: node`. When the node is busy or
+does not answer they return `Unavailable`. The other calls above still answer `OutOfRange`, `NotFound` or end as
+described.
+
 **Totals count pruned history**, from counters the writer keeps (never a `COUNT(*)` over retained rows):
 
 - `GetChainStats` totals, `GetAddress`, `BatchGetAddressTransactionCounts`, `GetToken`.

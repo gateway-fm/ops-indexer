@@ -66,7 +66,8 @@ func (d *DB) SaveRefillDay(ctx context.Context, r RefillDay) error {
 	return err
 }
 
-// SavedRefillDay is a checkpointed day, if any; full reports whether it has every optional part.
+// SavedRefillDay reports whether a day is checkpointed, and whether its checkpoint has the transaction bodies'
+// columns (bodies) and the receipts' columns (receipts).
 func (d *DB) SavedRefillDay(ctx context.Context, date time.Time) (saved, bodies, receipts bool, err error) {
 	var exists bool
 	if err := d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, DailyStatsRefillTable).Scan(&exists); err != nil || !exists {

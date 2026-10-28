@@ -162,8 +162,6 @@ func (d *DB) GetTotalMissingBlocks(ctx context.Context) (int64, error) {
 	return *total, err
 }
 
-// FindMissingBlocksInRange never reports a block below history_from(): those were pruned on purpose, and a gap
-// there would make catch-up fetch them back.
 // findMissingBlocksSQL lists the gaps in fromBlock..toBlock (from history_from() up) as ranges, highest first. Stored
 // blocks are excluded by an anti join on the primary key: NOT IN over a large range does not fit work_mem as a hash
 // and is re-run for every number.
@@ -184,6 +182,8 @@ const findMissingBlocksSQL = `
 		GROUP BY grp
 		ORDER BY from_num DESC`
 
+// FindMissingBlocksInRange never reports a block below history_from(): those were pruned on purpose, and a gap
+// there would make catch-up fetch them back.
 func (d *DB) FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]BlockRange, error) {
 	var ranges []BlockRange
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {

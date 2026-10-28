@@ -85,7 +85,7 @@ type ChainStats struct {
 	// Moving average over the last N blocks (N is indexer config).
 	AvgBlockTimeSeconds float32 `protobuf:"fixed32,7,opt,name=avg_block_time_seconds,json=avgBlockTimeSeconds,proto3" json:"avg_block_time_seconds,omitempty"`
 	AvgTxPerBlock       float32 `protobuf:"fixed32,8,opt,name=avg_tx_per_block,json=avgTxPerBlock,proto3" json:"avg_tx_per_block,omitempty"`
-	// Every block at or below it was pruned by the retention window (0: nothing pruned); history reads at or below it answer OUT_OF_RANGE; totals still count it.
+	// Every block at or below it was pruned by the retention window (0: nothing pruned); history reads at or below it answer OUT_OF_RANGE, or with PRUNED_LOOKUP on, blocks and transactions are served from the node; totals still count it.
 	PrunedThroughBlock uint64 `protobuf:"varint,9,opt,name=pruned_through_block,json=prunedThroughBlock,proto3" json:"pruned_through_block,omitempty"`
 	// Timestamp of pruned_through_block (unset: nothing pruned).
 	PrunedThroughTimestamp *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=pruned_through_timestamp,json=prunedThroughTimestamp,proto3" json:"pruned_through_timestamp,omitempty"`

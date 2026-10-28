@@ -748,8 +748,9 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 // ErrHistoryPruned refuses a recount of history that pruning has made partial.
 var ErrHistoryPruned = errors.New("history is pruned: a recount from the retained rows would drop the pruned counts")
 
-// RebuildAddressStats rebuilds address_stats after catchup completes, then recounts the days' address columns from it.
-// It refuses once anything was pruned.
+// RebuildAddressStats rebuilds address_stats from the stored history, then recounts the days' address columns from it.
+// It refuses once anything was pruned. The indexer no longer calls it (catch-up writes address_stats itself); it stays
+// as the tests' oracle for what the writer counts.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	if wm, _, err := d.PrunedThrough(ctx); err != nil {
 		return err

@@ -20,7 +20,7 @@ message ChainStats {
   float avg_block_time_seconds = 7;
   float avg_tx_per_block = 8;
 
-  // Every block at or below it was pruned by the retention window (0: nothing pruned); history reads at or below it answer OUT_OF_RANGE; totals still count it.
+  // Every block at or below it was pruned by the retention window (0: nothing pruned); history reads at or below it answer OUT_OF_RANGE, or with PRUNED_LOOKUP on, blocks and transactions are served from the node; totals still count it.
   uint64 pruned_through_block = 9;
   // Timestamp of pruned_through_block (unset: nothing pruned).
   google.protobuf.Timestamp pruned_through_timestamp = 10;
