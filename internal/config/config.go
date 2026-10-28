@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -279,6 +280,30 @@ func Load() (*Config, error) {
 // ever pruned (db.PruneFloorGap, prune_floor_gap()).
 const ReorgFloorBlocks = 12800
 
+// The retention and ledger minimums are derived for a chain of up to MaxChainBlocksPerSecond (100 ms blocks), with
+// catchUpHeadroom to spare: the ledger and the partitions keep ahead of such a chain ten times over, so a backlog
+// left by an outage shrinks at nine times the chain's rate instead of never.
+const (
+	MaxChainBlocksPerSecond = 10
+	catchUpHeadroom         = 10
+	// MinPollInterval bounds how often the retention pass and the ledger closer poll. Either finds work only once
+	// the head has moved by a span or a range, at least MinLedgerSpanBlocks(MinPollInterval) blocks; polling more
+	// often than once a second only reads the database for nothing.
+	MinPollInterval = time.Second
+	// partitionKeeperInterval is how often retention keeps partitions ahead of the head (the db package's
+	// ensureInterval).
+	partitionKeeperInterval = 10 * time.Second
+	// MinPartitionBlocks: the two partitions kept ahead of the head cover what the chain makes between two keeper
+	// checks, with the headroom: 2 x MinPartitionBlocks = 10 blocks/s x 10 x 10 s.
+	MinPartitionBlocks = MaxChainBlocksPerSecond * catchUpHeadroom * uint64(partitionKeeperInterval/time.Second) / 2
+)
+
+// MinLedgerSpanBlocks is the smallest LEDGER_SPAN_BLOCKS for a close interval: the closer closes one span per
+// interval, so a span must hold what the chain makes in one, with the headroom.
+func MinLedgerSpanBlocks(closeInterval time.Duration) uint64 {
+	return uint64(math.Ceil(MaxChainBlocksPerSecond * catchUpHeadroom * closeInterval.Seconds()))
+}
+
 func (c *Config) Validate() error {
 	if c.RPCURL == "" {
 		return fmt.Errorf("RPC_URL is required")
@@ -306,6 +331,26 @@ func (c *Config) Validate() error {
 	}
 	if c.LedgerSpanBlocks == 0 {
 		return fmt.Errorf("LEDGER_SPAN_BLOCKS must be greater than 0")
+	}
+	if c.PruneInterval < MinPollInterval {
+		return fmt.Errorf("PRUNE_INTERVAL=%s would run the retention pass back to back against the database: set it to at least %s",
+			c.PruneInterval, MinPollInterval)
+	}
+	if c.LedgerCloseInterval < MinPollInterval {
+		return fmt.Errorf("LEDGER_CLOSE_INTERVAL=%s would run the ledger closer back to back against the database: set it to at least %s",
+			c.LedgerCloseInterval, MinPollInterval)
+	}
+	if minSpan := MinLedgerSpanBlocks(c.LedgerCloseInterval); c.LedgerSpanBlocks < minSpan {
+		return fmt.Errorf("LEDGER_SPAN_BLOCKS=%d with LEDGER_CLOSE_INTERVAL=%s closes at most %.0f blocks/s, too slow to keep up with "+
+			"a chain of up to %d blocks/s with %dx headroom, and nothing is pruned while the ledger is behind: "+
+			"set LEDGER_SPAN_BLOCKS to at least %d, or shorten LEDGER_CLOSE_INTERVAL",
+			c.LedgerSpanBlocks, c.LedgerCloseInterval, float64(c.LedgerSpanBlocks)/c.LedgerCloseInterval.Seconds(),
+			MaxChainBlocksPerSecond, catchUpHeadroom, minSpan)
+	}
+	if c.PruneRetainBlocks > 0 && c.PartitionBlocks < MinPartitionBlocks {
+		return fmt.Errorf("PARTITION_BLOCKS=%d with retention on: two partitions are kept ahead of the head every %s, and partitions "+
+			"this small let a chain of up to %d blocks/s outrun them; set PARTITION_BLOCKS to at least %d",
+			c.PartitionBlocks, partitionKeeperInterval, MaxChainBlocksPerSecond, MinPartitionBlocks)
 	}
 	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
 		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+
