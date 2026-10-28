@@ -24,6 +24,10 @@ func nodeLookupErr(err error, op string) error {
 	if errors.Is(err, nodelookup.ErrBusy) {
 		return status.Error(codes.Unavailable, "pruned history: the node lookup is busy, retry later")
 	}
+	if errors.Is(err, nodelookup.ErrReceiptsUnavailable) {
+		slog.Warn("node lookup", "op", op, "error", err)
+		return status.Error(codes.Unavailable, "pruned history: the node has not returned this block's receipts, retry later")
+	}
 	slog.Error("node lookup", "op", op, "error", err)
 	return status.Errorf(codes.Unavailable, "pruned history: the node did not answer (%s)", op)
 }

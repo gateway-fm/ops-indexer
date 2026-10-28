@@ -17,11 +17,17 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 // ErrBusy: the lookup's node concurrency was taken for the whole request timeout.
 var ErrBusy = errors.New("node lookup: busy")
+
+// ErrReceiptsUnavailable: the node returned the block but not a receipt for each of its transactions (null, or a
+// partial list). The block is not served or cached: without its receipt a transaction's status, gas used, contract
+// address and categories are unknown.
+var ErrReceiptsUnavailable = errors.New("node lookup: block receipts unavailable")
 
 // Source is the node, as the lookup reads it. A missing block or transaction is (nil, nil) or found = false.
 type Source interface {
@@ -179,9 +185,29 @@ func (l *Lookup) fetch(ctx context.Context, number uint64) (*Block, error) {
 	if err != nil || raw == nil {
 		return nil, err
 	}
+	if missing := missingReceipts(raw, receipts); missing > 0 {
+		return nil, fmt.Errorf("%w: block %d, %d of %d transactions without a receipt",
+			ErrReceiptsUnavailable, number, missing, len(raw.Transactions))
+	}
 	b := MapBlock(raw, receipts)
 	l.store(b)
 	return b, nil
+}
+
+func missingReceipts(raw *rpc.RawBlock, receipts []*rpclient.Receipt) int {
+	have := make(map[common.Hash]bool, len(receipts))
+	for _, r := range receipts {
+		if r != nil {
+			have[r.TxHash] = true
+		}
+	}
+	missing := 0
+	for _, tx := range raw.Transactions {
+		if !have[tx.Hash] {
+			missing++
+		}
+	}
+	return missing
 }
 
 // withSlot runs fn with one of the node slots, within the request timeout; a slot not free in that time is ErrBusy.
