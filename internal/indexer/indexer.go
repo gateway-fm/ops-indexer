@@ -823,6 +823,11 @@ func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, erro
 			continue
 		}
 		chainHash, err := i.rpc.RawBlockHash(ctx, n)
+		if errors.Is(err, rpc.ErrBlockNotAvailable) {
+			log.Warn("the node does not have a stored block yet; the reorg checks compare it once the node serves it",
+				"block", n)
+			continue
+		}
 		if err != nil {
 			return top, fmt.Errorf("check the stored block %d against the chain: %w", n, err)
 		}
