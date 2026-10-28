@@ -194,6 +194,11 @@ func (m *MockDatabase) FindMissingBlocksInRange(ctx context.Context, fromBlock, 
 	return args.Get(0).([]db.BlockRange), args.Error(1)
 }
 
+func (m *MockDatabase) AdvanceMissingRange(ctx context.Context, r db.BlockRange, next uint64) error {
+	args := m.Called(ctx, r, next)
+	return args.Error(0)
+}
+
 func (m *MockDatabase) SaveMissingRanges(ctx context.Context, ranges []db.BlockRange) error {
 	args := m.Called(ctx, ranges)
 	return args.Error(0)

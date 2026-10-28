@@ -109,6 +109,25 @@ func (d *DB) DeleteMissingRangeByBlock(ctx context.Context, blockNumber uint64) 
 	return err
 }
 
+// AdvanceMissingRange records that the blocks of r below next are stored, in one transaction: the row starts at next,
+// or goes when next is past its end or the rest is already recorded on its own. A failure leaves r recorded whole,
+// never part of it lost.
+func (d *DB) AdvanceMissingRange(ctx context.Context, r BlockRange, next uint64) error {
+	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if next <= r.ToNumber {
+			tag, err := tx.Exec(ctx, `
+				UPDATE missing_block_ranges SET from_number = $2
+				WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM missing_block_ranges WHERE from_number = $2 AND to_number = $3)`,
+				r.ID, next, r.ToNumber)
+			if err != nil || tag.RowsAffected() > 0 {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM missing_block_ranges WHERE id = $1`, r.ID)
+		return err
+	})
+}
+
 // ShrinkMissingRange shrinks a range after processing a block.
 // If the processed block is in the middle, the range is split into two.
 func (d *DB) ShrinkMissingRange(ctx context.Context, id int, processedBlock uint64) error {

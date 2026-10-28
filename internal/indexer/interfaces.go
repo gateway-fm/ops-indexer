@@ -46,6 +46,7 @@ type Database interface {
 	UpdateIndexerProgress(ctx context.Context, minBlock, maxBlock uint64, backfillComplete bool) error
 	FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]db.BlockRange, error)
 	SaveMissingRanges(ctx context.Context, ranges []db.BlockRange) error
+	AdvanceMissingRange(ctx context.Context, r db.BlockRange, next uint64) error
 
 	GetAllTokenAddresses(ctx context.Context) ([]string, error)
 	InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 )
 
@@ -49,14 +48,12 @@ func (i *Indexer) retryMissing(ctx context.Context, lastIndexed uint64, receipts
 		if next == r.FromNumber {
 			return
 		}
-		if err := i.db.DeleteMissingRangeByBlock(ctx, r.FromNumber); err != nil {
-			log.Error("failed to remove indexed blocks from the missing ranges", "from", r.FromNumber, "to", next-1, "error", err)
+		if err := i.db.AdvanceMissingRange(ctx, r, next); err != nil {
+			log.Error("failed to record the indexed start of a missing range; it stays recorded whole",
+				"from", r.FromNumber, "indexed_to", next-1, "to", r.ToNumber, "error", err)
 			return
 		}
 		if next <= r.ToNumber {
-			if err := i.db.SaveMissingRanges(ctx, []db.BlockRange{{FromNumber: next, ToNumber: r.ToNumber}}); err != nil {
-				log.Error("failed to record the rest of a missing range", "from", next, "to", r.ToNumber, "error", err)
-			}
 			return
 		}
 		log.Info("indexed blocks recorded as missing", "from", r.FromNumber, "to", r.ToNumber)
