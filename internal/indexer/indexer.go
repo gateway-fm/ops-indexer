@@ -826,10 +826,13 @@ var startWaitInterval = 10 * time.Second
 // node serves every one, with a warning each interval and the count in indexer_start_waiting_blocks. Starting without
 // comparing them let catch-up build the next block on a stale one for good. Stored blocks above a node head that
 // stays below them for staleAboveHeadWait are reverted as stale; a block at or below the node's head the node never
-// serves (it lost it) keeps the start waiting.
+// serves (it lost it) keeps the start waiting. The revert above the node's head needs the latest head read to have
+// answered, with a head above 0: a head read that fails (a null or empty answer included) is retried, never taken as
+// a head below the stored one.
 func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChain uint64) (uint64, uint64, error) {
 	defer metrics.SetStartWaitingBlocks(0)
 	var belowSince time.Time
+	headRead := true
 	for lastIndexed > 0 {
 		var unserved []uint64
 		if top := min(lastIndexed, latestOnChain); top > 0 {
@@ -853,7 +856,7 @@ func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChai
 			belowSince = time.Time{}
 		} else if belowSince.IsZero() {
 			belowSince = time.Now()
-		} else if time.Since(belowSince) >= staleAboveHeadWait {
+		} else if headRead && latestOnChain > 0 && time.Since(belowSince) >= staleAboveHeadWait {
 			log.Warn("the node's head stayed below the stored head; reverting the stored blocks above it as stale",
 				"from", latestOnChain+1, "to", lastIndexed, "waited", staleAboveHeadWait)
 			if err := i.handleReorg(ctx, latestOnChain+1); err != nil {
@@ -874,7 +877,7 @@ func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChai
 		case <-time.After(startWaitInterval):
 		}
 		head, err := i.rpc.BlockNumber(ctx)
-		if err != nil {
+		if headRead = err == nil; !headRead {
 			log.Warn("failed to read the node head while waiting to start; retrying", "error", err)
 			continue
 		}

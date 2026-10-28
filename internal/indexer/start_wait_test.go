@@ -2,11 +2,16 @@ package indexer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,4 +211,54 @@ func TestStartRevertsStoredBlocksAboveANodeHeadThatStaysBelowThem(t *testing.T) 
 	require.Zero(t, countWhere(t, pool, `SELECT count(*) FROM address_stats WHERE address = $1`,
 		strings.ToLower(common.BytesToAddress(big.NewInt(0x1000+98).Bytes()).Hex())), "seen only in a reverted block")
 	require.Equal(t, derivedState(t, wantPool), derivedState(t, pool))
+}
+
+// nullHeadNode is a JSON-RPC node that serves blocks 1..90 with the stored hashes and answers eth_blockNumber with 90
+// once, then with null.
+func nullHeadNode(t *testing.T) *rpc.Client {
+	t.Helper()
+	var heads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		result := "null"
+		switch req.Method {
+		case "eth_blockNumber":
+			if heads.Add(1) == 1 {
+				result = `"0x5a"`
+			}
+		case "eth_getBlockByNumber":
+			var hex string
+			require.NoError(t, json.Unmarshal(req.Params[0], &hex))
+			n, err := strconv.ParseUint(strings.TrimPrefix(hex, "0x"), 16, 64)
+			require.NoError(t, err)
+			if n >= 1 && n <= 90 {
+				result = fmt.Sprintf(`{"number":%q,"hash":%q}`, hex, oldHash(n).Hex())
+			}
+		}
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, req.ID, result)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := rpc.New(srv.URL)
+	require.NoError(t, err)
+	return client
+}
+
+// A node whose head read answers null while the start waits (blocks 91..100 stored above its last head, 90) does not
+// make the stored chain look far ahead of a head of 0: the read is retried, and nothing is reverted however long it
+// lasts. Before, null decoded as head 0, and after staleAboveHeadWait the start deleted every stored block.
+func TestStartWaitRevertsNothingOnANullHead(t *testing.T) {
+	withShortStartWaits(t, 100*time.Millisecond)
+	store := newReorgStore(100, func() int { return 0 })
+	idx := NewWithConfig(store, nullHeadNode(t), 10*time.Millisecond, 0, &Config{RPCWorkers: 1, RPCRateLimit: 100})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, _, err := idx.checkStoredHead(ctx, 100, 90)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "still waiting for a head")
+	require.Empty(t, store.deletedBlocks())
 }

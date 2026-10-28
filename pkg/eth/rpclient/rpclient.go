@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -278,10 +279,19 @@ type Subscription interface {
 	Unsubscribe()
 }
 
+// BlockNumber is the node's head. A null or empty result is an error, not head 0: hexutil decodes both as 0, and a
+// head of 0 read from a node that answered nothing would make a stored chain look far ahead of it.
 func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
-	var result hexutil.Uint64
-	if err := c.CallContext(ctx, &result, "eth_blockNumber"); err != nil {
+	var raw json.RawMessage
+	if err := c.CallContext(ctx, &raw, "eth_blockNumber"); err != nil {
 		return 0, err
+	}
+	if s := strings.TrimSpace(string(raw)); s == "" || s == "null" || s == `""` || s == `"0x"` {
+		return 0, fmt.Errorf("eth_blockNumber returned %q, not a block number", s)
+	}
+	var result hexutil.Uint64
+	if err := result.UnmarshalJSON(raw); err != nil {
+		return 0, fmt.Errorf("eth_blockNumber: %w", err)
 	}
 	return uint64(result), nil
 }
