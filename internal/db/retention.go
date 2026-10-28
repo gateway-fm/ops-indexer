@@ -116,6 +116,70 @@ func (d *DB) EnsureHistoryPartitions(ctx context.Context, upto, sizeBlocks uint6
 	return made, nil
 }
 
+// coverHistoryFromZero gives a wiped database partitions from block 0 again: the ranges past the old watermark
+// are dropped without an archive (their rows are the wiped chain's), and ranges of the newest partition's size are
+// created below the lowest one left, each in its own transaction. Before the cut the legacy partition covers every
+// block, and nothing is done.
+func (d *DB) coverHistoryFromZero(ctx context.Context) error {
+	d.ensureMu.Lock()
+	defer d.ensureMu.Unlock()
+	rows, err := d.pool.Query(ctx, `
+		SELECT suffix, state FROM history_partitions WHERE state IN ('detaching', 'detached') ORDER BY lo NULLS FIRST`)
+	if err != nil {
+		return err
+	}
+	type pruned struct{ suffix, state string }
+	var ranges []pruned
+	for rows.Next() {
+		var p pruned
+		if err := rows.Scan(&p.suffix, &p.state); err != nil {
+			rows.Close()
+			return err
+		}
+		ranges = append(ranges, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range ranges {
+		if p.state == "detaching" {
+			if err := d.detachRange(ctx, p.suffix); err != nil {
+				return err
+			}
+		}
+		if err := d.dropRange(ctx, p.suffix); err != nil {
+			return err
+		}
+	}
+
+	var lowest, size *int64
+	var legacy bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT min(lo), COALESCE(bool_or(lo IS NULL), false),
+		       (SELECT hi - lo FROM history_partitions WHERE lo IS NOT NULL AND hi IS NOT NULL ORDER BY lo DESC LIMIT 1)
+		FROM history_partitions`).Scan(&lowest, &legacy, &size); err != nil {
+		return err
+	}
+	if legacy || lowest == nil || *lowest <= 0 || size == nil {
+		return nil
+	}
+	created := 0
+	for lo := int64(0); lo < *lowest; {
+		hi := lo + *size
+		if lo == 0 && *lowest%*size != 0 {
+			hi = *lowest % *size
+		}
+		if _, err := d.pool.Exec(ctx, `SELECT history_partition_create($1, $2)`, lo, hi); err != nil {
+			return fmt.Errorf("create the history partition from %d: %w", lo, err)
+		}
+		created++
+		lo = hi
+	}
+	log.Info("retention: history partitions created from block 0 after a wipe", "count", created, "below", *lowest)
+	return nil
+}
+
 // RunRetention keeps partitions ahead of the head once the history is cut and, with a window, cuts it and drops
 // whole ranges below the window. With RetainBlocks 0 on an uncut database it returns at once.
 func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {

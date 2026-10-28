@@ -2210,8 +2210,14 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 	return s, nil
 }
 
-// WipeAllData truncates all indexed tables, used for chain reset recovery.
+// WipeAllData truncates all indexed tables, used for chain reset recovery. It holds the history-DDL gate, so no
+// span closes and no range is detached or dropped while it runs.
 func (d *DB) WipeAllData(ctx context.Context) error {
+	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
+	if err != nil {
+		return err
+	}
+	defer release()
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we
 	// list child tables first for clarity.
@@ -2250,6 +2256,13 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"indexer_progress",
 		"missing_block_ranges",
 		"sync_status",
+		// The ledger's closed spans and the archive records describe the wiped chain. Left behind, every total
+		// would add the old chain's spans through prune_offsets, and a new range would count as archived already.
+		"ledger_address",
+		"ledger_token",
+		"ledger_chain",
+		"ledger_spans",
+		"history_archives",
 	}
 	for _, table := range tables {
 		if _, err := d.pool.Exec(ctx, "TRUNCATE TABLE "+table+" CASCADE"); err != nil {
@@ -2265,5 +2278,13 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"INSERT INTO indexer_progress (min_fetched_block, max_fetched_block, backfill_complete) VALUES (0, 0, false) ON CONFLICT DO NOTHING"); err != nil {
 		return fmt.Errorf("failed to re-seed indexer_progress: %w", err)
 	}
-	return nil
+	// Nothing of the new chain is pruned, and a refill or repair staged from the old chain must not be applied to it.
+	if _, err := d.pool.Exec(ctx,
+		"UPDATE prune_state SET pruned_through = 0, pruned_through_ts = 0, updated_at = now() WHERE id = 1"); err != nil {
+		return fmt.Errorf("failed to reset the prune watermark: %w", err)
+	}
+	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable); err != nil {
+		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
+	}
+	return d.coverHistoryFromZero(ctx)
 }

@@ -383,15 +383,15 @@ func (i *Indexer) publishProgressMetrics(ctx context.Context) {
 
 func (i *Indexer) Start(ctx context.Context) error {
 	// Blocks at or below the prune watermark are gone on purpose: gap counting, the missing-range collector
-	// and catch-up all start above it, or they would fetch the pruned history back.
+	// and catch-up all start above it, or they would fetch the pruned history back. A wipe resets the watermark,
+	// and the start block goes back to the configured one.
+	configuredStart := i.startBlock
 	if wm, _, err := i.db.PrunedThrough(ctx); err != nil {
 		return fmt.Errorf("read prune watermark: %w", err)
 	} else if wm > 0 && wm >= i.startBlock {
 		log.Info("starting above the prune watermark", "start_block", i.startBlock, "pruned_through", wm)
 		i.startBlock = wm + 1
 	}
-
-	go i.publishProgressMetrics(ctx)
 
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)
 	if err != nil {
@@ -455,6 +455,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 		if err := i.db.WipeAllData(ctx); err != nil {
 			return fmt.Errorf("failed to wipe data for reindex: %w", err)
 		}
+		i.startBlock = configuredStart
 		lastIndexed = 0
 		blockCount = 0
 		expectedBlocks = 0
@@ -507,6 +508,8 @@ func (i *Indexer) Start(ctx context.Context) error {
 			blocksToSync = latestOnChain - lastIndexed
 		}
 	}
+
+	go i.publishProgressMetrics(ctx)
 
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 	catchupThreshold := uint64(100)
