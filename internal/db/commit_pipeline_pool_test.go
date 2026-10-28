@@ -87,8 +87,7 @@ func withPoolSize(t *testing.T, d *DB, maxConns int) *DB {
 }
 
 // At the deepest COMMIT_PIPELINE the startup check allows, the pipeline commits every block even when the later
-// blocks take their connections first and the rest of the indexer holds all of its own. One connection fewer and
-// the first block never gets one: the hang the check refuses to start into.
+// blocks take their connections first and the rest of the indexer holds all of its own.
 func TestPipelineAtTheAllowedDepthCommitsWhenLaterBlocksTakeConnectionsFirst(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -102,16 +101,27 @@ func TestPipelineAtTheAllowedDepthCommitsWhenLaterBlocksTakeConnectionsFirst(t *
 		sep = "&"
 	}
 	cfg.DatabaseURL = d.pool.Config().ConnString() + sep + "pool_max_conns=" + strconv.Itoa(maxConns)
-	require.NoError(t, cfg.Validate(), "the depth under test must be the one the check allows")
+	require.NoError(t, cfg.CheckCommitPipeline(), "the depth under test must be the one the check allows")
 	cfg.CommitPipelineDepth++
-	require.Error(t, cfg.Validate(), "one block deeper must be refused")
+	require.Error(t, cfg.CheckCommitPipeline(), "one block deeper must be refused")
 	cfg.CommitPipelineDepth--
 
 	require.NoError(t, runPipelineWithLaterBlocksFirst(t, withPoolSize(t, d, maxConns), cfg.CommitPipelineDepth, beside))
 	var stored int
 	require.NoError(t, d.pool.QueryRow(context.Background(), `SELECT count(*) FROM blocks`).Scan(&stored))
 	require.Equal(t, cfg.CommitPipelineDepth, stored, "blocks committed")
+}
 
-	err := runPipelineWithLaterBlocksFirst(t, withPoolSize(t, d, maxConns-1), cfg.CommitPipelineDepth, beside)
-	require.True(t, errors.Is(err, context.DeadlineExceeded), "with one connection fewer the first block waits for one: %v", err)
+// A pipeline deeper than the pool stops for good: the later blocks take every connection and wait for the oldest to
+// commit, and the oldest never gets a connection to begin. As deep as the pool, with nothing else holding a
+// connection, it commits.
+func TestPipelineDeeperThanThePoolNeverBeginsTheOldestBlock(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	const maxConns = 4
+	err := runPipelineWithLaterBlocksFirst(t, withPoolSize(t, d, maxConns), maxConns+1, 0)
+	require.True(t, errors.Is(err, context.DeadlineExceeded), "the oldest block began with every connection taken: %v", err)
+
+	require.NoError(t, runPipelineWithLaterBlocksFirst(t, withPoolSize(t, d, maxConns), maxConns, 0))
 }

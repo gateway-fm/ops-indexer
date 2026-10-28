@@ -241,7 +241,10 @@ func (c *Config) Validate() error {
 	if c.RPCRateLimit <= 0 {
 		return fmt.Errorf("RPC_RATE_LIMIT must be greater than 0")
 	}
-	if err := c.validateCommitPipeline(); err != nil {
+	if c.BalanceWorkers < 0 {
+		return fmt.Errorf("BALANCE_WORKERS must not be negative")
+	}
+	if err := c.CheckCommitPipeline(); err != nil {
 		return err
 	}
 	if c.EnableOPDeposits {
@@ -255,7 +258,9 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func (c *Config) validateCommitPipeline() error {
+// CheckCommitPipeline refuses a COMMIT_PIPELINE deeper than the pool's maximum connections minus the ones kept for the
+// rest of the indexer (ConnectionsBesidePipeline).
+func (c *Config) CheckCommitPipeline() error {
 	if c.CommitPipelineDepth <= 1 {
 		return nil
 	}
@@ -267,12 +272,17 @@ func (c *Config) validateCommitPipeline() error {
 	if c.CommitPipelineDepth <= maxConns-beside {
 		return nil
 	}
-	return fmt.Errorf("COMMIT_PIPELINE=%d needs %d database connections: one per open block write and %d for the rest of "+
-		"the indexer (BALANCE_WORKERS=%d balance flushes when ENABLE_ASYNC_BALANCE is true, the daily statistics advance "+
-		"and the progress reads); the pool has %d (pool_max_conns in DATABASE_URL, default the larger of 4 and the CPU "+
-		"count). Raise pool_max_conns to %d or more, lower BALANCE_WORKERS, or set COMMIT_PIPELINE to at most %d",
-		c.CommitPipelineDepth, c.CommitPipelineDepth+beside, beside, c.BalanceWorkers, maxConns,
-		c.CommitPipelineDepth+beside, max(1, maxConns-beside))
+	balanceFlushes, lowerBalanceWorkers := "", ""
+	if c.EnableAsyncBalance {
+		balanceFlushes = fmt.Sprintf("BALANCE_WORKERS=%d balance flushes, ", c.BalanceWorkers)
+		lowerBalanceWorkers = "lower BALANCE_WORKERS, "
+	}
+	return fmt.Errorf("COMMIT_PIPELINE=%d leaves the rest of the indexer too few database connections: the pool has %d "+
+		"(pool_max_conns in DATABASE_URL, default the larger of 4 and the CPU count), the open block writes can hold %d, "+
+		"and %d more are kept for %sthe daily statistics advance and the progress reads, so they are not starved "+
+		"while the pipeline is full. Raise pool_max_conns to %d or more, %sor set COMMIT_PIPELINE to at most %d",
+		c.CommitPipelineDepth, maxConns, c.CommitPipelineDepth, beside, balanceFlushes,
+		c.CommitPipelineDepth+beside, lowerBalanceWorkers, max(1, maxConns-beside))
 }
 
 // ConnectionsBesidePipeline is how many database connections the rest of the indexer can hold while the standard
