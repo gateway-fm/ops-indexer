@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
@@ -16,9 +17,13 @@ var errReceiptsUnavailable = errors.New("receipts unavailable")
 // cannot be fetched before recording it in missing_block_ranges and moving past it.
 const maxReceiptAttempts = 10
 
+// defaultMissingRetryInterval is how often the standard loop retries the blocks it recorded as missing.
+const defaultMissingRetryInterval = 10 * time.Second
+
 // receiptSkip lets a head loop move past a block whose receipts the node never returns, instead
 // of stopping ingest at that block. The block is skipped only once it is recorded in
-// missing_block_ranges, where catch-up keeps retrying it; any other error still stops the loop.
+// missing_block_ranges, where catch-up, or in standard mode the loop itself (retryMissing), keeps retrying it; any
+// other error still stops the loop.
 type receiptSkip struct {
 	block    uint64
 	attempts int
@@ -26,6 +31,8 @@ type receiptSkip struct {
 	// checked against skippedHash when it starts there.
 	skipped     uint64
 	skippedHash common.Hash
+	// recorded is set when a block is recorded as missing, until the standard loop's retry finds none left.
+	recorded bool
 }
 
 func (s *receiptSkip) skip(ctx context.Context, d Database, blockNum uint64, err error) bool {
@@ -43,8 +50,9 @@ func (s *receiptSkip) skip(ctx context.Context, d Database, blockNum uint64, err
 		log.Error("failed to record block with unavailable receipts as missing; retrying it", "block", blockNum, "error", requeueErr)
 		return false
 	}
-	log.Error("receipts still unavailable; block recorded as missing and skipped, catch-up retries it",
+	log.Error("receipts still unavailable; block recorded as missing and skipped, to be retried",
 		"block", blockNum, "attempts", s.attempts, "error", err)
 	s.attempts = 0
+	s.recorded = true
 	return true
 }

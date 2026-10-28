@@ -80,6 +80,10 @@ type Indexer struct {
 	pollInterval time.Duration
 	startBlock   uint64
 
+	// missingRetryInterval is how often the standard loop retries the blocks it recorded as missing (retryMissing).
+	missingRetryInterval time.Duration
+	missingRetryAt       time.Time
+
 	indexRequests chan indexRequest
 	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
 	onIndexed func(uint64)
@@ -248,15 +252,16 @@ func New(database Database, rpcClient RPCClient, pollInterval time.Duration, sta
 
 func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Duration, startBlock uint64, cfg *Config) *Indexer {
 	idx := &Indexer{
-		db:            database,
-		rpc:           rpcClient,
-		pollInterval:  pollInterval,
-		startBlock:    startBlock,
-		indexRequests: make(chan indexRequest, 100),
-		config:        cfg,
-		tokenCache:    NewTokenCache(),
-		contractCache: NewContractCache(),
-		dailyStats:    &dailyStatsThrottle{},
+		db:                   database,
+		rpc:                  rpcClient,
+		pollInterval:         pollInterval,
+		startBlock:           startBlock,
+		missingRetryInterval: defaultMissingRetryInterval,
+		indexRequests:        make(chan indexRequest, 100),
+		config:               cfg,
+		tokenCache:           NewTokenCache(),
+		contractCache:        NewContractCache(),
+		dailyStats:           &dailyStatsThrottle{},
 	}
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
@@ -690,7 +695,8 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 
 	ticker := time.NewTicker(i.pollInterval)
 	defer ticker.Stop()
-	var receipts receiptSkip
+	receipts := receiptSkip{recorded: true}
+	i.missingRetryAt = time.Now().Add(i.missingRetryInterval)
 
 	for {
 		select {
@@ -713,6 +719,7 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 			}
 
 			lastIndexed = i.standardTick(ctx, lastIndexed, latestOnChain, &receipts)
+			i.retryMissing(ctx, lastIndexed, &receipts)
 		}
 	}
 }
