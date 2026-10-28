@@ -191,3 +191,45 @@ func TestRangeDetachGivesUpOnALongReaderAndFinishesLater(t *testing.T) {
 		require.False(t, exists, "%s_legacy dropped", tbl)
 	}
 }
+
+// A view or a foreign key outside the indexer that depends on a range's tables (one created on a history table
+// before it was partitioned stays on <table>_legacy) keeps that range on disk, whole and detached, until it is gone;
+// the ranges after it are still pruned and dropped.
+func TestRangeWithDependentObjectsIsKeptAndLaterRangesGo(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	_, err := d.pool.Exec(ctx, `
+		CREATE VIEW consumer_txs AS SELECT hash, block_number FROM transactions_legacy;
+		CREATE TABLE consumer_notes (tx TEXT REFERENCES transactions_legacy (hash), note TEXT)`)
+	require.NoError(t, err)
+	cfg := legacyPastTheWatermark(t, d)
+
+	finished, err := d.finishDetached(ctx, cfg)
+	require.NoError(t, err, "dependent objects are not a failure of the pass")
+	require.True(t, finished, "a range kept for its dependents does not hold up the ranges after it")
+	for _, tbl := range HistoryTables {
+		var exists bool
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, tbl+"_legacy").Scan(&exists))
+		require.True(t, exists, "%s_legacy is kept whole", tbl)
+	}
+	require.Contains(t, partitionRanges(t, d), "legacy:44001:detached")
+
+	seedHistory(t, d, 80_002, 100_001, 1)
+	closeLedger(t, d)
+	require.NoError(t, d.retentionPass(ctx, cfg))
+	wm, _, err := d.PrunedThrough(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(80_000), wm, "pruning goes on past the kept range")
+	var exists bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('transactions_p44001') IS NOT NULL`).Scan(&exists))
+	require.False(t, exists, "a later range is dropped")
+
+	_, err = d.pool.Exec(ctx, `DROP VIEW consumer_txs; DROP TABLE consumer_notes`)
+	require.NoError(t, err)
+	finished, err = d.finishDetached(ctx, cfg)
+	require.NoError(t, err)
+	require.True(t, finished)
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass('transactions_legacy') IS NOT NULL`).Scan(&exists))
+	require.False(t, exists, "the range goes once nothing depends on it")
+}

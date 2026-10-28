@@ -131,6 +131,11 @@ With `PRUNE_RETAIN_BLOCKS` set (0 = off, the default), the indexer keeps only th
 transactions, logs, token transfers, internal transactions, balance history) below its head and drops older ranges.
 Current state (addresses, tokens, holders, balances, NFT inventory, contracts, daily stats) is never pruned.
 
+Reading the history tables with SQL: since migration 014 each is partitioned by block, and a view or foreign key
+created on one before 014 is bound to its first partition, `<table>_legacy`. From the first cut on such a view sees
+no new block, and retention keeps the legacy range on disk, detached, while anything depends on it: it logs the
+objects, at the cut and at every pass. Re-create them on `<table>` and the next pass drops the range.
+
 `GetChainStats` reports the watermark: `pruned_through_block` is the newest pruned block (every block at or below it
 is gone; 0 = nothing pruned) and `pruned_through_timestamp` its timestamp (unset when nothing is pruned). With nothing
 pruned, every call behaves as before.

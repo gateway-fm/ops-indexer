@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -327,6 +328,13 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	}
 	cutAt := base + 2*cfg.PartitionBlocks + d.cutMargin
 	log.Info("retention: cutting the legacy partitions", "head", head, "node_head", base, "cut_at", cutAt, "extra_margin", d.cutMargin)
+	if deps, err := d.rangeDependents(ctx, "legacy"); err != nil {
+		return err
+	} else if len(deps) > 0 {
+		log.Warn("retention: objects outside the indexer read the legacy partitions, not the partitioned tables: from the cut "+
+			"on they see no new block, and once the legacy range is pruned they keep it on disk; re-create them on the partitioned tables",
+			"cut_at", cutAt, "dependents", strings.Join(deps, "; "))
+	}
 
 	start := time.Now()
 	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
@@ -702,11 +710,56 @@ func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) (finished 
 				return false, fmt.Errorf("archive %s: %w", p.suffix, err)
 			}
 		}
-		if ok, err := underGate("drop", p.suffix, func() error { return d.dropRange(ctx, p.suffix, readersWait) }); err != nil || !ok {
+		ok, err := underGate("drop", p.suffix, func() error { return d.dropRange(ctx, p.suffix, readersWait) })
+		if errors.Is(err, errRangeHasDependents) {
+			// Detached, the range holds nothing ingest or the API reads: the ranges after it go on.
+			log.Error("retention: a detached range stays on disk because objects outside the indexer depend on its tables; "+
+				"drop them, or re-create them on the partitioned tables, and the next pass drops it", "range", p.suffix, "error", err)
+			continue
+		}
+		if err != nil || !ok {
 			return false, err
 		}
 	}
 	return true, nil
+}
+
+// errRangeHasDependents: objects outside the indexer depend on a range's tables, so they cannot be dropped.
+var errRangeHasDependents = errors.New("objects outside the indexer depend on the range's tables")
+
+// historyDependents lists the objects that Postgres would refuse to drop table for: views that read it and foreign
+// keys that reference it, which consumers made on the history tables before they were partitioned, and any other.
+// The table's own constraints, such as the bound DETACH CONCURRENTLY adds, are not among them.
+func (d *DB) historyDependents(ctx context.Context, table string) ([]string, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT DISTINCT COALESCE(
+		           (SELECT 'view ' || r.ev_class::regclass::text FROM pg_rewrite r
+		            WHERE d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid),
+		           pg_describe_object(d.classid, d.objid, d.objsubid))
+		FROM pg_depend d
+		WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = to_regclass($1) AND d.deptype = 'n'
+		  AND NOT EXISTS (SELECT 1 FROM pg_constraint c
+		                  WHERE d.classid = 'pg_constraint'::regclass AND c.oid = d.objid AND c.conrelid = d.refobjid)
+		ORDER BY 1`, table)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// rangeDependents is historyDependents for every table of a range, each prefixed with its table.
+func (d *DB) rangeDependents(ctx context.Context, suffix string) ([]string, error) {
+	var all []string
+	for _, t := range HistoryTables {
+		deps, err := d.historyDependents(ctx, t+"_"+suffix)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			all = append(all, t+"_"+suffix+": "+dep)
+		}
+	}
+	return all, nil
 }
 
 // errRangeReadersBusy: a detach or a drop waited for the readers of a range's tables past its wait.
@@ -773,6 +826,11 @@ func (d *DB) detachRange(ctx context.Context, suffix string, wait time.Duration)
 // archiving on, archiveRange has recorded each one first.
 func (d *DB) dropRange(ctx context.Context, suffix string, wait time.Duration) error {
 	start := time.Now()
+	if deps, err := d.rangeDependents(ctx, suffix); err != nil {
+		return err
+	} else if len(deps) > 0 {
+		return fmt.Errorf("%w: %s", errRangeHasDependents, strings.Join(deps, "; "))
+	}
 	for _, t := range HistoryTables {
 		if err := d.execWithin(ctx, wait, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, pgx.Identifier{t + "_" + suffix}.Sanitize())); err != nil {
 			return fmt.Errorf("drop %s_%s: %w", t, suffix, err)
