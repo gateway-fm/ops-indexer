@@ -206,3 +206,42 @@ func TestIndexPrefetchedStopsWhenTheFirstBlockDoesNotExtendTheStoredHead(t *test
 		mockDB.AssertNotCalled(t, "InsertBlock", mock.Anything, mock.Anything)
 	}
 }
+
+// A block whose receipts never come is checked against the block before it first. One from a reorged fork is not
+// recorded as missing and moved past, which would make it the parent of the blocks indexed after it; the loop stops
+// there, as for any block that does not extend the last one.
+func TestPrefetchDoesNotSkipABlockFromAnotherForkWhoseReceiptsNeverCome(t *testing.T) {
+	for _, pipelined := range []bool{false, true} {
+		t.Run(map[bool]string{false: "serial", true: "pipelined"}[pipelined], func(t *testing.T) {
+			mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+			blocks := chainOfEmptyBlocks(1, 6)
+			blocks[3].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{3})}}
+			blocks[3].ParentHash = common.BytesToHash([]byte{0xf0, 0x2c})
+			for n, b := range blocks {
+				mockRPC.On("RawBlockByNumber", mock.Anything, n).Return(b, nil).Maybe()
+			}
+			mockRPC.On("FetchReceiptsBatch", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return(map[common.Hash]*rpclient.Receipt(nil), errors.New("receipts not found"))
+			mockDB.On("InsertBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockDB.On("RequeueMissingBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockDB.On("GetBlock", mock.Anything, uint64(2)).Return(&types.Block{Number: 2, Hash: blocks[2].Hash.Hex()}, nil)
+			idx := newPrefetchIndexer(mockDB, mockRPC)
+
+			var skip receiptSkip
+			for attempt := 1; attempt <= maxReceiptAttempts+1; attempt++ {
+				var last uint64
+				if pipelined {
+					last = idx.indexPipelined(context.Background(), 2, 6, 2, &skip)
+				} else {
+					last = idx.indexPrefetched(context.Background(), 2, 6, &skip)
+				}
+				if last != 2 {
+					t.Fatalf("attempt %d: last indexed %d, want 2: block 3's parent is not the stored block 2", attempt, last)
+				}
+			}
+			mockDB.AssertNotCalled(t, "RequeueMissingBlock", mock.Anything, mock.Anything)
+			mockDB.AssertNotCalled(t, "InsertBlock", mock.Anything, mock.Anything)
+		})
+	}
+}

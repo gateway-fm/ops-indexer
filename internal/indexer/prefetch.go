@@ -80,7 +80,8 @@ func (i *Indexer) storedHash(ctx context.Context, number uint64) common.Hash {
 // It stops at the first failure, as the sequential loop did, and leaves the rest to the next tick.
 // A prefetched block whose parent is not the block just committed was read before a reorg; it is
 // discarded unwritten, and the next tick's detectReorg sees the chain as it is then.
-// A block whose receipts never come is moved past once receipts records it as missing (receipt_skip.go).
+// A block whose receipts never come is moved past once receipts records it as missing (receipt_skip.go), and only
+// if it extends the block before it.
 func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint64, receipts *receiptSkip) uint64 {
 	if latest <= lastIndexed {
 		return lastIndexed
@@ -97,6 +98,11 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 		}
 
 		b := <-slot
+		if b.raw != nil && prevHash != (common.Hash{}) && b.raw.ParentHash != prevHash {
+			log.Warn("prefetched block does not extend the block just indexed, refetching on the next tick",
+				"block", b.number, "parent", b.raw.ParentHash.Hex(), "previous", prevHash.Hex())
+			return lastIndexed
+		}
 		if b.err != nil {
 			log.Error("failed to process block", "block", b.number, "error", b.err)
 			if b.raw == nil || !receipts.skip(ctx, i.db, b.number, b.err) {
@@ -104,11 +110,6 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
 			continue
-		}
-		if prevHash != (common.Hash{}) && b.raw.ParentHash != prevHash {
-			log.Warn("prefetched block does not extend the block just indexed, refetching on the next tick",
-				"block", b.number, "parent", b.raw.ParentHash.Hex(), "previous", prevHash.Hex())
-			return lastIndexed
 		}
 
 		var err error
@@ -211,6 +212,11 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		}
 
 		b := <-slot
+		if b.raw != nil && prevHash != (common.Hash{}) && b.raw.ParentHash != prevHash {
+			log.Warn("prefetched block does not extend the block before it, refetching on the next tick",
+				"block", b.number, "parent", b.raw.ParentHash.Hex(), "previous", prevHash.Hex())
+			break
+		}
 		if b.err != nil {
 			log.Error("failed to process block", "block", b.number, "error", b.err)
 			// A block whose receipts never come is moved past once recorded as missing (receipt_skip.go), after
@@ -220,11 +226,6 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
 			continue
-		}
-		if prevHash != (common.Hash{}) && b.raw.ParentHash != prevHash {
-			log.Warn("prefetched block does not extend the block before it, refetching on the next tick",
-				"block", b.number, "parent", b.raw.ParentHash.Hex(), "previous", prevHash.Hex())
-			break
 		}
 		prevHash = b.raw.Hash
 
