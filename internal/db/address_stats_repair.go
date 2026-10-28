@@ -49,8 +49,16 @@ const ledgerAddressRowsSQL = `
 // AddressStatsRepairTable holds the corrections a repair has staged and not applied yet.
 const AddressStatsRepairTable = "address_stats_repair"
 
+// addressStatsRepairTotalTable holds how many corrections were staged and how many are applied, so a repair is done
+// only when every staged correction was applied.
+const addressStatsRepairTotalTable = "address_stats_repair_total"
+
 // ErrAddressStatsRepairPending: corrections are staged and not all applied; apply them before staging again.
 var ErrAddressStatsRepairPending = errors.New("a staged address_stats repair is not applied yet")
+
+// ErrAddressStatsRepairLost: staged corrections disappeared before they were applied (an unlogged staging table from
+// an earlier build emptied by a crash or a failover, or one dropped by hand). The stage is removed; stage again.
+var ErrAddressStatsRepairLost = errors.New("staged address_stats corrections were lost before they were applied")
 
 // AddressStatsRepairStage describes what a staged repair changes.
 type AddressStatsRepairStage struct {
@@ -91,7 +99,8 @@ func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressSta
 		}
 		if !dry {
 			var pending bool
-			if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&pending); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL OR to_regclass($2) IS NOT NULL`,
+				table, addressStatsRepairTotalTable).Scan(&pending); err != nil {
 				return err
 			}
 			if pending {
@@ -103,7 +112,7 @@ func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressSta
 			Scan(&stage.LedgerClosedBelow, &stage.Head); err != nil {
 			return err
 		}
-		create := `CREATE UNLOGGED TABLE ` + table
+		create := `CREATE TABLE ` + table
 		if dry {
 			create = `CREATE TEMP TABLE ` + table
 		}
@@ -140,6 +149,14 @@ func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressSta
 			       (SELECT count(*) FROM address_stats a WHERE NOT EXISTS (SELECT 1 FROM address_stats_expected e WHERE e.address = a.address))`).
 			Scan(&stage.Changes, &stage.Missing, &stage.Untouched); err != nil {
 			return err
+		}
+		if !dry {
+			if _, err := tx.Exec(ctx, `CREATE TABLE `+addressStatsRepairTotalTable+` (staged BIGINT NOT NULL, applied BIGINT NOT NULL)`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO `+addressStatsRepairTotalTable+` VALUES ($1, 0)`, stage.Changes); err != nil {
+				return err
+			}
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT address, txs, internal, transfers, first_seen, last_seen, missing FROM `+table+`
@@ -178,16 +195,25 @@ var errDryRun = errors.New("dry run")
 // resumes at the next batch and never applies one twice. Counters move by the correction, first_seen and last_seen
 // only outward; a row that did not exist is created (is_contract from contracts) and counted in addresses_total.
 // The staging table is dropped with the last batch, which also recounts the days' address columns from the repaired
-// address_stats, under daily_stats_advance's lock: the repair moves first_seen and adds addresses.
+// address_stats, under daily_stats_advance's lock: the repair moves first_seen and adds addresses. The last batch
+// first checks that every staged correction was applied; if any is missing it removes the stage and returns
+// ErrAddressStatsRepairLost instead of done, and the repair is staged again.
 func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (applied, created int, done bool, err error) {
+	var lost error
 	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, AddressStatsRepairTable).Scan(&exists); err != nil {
+		var exists, totalled bool
+		if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL, to_regclass($2) IS NOT NULL`,
+			AddressStatsRepairTable, addressStatsRepairTotalTable).Scan(&exists, &totalled); err != nil {
 			return err
 		}
-		if !exists {
+		if !exists && !totalled {
 			done = true
 			return nil
+		}
+		if !exists {
+			lost = fmt.Errorf("%w: the staging table is gone", ErrAddressStatsRepairLost)
+			_, err := tx.Exec(ctx, `DROP TABLE `+addressStatsRepairTotalTable)
+			return err
 		}
 		if err := tx.QueryRow(ctx, `
 			WITH next AS (
@@ -214,18 +240,46 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 			SELECT count(*), count(*) FILTER (WHERE created) FROM applied`, batch).Scan(&applied, &created); err != nil {
 			return err
 		}
-		if applied == 0 {
-			done = true
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
+		if applied > 0 {
+			if totalled {
+				_, err := tx.Exec(ctx, `UPDATE `+addressStatsRepairTotalTable+` SET applied = applied + $1`, applied)
 				return err
 			}
-			if err := recountDailyAddressColumns(ctx, tx); err != nil {
+			return nil
+		}
+		var staged, appliedSoFar int64 = -1, 0
+		if totalled {
+			if err := tx.QueryRow(ctx, `SELECT staged, applied FROM `+addressStatsRepairTotalTable).Scan(&staged, &appliedSoFar); err != nil &&
+				!errors.Is(err, pgx.ErrNoRows) {
 				return err
 			}
-			_, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable)
+		}
+		if staged != appliedSoFar {
+			lost = fmt.Errorf("%w: %d staged, %d applied", ErrAddressStatsRepairLost, staged, appliedSoFar)
+			if staged < 0 {
+				lost = fmt.Errorf("%w: the stage has no recorded total, so whether it was all applied is unknown", ErrAddressStatsRepairLost)
+			}
+			if _, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+addressStatsRepairTotalTable)
 			return err
 		}
-		return nil
+		done = true
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
+			return err
+		}
+		if err := recountDailyAddressColumns(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DROP TABLE `+addressStatsRepairTotalTable)
+		return err
 	})
+	if err == nil && lost != nil {
+		err = lost
+	}
 	return applied, created, done, err
 }
