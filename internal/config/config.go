@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/viper"
 )
 
@@ -240,6 +241,9 @@ func (c *Config) Validate() error {
 	if c.RPCRateLimit <= 0 {
 		return fmt.Errorf("RPC_RATE_LIMIT must be greater than 0")
 	}
+	if err := c.validateCommitPipeline(); err != nil {
+		return err
+	}
 	if c.EnableOPDeposits {
 		if c.L1RPCURL == "" {
 			return fmt.Errorf("L1_RPC_URL is required when ENABLE_OP_DEPOSITS is true")
@@ -249,6 +253,37 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *Config) validateCommitPipeline() error {
+	if c.CommitPipelineDepth <= 1 {
+		return nil
+	}
+	pool, err := pgxpool.ParseConfig(c.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("DATABASE_URL: %w", err)
+	}
+	maxConns, beside := int(pool.MaxConns), c.ConnectionsBesidePipeline()
+	if c.CommitPipelineDepth <= maxConns-beside {
+		return nil
+	}
+	return fmt.Errorf("COMMIT_PIPELINE=%d needs %d database connections: one per open block write and %d for the rest of "+
+		"the indexer (BALANCE_WORKERS=%d balance flushes when ENABLE_ASYNC_BALANCE is true, the daily statistics advance "+
+		"and the progress reads); the pool has %d (pool_max_conns in DATABASE_URL, default the larger of 4 and the CPU "+
+		"count). Raise pool_max_conns to %d or more, lower BALANCE_WORKERS, or set COMMIT_PIPELINE to at most %d",
+		c.CommitPipelineDepth, c.CommitPipelineDepth+beside, beside, c.BalanceWorkers, maxConns,
+		c.CommitPipelineDepth+beside, max(1, maxConns-beside))
+}
+
+// ConnectionsBesidePipeline is how many database connections the rest of the indexer can hold while the standard
+// loop has COMMIT_PIPELINE block writes open.
+func (c *Config) ConnectionsBesidePipeline() int {
+	balanceFlushes := 0
+	if c.EnableAsyncBalance {
+		balanceFlushes = c.BalanceWorkers
+	}
+	const dailyStatsAdvance, progressReads = 1, 1
+	return balanceFlushes + dailyStatsAdvance + progressReads
 }
 
 func (c *Config) String() string {
