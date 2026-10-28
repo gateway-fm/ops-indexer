@@ -10,13 +10,17 @@ import (
 
 const watermarkTTL = 5 * time.Second
 
-// watermark caches the prune watermark. It only ever increases, so a stale value errs towards serving a
-// just-pruned block as not-found; handlers refresh it once when an explicit target comes back missing.
+// watermark caches the prune watermark; handlers refresh it once when an explicit target comes back missing. It
+// follows the stored value both ways, since FORCE_REINDEX's wipe sets it back to 0. Of concurrent refreshes the one
+// that started last wins: it read the watermark at least as late as any other, while a read that started earlier
+// and finished later could be from before a prune.
 type watermark struct {
 	mu        sync.Mutex
 	through   uint64
 	timestamp int64
 	readAt    time.Time
+	started   uint64
+	applied   uint64
 }
 
 func (s *Server) prunedThrough(ctx context.Context) (uint64, int64, error) {
@@ -30,6 +34,10 @@ func (s *Server) prunedThrough(ctx context.Context) (uint64, int64, error) {
 }
 
 func (s *Server) refreshPrunedThrough(ctx context.Context) (uint64, int64, error) {
+	s.watermark.mu.Lock()
+	s.watermark.started++
+	read := s.watermark.started
+	s.watermark.mu.Unlock()
 	through, ts, err := s.db.PrunedThrough(ctx)
 	if err != nil {
 		slog.Error("read prune watermark", "error", err)
@@ -37,10 +45,10 @@ func (s *Server) refreshPrunedThrough(ctx context.Context) (uint64, int64, error
 	}
 	s.watermark.mu.Lock()
 	defer s.watermark.mu.Unlock()
-	if through >= s.watermark.through {
-		s.watermark.through, s.watermark.timestamp = through, ts
+	if read > s.watermark.applied {
+		s.watermark.through, s.watermark.timestamp, s.watermark.applied = through, ts, read
+		s.watermark.readAt = time.Now()
 	}
-	s.watermark.readAt = time.Now()
 	return s.watermark.through, s.watermark.timestamp, nil
 }
 

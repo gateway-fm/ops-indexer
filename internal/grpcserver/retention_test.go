@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -193,5 +194,31 @@ func TestRetention_ExplicitBlockTargets(t *testing.T) {
 	}
 	if len(feed.GetTransactions()) != 3 {
 		t.Errorf("feed rows = %d, want 3", len(feed.GetTransactions()))
+	}
+}
+
+// FORCE_REINDEX's wipe sets the watermark back to 0. A watermark cached before the wipe must not keep answering
+// OUT_OF_RANGE for the new chain's blocks once they are stored again: the cache follows the stored value down too.
+func TestRetention_WatermarkFollowsAWipeDown(t *testing.T) {
+	h := newTestHarness(t)
+	defer h.cleanup()
+	ctx := context.Background()
+	h.prune(2)
+	if _, err := h.client.GetChainStats(ctx, &indexerv1.Empty{}); err != nil {
+		t.Fatalf("GetChainStats: %v", err)
+	}
+	_, err := h.client.GetBlock(ctx, &indexerv1.GetBlockRequest{Selector: &indexerv1.GetBlockRequest_Number{Number: 1}})
+	requireCode(t, err, codes.OutOfRange)
+
+	if err := h.db.WipeAllData(ctx); err != nil {
+		t.Fatalf("WipeAllData: %v", err)
+	}
+	seedChain(ctx, t, h.pool)
+	h.srv.watermark.mu.Lock()
+	h.srv.watermark.readAt = time.Time{}
+	h.srv.watermark.mu.Unlock()
+
+	if _, err := h.client.GetBlock(ctx, &indexerv1.GetBlockRequest{Selector: &indexerv1.GetBlockRequest_Number{Number: 1}}); err != nil {
+		t.Fatalf("GetBlock 1, stored again after the wipe: %v", err)
 	}
 }
