@@ -164,42 +164,7 @@ func (r *RealtimeIndexer) runSubscriptionMode(ctx context.Context, headers <-cha
 			latestBlock := header.Number.Uint64()
 			safeBlock := latestBlock - uint64(r.config.ConfirmationBlocks)
 
-			lastProcessed := r.GetLastProcessedBlock()
-			for blockNum := lastProcessed + 1; blockNum <= safeBlock; blockNum++ {
-				select {
-				case req := <-r.indexRequests:
-					err := r.processBlock(ctx, req.blockNumber)
-					req.done <- err
-				default:
-				}
-
-				if blockNum > 0 {
-					reorgDepth, err := r.detectReorg(ctx, blockNum-1)
-					if err != nil {
-						log.Error("realtime: failed to check for reorg", "error", err)
-					} else if reorgDepth > 0 {
-						log.Warn("realtime: detected reorg", "depth", reorgDepth)
-						if err := r.handleReorg(ctx, blockNum-reorgDepth); err != nil {
-							log.Error("realtime: failed to handle reorg", "error", err)
-						}
-						r.SetLastProcessedBlock(blockNum - reorgDepth - 1)
-						continue
-					}
-				}
-
-				if err := r.processBlock(ctx, blockNum); err != nil {
-					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					if !r.receipts.skip(ctx, r.db, blockNum, err) {
-						break
-					}
-				}
-
-				r.SetLastProcessedBlock(blockNum)
-
-				if blockNum%10 == 0 {
-					r.db.UpdateSyncStatus(ctx, blockNum, true)
-				}
-			}
+			r.indexUpTo(ctx, safeBlock)
 		}
 	}
 }
@@ -229,43 +194,56 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 			}
 
 			safeBlock := latestOnChain - uint64(r.config.ConfirmationBlocks)
-			lastProcessed := r.GetLastProcessedBlock()
+			r.indexUpTo(ctx, safeBlock)
+		}
+	}
+}
 
-			for blockNum := lastProcessed + 1; blockNum <= safeBlock; blockNum++ {
-				select {
-				case req := <-r.indexRequests:
-					err := r.processBlock(ctx, req.blockNumber)
-					req.done <- err
-				default:
+// indexUpTo indexes the blocks after the last processed one up to safeBlock. When stored blocks no longer match the
+// chain it reverts them and goes on from the fork point in the same pass. It returns at the first block it cannot
+// index, or when a reorg cannot be reverted, and the next tick starts again from the last processed block.
+func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
+	reverted := false
+	for blockNum := r.GetLastProcessedBlock() + 1; blockNum <= safeBlock; blockNum++ {
+		select {
+		case req := <-r.indexRequests:
+			err := r.processBlock(ctx, req.blockNumber)
+			req.done <- err
+		default:
+		}
+
+		if blockNum > 0 {
+			reorgDepth, err := r.detectReorg(ctx, blockNum-1)
+			if err != nil {
+				log.Error("realtime: failed to check for reorg", "error", err)
+			} else if reorgDepth > 0 {
+				if reverted {
+					return
 				}
-
-				if blockNum > 0 {
-					reorgDepth, err := r.detectReorg(ctx, blockNum-1)
-					if err != nil {
-						log.Error("realtime: failed to check for reorg", "error", err)
-					} else if reorgDepth > 0 {
-						log.Warn("realtime: detected reorg", "depth", reorgDepth)
-						if err := r.handleReorg(ctx, blockNum-reorgDepth); err != nil {
-							log.Error("realtime: failed to handle reorg", "error", err)
-						}
-						r.SetLastProcessedBlock(blockNum - reorgDepth - 1)
-						continue
-					}
+				fork := blockNum - reorgDepth
+				log.Warn("realtime: detected reorg", "depth", reorgDepth)
+				if err := r.handleReorg(ctx, fork); err != nil {
+					log.Error("realtime: failed to handle reorg", "error", err)
+					return
 				}
-
-				if err := r.processBlock(ctx, blockNum); err != nil {
-					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					if !r.receipts.skip(ctx, r.db, blockNum, err) {
-						break
-					}
-				}
-
-				r.SetLastProcessedBlock(blockNum)
-
-				if blockNum%10 == 0 {
-					r.db.UpdateSyncStatus(ctx, blockNum, true)
-				}
+				reverted = true
+				r.SetLastProcessedBlock(fork - 1)
+				blockNum = fork - 1
+				continue
 			}
+		}
+
+		if err := r.processBlock(ctx, blockNum); err != nil {
+			log.Error("realtime: failed to process block", "block", blockNum, "error", err)
+			if !r.receipts.skip(ctx, r.db, blockNum, err) {
+				return
+			}
+		}
+
+		r.SetLastProcessedBlock(blockNum)
+
+		if blockNum%10 == 0 {
+			r.db.UpdateSyncStatus(ctx, blockNum, true)
 		}
 	}
 }

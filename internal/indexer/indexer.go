@@ -649,9 +649,9 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 					log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
 					if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
 						log.Error("failed to handle reorg", "error", err)
-					} else {
-						lastIndexed = lastIndexed - reorgDepth
+						continue
 					}
+					lastIndexed = lastIndexed - reorgDepth
 				}
 			}
 
