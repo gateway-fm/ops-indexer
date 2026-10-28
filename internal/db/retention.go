@@ -320,9 +320,9 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 }
 
 // nodeHeadTimeout bounds a read of the node's head for retention. A node answers eth_blockNumber from memory in
-// milliseconds, so five seconds is far past a healthy answer, and the request has no response timeout of its own.
-// Without the bound a node that never answers held up the cut, and with it the history-DDL gate the ledger closer
-// waits on. On a timeout the stored head is used, as on any error: the cut then sits two partitions above it.
+// milliseconds, so five seconds is far past a healthy answer. The node client's own bound, RPC_TIMEOUT (60 s by
+// default), is sized for block and receipt replies: a node that stopped answering would hold the cut, and with it the
+// history-DDL gate the ledger closer waits on, for that long on every pass. On a timeout the stored head is used, as on any error: the cut then sits two partitions above it.
 const nodeHeadTimeout = 5 * time.Second
 
 // readNodeHead reads the node's head under nodeHeadTimeout; ok is false without a reader, or on an error, which it
