@@ -102,6 +102,7 @@ type reorgStore struct {
 	deleteErr error
 	keepBelow uint64
 	getErr    map[uint64]bool
+	deleted   []uint64
 }
 
 func newReorgStore(storedHead uint64, tick func() int) *reorgStore {
@@ -141,6 +142,7 @@ func (s *reorgStore) DeleteBlock(_ context.Context, n uint64) error {
 		return errors.New("delete failed")
 	}
 	delete(s.blocks, n)
+	s.deleted = append(s.deleted, n)
 	return nil
 }
 
@@ -153,6 +155,12 @@ func (s *reorgStore) InsertBlock(_ context.Context, b *types.Block) error {
 }
 
 func (s *reorgStore) UpdateSyncStatus(context.Context, uint64, bool) error { return nil }
+
+func (s *reorgStore) deletedBlocks() []uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]uint64(nil), s.deleted...)
+}
 
 func (s *reorgStore) written() []storedWrite {
 	s.mu.Lock()
