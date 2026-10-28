@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"sort"
 	"sync"
@@ -532,5 +533,20 @@ func TestRealtimeDoesNotSkipABlockFromAnotherForkWhoseReceiptsNeverCome(t *testi
 	}
 	if last := rt.GetLastProcessedBlock(); last != 2 {
 		t.Fatalf("last processed %d, want 2", last)
+	}
+}
+
+// Realtime starts at the node head, and a jump moves it there, with nothing stored at its cursor or for a long way
+// below: catch-up fills that. Its first batch goes on from the cursor; it does not start again after the highest
+// stored block, far below.
+func TestRealtimeAtAnUnstoredCursorDoesNotStartFromTheHighestStoredBlock(t *testing.T) {
+	node := newReorgNode(1000, 503)
+	store := newReorgStore(10, node.tick)
+	rt := newReorgRealtime(store, node, 500)
+
+	rt.indexUpTo(context.Background(), 500, 502)
+
+	if got := writtenNumbers(store.written()); fmt.Sprint(got) != "[501 502]" {
+		t.Fatalf("written %d blocks from %v, want [501 502]", len(got), got[:min(len(got), 3)])
 	}
 }

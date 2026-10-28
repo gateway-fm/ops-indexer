@@ -67,8 +67,10 @@ func (i *Indexer) prefetchBlocks(ctx context.Context, from, to uint64, depth int
 // stored, or a block receipts skipped (not stored) at lastIndexed. When lastIndexed is neither, as after a revert whose
 // delete committed but reported an error, the tick starts after the highest stored block below it, so the deleted
 // blocks are fetched again and the check is never skipped. Block 0, or nothing stored at or below lastIndexed, has
-// no hash to check against. A remembered hash the cursor has moved below is dropped. remembered reports that hash
-// is the remembered one (see recheckSkipped). ok is false when the store cannot be read; the tick then ends.
+// no hash to check against, and neither has realtime's cursor when it is not stored (cursorMayBeUnstored): realtime
+// starts, and jumps, at the node head with nothing stored below it, and its own check after a failed revert moves
+// the cursor down instead. A remembered hash the cursor has moved below is dropped. remembered reports that hash is
+// the remembered one (see recheckSkipped). ok is false when the store cannot be read; the tick then ends.
 func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) (from uint64, hash common.Hash, remembered, ok bool) {
 	if receipts.skipped > lastIndexed {
 		receipts.skipped, receipts.skippedHash = 0, common.Hash{}
@@ -86,6 +88,9 @@ func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *rece
 	}
 	if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
 		return lastIndexed, receipts.skippedHash, true, true
+	}
+	if i.cursorMayBeUnstored {
+		return lastIndexed, common.Hash{}, false, true
 	}
 	below, err := i.db.HighestBlockAtOrBelow(ctx, lastIndexed)
 	if err != nil {

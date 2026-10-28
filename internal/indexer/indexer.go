@@ -90,7 +90,9 @@ type Indexer struct {
 	indexRequests chan indexRequest
 	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
 	onIndexed func(uint64)
-	config    *Config
+	// cursorMayBeUnstored is set for realtime's batches (see anchor).
+	cursorMayBeUnstored bool
+	config              *Config
 
 	tokenCache    *TokenCache
 	contractCache *ContractCache

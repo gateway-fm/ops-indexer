@@ -218,6 +218,12 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 // hash reads before each, held realtime to ~3.8 blocks/s in a load test against a chain at ~8.4 (PRST-5438): after a
 // stall it could never catch up on its own.
 func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBlock uint64) {
+	if r.failedRevertFrom != 0 {
+		if !r.resumeAfterFailedRevert(ctx) {
+			return
+		}
+		lastProcessed = r.GetLastProcessedBlock()
+	}
 	if safeBlock <= lastProcessed {
 		return
 	}
@@ -232,6 +238,7 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBloc
 			if err := r.handleReorg(ctx, lastProcessed+1-depth); err != nil {
 				log.Error("realtime: failed to handle reorg; staying on the stale block to retry", "error", err)
 				r.revertPending.Store(true)
+				r.failedRevertFrom = lastProcessed + 1 - depth
 				return
 			}
 			r.revertPending.Store(false)
@@ -241,6 +248,7 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBloc
 	}
 	idx := r.blockIndexer()
 	idx.indexRequests = r.indexRequests
+	idx.cursorMayBeUnstored = true
 	idx.onIndexed = func(n uint64) {
 		r.SetLastProcessedBlock(n)
 		r.behind.Store(safeBlock - n)
