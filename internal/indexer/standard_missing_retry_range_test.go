@@ -20,10 +20,11 @@ type withholdingNode struct {
 	*receiptsGapNode
 	mu       sync.Mutex
 	withheld map[uint64]bool
+	asked    map[uint64]int
 }
 
 func newWithholdingNode(head uint64, blocks ...uint64) *withholdingNode {
-	n := &withholdingNode{receiptsGapNode: newReceiptsGapNode(head, 0), withheld: map[uint64]bool{}}
+	n := &withholdingNode{receiptsGapNode: newReceiptsGapNode(head, 0), withheld: map[uint64]bool{}, asked: map[uint64]int{}}
 	n.receiptsGapNode.withheld.Store(false)
 	for _, b := range blocks {
 		n.withheld[b] = true
@@ -40,6 +41,9 @@ func (n *withholdingNode) withhold(block uint64, on bool) {
 func (n *withholdingNode) FetchReceiptsBatch(ctx context.Context, hashes []common.Hash, w, r int, block ...uint64) (map[common.Hash]*rpclient.Receipt, error) {
 	n.mu.Lock()
 	held := len(block) > 0 && n.withheld[block[0]]
+	if len(block) > 0 {
+		n.asked[block[0]]++
+	}
 	n.mu.Unlock()
 	if held {
 		return nil, errors.New("receipts for the block unavailable: eth_getBlockReceipts returned null")
@@ -134,4 +138,34 @@ func TestRetryKeepsTheRestOfARangeRecordedWhenRecordingItFails(t *testing.T) {
 	idx.retryMissing(ctx, 100, &receiptSkip{recorded: true})
 	require.EqualValues(t, 4, countWhere(t, pool, `SELECT count(*) FROM blocks WHERE number BETWEEN 83 AND 86`))
 	require.Zero(t, countWhere(t, pool, `SELECT count(*) FROM missing_block_ranges`))
+}
+
+func (n *withholdingNode) timesAsked(block uint64) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.asked[block]
+}
+
+// The lowest recorded block never becomes available: the retry still fills a higher one, and asks for the lowest
+// again only after a growing pause.
+func TestRetryFillsHigherRangesPastOneThatKeepsFailing(t *testing.T) {
+	d, pool := refillTestDB(t)
+	ctx := context.Background()
+	node := newWithholdingNode(100, 83, 90)
+	idx := NewWithConfig(d, node, 5*time.Millisecond, 0, &Config{RPCWorkers: 1, RPCRateLimit: 100})
+	indexChainSkipping(t, idx, pool, 100, 2)
+
+	node.withhold(90, false)
+	idx.missingRetryAt = time.Time{}
+	idx.retryMissing(ctx, 100, &receiptSkip{recorded: true})
+	require.EqualValues(t, 1, countWhere(t, pool, `SELECT count(*) FROM blocks WHERE number = 90`), "90 is filled past the failing 83")
+	require.EqualValues(t, 1, countWhere(t, pool, `SELECT count(*) FROM missing_block_ranges WHERE from_number = 83`))
+	require.Zero(t, countWhere(t, pool, `SELECT count(*) FROM missing_block_ranges WHERE from_number = 90`))
+
+	before := node.timesAsked(83)
+	for k := 0; k < 3; k++ {
+		idx.missingRetryAt = time.Time{}
+		idx.retryMissing(ctx, 100, &receiptSkip{recorded: true})
+	}
+	require.Equal(t, before, node.timesAsked(83), "a block that keeps failing waits out its pause instead of being asked every pass")
 }

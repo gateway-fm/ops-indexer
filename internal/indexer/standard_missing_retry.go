@@ -13,11 +13,16 @@ import (
 const missingRetryBlocks = 20
 
 // retryMissing indexes, at most once per missingRetryInterval, the blocks recorded in missing_block_ranges below the
-// cursor, in block order: one interval after the loop starts (records a start left, with catch-up off), and then
-// while the loop has recorded blocks it has not seen filled. In standard mode nothing else reads that table while the process runs: the blocks the head
-// loop skipped for their receipts would wait for the next start, and the ledger, and with it retention, would stop
-// at the first of them. A block is written only when it extends the stored block below it and the stored block above
-// extends it; a block the node still cannot serve, or that does not fit, stays recorded and ends the pass.
+// cursor: one interval after the loop starts (records a start left, with catch-up off), and then while the loop has
+// recorded blocks it has not seen filled. In standard mode nothing else reads that table while the process runs: the
+// blocks the head loop skipped for their receipts would wait for the next start, and the ledger, and with it
+// retention, would stop at the first of them.
+//
+// A pass reads the newest recorded ranges (GetMissingRangesBatch) and works through them in block order, writing at
+// most missingRetryBlocks blocks. A block is written only when it extends the stored block below it and the stored
+// block above extends it. A block the node still cannot serve, or that does not fit, ends its range for this pass
+// and puts the range on a doubling pause (missingBackoff); the pass goes on with the next range, so one block that
+// keeps failing never holds up the others.
 func (i *Indexer) retryMissing(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) {
 	if !receipts.recorded || time.Now().Before(i.missingRetryAt) {
 		return
@@ -30,6 +35,7 @@ func (i *Indexer) retryMissing(ctx context.Context, lastIndexed uint64, receipts
 	}
 	if len(ranges) == 0 {
 		receipts.recorded = false
+		clear(i.missingBackoff)
 		return
 	}
 	sort.Slice(ranges, func(a, b int) bool { return ranges[a].FromNumber < ranges[b].FromNumber })
@@ -38,26 +44,52 @@ func (i *Indexer) retryMissing(ctx context.Context, lastIndexed uint64, receipts
 		if r.FromNumber > lastIndexed || budget == 0 {
 			return
 		}
-		next := r.FromNumber
+		if b, ok := i.missingBackoff[r.FromNumber]; ok && time.Now().Before(b.nextTry) {
+			continue
+		}
+		next, failed := r.FromNumber, false
 		for ; next <= r.ToNumber && next <= lastIndexed && budget > 0; next++ {
 			budget--
 			if !i.retryMissingBlock(ctx, next) {
+				failed = true
 				break
 			}
 		}
+		if failed {
+			i.backOffMissing(r.FromNumber, next)
+		} else {
+			delete(i.missingBackoff, r.FromNumber)
+		}
 		if next == r.FromNumber {
-			return
+			continue
 		}
 		if err := i.db.AdvanceMissingRange(ctx, r, next); err != nil {
 			log.Error("failed to record the indexed start of a missing range; it stays recorded whole",
 				"from", r.FromNumber, "indexed_to", next-1, "to", r.ToNumber, "error", err)
-			return
+			continue
 		}
-		if next <= r.ToNumber {
-			return
+		if next > r.ToNumber {
+			log.Info("indexed blocks recorded as missing", "from", r.FromNumber, "to", r.ToNumber)
 		}
-		log.Info("indexed blocks recorded as missing", "from", r.FromNumber, "to", r.ToNumber)
 	}
+}
+
+// missingAttempt is a recorded range's pause after a failed retry, kept in memory by its first unfilled block.
+type missingAttempt struct {
+	failures int
+	nextTry  time.Time
+}
+
+// backOffMissing pauses the range that now starts at block after a failure there: missingRetryInterval, doubling
+// with each consecutive failure, up to 64 intervals.
+func (i *Indexer) backOffMissing(from, block uint64) {
+	failures := i.missingBackoff[from].failures + 1
+	delete(i.missingBackoff, from)
+	if i.missingBackoff == nil {
+		i.missingBackoff = map[uint64]missingAttempt{}
+	}
+	i.missingBackoff[block] = missingAttempt{failures: failures,
+		nextTry: time.Now().Add(i.missingRetryInterval << min(failures-1, 6))}
 }
 
 // retryMissingBlock writes one recorded block and reports whether the pass goes on to the next.

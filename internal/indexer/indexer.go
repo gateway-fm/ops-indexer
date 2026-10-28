@@ -83,6 +83,7 @@ type Indexer struct {
 	// missingRetryInterval is how often the standard loop retries the blocks it recorded as missing (retryMissing).
 	missingRetryInterval time.Duration
 	missingRetryAt       time.Time
+	missingBackoff       map[uint64]missingAttempt
 
 	indexRequests chan indexRequest
 	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
