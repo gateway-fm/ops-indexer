@@ -67,8 +67,9 @@ func (i *Indexer) prefetchBlocks(ctx context.Context, from, to uint64, depth int
 // anchor is the block a tick starts after, and the hash its first block must extend. That is lastIndexed when it is
 // stored, or a block receipts skipped (not stored) at lastIndexed. When lastIndexed is neither, as after a revert whose
 // delete committed but reported an error, the tick starts after the highest stored block below it, so the deleted
-// blocks are fetched again and the check is never skipped. Block 0, or nothing stored at or below lastIndexed, has
-// no hash to check against, and neither has realtime's cursor when it is not stored (cursorMayBeUnstored): realtime
+// blocks are fetched again and the check is never skipped. When nothing is stored at or below lastIndexed, the
+// cursor is not trusted: the tick starts from the start block (indexingFloor), with no hash to check against. Block 0
+// has none either, and neither has realtime's cursor when it is not stored (cursorMayBeUnstored): realtime
 // starts, and jumps, at the node head with nothing stored below it, and its own check after a failed revert moves
 // the cursor down instead. A remembered hash the cursor has moved below is dropped. remembered reports that hash is
 // the remembered one (see recheckSkipped). ok is false when the store cannot be read; the tick then ends.
@@ -76,19 +77,21 @@ func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *rece
 	if receipts.skipped > lastIndexed {
 		receipts.skipped, receipts.skippedHash = 0, common.Hash{}
 	}
-	if lastIndexed == 0 {
+	if lastIndexed == 0 && i.startBlock == 0 {
 		return 0, common.Hash{}, false, true
 	}
-	b, err := i.db.GetBlock(ctx, lastIndexed)
-	if err != nil {
-		log.Error("failed to read the block before this tick, retrying on the next tick", "block", lastIndexed, "error", err)
-		return lastIndexed, common.Hash{}, false, false
-	}
-	if b != nil {
-		return lastIndexed, common.HexToHash(b.Hash), false, true
-	}
-	if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
-		return lastIndexed, receipts.skippedHash, true, true
+	if lastIndexed > 0 {
+		b, err := i.db.GetBlock(ctx, lastIndexed)
+		if err != nil {
+			log.Error("failed to read the block before this tick, retrying on the next tick", "block", lastIndexed, "error", err)
+			return lastIndexed, common.Hash{}, false, false
+		}
+		if b != nil {
+			return lastIndexed, common.HexToHash(b.Hash), false, true
+		}
+		if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
+			return lastIndexed, receipts.skippedHash, true, true
+		}
 	}
 	if i.cursorMayBeUnstored {
 		return lastIndexed, common.Hash{}, false, true
@@ -99,11 +102,34 @@ func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *rece
 		return lastIndexed, common.Hash{}, false, false
 	}
 	if below == nil {
-		return lastIndexed, common.Hash{}, false, true
+		return i.indexingFloor(ctx, lastIndexed)
 	}
 	log.Warn("the block before this tick is not stored; indexing again from the highest stored block below it",
 		"block", lastIndexed, "from", below.Number)
 	return below.Number, common.HexToHash(below.Hash), false, true
+}
+
+// indexingFloor is where a tick starts when nothing is stored at or below the cursor: a fresh database, or a revert
+// that deleted every stored block and reported an error. The cursor says nothing then, so the tick starts after the
+// block before the start block, or before the lowest block retention keeps if that is higher, with no hash to check.
+func (i *Indexer) indexingFloor(ctx context.Context, lastIndexed uint64) (from uint64, hash common.Hash, remembered, ok bool) {
+	floor := i.startBlock
+	wm, _, err := i.db.PrunedThrough(ctx)
+	if err != nil {
+		log.Error("failed to read the prune watermark, retrying on the next tick", "error", err)
+		return lastIndexed, common.Hash{}, false, false
+	}
+	if wm > 0 && wm+1 > floor {
+		floor = wm + 1
+	}
+	if floor == 0 {
+		return 0, common.Hash{}, false, true
+	}
+	if floor-1 != lastIndexed {
+		log.Warn("nothing is stored at or below the block before this tick; indexing from the start block",
+			"block", lastIndexed, "from", floor)
+	}
+	return floor - 1, common.Hash{}, false, true
 }
 
 // recheckSkipped is called when the tick's first block does not extend the remembered hash of the block skipped for
