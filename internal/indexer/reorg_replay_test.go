@@ -252,9 +252,10 @@ func writtenNumbers(ws []storedWrite) []uint64 {
 	return out
 }
 
-// After a reorg the realtime loop reverts the stale blocks and indexes again from the fork point in the same tick:
-// stored 1..100, the chain replaced 98..100, safe head 102, so 98..102 are written from the new chain, in order.
-func TestRealtimeReorgReplaysFromTheForkPointInTheSameTick(t *testing.T) {
+// After a reorg the realtime loop reverts the stale blocks in one tick and indexes from the fork point on the next:
+// stored 1..100, the chain replaced 98..100, safe head 102, so 98..102 are written from the new chain, in order, in
+// tick 2, with no block left behind for the gap collector.
+func TestRealtimeReorgReplaysFromTheForkPointInTheNextTick(t *testing.T) {
 	for _, mode := range []struct {
 		name         string
 		subscription bool
@@ -264,7 +265,7 @@ func TestRealtimeReorgReplaysFromTheForkPointInTheSameTick(t *testing.T) {
 			store := newReorgStore(100, node.tick)
 			rt := newReorgRealtime(store, node, 100)
 
-			runRealtime(t, rt, node, mode.subscription, 1, func() bool { return len(store.written()) >= 5 })
+			runRealtime(t, rt, node, mode.subscription, 2, func() bool { return len(store.written()) >= 5 })
 
 			ws := store.written()
 			got := writtenNumbers(ws)
@@ -273,8 +274,8 @@ func TestRealtimeReorgReplaysFromTheForkPointInTheSameTick(t *testing.T) {
 				t.Fatalf("written %v, want %v", got, want)
 			}
 			for i, w := range ws {
-				if w.number != want[i] || w.hash != node.chain[w.number].Hash.Hex() || w.tick != 1 {
-					t.Fatalf("write %d = block %d hash %s in tick %d, want block %d from the new chain in tick 1 (all writes %v)",
+				if w.number != want[i] || w.hash != node.chain[w.number].Hash.Hex() || w.tick != 2 {
+					t.Fatalf("write %d = block %d hash %s in tick %d, want block %d from the new chain in tick 2 (all writes %v)",
 						i, w.number, w.hash, w.tick, want[i], got)
 				}
 			}
