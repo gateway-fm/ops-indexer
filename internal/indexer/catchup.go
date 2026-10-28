@@ -52,7 +52,8 @@ type CatchupIndexer struct {
 	// Progress tracking
 	processedBlocks int64
 	totalMissing    int64
-	lastLogTime     time.Time
+	// lastLogNanos is when the progress line was last logged (UnixNano); every worker reads it, one claims each.
+	lastLogNanos atomic.Int64
 
 	// Coordination
 	wg     sync.WaitGroup
@@ -76,7 +77,7 @@ func NewCatchupIndexer(
 	tracingSupported bool,
 ) *CatchupIndexer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &CatchupIndexer{
+	c := &CatchupIndexer{
 		db:               database,
 		rpc:              rpcClient,
 		config:           cfg,
@@ -88,9 +89,10 @@ func NewCatchupIndexer(
 		workQueue:        make(chan uint64, cfg.QueueSize),
 		ctx:              ctx,
 		cancel:           cancel,
-		lastLogTime:      time.Now(),
 		pollInterval:     5 * time.Second,
 	}
+	c.lastLogNanos.Store(time.Now().UnixNano())
+	return c
 }
 
 // SetDailyStatsThrottle shares the main indexer's day-aggregate throttle with
@@ -345,6 +347,13 @@ func (c *CatchupIndexer) indexBlock(id int, blockNum uint64) {
 	}
 }
 
+// claimProgressLog reports whether the caller logs the progress line now: at most one worker per 5 s, however many
+// reach it at once.
+func (c *CatchupIndexer) claimProgressLog(now time.Time) bool {
+	last := c.lastLogNanos.Load()
+	return now.Sub(time.Unix(0, last)) > 5*time.Second && c.lastLogNanos.CompareAndSwap(last, now.UnixNano())
+}
+
 // tryBlock checks, writes and accounts for one block once, and reports whether the block is done with: stored (by
 // this worker or another writer), or recorded as missing again after a failed write.
 func (c *CatchupIndexer) tryBlock(id int, blockNum uint64, attempt int) bool {
@@ -383,8 +392,7 @@ func (c *CatchupIndexer) tryBlock(id int, blockNum uint64, attempt int) bool {
 
 	processed := atomic.AddInt64(&c.processedBlocks, 1)
 
-	if time.Since(c.lastLogTime) > 5*time.Second {
-		c.lastLogTime = time.Now()
+	if c.claimProgressLog(time.Now()) {
 
 		var remaining int64
 		if c.collector != nil {
