@@ -383,16 +383,18 @@ func TestDetectReorgKeepsTheMismatchFoundBeforeAnError(t *testing.T) {
 	}
 }
 
-// A reorg check that fails ends the tick before any block is indexed; the next tick, with the node healthy, reverts
-// the stale blocks and indexes the new chain.
+// A reorg check that fails ends the tick before any block is indexed. With the node healthy again, realtime reverts
+// the stale blocks on the next tick and indexes the new chain on the one after; the standard loop reverts and indexes
+// in the same tick.
 func TestReorgCheckErrorEndsTheTick(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		forkAt uint64
-		want   []uint64
+		name                       string
+		forkAt                     uint64
+		want                       []uint64
+		realtimeTick, standardTick int
 	}{
-		{"stale head", 98, []uint64{98, 99, 100, 101, 102}},
-		{"no mismatch", 200, []uint64{101, 102}},
+		{"stale head", 98, []uint64{98, 99, 100, 101, 102}, 3, 2},
+		{"no mismatch", 200, []uint64{101, 102}, 2, 2},
 	} {
 		for _, mode := range []struct {
 			name         string
@@ -404,9 +406,9 @@ func TestReorgCheckErrorEndsTheTick(t *testing.T) {
 				store := newReorgStore(100, node.tick)
 				rt := newReorgRealtime(store, node, 100)
 
-				runRealtime(t, rt, node, mode.subscription, 2, func() bool { return len(store.written()) >= len(c.want) })
+				runRealtime(t, rt, node, mode.subscription, c.realtimeTick, func() bool { return len(store.written()) >= len(c.want) })
 
-				assertWrittenInTick(t, store, node, c.want, 2)
+				assertWrittenInTick(t, store, node, c.want, c.realtimeTick)
 			})
 		}
 		t.Run(c.name+"/standard", func(t *testing.T) {
@@ -415,9 +417,9 @@ func TestReorgCheckErrorEndsTheTick(t *testing.T) {
 			store := newReorgStore(100, node.tick)
 			want := append(append([]uint64(nil), c.want...), 103)
 
-			runStandard(t, newReorgStandard(store, node), node, 100, 2, func() bool { return len(store.written()) >= len(want) })
+			runStandard(t, newReorgStandard(store, node), node, 100, c.standardTick, func() bool { return len(store.written()) >= len(want) })
 
-			assertWrittenInTick(t, store, node, want, 2)
+			assertWrittenInTick(t, store, node, want, c.standardTick)
 		})
 	}
 }

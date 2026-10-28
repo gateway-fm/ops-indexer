@@ -720,14 +720,16 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 }
 
 // standardTick reverts a reorg at the stored head, then indexes up to latestOnChain, and returns the new last
-// indexed block. A revert that fails ends the tick on the stale block, to retry on the next one, as realtime does:
-// indexing on would write the new fork on top of the stale blocks.
+// indexed block. A reorg check or a revert that fails ends the tick on the stale block, to retry on the next one, as
+// realtime does: indexing on would write the new fork on top of the stale blocks.
 func (i *Indexer) standardTick(ctx context.Context, lastIndexed, latestOnChain uint64, receipts *receiptSkip) uint64 {
 	if lastIndexed > 0 {
 		reorgDepth, err := i.detectReorg(ctx, lastIndexed)
 		if err != nil {
-			log.Error("failed to check for reorg", "error", err)
-		} else if reorgDepth > 0 {
+			log.Error("failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+			return lastIndexed
+		}
+		if reorgDepth > 0 {
 			log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
 			if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
 				log.Error("failed to handle reorg; staying on the stale block to retry", "error", err)
