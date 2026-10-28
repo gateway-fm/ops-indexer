@@ -11,8 +11,10 @@ import (
 )
 
 type Config struct {
-	RPCURL      string `mapstructure:"rpc_url"`
-	DatabaseURL string `mapstructure:"database_url"`
+	RPCURL string `mapstructure:"rpc_url"`
+	// RPCTimeout bounds every call to the node, from the request to the last byte of the reply.
+	RPCTimeout  time.Duration `mapstructure:"rpc_timeout"`
+	DatabaseURL string        `mapstructure:"database_url"`
 	// GRPCListenAddr is the address the chain-indexer gRPC server binds to,
 	// e.g. ":50051". Required.
 	GRPCListenAddr string        `mapstructure:"grpc_listen_addr"`
@@ -107,6 +109,7 @@ type Config struct {
 
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("rpc_url", "http://127.0.0.1:8545")
+	v.SetDefault("rpc_timeout", "60s")
 	v.SetDefault("database_url", "postgres://postgres:postgres@localhost:5432/chain_indexer?sslmode=disable")
 	v.SetDefault("grpc_listen_addr", ":50051")
 	v.SetDefault("api_port", 8080)
@@ -194,6 +197,7 @@ func Load() (*Config, error) {
 
 	cfg := &Config{}
 	cfg.RPCURL = v.GetString("rpc_url")
+	cfg.RPCTimeout = v.GetDuration("rpc_timeout")
 	cfg.DatabaseURL = v.GetString("database_url")
 	cfg.GRPCListenAddr = v.GetString("grpc_listen_addr")
 	cfg.APIPort = v.GetInt("api_port")
@@ -307,6 +311,9 @@ func MinLedgerSpanBlocks(closeInterval time.Duration) uint64 {
 func (c *Config) Validate() error {
 	if c.RPCURL == "" {
 		return fmt.Errorf("RPC_URL is required")
+	}
+	if c.RPCTimeout <= 0 {
+		return fmt.Errorf("RPC_TIMEOUT must be greater than 0, got %s", c.RPCTimeout)
 	}
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")

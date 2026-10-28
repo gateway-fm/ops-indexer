@@ -3,11 +3,13 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func pipelineConfig(depth int, poolMaxConns string) *Config {
 	return &Config{
 		RPCURL:              "http://node",
+		RPCTimeout:          time.Minute,
 		DatabaseURL:         "postgres://db/indexer?pool_max_conns=" + poolMaxConns,
 		APIPort:             8080,
 		RPCWorkers:          1,

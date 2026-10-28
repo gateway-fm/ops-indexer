@@ -21,7 +21,7 @@ import (
 // blocks never reached daily_stats and are now pruned, and recompute the history-wide columns of every day.
 // --plan only finds each day's blocks and prints the requests a refill would make; --dry-run counts and prints the
 // rows it would write. A stopped run resumes from its checkpointed days.
-func runRefillDailyStats(args []string, database *db.DB, rpcURL string) int {
+func runRefillDailyStats(args []string, database *db.DB, rpcURL string, rpcTimeout time.Duration) int {
 	fs := flag.NewFlagSet("refill-daily-stats", flag.ExitOnError)
 	from := fs.String("from", "", "first UTC day, YYYY-MM-DD")
 	to := fs.String("to", "", "last UTC day, YYYY-MM-DD (inclusive)")
@@ -59,7 +59,7 @@ func runRefillDailyStats(args []string, database *db.DB, rpcURL string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	report, err := indexer.RefillDailyStats(ctx, database, indexer.RefillNode{C: rpclient.Dial(rpcURL)}, days, indexer.DailyRefillOptions{
+	report, err := indexer.RefillDailyStats(ctx, database, indexer.RefillNode{C: rpclient.DialTimeout(rpcURL, rpcTimeout)}, days, indexer.DailyRefillOptions{
 		Bodies: *bodies, Receipts: *receipts, BatchesPerSecond: *perSecond, Batch: *batch, Plan: *plan, Dry: *dry})
 	if report != nil {
 		var blocks uint64

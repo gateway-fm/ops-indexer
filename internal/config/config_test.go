@@ -8,7 +8,7 @@ import (
 )
 
 func validConfig() *Config {
-	return &Config{RPCURL: "http://node", DatabaseURL: "postgres://db", APIPort: 8080, RPCWorkers: 1, RPCRateLimit: 1,
+	return &Config{RPCURL: "http://node", RPCTimeout: time.Minute, DatabaseURL: "postgres://db", APIPort: 8080, RPCWorkers: 1, RPCRateLimit: 1,
 		LedgerSpanBlocks: 100_000, LedgerCloseInterval: 10 * time.Second, PruneInterval: time.Minute, PartitionBlocks: 10_000}
 }
 
@@ -81,4 +81,20 @@ func TestValidateRefusesTinyPartitionsWithRetention(t *testing.T) {
 	require.NoError(t, c.Validate())
 	c.PruneRetainBlocks, c.PartitionBlocks = 0, 1
 	require.NoError(t, c.Validate(), "without retention PARTITION_BLOCKS is not used")
+}
+
+func TestValidateRefusesAnUnboundedRPCTimeout(t *testing.T) {
+	c := validConfig()
+	for _, d := range []time.Duration{0, -time.Second} {
+		c.RPCTimeout = d
+		require.ErrorContains(t, c.Validate(), "RPC_TIMEOUT")
+	}
+}
+
+func TestRPCTimeoutDefault(t *testing.T) {
+	t.Setenv("RPC_URL", "http://node")
+	t.Setenv("DATABASE_URL", "postgres://db")
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, time.Minute, cfg.RPCTimeout)
 }

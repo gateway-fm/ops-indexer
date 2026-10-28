@@ -44,15 +44,25 @@ type Client struct {
 	nextID     atomic.Uint64
 }
 
+// DefaultTimeout bounds a node call, from the request to the last byte of the reply, when the caller sets no other
+// (RPC_TIMEOUT). A call past it fails with an error, as a refused connection does.
+const DefaultTimeout = 60 * time.Second
+
+// New uses httpClient, or one bounded by DefaultTimeout when it is nil.
 func New(url string, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: DefaultTimeout}
 	}
 	return &Client{url: url, httpClient: httpClient}
 }
 
 func Dial(url string) *Client {
-	return New(url, nil)
+	return DialTimeout(url, DefaultTimeout)
+}
+
+// DialTimeout is Dial with every call bounded by timeout.
+func DialTimeout(url string, timeout time.Duration) *Client {
+	return New(url, &http.Client{Timeout: timeout})
 }
 
 type jsonrpcRequest struct {

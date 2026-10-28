@@ -57,7 +57,7 @@ func main() {
 	defer database.Close()
 	database.RebuildWorkMem = cfg.RebuildWorkMem
 	if len(os.Args) > 1 && os.Args[1] == "refill-daily-stats" {
-		code := runRefillDailyStats(os.Args[2:], database, cfg.RPCURL)
+		code := runRefillDailyStats(os.Args[2:], database, cfg.RPCURL, cfg.RPCTimeout)
 		database.Close()
 		os.Exit(code)
 	}
@@ -67,7 +67,7 @@ func main() {
 		os.Exit(code)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "backfill-contracts" {
-		code := runBackfillContracts(os.Args[2:], database, cfg.RPCURL)
+		code := runBackfillContracts(os.Args[2:], database, cfg.RPCURL, cfg.RPCTimeout)
 		database.Close()
 		os.Exit(code)
 	}
@@ -114,7 +114,7 @@ func main() {
 		log.Fatal("failed to create history partitions", "error", err)
 	}
 
-	rpcClient, err := rpc.New(cfg.RPCURL)
+	rpcClient, err := rpc.NewWithTimeout(cfg.RPCURL, cfg.RPCTimeout)
 	if err != nil {
 		log.Fatal("failed to create rpc client", "error", err)
 	}

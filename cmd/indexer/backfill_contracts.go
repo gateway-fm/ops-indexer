@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/indexer"
@@ -17,7 +18,7 @@ import (
 // of contracts deployed by other contracts. It uses the indexer's own config (DATABASE_URL, RPC_URL), runs no
 // migrations, and is safe to run next to the live indexer and to rerun. "-" reads the list from stdin: the image is
 // distroless, so `kubectl exec -i ... < list.csv` is how a list reaches it.
-func runBackfillContracts(args []string, database *db.DB, rpcURL string) int {
+func runBackfillContracts(args []string, database *db.DB, rpcURL string, rpcTimeout time.Duration) int {
 	fs := flag.NewFlagSet("backfill-contracts", flag.ExitOnError)
 	csvPath := fs.String("csv", "", "address,creation_tx_hash,block_number rows of internal creations to trace (- for stdin)")
 	perSecond := fs.Float64("rate", 5, "node requests per second")
@@ -42,7 +43,7 @@ func runBackfillContracts(args []string, database *db.DB, rpcURL string) int {
 			return 1
 		}
 	}
-	node, err := rpc.New(rpcURL)
+	node, err := rpc.NewWithTimeout(rpcURL, rpcTimeout)
 	if err != nil {
 		log.Error("backfill-contracts: rpc client", "error", err)
 		return 1
