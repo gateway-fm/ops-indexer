@@ -266,6 +266,30 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 	}
 }
 
+// nodeHeadTimeout bounds a read of the node's head for retention. A node answers eth_blockNumber from memory in
+// milliseconds, so five seconds is far past a healthy answer, and the request has no response timeout of its own.
+// Without the bound a node that never answers held up the cut, and with it the history-DDL gate the ledger closer
+// waits on. On a timeout the stored head is used, as on any error: the cut then sits two partitions above it.
+const nodeHeadTimeout = 5 * time.Second
+
+// readNodeHead reads the node's head under nodeHeadTimeout; ok is false without a reader, or on an error, which it
+// logs.
+func readNodeHead(ctx context.Context, nodeHead func(context.Context) (uint64, error)) (head uint64, ok bool) {
+	if nodeHead == nil {
+		return 0, false
+	}
+	readCtx, cancel := context.WithTimeout(ctx, nodeHeadTimeout)
+	defer cancel()
+	head, err := nodeHead(readCtx)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Warn("retention: the node's head was not read; using the stored head", "timeout", nodeHeadTimeout, "error", err)
+		}
+		return 0, false
+	}
+	return head, true
+}
+
 // ensureInterval is how often partitions are kept ahead, and how long a failed start waits before reading again.
 func ensureInterval(cfg RetentionConfig) time.Duration {
 	if cfg.EnsureInterval == 0 {
@@ -286,8 +310,8 @@ func (d *DB) keepPartitionsAhead(ctx context.Context, cfg RetentionConfig) {
 		case <-ticker.C:
 		}
 		head, err := d.GetLatestBlockNumber(ctx)
-		if err == nil && cfg.NodeHead != nil {
-			if node, nerr := cfg.NodeHead(ctx); nerr == nil && node > head {
+		if err == nil {
+			if node, ok := readNodeHead(ctx, cfg.NodeHead); ok && node > head {
 				head = node
 			}
 		}
@@ -353,6 +377,7 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 // that holds a history table off the finish is waited out while the head stays more than a partition below C; past
 // that the cut is abandoned, and retentionPass drops its check, waiting for that transaction as long as it lasts.
 func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
+	node, nodeKnown := readNodeHead(ctx, cfg.NodeHead)
 	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
 	if err != nil {
 		return err
@@ -364,10 +389,8 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	}
 	headAtStart := head
 	base := head
-	if cfg.NodeHead != nil {
-		if node, err := cfg.NodeHead(ctx); err == nil && node > base {
-			base = node
-		}
+	if nodeKnown && node > base {
+		base = node
 	}
 	cutAt := base + 2*cfg.PartitionBlocks + d.cutMargin
 	log.Info("retention: cutting the legacy partitions", "head", head, "node_head", base, "cut_at", cutAt, "extra_margin", d.cutMargin)

@@ -2,9 +2,12 @@ package db
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
@@ -19,7 +22,16 @@ type LedgerConfig struct {
 	// HeadLag reports how many blocks ingest is behind the node; while it exceeds MaxHeadLag the closer waits.
 	HeadLag    func(ctx context.Context) (uint64, error)
 	MaxHeadLag uint64
+	// GateWait bounds a span close's wait for the history-DDL gate (0: defaultLedgerGateWait).
+	GateWait time.Duration
 }
+
+// defaultLedgerGateWait: retention holds the history-DDL gate for its DDL, a cut's validation the longest. Past a
+// minute the close gives up and the closer logs it and retries next interval, so a gate held for good shows in the
+// log at least once a minute instead of stopping the closer silently.
+const defaultLedgerGateWait = time.Minute
+
+var errLedgerGateBusy = errors.New("the history-DDL gate is held by retention")
 
 // CloseLedgerSpans closes up to max spans after the closed prefix, stopping at the first that is not final and
 // complete; it returns how many it closed.
@@ -38,7 +50,7 @@ func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (i
 					return err
 				}
 			}
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, historyDDLGate); err != nil {
+			if err := lockGateShared(ctx, tx, cfg.GateWait); err != nil {
 				return err
 			}
 			return tx.QueryRow(ctx, `SELECT ledger_close_span($1, $2)`, lo, hi).Scan(&ok)
@@ -53,6 +65,29 @@ func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (i
 		metrics.SetLedgerClosedThrough(uint64(hi - 1))
 	}
 	return closed, nil
+}
+
+// lockGateShared takes the history-DDL gate shared for the transaction, waiting at most wait; the transaction's own
+// lock_timeout applies again afterwards.
+func lockGateShared(ctx context.Context, tx pgx.Tx, wait time.Duration) error {
+	if wait == 0 {
+		wait = defaultLedgerGateWait
+	}
+	var prev string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('lock_timeout')`).Scan(&prev); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, fmt.Sprintf("%dms", wait.Milliseconds())); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, historyDDLGate); err != nil {
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			return fmt.Errorf("%w for more than %s", errLedgerGateBusy, wait)
+		}
+		return err
+	}
+	_, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, prev)
+	return err
 }
 
 // RunLedger closes one span per interval while there is one to close, retention on or off.
@@ -80,7 +115,9 @@ func (d *DB) ingestLagging(ctx context.Context, cfg LedgerConfig) (uint64, bool)
 	if cfg.MaxHeadLag == 0 || cfg.HeadLag == nil {
 		return 0, false
 	}
-	behind, err := cfg.HeadLag(ctx)
+	lagCtx, cancel := context.WithTimeout(ctx, nodeHeadTimeout)
+	defer cancel()
+	behind, err := cfg.HeadLag(lagCtx)
 	if err != nil {
 		return 0, false
 	}
