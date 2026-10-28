@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -111,9 +112,15 @@ func (d *DB) SavedRefillDays(ctx context.Context) ([]RefillDay, error) {
 
 var errRefillDryRun = errors.New("dry run")
 
+// ErrRefillAboveWatermark: a refilled day ends above the daily_stats watermark. daily_stats_advance has not counted
+// all its stored blocks yet and would add the rest on top of the node's counts.
+var ErrRefillAboveWatermark = errors.New("the day ends above the daily_stats watermark")
+
 // WriteRefilledDailyStats writes the refilled days into daily_stats, under daily_stats_advance's lock, in one
 // transaction, and returns every daily_stats row from the first refilled day on as written. Dry, it rolls back.
 //
+//   - A day that ends above the watermark is refused, the whole call with it (ErrRefillAboveWatermark): the
+//     advance counts that day's stored blocks itself. Refill it once the watermark has passed it.
 //   - A refilled day takes its block-level columns from the node's counts, with daily_stats_advance's formulas. A
 //     part the refill did not fetch (gas price, active addresses, success/failure, token transfers) keeps the stored
 //     value.
@@ -130,6 +137,16 @@ func (d *DB) WriteRefilledDailyStats(ctx context.Context, days []RefillDay, dry 
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
 			return err
+		}
+		var watermark int64
+		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT last_block FROM daily_stats_watermark WHERE id = 1), -1)`).Scan(&watermark); err != nil {
+			return err
+		}
+		for _, r := range days {
+			if int64(r.LastBlock) > watermark {
+				return fmt.Errorf("%w: %s ends at block %d, daily_stats is counted through block %d; refill it once the watermark has passed it",
+					ErrRefillAboveWatermark, r.Date.Format("2006-01-02"), r.LastBlock, watermark)
+			}
 		}
 		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE refill_days (`+refillColumns+`) ON COMMIT DROP`); err != nil {
 			return err
