@@ -58,6 +58,11 @@ var (
 		Help: "Blocks below the chain head absent from the database.",
 	})
 
+	startWaitingBlocks = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_start_waiting_blocks",
+		Help: "Stored blocks the start is waiting for the node to serve before it compares them with the chain; 0 once started.",
+	})
+
 	dailyStatsLag = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "indexer_daily_stats_watermark_lag_blocks",
 		Help: "Highest stored block minus the daily statistics watermark. It stays high while a missing block holds daily_stats for every later day.",
@@ -158,6 +163,8 @@ func SetChainHead(block uint64) { chainHeadBlock.Set(float64(block)) }
 func SetLastIndexed(block uint64) { lastIndexedBlock.Set(float64(block)) }
 
 func SetMissingBlocks(n int64) { missingBlocks.Set(float64(n)) }
+
+func SetStartWaitingBlocks(n uint64) { startWaitingBlocks.Set(float64(n)) }
 
 func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
 

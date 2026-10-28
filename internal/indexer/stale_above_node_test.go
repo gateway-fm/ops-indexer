@@ -62,7 +62,7 @@ func staleBlocksAboveTheNodeHead(t *testing.T, depth int) {
 
 	idx := NewWithConfig(d, mockRPC, time.Second, 0, &Config{RPCWorkers: 4, RPCRateLimit: 100, DBBatchSize: 100, CommitPipelineDepth: depth})
 	// Start: lastIndexed 100, node head 90.
-	head, err := idx.revertStaleHead(ctx, min(uint64(100), uint64(90)))
+	head, _, err := idx.revertStaleHead(ctx, min(uint64(100), uint64(90)))
 	require.NoError(t, err)
 	require.Equal(t, uint64(90), head, "start check sees nothing stale at or below the node head")
 

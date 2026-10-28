@@ -40,7 +40,7 @@ func TestStartRevertsAStaleStoredHead(t *testing.T) {
 	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil)
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
-	head, err := idx.revertStaleHead(ctx, 100)
+	head, _, err := idx.revertStaleHead(ctx, 100)
 	require.NoError(t, err)
 	require.Equal(t, uint64(87), head)
 	mockDB.AssertNumberOfCalls(t, "DeleteBlock", 13)
@@ -54,7 +54,7 @@ func TestStartRefusesAStaleStoredHeadItCannotRevert(t *testing.T) {
 	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(errors.New("daily_stats_invalidate: day partly pruned"))
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
-	_, err := idx.revertStaleHead(context.Background(), 100)
+	_, _, err := idx.revertStaleHead(context.Background(), 100)
 	require.ErrorContains(t, err, "stale fork")
 }
 
@@ -138,7 +138,7 @@ func TestStartRefusesATooDeepStaleForkWithoutDeleting(t *testing.T) {
 	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil).Maybe()
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
-	_, err := idx.revertStaleHead(context.Background(), 300)
+	_, _, err := idx.revertStaleHead(context.Background(), 300)
 	require.ErrorIs(t, err, errStaleForkTooDeep)
 	mockDB.AssertNotCalled(t, "DeleteBlock", mock.Anything, mock.Anything)
 }
@@ -161,7 +161,7 @@ func TestStartRevertsAStaleBlockUnderAMatchingHead(t *testing.T) {
 	mockDB.On("DeleteBlock", mock.Anything, mock.Anything).Return(nil)
 	idx := newPrefetchIndexer(mockDB, mockRPC)
 
-	head, err := idx.revertStaleHead(context.Background(), 100)
+	head, _, err := idx.revertStaleHead(context.Background(), 100)
 	require.NoError(t, err)
 	require.Equal(t, uint64(96), head)
 	mockDB.AssertNumberOfCalls(t, "DeleteBlock", 4)

@@ -487,13 +487,12 @@ func (i *Indexer) Start(ctx context.Context) error {
 	}
 
 	// The stored head may be on a stale fork: a reorg while the indexer was down, or a revert that kept failing
-	// until a restart. It is reverted before the start mode is chosen: collector mode starts realtime at the node
-	// head, whose reorg check never reaches below its own cursor, and catch-up fills the gap with no parent check.
-	// Stored blocks above the node's head cannot be compared yet; a stale fork below them takes them with it.
-	// A stale fork deeper than any reorg is a reset whose new chain already reached the old height: FORCE_REINDEX
-	// wipes it, as it does a reset the height gives away.
-	if top := min(lastIndexed, latestOnChain); top > 0 {
-		head, err := i.revertStaleHead(ctx, top)
+	// until a restart. It is reverted before the start mode is chosen (checkStoredHead): collector mode starts
+	// realtime at the node head, whose reorg check never reaches below its own cursor, and catch-up fills the gap with
+	// no parent check. A stale fork deeper than any reorg is a reset whose new chain already reached the old height:
+	// FORCE_REINDEX wipes it, as it does a reset the height gives away.
+	if lastIndexed > 0 {
+		head, chainHead, err := i.checkStoredHead(ctx, lastIndexed, latestOnChain)
 		if errors.Is(err, errStaleForkTooDeep) && os.Getenv("FORCE_REINDEX") == "true" {
 			metrics.ChainResetDetected()
 			if err := wipe(); err != nil {
@@ -501,9 +500,12 @@ func (i *Indexer) Start(ctx context.Context) error {
 			}
 		} else if err != nil {
 			return err
-		} else if head < top {
-			lastIndexed = head
-			blocksToSync = latestOnChain - lastIndexed
+		} else {
+			lastIndexed, latestOnChain = head, chainHead
+			blocksToSync = 0
+			if latestOnChain > lastIndexed {
+				blocksToSync = latestOnChain - lastIndexed
+			}
 		}
 	}
 
@@ -809,34 +811,114 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 
 var errStaleForkTooDeep = errors.New("is on a stale fork deeper than any reorg")
 
+// staleAboveHeadWait is how long the start waits for a node whose head stays below the stored head before it treats
+// the stored blocks above the node's head as stale: the chain reorged onto a shorter one, or the node lost them. A
+// node that was only slow costs those blocks being indexed again.
+var staleAboveHeadWait = 10 * time.Minute
+
+// startWaitInterval is how often a start waiting for the node to serve stored blocks checks again, and warns.
+var startWaitInterval = 10 * time.Second
+
+// checkStoredHead compares the stored chain with the node before any loop starts, reverts a stale fork it finds
+// (revertStaleHead), and returns the stored head and the node head to start from. A stored block the node does not
+// serve, at or below its head, or above it, cannot be compared: the start waits, startWaitInterval at a time, until the
+// node serves every one, with a warning each interval and the count in indexer_start_waiting_blocks. Starting without
+// comparing them let catch-up build the next block on a stale one for good. Stored blocks above a node head that
+// stays below them for staleAboveHeadWait are reverted as stale; a block at or below the node's head the node never
+// serves (it lost it) keeps the start waiting.
+func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChain uint64) (uint64, uint64, error) {
+	defer metrics.SetStartWaitingBlocks(0)
+	var belowSince time.Time
+	for lastIndexed > 0 {
+		var unserved []uint64
+		if top := min(lastIndexed, latestOnChain); top > 0 {
+			head, skipped, err := i.revertStaleHead(ctx, top)
+			if err != nil {
+				return lastIndexed, latestOnChain, err
+			}
+			if head < top {
+				lastIndexed = head
+			}
+			unserved = skipped
+		}
+		var above uint64
+		if lastIndexed > latestOnChain {
+			above = lastIndexed - latestOnChain
+		}
+		if len(unserved) == 0 && above == 0 {
+			break
+		}
+		if above == 0 {
+			belowSince = time.Time{}
+		} else if belowSince.IsZero() {
+			belowSince = time.Now()
+		} else if time.Since(belowSince) >= staleAboveHeadWait {
+			log.Warn("the node's head stayed below the stored head; reverting the stored blocks above it as stale",
+				"from", latestOnChain+1, "to", lastIndexed, "waited", staleAboveHeadWait)
+			if err := i.handleReorg(ctx, latestOnChain+1); err != nil {
+				return lastIndexed, latestOnChain, fmt.Errorf("revert the stored blocks above the node's head %d: %w", latestOnChain, err)
+			}
+			lastIndexed, belowSince = latestOnChain, time.Time{}
+			continue
+		}
+		metrics.SetStartWaitingBlocks(uint64(len(unserved)) + above)
+		args := []any{"stored_head", lastIndexed, "node_head", latestOnChain, "above_node_head", above, "unserved", len(unserved)}
+		if len(unserved) > 0 {
+			args = append(args, "unserved_from", unserved[len(unserved)-1], "unserved_to", unserved[0])
+		}
+		log.Warn("waiting for the node to serve stored blocks: they are compared with the chain before indexing starts", args...)
+		select {
+		case <-ctx.Done():
+			return lastIndexed, latestOnChain, ctx.Err()
+		case <-time.After(startWaitInterval):
+		}
+		head, err := i.rpc.BlockNumber(ctx)
+		if err != nil {
+			log.Warn("failed to read the node head while waiting to start; retrying", "error", err)
+			continue
+		}
+		if head+maxReorgDepth < lastIndexed {
+			metrics.ChainResetDetected()
+			return lastIndexed, head, fmt.Errorf("chain reset detected while waiting to start (chain_head=%d, last_indexed=%d): "+
+				"set FORCE_REINDEX=true to wipe and re-index", head, lastIndexed)
+		}
+		latestOnChain = head
+	}
+	return lastIndexed, latestOnChain, nil
+}
+
 // staleHeadWindow is how many blocks below the stored head the start check reads at least, as detectReorg does per
 // tick: a stale block under a matching head (a partial revert) is reverted too.
 const staleHeadWindow = 10
 
 // revertStaleHead measures how far below top the stored chain no longer matches the node, down to the deepest
 // mismatch in the first staleHeadWindow blocks or, below them, to the first stored block that matches, then reverts that many blocks, with every stored block above them, at once, and returns the
-// block the stored chain then ends at (top when nothing was stale). A stale fork deeper than maxReorgDepth (a reset
+// block the stored chain then ends at (top when nothing was stale), with the stored blocks at or below it the node
+// does not serve yet, which it could not compare (from top down; it stops after staleHeadWindow of them, since
+// checkStoredHead walks again once they are served). A stale fork deeper than maxReorgDepth (a reset
 // chain, or RPC_URL pointing at another chain) refuses the start before anything is deleted, as does a revert that
 // fails: starting on top of the fork would keep it stored for good.
-func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, error) {
+func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, []uint64, error) {
 	var depth uint64
+	var skipped []uint64
 	for d := uint64(0); d < top && d <= maxReorgDepth; d++ {
 		n := top - d
 		stored, err := i.db.GetBlock(ctx, n)
 		if err != nil {
-			return top, fmt.Errorf("read the stored block %d: %w", n, err)
+			return top, nil, fmt.Errorf("read the stored block %d: %w", n, err)
 		}
 		if stored == nil {
 			continue
 		}
 		chainHash, err := i.rpc.RawBlockHash(ctx, n)
 		if errors.Is(err, rpc.ErrBlockNotAvailable) {
-			log.Warn("the node does not have a stored block yet; the reorg checks compare it once the node serves it",
-				"block", n)
+			if skipped = append(skipped, n); len(skipped) >= staleHeadWindow {
+				break
+			}
 			continue
 		}
 		if err != nil {
-			return top, fmt.Errorf("check the stored block %d against the chain: %w", n, err)
+			return top, nil, fmt.Errorf("check the stored block %d against the chain: %w", n, err)
 		}
 		if stored.Hash == chainHash {
 			if d+1 >= staleHeadWindow {
@@ -845,19 +927,25 @@ func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, erro
 			continue
 		}
 		if depth = d + 1; depth > maxReorgDepth {
-			return top, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset, or "+
+			return top, nil, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset, or "+
 				"RPC_URL points at another chain; nothing was deleted. Set FORCE_REINDEX=true to wipe and re-index",
 				top, errStaleForkTooDeep, maxReorgDepth)
 		}
 	}
 	if depth == 0 {
-		return top, nil
+		return top, skipped, nil
 	}
 	log.Warn("the stored head is on a stale fork; reverting it before starting", "block", top, "depth", depth)
 	if err := i.handleReorg(ctx, top-depth+1); err != nil {
-		return top, fmt.Errorf("the stored block %d is on a stale fork and reverting it failed: %w", top, err)
+		return top, nil, fmt.Errorf("the stored block %d is on a stale fork and reverting it failed: %w", top, err)
 	}
-	return top - depth, nil
+	var kept []uint64
+	for _, n := range skipped {
+		if n <= top-depth {
+			kept = append(kept, n)
+		}
+	}
+	return top - depth, kept, nil
 }
 
 func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
