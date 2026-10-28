@@ -18,6 +18,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 // maxReorgDepth is the maximum number of blocks we expect a legitimate reorg
@@ -43,13 +44,24 @@ type Config struct {
 	CatchupBatchSize int
 	CatchupQueueSize int
 
-	SkipAddressStats    bool
-	SkipReceiptTxTypes  map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
+	SkipAddressStats   bool
+	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
-	// DailyStatsMinInterval is the minimum time between two recomputations of
-	// the current day's daily_stats row. Zero keeps the old behaviour (every
-	// 100th block). See dailyStatsThrottle.
+	// DailyStatsMinInterval is the minimum time between two daily_stats
+	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
+
+	// CommitPipelineDepth is how many blocks the standard loop writes at once (the pipelined
+	// commit). 1 is the sequential committer. See indexPipelined.
+	CommitPipelineDepth int
+
+	// BalanceDedupWindow holds balance work per (address, token) for this long before one fetch.
+	BalanceDedupWindow time.Duration
+
+	// BalanceReaderBatch > 1 reads up to that many balances per eth_call through BalanceReader;
+	// BalanceSkipL1 sends skipL1Charging with those calls.
+	BalanceReaderBatch int
+	BalanceSkipL1      bool
 
 	EnableOPDeposits bool
 }
@@ -239,18 +251,12 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
 		idx.balanceWorkers = NewBalanceWorkerPool(database, rpcClient, cfg.BalanceWorkers, cfg.RPCRateLimit)
-		// When balances actually land in the DB, refresh holder_count for the
-		// affected tokens so the cached count on the tokens row matches the
-		// new balance set without waiting for the next transfer.
-		idx.balanceWorkers.SetOnFlush(func(tokenAddresses []string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			for _, addr := range tokenAddresses {
-				if err := database.RefreshTokenStats(ctx, addr); err != nil {
-					log.Warn("refresh token stats after balance flush failed", "token", addr, "error", err)
-				}
-			}
-		})
+		idx.balanceWorkers.SetDedupWindow(cfg.BalanceDedupWindow)
+		idx.balanceWorkers.SetReaderBatch(cfg.BalanceReaderBatch, cfg.BalanceSkipL1)
+		// No post-flush stats refresh any more: holder_count is maintained by
+		// InsertBalancesBatch itself, in the transaction that writes the
+		// balances (PRST-4669). The callback used to trigger a COUNT(*) per
+		// token per flush of each worker -- ~7 per indexed block under load.
 	}
 
 	return idx
@@ -448,16 +454,6 @@ func (i *Indexer) Start(ctx context.Context) error {
 		}
 	}
 
-	// Backfill daily stats in background
-	go func() {
-		log.Info("starting daily stats backfill")
-		if err := i.db.BackfillDailyStats(ctx); err != nil {
-			log.Warn("daily stats backfill failed", "error", err)
-		} else {
-			log.Info("daily stats backfill completed")
-		}
-	}()
-
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 	catchupThreshold := uint64(100)
 	useCatchup := i.config.CatchupEnabled && (hasGaps || blocksToSync > catchupThreshold)
@@ -648,71 +644,81 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 			if lastIndexed > 0 {
 				reorgDepth, err := i.detectReorg(ctx, lastIndexed)
 				if err != nil {
-					log.Error("failed to check for reorg", "error", err)
-				} else if reorgDepth > 0 {
+					log.Error("failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+					continue
+				}
+				if reorgDepth > 0 {
 					log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
 					if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
 						log.Error("failed to handle reorg", "error", err)
-					} else {
-						lastIndexed = lastIndexed - reorgDepth
+						continue
 					}
+					lastIndexed = lastIndexed - reorgDepth
 				}
 			}
 
-			for blockNum := lastIndexed + 1; blockNum <= latestOnChain; blockNum++ {
-				select {
-				case req := <-i.indexRequests:
-					err := i.processBlock(ctx, req.blockNumber)
-					req.done <- err
-				default:
-				}
-
-				if err := i.processBlock(ctx, blockNum); err != nil {
-					log.Error("failed to process block", "block", blockNum, "error", err)
-					if !receipts.skip(ctx, i.db, blockNum, err) {
-						break
-					}
-				}
-				lastIndexed = blockNum
-
-				if blockNum%10 == 0 {
-					i.db.UpdateSyncStatus(ctx, lastIndexed, true)
-				}
+			if i.config.CommitPipelineDepth > 1 {
+				lastIndexed = i.indexPipelined(ctx, lastIndexed, latestOnChain, i.config.CommitPipelineDepth, &receipts)
+			} else {
+				lastIndexed = i.indexPrefetched(ctx, lastIndexed, latestOnChain, &receipts)
 			}
 		}
 	}
 }
 
+// detectReorg walks down from blockNumber comparing stored and chain hashes and
+// returns how many blocks, counted from blockNumber, no longer match the chain.
+//
+// It used to return at the FIRST mismatch, i.e. always depth 1 when the head
+// block differed, so a reorg deeper than one block reverted only the head and
+// left the stale blocks beneath it in place forever (a test that corrupted three
+// stored hashes saw one reverted, two kept). It now scans the whole
+// window and returns the DEEPEST mismatch: a real reorg mismatches from the
+// head down to the fork point, and a stored block that disagrees with the
+// chain beneath a matching head (a corrupted or partially reverted database)
+// is reverted too rather than kept. The window was always scanned in full in
+// the no-reorg case, so the cost per poll tick is unchanged.
+//
+// A read that fails part way returns the error with the depth found so far.
+// The caller indexes nothing on that tick and walks again on the next one.
 func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, error) {
 	maxReorgCheck := uint64(10)
+	var deepest uint64
 	for depth := uint64(0); depth < maxReorgCheck && blockNumber > depth; depth++ {
 		checkBlock := blockNumber - depth
 
 		storedBlock, err := i.db.GetBlock(ctx, checkBlock)
-		if err != nil || storedBlock == nil {
+		if err != nil {
+			return deepest, err
+		}
+		if storedBlock == nil {
 			continue
 		}
 
 		chainHash, err := i.rpc.RawBlockHash(ctx, checkBlock)
 		if err != nil {
-			return 0, err
+			return deepest, err
 		}
 
-		if storedBlock.Hash != chainHash {
-			storedHash := storedBlock.Hash
-			chainHashLog := chainHash
-			if len(storedHash) > 16 {
-				storedHash = storedHash[:16]
-			}
-			if len(chainHashLog) > 16 {
-				chainHashLog = chainHashLog[:16]
-			}
-			log.Warn("reorg detected",
-				"block", checkBlock,
-				"stored_hash", storedHash,
-				"chain_hash", chainHashLog)
-			return depth + 1, nil
+		if storedBlock.Hash == chainHash {
+			continue
 		}
+		storedHash := storedBlock.Hash
+		chainHashLog := chainHash
+		if len(storedHash) > 16 {
+			storedHash = storedHash[:16]
+		}
+		if len(chainHashLog) > 16 {
+			chainHashLog = chainHashLog[:16]
+		}
+		log.Warn("reorg detected",
+			"block", checkBlock,
+			"stored_hash", storedHash,
+			"chain_hash", chainHashLog)
+		deepest = depth + 1
+	}
+	if deepest > 0 {
+		return deepest, nil
 	}
 	return 0, nil
 }
@@ -750,7 +756,10 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 	if len(rawBlock.Transactions) > 0 {
 		return i.processBlockParallelRaw(ctx, rawBlock)
 	}
+	return i.insertEmptyBlock(ctx, rawBlock)
+}
 
+func (i *Indexer) insertEmptyBlock(ctx context.Context, rawBlock *rpc.RawBlock) error {
 	b := &types.Block{
 		Number:           rawBlock.NumberU64(),
 		Hash:             rawBlock.Hash.Hex(),
@@ -780,27 +789,58 @@ func (i *Indexer) processBlockRaw(ctx context.Context, number uint64) error {
 	return nil
 }
 
-func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.RawBlock) error {
-	start := time.Now()
-	defer metrics.StageTimer(metrics.StageBlockTotal)()
-	blockNumber := rawBlock.NumberU64()
-	rawTxs := rawBlock.Transactions
-	blockTimestamp := uint64(rawBlock.Timestamp)
-
-	// Build receipt fetch list, skipping tx types that are known to fail
-	// (e.g. type 126 OP deposit system transactions on op-reth devnets)
-	txHashes := make([]common.Hash, 0, len(rawTxs))
-	for _, tx := range rawTxs {
+// receiptTxHashes lists the transactions whose receipts are fetched, skipping tx types that are
+// known to fail (e.g. type 126 OP deposit system transactions on op-reth devnets).
+func (i *Indexer) receiptTxHashes(rawBlock *rpc.RawBlock) []common.Hash {
+	txHashes := make([]common.Hash, 0, len(rawBlock.Transactions))
+	for _, tx := range rawBlock.Transactions {
 		if i.config.SkipReceiptTxTypes != nil && i.config.SkipReceiptTxTypes[int(tx.Type)] {
 			continue
 		}
 		txHashes = append(txHashes, tx.Hash)
 	}
+	return txHashes
+}
 
-	receipts, err := i.rpc.FetchReceiptsBatch(ctx, txHashes, i.config.RPCWorkers, i.config.RPCRateLimit, blockNumber)
+func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.RawBlock) error {
+	receipts, err := i.rpc.FetchReceiptsBatch(ctx, i.receiptTxHashes(rawBlock), i.config.RPCWorkers, i.config.RPCRateLimit, rawBlock.NumberU64())
 	if err != nil {
 		return fmt.Errorf("%w: %w", errReceiptsUnavailable, err)
 	}
+	return i.processBlockWithReceipts(ctx, rawBlock, receipts)
+}
+
+// processBlockWithReceipts is everything after the two chain reads: it builds the block's rows and
+// commits them. The standard loop prefetches the reads (prefetch.go) and calls this in block order.
+func (i *Indexer) processBlockWithReceipts(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) error {
+	defer metrics.StageTimer(metrics.StageBlockTotal)()
+	b := i.buildBlock(ctx, rawBlock, receipts)
+	commitStart := time.Now()
+	if err := i.db.InsertBlockDataBatch(ctx, b.data); err != nil {
+		return err
+	}
+	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
+	i.afterCommit(ctx, b)
+	return nil
+}
+
+// builtBlock is a block turned into rows, with what has to happen once those rows are committed.
+type builtBlock struct {
+	raw            *rpc.RawBlock
+	data           *db.BlockData
+	balanceWork    []BalanceWork
+	discovered     []string
+	start          time.Time
+	blockNumber    uint64
+	blockTimestamp uint64
+}
+
+func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) *builtBlock {
+	start := time.Now()
+	blockNumber := rawBlock.NumberU64()
+	rawTxs := rawBlock.Transactions
+	blockTimestamp := uint64(rawBlock.Timestamp)
+	txHashes := i.receiptTxHashes(rawBlock)
 
 	blockData := &db.BlockData{
 		Block: &types.Block{
@@ -1095,6 +1135,10 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		}
 	}
 
+	// Addresses to mark as known, but only once their tokens row is committed --
+	// see the Add below the batch.
+	var discovered []string
+
 	if len(newTokenAddresses) > 0 {
 		// A token is only ever discovered from a Transfer event we just parsed,
 		// and that path already classifies ERC721 by its 4-topic signature (the
@@ -1128,7 +1172,7 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 					BlockNumber: blockNumber,
 					CreationTx:  &txHash,
 				})
-				i.tokenCache.Add(addr.Hex())
+				discovered = append(discovered, addr.Hex())
 			}
 		}
 	}
@@ -1144,15 +1188,37 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 		}
 	}
 
-	commitStart := time.Now()
-	if err := i.db.InsertBlockDataBatch(ctx, blockData); err != nil {
-		return err
-	}
-	metrics.ObserveStage(metrics.StageDBCommit, time.Since(commitStart))
+	return &builtBlock{raw: rawBlock, data: blockData, balanceWork: balanceWork, discovered: discovered,
+		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp}
+}
 
-	// Refresh derived stats (transfer_count, total_supply, holder_count) for
-	// each token touched in this block. Cheap aggregate queries; runs
-	// synchronously so the new counts are visible on the next read.
+func (i *Indexer) afterCommit(ctx context.Context, b *builtBlock) {
+	rawBlock, blockData, balanceWork, discovered := b.raw, b.data, b.balanceWork, b.discovered
+	start, blockNumber, blockTimestamp, rawTxs := b.start, b.blockNumber, b.blockTimestamp, b.raw.Transactions
+
+	// Marked known only now, after the row is committed. Adding before the
+	// batch made the cache claim a token whose row was still uncommitted (or
+	// whose batch went on to fail), and another worker parsing a transfer of
+	// that token in the window would then omit it from its own data.Tokens --
+	// so it neither seeded the row nor was covered by the seed, and its delta
+	// UPDATE found no visible row and silently counted nothing.
+	//
+	// With the Add here, that worker still sees a cache miss, still queues the
+	// token, and blocks on the tokens primary key until the first worker
+	// commits. It then reads wasNew = false against a visible row and its own
+	// delta applies. The serialisation point is a lock the insert already
+	// takes; the cost is one duplicate metadata fetch in that window.
+	for _, addr := range discovered {
+		i.tokenCache.Add(addr)
+	}
+
+	// Refresh the stats that are still recomputed for each token touched in
+	// this block -- only ERC721 total_supply is left. transfer_count and
+	// total_supply (ERC20) are maintained by the delta writes inside
+	// InsertBlockDataBatch above; holder_count by InsertBalancesBatch when the
+	// balances land (PRST-4669). For an ERC20 token this is one PK read.
+	//
+	// Runs synchronously so the new count is visible on the next read.
 	if len(blockData.Transfers) > 0 {
 		touched := make(map[string]struct{}, len(blockData.Transfers))
 		for _, t := range blockData.Transfers {
@@ -1197,20 +1263,9 @@ func (i *Indexer) processBlockParallelRaw(ctx context.Context, rawBlock *rpc.Raw
 			"elapsed", elapsed)
 	}
 
-	// Recompute the day's daily_stats row, throttled.
-	//
-	// ComputeDailyStats re-aggregates the WHOLE day from base tables: six
-	// queries, the largest a COUNT(DISTINCT from/to address) over every
-	// transaction of the day. That cost grows with the day's volume: 1.9 s
-	// per call at 2.1M transactions on the PRST-4669 rig, ~2.7 s for the six
-	// together, and it was fired every 100 blocks -- every 10-14 s at 500 tx/s
-	// -- so it was 21.5% of all database time once holder_count stopped
-	// dominating, and on course to saturate a core by mid-day. The row it
-	// maintains is a dashboard aggregate: a day's row may lag its blocks by up to
-	// one interval plus one run. Same queries, fewer runs.
+	// Advance daily_stats, throttled. The row is a dashboard aggregate: a day's
+	// row may lag its blocks by up to one interval plus one run.
 	i.scheduleDailyStats(ctx, blockNumber, blockDay(blockTimestamp))
-
-	return nil
 }
 
 func blockDay(timestamp uint64) time.Time {
@@ -1229,8 +1284,8 @@ func (i *Indexer) scheduleDailyStats(ctx context.Context, blockNumber uint64, da
 	go func() {
 		defer i.scheduleDeferredDailyStats(ctx)
 		defer i.dailyStats.done()
-		for _, d := range days {
-			if !i.updateDailyStatsForDate(ctx, d) {
+		if !i.advanceDailyStats(ctx) {
+			for _, d := range days {
 				i.dailyStats.markDirty(d)
 			}
 		}
@@ -1264,14 +1319,9 @@ func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta
 	}
 }
 
-func (i *Indexer) updateDailyStatsForDate(ctx context.Context, date time.Time) bool {
-	stats, err := i.db.ComputeDailyStats(ctx, date)
-	if err != nil {
-		log.Warn("failed to compute daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)
-		return false
-	}
-	if err := i.db.UpsertDailyStats(ctx, stats); err != nil {
-		log.Warn("failed to upsert daily stats; will retry", "date", date.Format("2006-01-02"), "error", err)
+func (i *Indexer) advanceDailyStats(ctx context.Context) bool {
+	if _, err := i.db.AdvanceDailyStats(ctx); err != nil {
+		log.Warn("failed to advance daily stats; will retry", "error", err)
 		return false
 	}
 	return true

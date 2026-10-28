@@ -101,7 +101,7 @@ func (c *Client) RawBlockByNumber(ctx context.Context, number uint64) (*RawBlock
 	if err != nil {
 		return nil, fmt.Errorf("raw block fetch for %d: %w", number, err)
 	}
-	if raw.Number == nil {
+	if raw.Number == nil || raw.Hash == (common.Hash{}) {
 		return nil, fmt.Errorf("block %d not found", number)
 	}
 	return &raw, nil
@@ -114,6 +114,9 @@ func (c *Client) RawBlockHash(ctx context.Context, number uint64) (string, error
 	err := c.raw.CallContext(ctx, &raw, "eth_getBlockByNumber", toHex(number), false)
 	if err != nil {
 		return "", fmt.Errorf("raw block hash fetch for %d: %w", number, err)
+	}
+	if raw.Hash == (common.Hash{}) {
+		return "", fmt.Errorf("block %d not available from the node", number)
 	}
 	return raw.Hash.Hex(), nil
 }

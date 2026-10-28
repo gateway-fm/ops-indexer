@@ -42,6 +42,9 @@ type RealtimeIndexer struct {
 	lastProcessedBlock uint64
 	mu                 sync.RWMutex
 	receipts           receiptSkip
+	// failedRevertFrom is the fork point of a revert that returned an error, until the next tick has checked what it
+	// left stored; 0 when there is none.
+	failedRevertFrom uint64
 
 	// Coordination
 	ctx    context.Context
@@ -164,42 +167,7 @@ func (r *RealtimeIndexer) runSubscriptionMode(ctx context.Context, headers <-cha
 			latestBlock := header.Number.Uint64()
 			safeBlock := latestBlock - uint64(r.config.ConfirmationBlocks)
 
-			lastProcessed := r.GetLastProcessedBlock()
-			for blockNum := lastProcessed + 1; blockNum <= safeBlock; blockNum++ {
-				select {
-				case req := <-r.indexRequests:
-					err := r.processBlock(ctx, req.blockNumber)
-					req.done <- err
-				default:
-				}
-
-				if blockNum > 0 {
-					reorgDepth, err := r.detectReorg(ctx, blockNum-1)
-					if err != nil {
-						log.Error("realtime: failed to check for reorg", "error", err)
-					} else if reorgDepth > 0 {
-						log.Warn("realtime: detected reorg", "depth", reorgDepth)
-						if err := r.handleReorg(ctx, blockNum-reorgDepth); err != nil {
-							log.Error("realtime: failed to handle reorg", "error", err)
-						}
-						r.SetLastProcessedBlock(blockNum - reorgDepth - 1)
-						continue
-					}
-				}
-
-				if err := r.processBlock(ctx, blockNum); err != nil {
-					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					if !r.receipts.skip(ctx, r.db, blockNum, err) {
-						break
-					}
-				}
-
-				r.SetLastProcessedBlock(blockNum)
-
-				if blockNum%10 == 0 {
-					r.db.UpdateSyncStatus(ctx, blockNum, true)
-				}
-			}
+			r.indexUpTo(ctx, safeBlock)
 		}
 	}
 }
@@ -229,45 +197,92 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 			}
 
 			safeBlock := latestOnChain - uint64(r.config.ConfirmationBlocks)
-			lastProcessed := r.GetLastProcessedBlock()
-
-			for blockNum := lastProcessed + 1; blockNum <= safeBlock; blockNum++ {
-				select {
-				case req := <-r.indexRequests:
-					err := r.processBlock(ctx, req.blockNumber)
-					req.done <- err
-				default:
-				}
-
-				if blockNum > 0 {
-					reorgDepth, err := r.detectReorg(ctx, blockNum-1)
-					if err != nil {
-						log.Error("realtime: failed to check for reorg", "error", err)
-					} else if reorgDepth > 0 {
-						log.Warn("realtime: detected reorg", "depth", reorgDepth)
-						if err := r.handleReorg(ctx, blockNum-reorgDepth); err != nil {
-							log.Error("realtime: failed to handle reorg", "error", err)
-						}
-						r.SetLastProcessedBlock(blockNum - reorgDepth - 1)
-						continue
-					}
-				}
-
-				if err := r.processBlock(ctx, blockNum); err != nil {
-					log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-					if !r.receipts.skip(ctx, r.db, blockNum, err) {
-						break
-					}
-				}
-
-				r.SetLastProcessedBlock(blockNum)
-
-				if blockNum%10 == 0 {
-					r.db.UpdateSyncStatus(ctx, blockNum, true)
-				}
-			}
+			r.indexUpTo(ctx, safeBlock)
 		}
 	}
+}
+
+// indexUpTo indexes the blocks after the last processed one up to safeBlock. When stored blocks no longer match the
+// chain it reverts them and goes on from the fork point in the same pass. It returns at the first block it cannot
+// index, or when a reorg cannot be reverted, and the next tick starts again from the last processed block.
+func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
+	if !r.resumeAfterFailedRevert(ctx) {
+		return
+	}
+	reverted := false
+	for blockNum := r.GetLastProcessedBlock() + 1; blockNum <= safeBlock; blockNum++ {
+		select {
+		case req := <-r.indexRequests:
+			err := r.processBlock(ctx, req.blockNumber)
+			req.done <- err
+		default:
+		}
+
+		if blockNum > 0 {
+			reorgDepth, err := r.detectReorg(ctx, blockNum-1)
+			if err != nil {
+				log.Error("realtime: failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+				return
+			}
+			if reorgDepth > 0 {
+				if reverted {
+					return
+				}
+				fork := blockNum - reorgDepth
+				log.Warn("realtime: detected reorg", "depth", reorgDepth)
+				if err := r.handleReorg(ctx, fork); err != nil {
+					log.Error("realtime: failed to handle reorg", "error", err)
+					r.failedRevertFrom = fork
+					return
+				}
+				reverted = true
+				r.SetLastProcessedBlock(fork - 1)
+				blockNum = fork - 1
+				continue
+			}
+		}
+
+		if err := r.processBlock(ctx, blockNum); err != nil {
+			log.Error("realtime: failed to process block", "block", blockNum, "error", err)
+			if !r.receipts.skip(ctx, r.db, blockNum, err) {
+				return
+			}
+		}
+
+		r.SetLastProcessedBlock(blockNum)
+
+		if blockNum%10 == 0 {
+			r.db.UpdateSyncStatus(ctx, blockNum, true)
+		}
+	}
+}
+
+// resumeAfterFailedRevert moves the cursor down to what a failed revert left stored. A delete that reported an error
+// may have committed (a lost acknowledgement), and the reorg check skips blocks that are not stored, so with the
+// cursor still above them the deleted blocks would never be indexed again. The cursor goes to the highest stored
+// block at or below it, and no lower than the block before the fork: a block the revert deleted is indexed again,
+// and a stale block it left is found by the reorg check again. It reports false when the store cannot be read.
+func (r *RealtimeIndexer) resumeAfterFailedRevert(ctx context.Context) bool {
+	if r.failedRevertFrom == 0 {
+		return true
+	}
+	cursor := r.GetLastProcessedBlock()
+	below, err := r.db.HighestBlockAtOrBelow(ctx, cursor)
+	if err != nil {
+		log.Error("realtime: failed to read what a failed revert left stored, retrying on the next tick", "error", err)
+		return false
+	}
+	resume := r.failedRevertFrom - 1
+	if below != nil && below.Number > resume {
+		resume = below.Number
+	}
+	if resume < cursor {
+		log.Warn("realtime: a failed revert left blocks deleted; indexing again from the highest stored block",
+			"cursor", cursor, "from", resume)
+		r.SetLastProcessedBlock(resume)
+	}
+	r.failedRevertFrom = 0
+	return true
 }
 
 func (r *RealtimeIndexer) processBlock(ctx context.Context, number uint64) error {
@@ -292,30 +307,45 @@ func (r *RealtimeIndexer) blockIndexer() *Indexer {
 	}
 }
 
+// detectReorg: see Indexer.detectReorg. Same walk, same fix (PRST-5320): it
+// scans the whole 10-block window and returns the depth of the deepest stored
+// block that no longer matches the chain, not 1 as soon as the top mismatches.
 func (r *RealtimeIndexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, error) {
 	maxReorgCheck := uint64(10)
+	var deepest uint64
 	for depth := uint64(0); depth < maxReorgCheck && blockNumber > depth; depth++ {
 		checkBlock := blockNumber - depth
 
 		storedBlock, err := r.db.GetBlock(ctx, checkBlock)
-		if err != nil || storedBlock == nil {
+		if err != nil {
+			return deepest, err
+		}
+		if storedBlock == nil {
 			continue
 		}
 
 		chainHash, err := r.rpc.RawBlockHash(ctx, checkBlock)
 		if err != nil {
-			return 0, err
+			return deepest, err
 		}
 
-		if storedBlock.Hash != chainHash {
-			log.Warn("realtime: reorg detected",
-				"block", checkBlock,
-				"stored_hash", storedBlock.Hash[:16],
-				"chain_hash", chainHash[:16])
-			return depth + 1, nil
+		if storedBlock.Hash == chainHash {
+			continue
 		}
+		storedHash, chainHashLog := storedBlock.Hash, chainHash
+		if len(storedHash) > 16 {
+			storedHash = storedHash[:16]
+		}
+		if len(chainHashLog) > 16 {
+			chainHashLog = chainHashLog[:16]
+		}
+		log.Warn("realtime: reorg detected",
+			"block", checkBlock,
+			"stored_hash", storedHash,
+			"chain_hash", chainHashLog)
+		deepest = depth + 1
 	}
-	return 0, nil
+	return deepest, nil
 }
 
 func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) error {

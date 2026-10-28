@@ -1,0 +1,12 @@
+-- Serialise balance writers per (token, address) key for the rest of the
+-- transaction. Keys are 32-bit FNV-1a hashes of "token|address", sorted and
+-- deduplicated by the caller so every transaction acquires them in one total
+-- order (no cycles between two flushes).
+--
+-- The two-int form is a different lock space from the one-bigint form that
+-- InsertBlockDataBatch uses for tokens rows, so a hash collision between a
+-- balance key and a token key cannot create a lock-order cycle between the
+-- block path and this one. 4669 is the ticket number, used as the namespace.
+--
+--   $1 int4[] sorted ascending
+SELECT pg_advisory_xact_lock(4669, k) FROM unnest($1::int4[]) AS k

@@ -26,7 +26,7 @@ func newMockSubscription() *mockSubscription {
 	return &mockSubscription{errCh: make(chan error, 1)}
 }
 
-func (s *mockSubscription) Unsubscribe() {}
+func (s *mockSubscription) Unsubscribe()      {}
 func (s *mockSubscription) Err() <-chan error { return s.errCh }
 
 func newTestCatchupIndexer(mockDB *MockDatabase, mockRPC *MockRPCClient) *CatchupIndexer {
@@ -545,6 +545,8 @@ func TestRealtimeIndexer_ReorgError_DoesNotDeleteBlocks(t *testing.T) {
 		Hash:   "0xstoredblock4hash",
 	}, nil)
 	mockRPC.On("RawBlockHash", mock.Anything, uint64(4)).Return("", fmt.Errorf("RPC unavailable")).Once()
+	mockRPC.On("RawBlockHash", mock.Anything, uint64(4)).Return("0xstoredblock4hash", nil)
+	mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil)
 
 	rawBlock5 := makeRawBlock(5)
 
@@ -573,4 +575,24 @@ func TestRealtimeIndexer_ReorgError_DoesNotDeleteBlocks(t *testing.T) {
 	assert.GreaterOrEqual(t, rt.GetLastProcessedBlock(), uint64(5))
 
 	rt.Stop()
+}
+
+// Realtime's detector reports the deepest stale block in its window, not the first one it meets,
+// so every stale block is reverted (PRST-5320).
+func TestRealtimeIndexer_DetectReorg_ReportsTheDeepestStaleBlock(t *testing.T) {
+	mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+	rt := NewRealtimeIndexer(mockDB, mockRPC, &RealtimeConfig{ConfirmationBlocks: 1, PollInterval: 100 * time.Millisecond},
+		&Config{}, NewTokenCache(), NewContractCache(), nil, false)
+	for n := uint64(91); n <= 100; n++ {
+		stored := fmt.Sprintf("0x%064x", 1000+n)
+		chain := stored
+		if n >= 98 {
+			stored = fmt.Sprintf("0x%064x", 9000+n)
+		}
+		mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: stored}, nil)
+		mockRPC.On("RawBlockHash", mock.Anything, n).Return(chain, nil)
+	}
+	depth, err := rt.detectReorg(context.Background(), 100)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(3), depth, "blocks 98, 99 and 100 are stale")
 }

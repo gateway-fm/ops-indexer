@@ -16,13 +16,15 @@ import (
 var migrations embed.FS
 
 type DB struct {
-	pool          *pgxpool.Pool
+	pool *pgxpool.Pool
 	// HiddenTxTypes are transaction type numbers excluded from default listings
 	// (e.g. 126 for OP deposit system transactions). Set via HIDDEN_TX_TYPES env var.
 	HiddenTxTypes []int
 	// RebuildWorkMem is the work_mem for the address_stats rebuild transaction.
 	// Empty falls back to a safe default. Set via REBUILD_WORK_MEM env var.
 	RebuildWorkMem string
+	lateDays       lateDays
+	statsGap       statsGap
 }
 
 func New(databaseURL string) (*DB, error) {
@@ -93,7 +95,54 @@ func (d *DB) Migrate() error {
 	}
 	log.Info("chain_counters re-seeded from row counts")
 
+	// Same reconciliation, one level down: tokens.transfer_count and
+	// tokens.total_supply are maintained by deltas in InsertBlockDataBatch, so
+	// every row written before that existed still holds a value computed the
+	// old way -- and rows written by a build without the delta would keep
+	// drifting. One absolute pass at startup makes them agree with the stored
+	// transfers.
+	//
+	// ERC721 total_supply is left alone: it derives from nft_tokens rather than
+	// from token_transfers and RefreshTokenStats still recomputes it per block.
+	if _, err := d.pool.Exec(ctx, `
+		UPDATE tokens t SET
+			transfer_count = s.cnt,
+			total_supply = CASE WHEN t.token_type = 'ERC20' THEN `+clampSupply(`s.supply`)+` ELSE t.total_supply END
+		FROM (
+			SELECT token_address,
+			       COUNT(*) AS cnt,
+			       COALESCE(
+			           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+			         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END),
+			           0) AS supply
+			FROM token_transfers GROUP BY token_address
+		) s
+		WHERE t.address = s.token_address
+		  AND (t.transfer_count IS DISTINCT FROM s.cnt
+		       OR (t.token_type = 'ERC20' AND t.total_supply IS DISTINCT FROM s.supply))`); err != nil {
+		return fmt.Errorf("failed to re-seed token transfer counters: %w", err)
+	}
+
+	// A token whose every transfer row is gone (or that never had one) is not
+	// covered by the join above; zero it so a stale count cannot survive.
+	if _, err := d.pool.Exec(ctx, `
+		UPDATE tokens SET transfer_count = 0
+		WHERE transfer_count <> 0
+		  AND NOT EXISTS (SELECT 1 FROM token_transfers WHERE token_address = tokens.address)`); err != nil {
+		return fmt.Errorf("failed to zero token transfer counters: %w", err)
+	}
+	log.Info("token transfer counters re-seeded from token_transfers")
+
 	if err := d.reconcileTokenBalancesCurrent(ctx); err != nil {
+		return err
+	}
+
+	// holder_count is delta-maintained by InsertBalancesBatch (PRST-4669), in
+	// the transaction that writes the current balances, so no crash separates
+	// the two. It is re-seeded here for databases a build without that writer
+	// wrote: every database upgraded from 0.4.0, and one that ran an older
+	// build again after a rollback.
+	if err := d.ReseedHolderCounts(ctx); err != nil {
 		return err
 	}
 

@@ -80,11 +80,17 @@ func main() {
 	if err := database.Migrate(); err != nil {
 		log.Fatal("failed to run migrations", "error", err)
 	}
+	if cfg.TxHashIndexes {
+		if err := database.EnsureTxHashIndexes(context.Background()); err != nil {
+			log.Fatal("failed to build the tx_hash lookup indexes", "error", err)
+		}
+	}
 
 	rpcClient, err := rpc.New(cfg.RPCURL)
 	if err != nil {
 		log.Fatal("failed to create rpc client", "error", err)
 	}
+	rpcClient.LimitReceipts(cfg.RPCWorkers, cfg.RPCRateLimit)
 
 	idxCfg := &indexer.Config{
 		RPCWorkers:            cfg.RPCWorkers,
@@ -102,6 +108,10 @@ func main() {
 		CatchupQueueSize:      cfg.CatchupQueueSize,
 		SkipReceiptTxTypes:    skipReceipts,
 		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
+		CommitPipelineDepth:   cfg.CommitPipelineDepth,
+		BalanceDedupWindow:    cfg.BalanceDedupWindow,
+		BalanceReaderBatch:    cfg.BalanceReaderBatch,
+		BalanceSkipL1:         cfg.BalanceSkipL1,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

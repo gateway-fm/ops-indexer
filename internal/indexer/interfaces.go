@@ -3,7 +3,6 @@ package indexer
 import (
 	"context"
 	"math/big"
-	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
@@ -18,9 +17,11 @@ type Database interface {
 	GetBlockCount(ctx context.Context) (int64, error)
 	GetBlockCountInRange(ctx context.Context, from, to uint64) (int64, error)
 	GetBlock(ctx context.Context, number uint64) (*types.Block, error)
+	HighestBlockAtOrBelow(ctx context.Context, number uint64) (*types.Block, error)
 	DeleteBlock(ctx context.Context, number uint64) error
 	InsertBlock(ctx context.Context, b *types.Block) error
 	InsertBlockDataBatch(ctx context.Context, b *db.BlockData) error
+	BeginBlockData(ctx context.Context, b *db.BlockData) (*db.BlockWrite, error)
 	UpdateSyncStatus(ctx context.Context, lastIndexed uint64, isSyncing bool) error
 	HasBlock(ctx context.Context, number uint64) (bool, error)
 	DeleteMissingRangeByBlock(ctx context.Context, blockNum uint64) error
@@ -50,9 +51,7 @@ type Database interface {
 	InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error
 	RefreshTokenStats(ctx context.Context, tokenAddress string) error
 
-	ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error)
-	UpsertDailyStats(ctx context.Context, stats *types.DailyStats) error
-	BackfillDailyStats(ctx context.Context) error
+	AdvanceDailyStats(ctx context.Context) (uint64, error)
 
 	WipeAllData(ctx context.Context) error
 }

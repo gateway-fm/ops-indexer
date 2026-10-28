@@ -269,6 +269,14 @@ func readBenchSeedState(tb testing.TB, d *DB) benchSeedStateRow {
 func restoreSeededState(tb testing.TB, d *DB, head uint64) {
 	tb.Helper()
 	ctx := context.Background()
+	// Logs and transfers are keyed by (block_number, log_index) with no foreign key to transactions since
+	// migration 013, so the block delete no longer cascades to them: delete them by block, as DeleteBlock does.
+	for _, table := range []string{"logs", "token_transfers"} {
+		if _, err := d.pool.Exec(ctx, `DELETE FROM `+table+` WHERE block_number > $1`, head); err != nil {
+			tb.Errorf("restore seeded state: delete %s above %d: %v", table, head, err)
+			return
+		}
+	}
 	if _, err := d.pool.Exec(ctx, `DELETE FROM blocks WHERE number > $1`, head); err != nil {
 		tb.Errorf("restore seeded state: delete blocks above %d: %v", head, err)
 		return

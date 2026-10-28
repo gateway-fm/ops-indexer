@@ -5,21 +5,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	RPCURL          string        `mapstructure:"rpc_url"`
-	DatabaseURL     string        `mapstructure:"database_url"`
+	RPCURL      string `mapstructure:"rpc_url"`
+	DatabaseURL string `mapstructure:"database_url"`
 	// GRPCListenAddr is the address the chain-indexer gRPC server binds to,
 	// e.g. ":50051". Required.
-	GRPCListenAddr  string        `mapstructure:"grpc_listen_addr"`
-	APIPort         int           `mapstructure:"api_port"`
-	PollInterval    time.Duration `mapstructure:"poll_interval"`
+	GRPCListenAddr string        `mapstructure:"grpc_listen_addr"`
+	APIPort        int           `mapstructure:"api_port"`
+	PollInterval   time.Duration `mapstructure:"poll_interval"`
 	// Minimum interval between recomputations of the current day's daily_stats
 	// row (PRST-4669). 0 = every 100 blocks (legacy).
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
-	StartBlock      uint64        `mapstructure:"start_block"`
+	CommitPipelineDepth   int           `mapstructure:"commit_pipeline"`
+	BalanceDedupWindow    time.Duration `mapstructure:"balance_dedup_window"`
+	BalanceReaderBatch    int           `mapstructure:"balance_reader_batch"`
+	BalanceSkipL1         bool          `mapstructure:"balance_skip_l1"`
+	// TxHashIndexes keeps an index on tx_hash in logs and token_transfers for consumers that read them by
+	// transaction hash (0.4.0 had one); false spares ingest its random writes.
+	TxHashIndexes bool   `mapstructure:"tx_hash_indexes"`
+	StartBlock    uint64 `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -50,7 +58,7 @@ type Config struct {
 
 	// Set PRIVACY_PROXY_URL to enable proxy mode (auth + privacy enforcement).
 	// Leave empty for standalone mode (direct DB/RPC access).
-	PrivacyProxyURL       string `mapstructure:"privacy_proxy_url"`
+	PrivacyProxyURL string `mapstructure:"privacy_proxy_url"`
 	// PrivacyProxyPublicURL is the browser-facing URL for OAuth redirects.
 	// Defaults to PrivacyProxyURL if not set. Set this when the proxy is on a
 	// Docker-internal hostname (e.g. privacy-proxy-proxy-backend-1) but the
@@ -59,15 +67,15 @@ type Config struct {
 	SSOClientID           string `mapstructure:"sso_client_id"`
 	SSORedirectURI        string `mapstructure:"sso_redirect_uri"`
 
-	LogLevel              string        `mapstructure:"log_level"`
+	LogLevel string `mapstructure:"log_level"`
 
 	// HiddenTxTypes is a comma-separated list of transaction type numbers to
 	// exclude from the default transaction listings (e.g. "126" for OP deposit TXs).
-	HiddenTxTypes         string        `mapstructure:"hidden_tx_types"`
+	HiddenTxTypes string `mapstructure:"hidden_tx_types"`
 
 	// RebuildWorkMem sets work_mem (via SET LOCAL) for the one-shot address_stats
 	// rebuild. Env: REBUILD_WORK_MEM. Lower it on memory-tight Postgres.
-	RebuildWorkMem        string        `mapstructure:"rebuild_work_mem"`
+	RebuildWorkMem string `mapstructure:"rebuild_work_mem"`
 
 	EnableOPDeposits      bool          `mapstructure:"enable_op_deposits"`
 	L1RPCURL              string        `mapstructure:"l1_rpc_url"`
@@ -84,6 +92,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("api_port", 8080)
 	v.SetDefault("poll_interval", "2s")
 	v.SetDefault("daily_stats_min_interval", "60s")
+	v.SetDefault("commit_pipeline", 1)
+	v.SetDefault("balance_dedup_window", "0s")
+	v.SetDefault("balance_reader_batch", 0)
+	v.SetDefault("balance_skip_l1", false)
+	v.SetDefault("tx_hash_indexes", true)
 	v.SetDefault("start_block", 0)
 
 	v.SetDefault("rpc_workers", 50)
@@ -152,6 +165,11 @@ func Load() (*Config, error) {
 	cfg.APIPort = v.GetInt("api_port")
 	cfg.PollInterval = v.GetDuration("poll_interval")
 	cfg.DailyStatsMinInterval = v.GetDuration("daily_stats_min_interval")
+	cfg.CommitPipelineDepth = v.GetInt("commit_pipeline")
+	cfg.BalanceDedupWindow = v.GetDuration("balance_dedup_window")
+	cfg.BalanceReaderBatch = v.GetInt("balance_reader_batch")
+	cfg.BalanceSkipL1 = v.GetBool("balance_skip_l1")
+	cfg.TxHashIndexes = v.GetBool("tx_hash_indexes")
 	cfg.StartBlock = v.GetUint64("start_block")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
@@ -223,6 +241,12 @@ func (c *Config) Validate() error {
 	if c.RPCRateLimit <= 0 {
 		return fmt.Errorf("RPC_RATE_LIMIT must be greater than 0")
 	}
+	if c.BalanceWorkers < 0 {
+		return fmt.Errorf("BALANCE_WORKERS must not be negative")
+	}
+	if err := c.CheckCommitPipeline(); err != nil {
+		return err
+	}
 	if c.EnableOPDeposits {
 		if c.L1RPCURL == "" {
 			return fmt.Errorf("L1_RPC_URL is required when ENABLE_OP_DEPOSITS is true")
@@ -232,6 +256,44 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// CheckCommitPipeline refuses a COMMIT_PIPELINE deeper than the pool's maximum connections minus the ones kept for the
+// rest of the indexer (ConnectionsBesidePipeline).
+func (c *Config) CheckCommitPipeline() error {
+	if c.CommitPipelineDepth <= 1 {
+		return nil
+	}
+	pool, err := pgxpool.ParseConfig(c.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("DATABASE_URL: %w", err)
+	}
+	maxConns, beside := int(pool.MaxConns), c.ConnectionsBesidePipeline()
+	if c.CommitPipelineDepth <= maxConns-beside {
+		return nil
+	}
+	balanceFlushes, lowerBalanceWorkers := "", ""
+	if c.EnableAsyncBalance {
+		balanceFlushes = fmt.Sprintf("BALANCE_WORKERS=%d balance flushes, ", c.BalanceWorkers)
+		lowerBalanceWorkers = "lower BALANCE_WORKERS, "
+	}
+	return fmt.Errorf("COMMIT_PIPELINE=%d leaves the rest of the indexer too few database connections: the pool has %d "+
+		"(pool_max_conns in DATABASE_URL, default the larger of 4 and the CPU count), the open block writes can hold %d, "+
+		"and %d more are kept for %sthe daily statistics advance and the progress reads, so they are not starved "+
+		"while the pipeline is full. Raise pool_max_conns to %d or more, %sor set COMMIT_PIPELINE to at most %d",
+		c.CommitPipelineDepth, maxConns, c.CommitPipelineDepth, beside, balanceFlushes,
+		c.CommitPipelineDepth+beside, lowerBalanceWorkers, max(1, maxConns-beside))
+}
+
+// ConnectionsBesidePipeline is how many database connections the rest of the indexer can hold while the standard
+// loop has COMMIT_PIPELINE block writes open.
+func (c *Config) ConnectionsBesidePipeline() int {
+	balanceFlushes := 0
+	if c.EnableAsyncBalance {
+		balanceFlushes = c.BalanceWorkers
+	}
+	const dailyStatsAdvance, progressReads = 1, 1
+	return balanceFlushes + dailyStatsAdvance + progressReads
 }
 
 func (c *Config) String() string {

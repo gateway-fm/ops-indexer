@@ -23,7 +23,6 @@ func TestWorkerSkipsTokenWithShortBalanceResponse(t *testing.T) {
 	}).Return(nil)
 
 	p := NewBalanceWorkerPool(mockDB, mockRPC, 1, 0)
-	p.SetOnFlush(func([]string) {})
 	p.Start()
 	defer p.Stop()
 	p.QueueWork(BalanceWork{Address: common.HexToAddress("0xa1"), TokenAddress: bad, BlockNumber: 1})

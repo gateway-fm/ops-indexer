@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // MockDatabase is a mock of the Database interface
@@ -48,6 +50,14 @@ func (m *MockDatabase) GetBlock(ctx context.Context, number uint64) (*types.Bloc
 	return args.Get(0).(*types.Block), args.Error(1)
 }
 
+func (m *MockDatabase) HighestBlockAtOrBelow(ctx context.Context, number uint64) (*types.Block, error) {
+	args := m.Called(ctx, number)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*types.Block), args.Error(1)
+}
+
 func (m *MockDatabase) DeleteBlock(ctx context.Context, number uint64) error {
 	args := m.Called(ctx, number)
 	return args.Error(0)
@@ -61,6 +71,17 @@ func (m *MockDatabase) InsertBlock(ctx context.Context, b *types.Block) error {
 func (m *MockDatabase) InsertBlockDataBatch(ctx context.Context, b *db.BlockData) error {
 	args := m.Called(ctx, b)
 	return args.Error(0)
+}
+
+func (m *MockDatabase) AdvanceDailyStats(ctx context.Context) (uint64, error) {
+	args := m.Called(ctx)
+	return uint64(args.Int(0)), args.Error(1)
+}
+
+func (m *MockDatabase) BeginBlockData(ctx context.Context, b *db.BlockData) (*db.BlockWrite, error) {
+	args := m.Called(ctx, b)
+	w, _ := args.Get(0).(*db.BlockWrite)
+	return w, args.Error(1)
 }
 
 func (m *MockDatabase) UpdateSyncStatus(ctx context.Context, lastIndexed uint64, isSyncing bool) error {
@@ -191,24 +212,6 @@ func (m *MockDatabase) InsertBalancesBatch(ctx context.Context, balances []*type
 
 func (m *MockDatabase) RefreshTokenStats(ctx context.Context, tokenAddress string) error {
 	args := m.Called(ctx, tokenAddress)
-	return args.Error(0)
-}
-
-func (m *MockDatabase) ComputeDailyStats(ctx context.Context, date time.Time) (*types.DailyStats, error) {
-	args := m.Called(ctx, date)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-	return args.Get(0).(*types.DailyStats), args.Error(1)
-}
-
-func (m *MockDatabase) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) error {
-	args := m.Called(ctx, stats)
-	return args.Error(0)
-}
-
-func (m *MockDatabase) BackfillDailyStats(ctx context.Context) error {
-	args := m.Called(ctx)
 	return args.Error(0)
 }
 
@@ -348,9 +351,39 @@ func TestIndexer_DetectReorg(t *testing.T) {
 		chainHash99 := "0x1111111111111111111111111111111111111111111111111111111111111111"
 		mockRPC.On("RawBlockHash", ctx, uint64(99)).Return(chainHash99, nil).Once()
 
+		// The detector scans the whole window (PRST-4669): the deeper blocks match.
+		deepHash := "0x2222222222222222222222222222222222222222222222222222222222222222"
+		mockDB.On("GetBlock", ctx, mock.Anything).Return(&types.Block{Hash: deepHash}, nil)
+		mockRPC.On("RawBlockHash", ctx, mock.Anything).Return(deepHash, nil)
+
 		reorgAt, err := idx.detectReorg(ctx, blockNum)
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(2), reorgAt) // depth 1 (parent) + 1
+		mockDB.AssertExpectations(t)
+		mockRPC.AssertExpectations(t)
+	})
+
+	// PRST-4669: a reorg deeper than one block used to be reported as depth 1
+	// (the detector returned at the first mismatch), so only the head block was
+	// reverted and the stale blocks beneath it stayed. Three mismatching blocks
+	// under the head must be reported as depth 3.
+	t.Run("deep reorg reports the deepest mismatch", func(t *testing.T) {
+		mockDB := new(MockDatabase)
+		mockRPC := new(MockRPCClient)
+		idx := New(mockDB, mockRPC, time.Second, 0)
+
+		stale := "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		good := "0x3333333333333333333333333333333333333333333333333333333333333333"
+		for _, n := range []uint64{100, 99, 98} {
+			mockDB.On("GetBlock", ctx, n).Return(&types.Block{Hash: stale}, nil).Once()
+			mockRPC.On("RawBlockHash", ctx, n).Return(good, nil).Once()
+		}
+		mockDB.On("GetBlock", ctx, mock.Anything).Return(&types.Block{Hash: good}, nil)
+		mockRPC.On("RawBlockHash", ctx, mock.Anything).Return(good, nil)
+
+		reorgAt, err := idx.detectReorg(ctx, uint64(100))
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(3), reorgAt)
 		mockDB.AssertExpectations(t)
 		mockRPC.AssertExpectations(t)
 	})
@@ -368,13 +401,13 @@ func TestIndexer_ProcessBlock(t *testing.T) {
 		blockNumber := hexutil.Big(*big.NewInt(int64(blockNum)))
 
 		rawBlock := &rpc.RawBlock{
-			Number:     &blockNumber,
-			Hash:       common.HexToHash("0xaaa"),
-			ParentHash: common.HexToHash("0x123"),
-			Timestamp:  hexutil.Uint64(time.Now().Unix()),
-			GasUsed:    hexutil.Uint64(0),
-			GasLimit:   hexutil.Uint64(8000000),
-			Miner:      common.HexToAddress("0x0"),
+			Number:       &blockNumber,
+			Hash:         common.HexToHash("0xaaa"),
+			ParentHash:   common.HexToHash("0x123"),
+			Timestamp:    hexutil.Uint64(time.Now().Unix()),
+			GasUsed:      hexutil.Uint64(0),
+			GasLimit:     hexutil.Uint64(8000000),
+			Miner:        common.HexToAddress("0x0"),
 			Transactions: []rpc.RawTransaction{},
 		}
 
@@ -444,6 +477,91 @@ func TestIndexer_ProcessBlock(t *testing.T) {
 	})
 }
 
+// TestIndexer_TokenCacheNotPoisonedByFailedBatch pins the ordering that keeps
+// the new-token counter seed correct.
+//
+// tokenCache.Add used to run as soon as metadata came back, before
+// InsertBlockDataBatch. Two things followed. A batch that then failed left the
+// cache claiming a token whose row was never written. And, worse, another
+// worker parsing a transfer of that token inside the window saw a cache hit,
+// omitted the token from its own data.Tokens, and so neither seeded the row nor
+// was covered by the seed -- its delta UPDATE found no visible row and silently
+// counted nothing, permanently short.
+//
+// The concurrent interleaving cannot be provoked on demand, but the ordering it
+// depends on can: after a failed batch the token must still be unknown, so the
+// next attempt re-queues it and blocks on the tokens primary key instead of
+// skipping it.
+func TestIndexer_TokenCacheNotPoisonedByFailedBatch(t *testing.T) {
+	ctx := context.Background()
+	mockDB := new(MockDatabase)
+	mockRPC := new(MockRPCClient)
+	idx := New(mockDB, mockRPC, time.Second, 0)
+
+	blockNum := uint64(4931)
+	blockNumber := hexutil.Big(*big.NewInt(int64(blockNum)))
+	txHash := common.HexToHash("0xfeed01")
+	tokenAddr := common.HexToAddress("0x00000000000000000000000000000000000c7ac1")
+	toAddr := common.HexToAddress("0x222")
+
+	rawBlock := &rpc.RawBlock{
+		Number:     &blockNumber,
+		Hash:       common.HexToHash("0xccc"),
+		ParentHash: common.HexToHash("0x000"),
+		Timestamp:  hexutil.Uint64(time.Now().Unix()),
+		GasUsed:    hexutil.Uint64(21000),
+		GasLimit:   hexutil.Uint64(8000000),
+		Miner:      common.HexToAddress("0x0"),
+		Transactions: []rpc.RawTransaction{{
+			Hash:             txHash,
+			BlockHash:        common.HexToHash("0xccc"),
+			BlockNumber:      &blockNumber,
+			TransactionIndex: hexutil.Uint64(0),
+			From:             common.HexToAddress("0x111"),
+			To:               &toAddr,
+			Value:            func() *hexutil.Big { v := hexutil.Big(*big.NewInt(0)); return &v }(),
+			Gas:              hexutil.Uint64(21000),
+			GasPrice:         func() *hexutil.Big { v := hexutil.Big(*big.NewInt(1)); return &v }(),
+			Input:            hexutil.Bytes{},
+			Nonce:            func() *hexutil.Uint64 { v := hexutil.Uint64(0); return &v }(),
+			Type:             hexutil.Uint64(0),
+		}},
+	}
+
+	// One ERC20 Transfer log, so the token is discovered.
+	holder := common.HexToHash("0x0000000000000000000000001111111111111111111111111111111111111111")
+	mockRPC.On("RawBlockByNumber", ctx, blockNum).Return(rawBlock, nil).Once()
+	mockRPC.On("FetchReceiptsBatch", ctx, []common.Hash{txHash}, mock.Anything, mock.Anything).
+		Return(map[common.Hash]*rpclient.Receipt{
+			txHash: {Status: 1, TxHash: txHash, Logs: []*rpclient.Log{{
+				Address: tokenAddr,
+				Topics:  []common.Hash{transferTopic, common.Hash{}, holder},
+				Data:    hexutil.Bytes(common.LeftPadBytes(big.NewInt(1000).Bytes(), 32)),
+				TxHash:  txHash,
+			}}},
+		}, nil).Once()
+
+	name := "Cache Token"
+	mockRPC.On("FetchTokenMetadataBatch", ctx, mock.Anything, mock.Anything, mock.Anything).
+		Return(map[common.Address]*rpc.TokenMetadataResult{
+			tokenAddr: {Address: tokenAddr, Symbol: "CT", Name: &name, Decimals: 18},
+		}, nil).Once()
+
+	// The batch fails, so nothing was committed.
+	mockDB.On("InsertBlockDataBatch", ctx, mock.Anything).
+		Return(errors.New("commit failed")).Once()
+
+	err := idx.processBlock(ctx, blockNum)
+	require.Error(t, err, "a failed batch must surface as an error")
+
+	assert.False(t, idx.tokenCache.Has(tokenAddr.Hex()),
+		"the cache must not claim a token whose row was never committed: another worker would "+
+			"then omit it from its own data.Tokens and its counter delta would find no row")
+
+	mockDB.AssertExpectations(t)
+	mockRPC.AssertExpectations(t)
+}
+
 func TestChainResetDetection(t *testing.T) {
 	t.Run("detects chain reset and returns error without FORCE_REINDEX", func(t *testing.T) {
 		mockDB := new(MockDatabase)
@@ -489,7 +607,6 @@ func TestChainResetDetection(t *testing.T) {
 		// After wipe, lastIndexed becomes 0, blocksToSync is 5 < catchupThreshold (100),
 		// so it goes into startStandardMode. We need UpdateSyncStatus and the poll loop.
 		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-		mockDB.On("BackfillDailyStats", mock.Anything).Return(nil).Maybe()
 
 		// Standard mode will poll; we just need to let it run briefly and cancel.
 		mockRPC.On("SubscribeNewHead", mock.Anything, mock.Anything).Return(newMockSubscription(), nil).Maybe()
@@ -532,7 +649,6 @@ func TestChainResetDetection(t *testing.T) {
 		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
 		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
 		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-		mockDB.On("BackfillDailyStats", mock.Anything).Return(nil).Maybe()
 
 		os.Unsetenv("FORCE_REINDEX")
 

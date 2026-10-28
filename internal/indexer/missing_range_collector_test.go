@@ -14,12 +14,12 @@ import (
 
 func TestMissingRangeCollector_InitialScan(t *testing.T) {
 	tests := []struct {
-		name           string
-		firstBlock     uint64
-		lastBlock      uint64
-		batchSize      uint64
-		missingRanges  map[string][]db.BlockRange // key: "from-to"
-		expectSaveCalls int
+		name              string
+		firstBlock        uint64
+		lastBlock         uint64
+		batchSize         uint64
+		missingRanges     map[string][]db.BlockRange // key: "from-to"
+		expectSaveCalls   int
 		expectSavedRanges []db.BlockRange
 	}{
 		{
