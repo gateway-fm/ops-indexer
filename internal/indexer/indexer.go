@@ -494,12 +494,17 @@ func (i *Indexer) Start(ctx context.Context) error {
 	// FORCE_REINDEX wipes it, as it does a reset the height gives away.
 	if lastIndexed > 0 {
 		head, chainHead, err := i.checkStoredHead(ctx, lastIndexed, latestOnChain)
-		if errors.Is(err, errStaleForkTooDeep) && os.Getenv("FORCE_REINDEX") == "true" {
+		reset := errors.Is(err, errChainResetWhileWaiting)
+		if (errors.Is(err, errStaleForkTooDeep) || reset) && os.Getenv("FORCE_REINDEX") == "true" {
 			metrics.ChainResetDetected()
+			latestOnChain = chainHead
 			if err := wipe(); err != nil {
 				return err
 			}
 		} else if err != nil {
+			if reset {
+				metrics.ChainResetDetected()
+			}
 			return err
 		} else {
 			lastIndexed, latestOnChain = head, chainHead
@@ -812,6 +817,8 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 
 var errStaleForkTooDeep = errors.New("is on a stale fork deeper than any reorg")
 
+var errChainResetWhileWaiting = errors.New("chain reset detected while waiting to start")
+
 // staleAboveHeadWait is how long the start waits for a node whose head stays below the stored head before it treats
 // the stored blocks above the node's head as stale: the chain reorged onto a shorter one, or the node lost them. A
 // node that was only slow costs those blocks being indexed again.
@@ -828,7 +835,8 @@ var startWaitInterval = 10 * time.Second
 // stays below them for staleAboveHeadWait are reverted as stale; a block at or below the node's head the node never
 // serves (it lost it) keeps the start waiting. The revert above the node's head needs the latest head read to have
 // answered, with a head above 0: a head read that fails (a null or empty answer included) is retried, never taken as
-// a head below the stored one.
+// a head below the stored one. A chain reset found while waiting refuses the start, or with FORCE_REINDEX wipes, as
+// at startup.
 func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChain uint64) (uint64, uint64, error) {
 	defer metrics.SetStartWaitingBlocks(0)
 	var belowSince time.Time
@@ -882,9 +890,8 @@ func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChai
 			continue
 		}
 		if head+maxReorgDepth < lastIndexed {
-			metrics.ChainResetDetected()
-			return lastIndexed, head, fmt.Errorf("chain reset detected while waiting to start (chain_head=%d, last_indexed=%d): "+
-				"set FORCE_REINDEX=true to wipe and re-index", head, lastIndexed)
+			return lastIndexed, head, fmt.Errorf("%w (chain_head=%d, last_indexed=%d): the chain was likely restarted with "+
+				"fresh state; set FORCE_REINDEX=true to wipe and re-index", errChainResetWhileWaiting, head, lastIndexed)
 		}
 		latestOnChain = head
 	}

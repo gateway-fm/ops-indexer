@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -261,4 +262,44 @@ func TestStartWaitRevertsNothingOnANullHead(t *testing.T) {
 	_, _, err := idx.checkStoredHead(ctx, 100, 90)
 	require.ErrorIs(t, err, context.DeadlineExceeded, "still waiting for a head")
 	require.Empty(t, store.deletedBlocks())
+}
+
+// A chain reset found while the start waits (the node's head drops far below the stored head) refuses the start, or
+// with FORCE_REINDEX wipes and starts, as the reset found at startup does.
+func TestStartWaitHonoursForceReindexOnAChainReset(t *testing.T) {
+	withShortStartWaits(t, time.Hour)
+	start := func(force bool) (*MockDatabase, error) {
+		mockDB, mockRPC := new(MockDatabase), new(MockRPCClient)
+		for n := uint64(1); n <= 300; n++ {
+			hash := fmt.Sprintf("0x%064x", 1000+n)
+			mockDB.On("GetBlock", mock.Anything, n).Return(&types.Block{Number: n, Hash: hash}, nil).Maybe()
+			mockRPC.On("RawBlockHash", mock.Anything, n).Return(hash, nil).Maybe()
+		}
+		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(300), nil)
+		mockDB.On("GetBlockCount", mock.Anything).Return(int64(300), nil)
+		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(300), nil).Maybe()
+		mockDB.On("GetAllTokenAddresses", mock.Anything).Return([]string{}, nil).Maybe()
+		mockDB.On("WipeAllData", mock.Anything).Return(nil).Maybe()
+		mockDB.On("UpdateSyncStatus", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(290), nil).Once()
+		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(100), nil)
+		mockRPC.On("CheckTracingSupport", mock.Anything).Return(false, nil).Maybe()
+		idx := NewWithConfig(mockDB, mockRPC, time.Second, 0, &Config{RPCWorkers: 4, RPCRateLimit: 100, DBBatchSize: 100})
+		if force {
+			t.Setenv("FORCE_REINDEX", "true")
+		} else {
+			t.Setenv("FORCE_REINDEX", "")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		return mockDB, idx.Start(ctx)
+	}
+
+	mockDB, err := start(false)
+	require.ErrorIs(t, err, errChainResetWhileWaiting)
+	mockDB.AssertNotCalled(t, "WipeAllData", mock.Anything)
+
+	mockDB, err = start(true)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the start goes on after the wipe")
+	mockDB.AssertCalled(t, "WipeAllData", mock.Anything)
 }
