@@ -2310,7 +2310,9 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 	return nil
 }
 
-// ResumeInterruptedWipe finishes a wipe that was stopped part way, before anything reads the indexed tables.
+// ResumeInterruptedWipe finishes a wipe that was stopped part way. Reconcile runs it first, so it finishes before
+// ingest, the ledger closer and retention start; the gRPC server already serves while it runs, and answers from the
+// half-wiped tables until it is done.
 func (d *DB) ResumeInterruptedWipe(ctx context.Context) error {
 	var marked bool
 	if err := d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, WipeMarkTable).Scan(&marked); err != nil {

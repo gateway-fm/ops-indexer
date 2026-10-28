@@ -241,7 +241,8 @@ func (d *DB) EnsureHistoryPartitions(ctx context.Context, upto, sizeBlocks uint6
 
 // coverHistoryFromZero gives a wiped database partitions from block 0 again: the ranges past the old watermark
 // are dropped without an archive (their rows are the wiped chain's), and fillHistoryGaps creates the ranges below
-// the lowest one left. Stopped part way, the next ensure finishes them.
+// the lowest one left. Stopped part way, the wipe is redone at the next start (ResumeInterruptedWipe), and any
+// ensure fills the gaps meanwhile.
 func (d *DB) coverHistoryFromZero(ctx context.Context) error {
 	d.ensureMu.Lock()
 	defer d.ensureMu.Unlock()
