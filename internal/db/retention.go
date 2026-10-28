@@ -35,6 +35,9 @@ type RetentionConfig struct {
 	// DropGateWait bounds how long a detach or a drop waits for the ledger closer's span; past it the range is left
 	// for the next pass. Default 10 min.
 	DropGateWait time.Duration
+	// DetachWait bounds how long a detach or a drop waits for the readers of the range's tables; past it the range is
+	// left for the next pass, a detach pending. Default 30 s.
+	DetachWait time.Duration
 	// ArchiveDir, when set, receives every detached partition before it is dropped.
 	ArchiveDir string
 	// NodeHead, when set, is the chain head: the cut is placed above it, not only above the stored head, so a cut
@@ -144,11 +147,11 @@ func (d *DB) coverHistoryFromZero(ctx context.Context) error {
 	}
 	for _, p := range ranges {
 		if p.state == "detaching" {
-			if err := d.detachRange(ctx, p.suffix); err != nil {
+			if err := d.detachRange(ctx, p.suffix, 0); err != nil {
 				return err
 			}
 		}
-		if err := d.dropRange(ctx, p.suffix); err != nil {
+		if err := d.dropRange(ctx, p.suffix, 0); err != nil {
 			return err
 		}
 	}
@@ -592,6 +595,10 @@ func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) (finished 
 	if wait == 0 {
 		wait = 10 * time.Minute
 	}
+	readersWait := cfg.DetachWait
+	if readersWait == 0 {
+		readersWait = 30 * time.Second
+	}
 	underGate := func(step, suffix string, fn func() error) (bool, error) {
 		release, err := d.holdHistoryDDLGate(ctx, wait)
 		if errors.Is(err, errHistoryDDLGateBusy) {
@@ -602,11 +609,18 @@ func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) (finished 
 			return false, err
 		}
 		defer release()
-		return true, fn()
+		if err := fn(); errors.Is(err, errRangeReadersBusy) {
+			log.Info("retention: readers of the range outlasted the wait; retrying next pass", "step", step, "range", suffix,
+				"wait", readersWait, "error", err)
+			return false, nil
+		} else if err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	for _, p := range ranges {
 		if p.state == "detaching" {
-			if ok, err := underGate("detach", p.suffix, func() error { return d.detachRange(ctx, p.suffix) }); err != nil || !ok {
+			if ok, err := underGate("detach", p.suffix, func() error { return d.detachRange(ctx, p.suffix, readersWait) }); err != nil || !ok {
 				return false, err
 			}
 		}
@@ -615,16 +629,42 @@ func (d *DB) finishDetached(ctx context.Context, cfg RetentionConfig) (finished 
 				return false, fmt.Errorf("archive %s: %w", p.suffix, err)
 			}
 		}
-		if ok, err := underGate("drop", p.suffix, func() error { return d.dropRange(ctx, p.suffix) }); err != nil || !ok {
+		if ok, err := underGate("drop", p.suffix, func() error { return d.dropRange(ctx, p.suffix, readersWait) }); err != nil || !ok {
 			return false, err
 		}
 	}
 	return true, nil
 }
 
+// errRangeReadersBusy: a detach or a drop waited for the readers of a range's tables past its wait.
+var errRangeReadersBusy = errors.New("readers of the range held it past the wait")
+
+// execWithin runs one statement on its own connection under a lock and a statement timeout of wait, so it never
+// waits on a reader for longer. A statement it cancels reports errRangeReadersBusy.
+func (d *DB) execWithin(ctx context.Context, wait time.Duration, sql string) error {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	defer func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `RESET statement_timeout; RESET lock_timeout`)
+	}()
+	ms := wait.Milliseconds()
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`SET statement_timeout = '%dms'; SET lock_timeout = '%dms'`, ms, ms)); err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, sql)
+	if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && (pgErr.Code == "57014" || pgErr.Code == "55P03") && ctx.Err() == nil {
+		return fmt.Errorf("%w (%s): %v", errRangeReadersBusy, wait, err)
+	}
+	return err
+}
+
 // detachRange detaches the range's partition of every history table with DETACH CONCURRENTLY (SHARE UPDATE
-// EXCLUSIVE on the parent: ingest keeps running), finishing a detach a crash left pending.
-func (d *DB) detachRange(ctx context.Context, suffix string) error {
+// EXCLUSIVE on the parent: ingest keeps running), finishing a detach a crash or an earlier wait left pending. Each
+// detach waits at most wait for the transactions that still read the partition; one that outlasts it stays pending.
+func (d *DB) detachRange(ctx context.Context, suffix string, wait time.Duration) error {
 	start := time.Now()
 	for _, t := range HistoryTables {
 		part := t + "_" + suffix
@@ -642,7 +682,7 @@ func (d *DB) detachRange(ctx context.Context, suffix string) error {
 		if pending {
 			mode = "FINALIZE"
 		}
-		if _, err := d.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s %s`,
+		if err := d.execWithin(ctx, wait, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s %s`,
 			pgx.Identifier{t}.Sanitize(), pgx.Identifier{part}.Sanitize(), mode)); err != nil {
 			return fmt.Errorf("detach %s: %w", part, err)
 		}
@@ -656,11 +696,12 @@ func (d *DB) detachRange(ctx context.Context, suffix string) error {
 	return nil
 }
 
-// dropRange drops a detached range's tables. With archiving on, archiveRange has recorded each one first.
-func (d *DB) dropRange(ctx context.Context, suffix string) error {
+// dropRange drops a detached range's tables, each waiting at most wait for a transaction that still reads it. With
+// archiving on, archiveRange has recorded each one first.
+func (d *DB) dropRange(ctx context.Context, suffix string, wait time.Duration) error {
 	start := time.Now()
 	for _, t := range HistoryTables {
-		if _, err := d.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, pgx.Identifier{t + "_" + suffix}.Sanitize())); err != nil {
+		if err := d.execWithin(ctx, wait, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, pgx.Identifier{t + "_" + suffix}.Sanitize())); err != nil {
 			return fmt.Errorf("drop %s_%s: %w", t, suffix, err)
 		}
 	}

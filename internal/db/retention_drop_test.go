@@ -140,3 +140,54 @@ func TestRangeDropSkipsThePassWhenTheGateStaysBusy(t *testing.T) {
 	attached, _ = legacyBlocksPartition(t, d)
 	require.False(t, attached)
 }
+
+// A reader that keeps a history table open holds up a detach of a range past the watermark only for the detach's
+// wait: the pass gives up, leaves the detach pending with the pool's connections returned, and a later pass, once
+// the reader is gone, finishes it.
+func TestRangeDetachGivesUpOnALongReaderAndFinishesLater(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := legacyPastTheWatermark(t, d)
+	cfg.DetachWait = time.Second
+
+	reader, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = reader.Rollback(ctx) }()
+	var n int64
+	require.NoError(t, reader.QueryRow(ctx, `SELECT count(*) FROM logs`).Scan(&n))
+
+	type result struct {
+		finished bool
+		err      error
+	}
+	pass := make(chan result, 1)
+	pctx, stop := context.WithCancel(ctx)
+	defer stop()
+	start := time.Now()
+	go func() {
+		finished, err := d.finishDetached(pctx, cfg)
+		pass <- result{finished, err}
+	}()
+	select {
+	case r := <-pass:
+		require.NoError(t, r.err, "a reader holding the range is not a failure")
+		require.False(t, r.finished)
+	case <-time.After(20 * time.Second):
+		stop()
+		t.Fatal("the detach waited on the reader past its wait")
+	}
+	require.Less(t, time.Since(start), 10*time.Second)
+	require.Equal(t, int32(1), d.pool.Stat().AcquiredConns(), "only the reader's connection is still held")
+	require.Contains(t, partitionRanges(t, d), "legacy:44001:detaching")
+
+	require.NoError(t, reader.Rollback(ctx))
+	finished, err := d.finishDetached(ctx, cfg)
+	require.NoError(t, err)
+	require.True(t, finished)
+	for _, tbl := range HistoryTables {
+		var exists bool
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, tbl+"_legacy").Scan(&exists))
+		require.False(t, exists, "%s_legacy dropped", tbl)
+	}
+}
