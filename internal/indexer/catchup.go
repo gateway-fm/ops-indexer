@@ -289,6 +289,16 @@ func (c *CatchupIndexer) IsRunning() bool {
 	}
 }
 
+// catchupRetryWait is the first wait before a dequeued block is tried again; each failure doubles it, up to
+// catchupRetryWaitMax. After catchupAttempts tries in memory the block is only recorded as missing again, which
+// catch-up's next poll picks up.
+var catchupRetryWait = 100 * time.Millisecond
+
+const (
+	catchupRetryWaitMax = 5 * time.Second
+	catchupAttempts     = 5
+)
+
 func (c *CatchupIndexer) worker(id int) {
 	defer c.wg.Done()
 
@@ -305,57 +315,89 @@ func (c *CatchupIndexer) worker(id int) {
 			metrics.SetQueueDepth(metrics.QueueCatchup, len(c.workQueue))
 
 			c.yieldToRealtime(id)
-
-			// Block may have been indexed by another process in the meantime
-			exists, err := c.db.HasBlock(c.ctx, blockNum)
-			if err != nil {
-				log.Error("catchup: failed to check block existence", "block", blockNum, "error", err)
-				continue
-			}
-			if exists {
-				if c.collector != nil {
-					c.collector.MarkBlockProcessed(c.ctx, blockNum)
-				}
-				atomic.AddInt64(&c.processedBlocks, 1)
-				continue
-			}
-
-			if err := c.processBlock(blockNum); err != nil {
-				log.Error("catchup: failed to process block", "worker", id, "block", blockNum, "error", err)
-				// Re-insert into missing_block_ranges so the block is retried on next
-				// poll. Without this, the block is permanently lost: the parent range
-				// is already deleted from missing_block_ranges when the first sibling
-				// block succeeds, so a failed block would never be retried.
-				if requeueErr := c.db.RequeueMissingBlock(c.ctx, blockNum); requeueErr != nil {
-					log.Error("catchup: failed to requeue block after error", "block", blockNum, "error", requeueErr)
-				}
-				continue
-			}
-
-			if c.collector != nil {
-				c.collector.MarkBlockProcessed(c.ctx, blockNum)
-			} else {
-				c.db.DeleteMissingRangeByBlock(c.ctx, blockNum)
-			}
-
-			processed := atomic.AddInt64(&c.processedBlocks, 1)
-
-			if time.Since(c.lastLogTime) > 5*time.Second {
-				c.lastLogTime = time.Now()
-
-				var remaining int64
-				if c.collector != nil {
-					remaining, _ = c.collector.GetTotalMissingBlocks(c.ctx)
-				} else {
-					remaining, _ = c.db.GetTotalMissingBlocks(c.ctx)
-				}
-
-				log.Info("catchup: queue drain",
-					"blocks_processed_since_start", processed,
-					"queue_remaining", remaining)
-			}
+			c.indexBlock(id, blockNum)
 		}
 	}
+}
+
+// indexBlock stores a dequeued block, or records it as missing again, and does not return before one of the two has
+// happened (or the indexer stops). Its range row is already gone and the collector's scans do not come back to it, so
+// a block dropped here would stay missing until the next start. An existence check or a write that fails is tried
+// again in memory; after catchupAttempts tries the block is only recorded as missing, retried until that succeeds.
+func (c *CatchupIndexer) indexBlock(id int, blockNum uint64) {
+	wait := catchupRetryWait
+	for attempt := 1; ; attempt++ {
+		if attempt > catchupAttempts {
+			err := c.db.RequeueMissingBlock(c.ctx, blockNum)
+			if err == nil {
+				return
+			}
+			log.Error("catchup: failed to record block as missing; retrying", "block", blockNum, "error", err)
+		} else if c.tryBlock(id, blockNum, attempt) {
+			return
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, catchupRetryWaitMax)
+	}
+}
+
+// tryBlock checks, writes and accounts for one block once, and reports whether the block is done with: stored (by
+// this worker or another writer), or recorded as missing again after a failed write.
+func (c *CatchupIndexer) tryBlock(id int, blockNum uint64, attempt int) bool {
+	// Block may have been indexed by another process in the meantime
+	exists, err := c.db.HasBlock(c.ctx, blockNum)
+	if err != nil {
+		log.Error("catchup: failed to check block existence; retrying", "block", blockNum, "attempt", attempt, "error", err)
+		return false
+	}
+	if exists {
+		if c.collector != nil {
+			c.collector.MarkBlockProcessed(c.ctx, blockNum)
+		}
+		atomic.AddInt64(&c.processedBlocks, 1)
+		return true
+	}
+
+	if err := c.processBlock(blockNum); err != nil {
+		log.Error("catchup: failed to process block", "worker", id, "block", blockNum, "error", err)
+		// Re-insert into missing_block_ranges so the block is retried on next
+		// poll. Without this, the block is permanently lost: the parent range
+		// is already deleted from missing_block_ranges when the first sibling
+		// block succeeds, so a failed block would never be retried.
+		if requeueErr := c.db.RequeueMissingBlock(c.ctx, blockNum); requeueErr != nil {
+			log.Error("catchup: failed to requeue block after error; retrying", "block", blockNum, "error", requeueErr)
+			return false
+		}
+		return true
+	}
+
+	if c.collector != nil {
+		c.collector.MarkBlockProcessed(c.ctx, blockNum)
+	} else {
+		c.db.DeleteMissingRangeByBlock(c.ctx, blockNum)
+	}
+
+	processed := atomic.AddInt64(&c.processedBlocks, 1)
+
+	if time.Since(c.lastLogTime) > 5*time.Second {
+		c.lastLogTime = time.Now()
+
+		var remaining int64
+		if c.collector != nil {
+			remaining, _ = c.collector.GetTotalMissingBlocks(c.ctx)
+		} else {
+			remaining, _ = c.db.GetTotalMissingBlocks(c.ctx)
+		}
+
+		log.Info("catchup: queue drain",
+			"blocks_processed_since_start", processed,
+			"queue_remaining", remaining)
+	}
+	return true
 }
 
 func (c *CatchupIndexer) processBlock(number uint64) error {
