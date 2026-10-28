@@ -216,6 +216,60 @@ func (r *dailyRefill) blocks(ctx context.Context, numbers []uint64, bodies bool)
 	return out, nil
 }
 
+// ErrRefillReceiptsIncomplete: the node kept answering a block's receipts as null, or with fewer receipts than the block
+// has transactions, so its day cannot be counted.
+var ErrRefillReceiptsIncomplete = errors.New("the node did not return every receipt of a block")
+
+// incompleteReceiptsAttempts is how many times a batch whose receipts came back incomplete is asked for.
+const incompleteReceiptsAttempts = 3
+
+// allReceipts reads the receipts of numbers, whose headers are blocks. A null answer, or fewer receipts than a block
+// has transactions, is a node that has not processed the block yet: the batch is asked again after a pause, and
+// still incomplete, the day fails (ErrRefillReceiptsIncomplete) and is not checkpointed.
+func (r *dailyRefill) allReceipts(ctx context.Context, numbers []uint64, blocks []*RefillBlock) ([][]*rpclient.Receipt, error) {
+	pause := r.retryPause
+	for attempt := 1; ; attempt++ {
+		var receipts [][]*rpclient.Receipt
+		if err := r.withRetry(ctx, len(numbers), func() (err error) {
+			receipts, err = r.node.BlockReceipts(ctx, numbers)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+		lacking := -1
+		for i, b := range blocks {
+			got := 0
+			if i < len(receipts) {
+				for _, rc := range receipts[i] {
+					if rc != nil {
+						got++
+					}
+				}
+			}
+			if got < b.TxCount {
+				lacking = i
+				break
+			}
+		}
+		if lacking < 0 {
+			return receipts, nil
+		}
+		b := blocks[lacking]
+		if attempt == incompleteReceiptsAttempts {
+			return nil, fmt.Errorf("%w: block %d has %d transactions, the node returned fewer receipts after %d attempts",
+				ErrRefillReceiptsIncomplete, b.Number, b.TxCount, attempt)
+		}
+		log.Warn("refill-daily-stats: the node returned fewer receipts than a block has transactions; retrying",
+			"block", b.Number, "transactions", b.TxCount, "attempt", attempt, "pause", pause)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pause):
+		}
+		pause *= 2
+	}
+}
+
 func (r *dailyRefill) timestamp(ctx context.Context, n uint64) (uint64, error) {
 	if ts, ok := r.ts[n]; ok {
 		return ts, nil
@@ -294,11 +348,8 @@ func (r *dailyRefill) countDay(ctx context.Context, dr DayRange) (db.RefillDay, 
 			delete(r.ts, b.Number)
 		}
 		if r.opts.Receipts {
-			var receipts [][]*rpclient.Receipt
-			if err := r.withRetry(ctx, len(numbers), func() (err error) {
-				receipts, err = r.node.BlockReceipts(ctx, numbers)
-				return err
-			}); err != nil {
+			receipts, err := r.allReceipts(ctx, numbers, blocks)
+			if err != nil {
 				return rd, err
 			}
 			for _, block := range receipts {
