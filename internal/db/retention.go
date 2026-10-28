@@ -485,22 +485,22 @@ var errHistoryDDLGateBusy = errors.New("the ledger closer held the history-DDL g
 // in progress; a waiting exclusive request keeps the closer from starting another. Queued behind a span read
 // instead, a DDL lock request would hold up ingest's own statements on the history tables. Ingest never takes the
 // gate. The returned func releases it.
+//
+// The connection is opened beside the pool, not taken from it: the statements under the gate run on the pool, and
+// with the gate holding a pool connection a pool of one would wait for a second connection for good.
 func (d *DB) holdHistoryDDLGate(ctx context.Context, wait time.Duration) (func(), error) {
-	conn, err := d.pool.Acquire(ctx)
+	conn, err := pgx.ConnectConfig(ctx, d.pool.Config().ConnConfig.Copy())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open the history-DDL gate's connection: %w", err)
 	}
-	reset := func() {
-		_, _ = conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`)
-		conn.Release()
-	}
+	closeConn := func() { _ = conn.Close(context.WithoutCancel(ctx)) }
 	start := time.Now()
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`SET lock_timeout = '%dms'`, wait.Milliseconds())); err != nil {
-		reset()
+		closeConn()
 		return nil, err
 	}
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, historyDDLGate); err != nil {
-		reset()
+		closeConn()
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "55P03" {
 			return nil, fmt.Errorf("%w (%s)", errHistoryDDLGateBusy, wait)
 		}
@@ -511,7 +511,7 @@ func (d *DB) holdHistoryDDLGate(ctx context.Context, wait time.Duration) (func()
 	}
 	return func() {
 		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1, 1)`, historyDDLGate)
-		reset()
+		closeConn()
 	}, nil
 }
 
