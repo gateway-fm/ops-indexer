@@ -17,6 +17,7 @@ type Database interface {
 	GetBlockCount(ctx context.Context) (int64, error)
 	GetBlockCountInRange(ctx context.Context, from, to uint64) (int64, error)
 	GetBlock(ctx context.Context, number uint64) (*types.Block, error)
+	HighestBlockAtOrBelow(ctx context.Context, number uint64) (*types.Block, error)
 	DeleteBlock(ctx context.Context, number uint64) error
 	InsertBlock(ctx context.Context, b *types.Block) error
 	InsertBlockDataBatch(ctx context.Context, b *db.BlockData) error

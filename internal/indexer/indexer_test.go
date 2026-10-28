@@ -50,6 +50,14 @@ func (m *MockDatabase) GetBlock(ctx context.Context, number uint64) (*types.Bloc
 	return args.Get(0).(*types.Block), args.Error(1)
 }
 
+func (m *MockDatabase) HighestBlockAtOrBelow(ctx context.Context, number uint64) (*types.Block, error) {
+	args := m.Called(ctx, number)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*types.Block), args.Error(1)
+}
+
 func (m *MockDatabase) DeleteBlock(ctx context.Context, number uint64) error {
 	args := m.Called(ctx, number)
 	return args.Error(0)

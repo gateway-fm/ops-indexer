@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -243,5 +244,63 @@ func TestPrefetchDoesNotSkipABlockFromAnotherForkWhoseReceiptsNeverCome(t *testi
 			mockDB.AssertNotCalled(t, "RequeueMissingBlock", mock.Anything, mock.Anything)
 			mockDB.AssertNotCalled(t, "InsertBlock", mock.Anything, mock.Anything)
 		})
+	}
+}
+
+// The block a tick starts from must be stored for the first fetched block to be checked against it. When it is not
+// (a revert deleted it and reported an error), the tick starts from the highest stored block below instead of
+// skipping the check: here block 100 is missing, the stored 99 is stale, and nothing is written on top of it.
+func TestPrefetchWithoutItsStartBlockStoredStillChecksTheParent(t *testing.T) {
+	for _, pipelined := range []bool{false, true} {
+		t.Run(map[bool]string{false: "serial", true: "pipelined"}[pipelined], func(t *testing.T) {
+			node := newReorgNode(99, 103)
+			store := newReorgStore(99, node.tick)
+			idx := newReorgStandard(store, node)
+
+			var last uint64
+			if pipelined {
+				last = idx.indexPipelined(context.Background(), 100, 103, 2, &receiptSkip{})
+			} else {
+				last = idx.indexPrefetched(context.Background(), 100, 103, &receiptSkip{})
+			}
+			if w := writtenNumbers(store.written()); len(w) != 0 {
+				t.Fatalf("written %v on top of a stale block 99 while block 100 was not stored", w)
+			}
+			if last != 99 {
+				t.Fatalf("last indexed %d, want 99, the highest stored block", last)
+			}
+		})
+	}
+}
+
+// receiptlessNode is a reorgNode whose receipts never come.
+type receiptlessNode struct{ *reorgNode }
+
+func (receiptlessNode) FetchReceiptsBatch(context.Context, []common.Hash, int, int, ...uint64) (map[common.Hash]*rpclient.Receipt, error) {
+	return nil, errors.New("receipts not found")
+}
+
+// A block skipped for its receipts at the end of a tick is not stored, and the next tick starts after it: it checks
+// the next block against the skipped block's hash and goes on, instead of starting again below it.
+func TestPrefetchContinuesAfterABlockSkippedAtTheEndOfATick(t *testing.T) {
+	node := newReorgNode(1000, 8)
+	node.chain[6].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{6})}}
+	store := newReorgStore(5, node.tick)
+	store.MockDatabase.On("RequeueMissingBlock", mock.Anything, uint64(6)).Return(nil)
+	idx := NewWithConfig(store, receiptlessNode{node}, 10*time.Millisecond, 0, &Config{RPCWorkers: 1, RPCRateLimit: 100})
+
+	var skip receiptSkip
+	last := uint64(5)
+	for attempt := 0; attempt < maxReceiptAttempts; attempt++ {
+		last = idx.indexPrefetched(context.Background(), last, 6, &skip)
+	}
+	if last != 6 {
+		t.Fatalf("last indexed %d, want 6 once block 6 is recorded as missing", last)
+	}
+	if last = idx.indexPrefetched(context.Background(), last, 8, &skip); last != 8 {
+		t.Fatalf("next tick indexed up to %d, want 8: it starts after the skipped block 6", last)
+	}
+	if got := writtenNumbers(store.written()); fmt.Sprint(got) != "[7 8]" {
+		t.Fatalf("written %v, want [7 8]", got)
 	}
 }

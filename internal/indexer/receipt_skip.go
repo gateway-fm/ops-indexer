@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 )
 
 // errReceiptsUnavailable marks a block whose header and transactions were fetched but whose
@@ -21,6 +22,10 @@ const maxReceiptAttempts = 10
 type receiptSkip struct {
 	block    uint64
 	attempts int
+	// skipped and skippedHash are the last block moved past, which is not stored; the next tick's first block is
+	// checked against skippedHash when it starts there.
+	skipped     uint64
+	skippedHash common.Hash
 }
 
 func (s *receiptSkip) skip(ctx context.Context, d Database, blockNum uint64, err error) bool {

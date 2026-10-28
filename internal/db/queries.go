@@ -59,6 +59,21 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 	return nil
 }
 
+// HighestBlockAtOrBelow is the highest stored block numbered at most number, with its number and hash only, or nil
+// when none is. It reads the primary key backwards from number.
+func (d *DB) HighestBlockAtOrBelow(ctx context.Context, number uint64) (*types.Block, error) {
+	var b types.Block
+	err := d.pool.QueryRow(ctx, `SELECT number, hash FROM blocks WHERE number <= $1 ORDER BY number DESC LIMIT 1`, number).
+		Scan(&b.Number, &b.Hash)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
 func (d *DB) GetBlock(ctx context.Context, number uint64) (*types.Block, error) {
 	var b types.Block
 	err := d.pool.QueryRow(ctx, `

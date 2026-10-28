@@ -63,17 +63,37 @@ func (i *Indexer) prefetchBlocks(ctx context.Context, from, to uint64, depth int
 	return slots
 }
 
-// storedHash is the hash of the stored block number, which the first block of a tick must extend, or the zero hash
-// (no check) when that block is 0, as in detectReorg, or is not stored or cannot be read.
-func (i *Indexer) storedHash(ctx context.Context, number uint64) common.Hash {
-	if number == 0 {
-		return common.Hash{}
+// anchor is the block a tick starts after, and the hash its first block must extend. That is lastIndexed when it is
+// stored, or a block receipts skipped (not stored) at lastIndexed. When lastIndexed is neither, as after a revert whose
+// delete committed but reported an error, the tick starts after the highest stored block below it, so the deleted
+// blocks are fetched again and the check is never skipped. Block 0, or nothing stored at or below lastIndexed, has
+// no hash to check against. ok is false when the store cannot be read; the tick then ends.
+func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) (from uint64, hash common.Hash, ok bool) {
+	if lastIndexed == 0 {
+		return 0, common.Hash{}, true
 	}
-	b, err := i.db.GetBlock(ctx, number)
-	if err != nil || b == nil {
-		return common.Hash{}
+	b, err := i.db.GetBlock(ctx, lastIndexed)
+	if err != nil {
+		log.Error("failed to read the block before this tick, retrying on the next tick", "block", lastIndexed, "error", err)
+		return lastIndexed, common.Hash{}, false
 	}
-	return common.HexToHash(b.Hash)
+	if b != nil {
+		return lastIndexed, common.HexToHash(b.Hash), true
+	}
+	if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
+		return lastIndexed, receipts.skippedHash, true
+	}
+	below, err := i.db.HighestBlockAtOrBelow(ctx, lastIndexed)
+	if err != nil {
+		log.Error("failed to read the highest stored block, retrying on the next tick", "below", lastIndexed, "error", err)
+		return lastIndexed, common.Hash{}, false
+	}
+	if below == nil {
+		return lastIndexed, common.Hash{}, true
+	}
+	log.Warn("the block before this tick is not stored; indexing again from the highest stored block below it",
+		"block", lastIndexed, "from", below.Number)
+	return below.Number, common.HexToHash(below.Hash), true
 }
 
 // indexPrefetched indexes lastIndexed+1..latest in order and returns the new last indexed block.
@@ -86,10 +106,13 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 	if latest <= lastIndexed {
 		return lastIndexed
 	}
+	lastIndexed, prevHash, ok := i.anchor(ctx, lastIndexed, receipts)
+	if !ok {
+		return lastIndexed
+	}
 	fetchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	prevHash := i.storedHash(ctx, lastIndexed)
 	for slot := range i.prefetchBlocks(fetchCtx, lastIndexed+1, latest, blockPrefetchDepth) {
 		select {
 		case req := <-i.indexRequests:
@@ -109,6 +132,7 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 				return lastIndexed
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
+			receipts.skipped, receipts.skippedHash = b.number, b.raw.Hash
 			continue
 		}
 
@@ -197,7 +221,11 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		return true
 	}
 
-	prevHash := i.storedHash(ctx, lastIndexed)
+	from, prevHash, ok := i.anchor(ctx, lastIndexed, receipts)
+	if !ok {
+		return lastIndexed
+	}
+	lastIndexed = from
 	for slot := range i.prefetchBlocks(fetchCtx, lastIndexed+1, latest, blockPrefetchDepth+depth) {
 		// Serve a block request (as indexPrefetched does) between blocks. Finish what is in flight first, so the
 		// requested block never runs beside a pipelined one and committed blocks stay a prefix.
@@ -225,6 +253,7 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 				break
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
+			receipts.skipped, receipts.skippedHash = b.number, b.raw.Hash
 			continue
 		}
 		prevHash = b.raw.Hash

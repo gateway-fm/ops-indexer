@@ -42,6 +42,9 @@ type RealtimeIndexer struct {
 	lastProcessedBlock uint64
 	mu                 sync.RWMutex
 	receipts           receiptSkip
+	// failedRevertFrom is the fork point of a revert that returned an error, until the next tick has checked what it
+	// left stored; 0 when there is none.
+	failedRevertFrom uint64
 
 	// Coordination
 	ctx    context.Context
@@ -203,6 +206,9 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 // chain it reverts them and goes on from the fork point in the same pass. It returns at the first block it cannot
 // index, or when a reorg cannot be reverted, and the next tick starts again from the last processed block.
 func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
+	if !r.resumeAfterFailedRevert(ctx) {
+		return
+	}
 	reverted := false
 	for blockNum := r.GetLastProcessedBlock() + 1; blockNum <= safeBlock; blockNum++ {
 		select {
@@ -226,6 +232,7 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
 				log.Warn("realtime: detected reorg", "depth", reorgDepth)
 				if err := r.handleReorg(ctx, fork); err != nil {
 					log.Error("realtime: failed to handle reorg", "error", err)
+					r.failedRevertFrom = fork
 					return
 				}
 				reverted = true
@@ -248,6 +255,34 @@ func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
 			r.db.UpdateSyncStatus(ctx, blockNum, true)
 		}
 	}
+}
+
+// resumeAfterFailedRevert moves the cursor down to what a failed revert left stored. A delete that reported an error
+// may have committed (a lost acknowledgement), and the reorg check skips blocks that are not stored, so with the
+// cursor still above them the deleted blocks would never be indexed again. The cursor goes to the highest stored
+// block at or below it, and no lower than the block before the fork: a block the revert deleted is indexed again,
+// and a stale block it left is found by the reorg check again. It reports false when the store cannot be read.
+func (r *RealtimeIndexer) resumeAfterFailedRevert(ctx context.Context) bool {
+	if r.failedRevertFrom == 0 {
+		return true
+	}
+	cursor := r.GetLastProcessedBlock()
+	below, err := r.db.HighestBlockAtOrBelow(ctx, cursor)
+	if err != nil {
+		log.Error("realtime: failed to read what a failed revert left stored, retrying on the next tick", "error", err)
+		return false
+	}
+	resume := r.failedRevertFrom - 1
+	if below != nil && below.Number > resume {
+		resume = below.Number
+	}
+	if resume < cursor {
+		log.Warn("realtime: a failed revert left blocks deleted; indexing again from the highest stored block",
+			"cursor", cursor, "from", resume)
+		r.SetLastProcessedBlock(resume)
+	}
+	r.failedRevertFrom = 0
+	return true
 }
 
 func (r *RealtimeIndexer) processBlock(ctx context.Context, number uint64) error {

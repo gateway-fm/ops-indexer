@@ -103,6 +103,9 @@ type reorgStore struct {
 	keepBelow uint64
 	getErr    map[uint64]bool
 	deleted   []uint64
+	// faults makes the next DeleteBlock of a block fail once: "ack" commits the delete and then reports an error, as a
+	// lost COMMIT acknowledgement does; "fail" reports an error with nothing deleted.
+	faults map[uint64]string
 }
 
 func newReorgStore(storedHead uint64, tick func() int) *reorgStore {
@@ -125,6 +128,18 @@ func (s *reorgStore) GetBlock(_ context.Context, n uint64) (*types.Block, error)
 	return nil, nil
 }
 
+func (s *reorgStore) HighestBlockAtOrBelow(_ context.Context, n uint64) (*types.Block, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *types.Block
+	for m, h := range s.blocks {
+		if m <= n && (best == nil || m > best.Number) {
+			best = &types.Block{Number: m, Hash: h}
+		}
+	}
+	return best, nil
+}
+
 func (s *reorgStore) GetLatestBlockNumber(context.Context) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,8 +156,16 @@ func (s *reorgStore) DeleteBlock(_ context.Context, n uint64) error {
 	if s.deleteErr != nil || n < s.keepBelow {
 		return errors.New("delete failed")
 	}
+	fault := s.faults[n]
+	delete(s.faults, n)
+	if fault == "fail" {
+		return errors.New("delete failed")
+	}
 	delete(s.blocks, n)
 	s.deleted = append(s.deleted, n)
+	if fault == "ack" {
+		return errors.New("connection reset while committing")
+	}
 	return nil
 }
 
@@ -408,6 +431,57 @@ func assertWrittenInTick(t *testing.T, store *reorgStore, node *reorgNode, want 
 		if w.number != want[i] || w.hash != node.chain[w.number].Hash.Hex() || w.tick != tick {
 			t.Fatalf("write %d = block %d hash %s in tick %d, want block %d from the chain in tick %d (all writes %v)",
 				i, w.number, w.hash, w.tick, want[i], tick, writtenNumbers(ws))
+		}
+	}
+}
+
+// A revert whose last delete reported an error may still have deleted the blocks: the COMMIT's acknowledgement can
+// be lost. Whatever the deletes did, the next ticks index the new chain from the fork with no block missing: a deleted
+// block is indexed again, and a stale block still stored is reverted again.
+func TestFailedRevertReplaysTheForkWhateverTheDeletesDid(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		faults map[uint64]string
+	}{
+		{"acknowledgement lost on the last delete", map[uint64]string{98: "ack"}},
+		{"last delete rolled back", map[uint64]string{98: "fail"}},
+		{"partial: 100 deleted, 99 fails", map[uint64]string{99: "fail"}},
+	} {
+		for _, loop := range []string{"realtime", "standard"} {
+			t.Run(c.name+"/"+loop, func(t *testing.T) {
+				node := newReorgNode(98, 103)
+				store := newReorgStore(100, node.tick)
+				store.faults = map[uint64]string{}
+				for n, f := range c.faults {
+					store.faults[n] = f
+				}
+				top := uint64(102)
+				var run func(ctx context.Context)
+				if loop == "realtime" {
+					rt := newReorgRealtime(store, node, 100)
+					run = func(ctx context.Context) { _ = rt.runPollingMode(ctx) }
+				} else {
+					top = 103
+					idx := newReorgStandard(store, node)
+					run = func(ctx context.Context) { _ = idx.startStandardMode(ctx, 100) }
+				}
+				replayed := func() bool {
+					for n, h := range store.hashes(98, top) {
+						if h != node.chain[n].Hash.Hex() {
+							return false
+						}
+					}
+					return true
+				}
+				runUntil(t, run, node.tick, 1, replayed)
+
+				for n, h := range store.hashes(1, top) {
+					if h != node.chain[n].Hash.Hex() {
+						t.Fatalf("block %d stored as %q, want %s: every block up to %d from the new chain (writes %v, deletes %v)",
+							n, h, node.chain[n].Hash.Hex(), top, writtenNumbers(store.written()), store.deletedBlocks())
+					}
+				}
+			})
 		}
 	}
 }
