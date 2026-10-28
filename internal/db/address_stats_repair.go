@@ -193,13 +193,16 @@ var errDryRun = errors.New("dry run")
 // ApplyAddressStatsRepairBatch applies the next batch of staged corrections, in address order (the order ingest locks
 // address_stats rows in), and removes them from the staging table in the same transaction, so a stopped repair
 // resumes at the next batch and never applies one twice. Counters move by the correction, first_seen and last_seen
-// only outward; a row that did not exist is created (is_contract from contracts) and counted in addresses_total.
+// only outward; a row that did not exist is created (is_contract from contracts) and counted in addresses_total, but
+// only for an address that still has rows: one a reorg removed after the stage keeps no row. Such a correction is
+// counted as handled, not applied.
 // The staging table is dropped with the last batch, which also recounts the days' address columns from the repaired
 // address_stats, under daily_stats_advance's lock: the repair moves first_seen and adds addresses. The last batch
 // first checks that every staged correction was applied; if any is missing it removes the stage and returns
 // ErrAddressStatsRepairLost instead of done, and the repair is staged again.
 func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (applied, created int, done bool, err error) {
 	var lost error
+	var handled int
 	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		var exists, totalled bool
 		if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL, to_regclass($2) IS NOT NULL`,
@@ -220,11 +223,25 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 				DELETE FROM `+AddressStatsRepairTable+` r
 				WHERE r.address IN (SELECT address FROM `+AddressStatsRepairTable+` ORDER BY address LIMIT $1)
 				RETURNING r.*
+			), kept AS (
+				-- A correction creates a row only for an address that still has rows: one a reorg removed since the
+				-- stage (no remaining block had seen it) stays without a row, as the revert left it.
+				SELECT n.* FROM next n
+				WHERE EXISTS (SELECT 1 FROM address_stats a WHERE a.address = n.address)
+				   OR EXISTS (SELECT 1 FROM transactions t WHERE t.from_address = n.address)
+				   OR EXISTS (SELECT 1 FROM transactions t WHERE t.to_address = n.address)
+				   OR EXISTS (SELECT 1 FROM token_transfers t WHERE t.from_address = n.address)
+				   OR EXISTS (SELECT 1 FROM token_transfers t WHERE t.to_address = n.address)
+				   OR EXISTS (SELECT 1 FROM internal_transactions t WHERE t.from_address = n.address)
+				   OR EXISTS (SELECT 1 FROM internal_transactions t WHERE t.to_address = n.address)
+				   OR EXISTS (SELECT 1 FROM contracts c WHERE c.address = n.address)
+				   OR EXISTS (SELECT 1 FROM ledger_spans s WHERE EXISTS (
+				          SELECT 1 FROM ledger_address l WHERE l.lo = s.lo AND l.address = n.address))
 			), applied AS (
 				INSERT INTO address_stats AS a (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
 				SELECT n.address, n.txs, n.internal, n.transfers, n.first_seen, n.last_seen,
 				       EXISTS (SELECT 1 FROM contracts c WHERE c.address = n.address), NOW()
-				FROM next n ORDER BY n.address
+				FROM kept n ORDER BY n.address
 				ON CONFLICT (address) DO UPDATE SET
 					tx_count = a.tx_count + EXCLUDED.tx_count,
 					internal_tx_count = a.internal_tx_count + EXCLUDED.internal_tx_count,
@@ -237,12 +254,13 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 				UPDATE chain_counters SET count = count + (SELECT count(*) FROM applied WHERE created), updated_at = NOW()
 				WHERE name = 'addresses_total' AND EXISTS (SELECT 1 FROM applied WHERE created)
 			)
-			SELECT count(*), count(*) FILTER (WHERE created) FROM applied`, batch).Scan(&applied, &created); err != nil {
+			SELECT (SELECT count(*) FROM next), count(*), count(*) FILTER (WHERE created) FROM applied`, batch).
+			Scan(&handled, &applied, &created); err != nil {
 			return err
 		}
-		if applied > 0 {
+		if handled > 0 {
 			if totalled {
-				_, err := tx.Exec(ctx, `UPDATE `+addressStatsRepairTotalTable+` SET applied = applied + $1`, applied)
+				_, err := tx.Exec(ctx, `UPDATE `+addressStatsRepairTotalTable+` SET applied = applied + $1`, handled)
 				return err
 			}
 			return nil
