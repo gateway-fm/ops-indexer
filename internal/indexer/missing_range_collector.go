@@ -52,6 +52,9 @@ type MissingRangeCollector struct {
 	// State
 	backfillComplete bool
 	initialScanDone  bool
+	// unscanned holds the startup scan's batches that failed; the forward scanner scans them again on its next
+	// pass, so their gaps are queued without a restart.
+	unscanned []db.BlockRange
 
 	// Coordination
 	mu     sync.RWMutex
@@ -162,19 +165,15 @@ func (c *MissingRangeCollector) initialScan(ctx context.Context, lastBlock uint6
 			toBlock = lastBlock
 		}
 
-		ranges, err := c.db.FindMissingBlocksInRange(ctx, fromBlock, toBlock)
+		found, err := c.scanBatch(ctx, fromBlock, toBlock)
 		if err != nil {
-			log.Error("failed to find missing blocks", "from", fromBlock, "to", toBlock, "error", err)
+			log.Error("initial gap scan batch failed, retrying on a later pass", "from", fromBlock, "to", toBlock, "error", err)
+			c.mu.Lock()
+			c.unscanned = append(c.unscanned, db.BlockRange{FromNumber: fromBlock, ToNumber: toBlock})
+			c.mu.Unlock()
 			continue
 		}
-
-		if len(ranges) > 0 {
-			if err := c.db.SaveMissingRanges(ctx, ranges); err != nil {
-				log.Error("failed to save missing ranges", "error", err)
-				continue
-			}
-			totalRanges += len(ranges)
-		}
+		totalRanges += found
 
 		if toBlock%100000 == 0 || toBlock == lastBlock {
 			log.Info("initial scan progress",
@@ -184,12 +183,56 @@ func (c *MissingRangeCollector) initialScan(ctx context.Context, lastBlock uint6
 	}
 
 	totalMissing, _ := c.db.GetTotalMissingBlocks(ctx)
+	c.mu.RLock()
+	unscanned := len(c.unscanned)
+	c.mu.RUnlock()
 	log.Info("initial scan complete",
 		"ranges_found", totalRanges,
-		"total_missing_blocks", totalMissing)
+		"total_missing_blocks", totalMissing,
+		"batches_to_retry", unscanned)
 
 	c.initialScanDone = true
 	return nil
+}
+
+// scanBatch finds the missing blocks in [from, to] and saves them as ranges, returning how many it saved.
+func (c *MissingRangeCollector) scanBatch(ctx context.Context, from, to uint64) (int, error) {
+	ranges, err := c.db.FindMissingBlocksInRange(ctx, from, to)
+	if err != nil {
+		return 0, err
+	}
+	if len(ranges) > 0 {
+		if err := c.db.SaveMissingRanges(ctx, ranges); err != nil {
+			return 0, err
+		}
+	}
+	return len(ranges), nil
+}
+
+// rescanFailed scans again the startup scan's batches that failed, oldest first, and stops at the first that fails
+// again.
+func (c *MissingRangeCollector) rescanFailed() {
+	for {
+		c.mu.RLock()
+		if len(c.unscanned) == 0 {
+			c.mu.RUnlock()
+			return
+		}
+		r := c.unscanned[0]
+		c.mu.RUnlock()
+		if c.ctx.Err() != nil {
+			return
+		}
+		found, err := c.scanBatch(c.ctx, r.FromNumber, r.ToNumber)
+		if err != nil {
+			log.Error("initial gap scan batch failed again, retrying on a later pass", "from", r.FromNumber, "to", r.ToNumber, "error", err)
+			return
+		}
+		log.Info("initial gap scan batch rescanned", "from", r.FromNumber, "to", r.ToNumber, "ranges_found", found)
+		c.mu.Lock()
+		c.unscanned = c.unscanned[1:]
+		c.mu.Unlock()
+	}
 }
 
 func (c *MissingRangeCollector) backwardScanner() {
@@ -296,6 +339,8 @@ func (c *MissingRangeCollector) SetCeiling(ceiling func() uint64) {
 }
 
 func (c *MissingRangeCollector) scanForward() {
+	c.rescanFailed()
+
 	chainHead, err := c.rpc.BlockNumber(c.ctx)
 	if err != nil {
 		log.Error("failed to get chain head", "error", err)

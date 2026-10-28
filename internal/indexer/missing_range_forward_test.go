@@ -69,3 +69,32 @@ func TestForwardScanAdvancesBatchByBatchAndResumesAfterATimeout(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(5), total, "blocks 50000, 210000-210002 and 340000")
 }
+
+// A startup gap-scan batch that fails, here at its statement timeout, is not lost: the collector scans it again on
+// its next forward pass and queues the gap it holds.
+func TestInitialScanRetriesAFailedBatchOnTheNextPass(t *testing.T) {
+	store, pool := refillTestDB(t)
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT n, '0xhash' || n, '0xparent' || n, 1000, 21000, 30000000, 0
+		FROM generate_series(1, 300000) AS n WHERE n <> 150000`)
+	require.NoError(t, err)
+
+	database := &timeoutOnceDB{DB: store, failAt: 150_000}
+	node := new(MockRPCClient)
+	node.On("BlockNumber", mock.Anything).Return(uint64(300_000), nil)
+	c := NewMissingRangeCollector(database, node, &MissingRangeCollectorConfig{
+		BatchSize: 100_000, BackwardScanInterval: time.Hour, ForwardScanInterval: time.Hour, FirstBlock: 1, LastBlock: 300_000})
+	require.NoError(t, c.Start(context.Background()))
+	defer c.Stop()
+
+	c.scanForward()
+	require.Equal(t, [][2]uint64{{1, 100_000}, {100_001, 200_000}, {200_001, 300_000}, {100_001, 200_000}},
+		database.scanned, "the failed batch again on the next pass")
+	total, err := store.GetTotalMissingBlocks(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total, "block 150000 is queued for catch-up")
+
+	c.scanForward()
+	require.Len(t, database.scanned, 4, "a batch that succeeded is not scanned again")
+}
