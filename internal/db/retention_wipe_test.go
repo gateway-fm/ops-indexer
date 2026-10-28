@@ -50,3 +50,46 @@ func TestWipeAfterAPruneResetsRetentionAndLedgerState(t *testing.T) {
 		require.NoError(t, insertCutTestBlock(d, n), "the new chain's block %d can be stored", n)
 	}
 }
+
+// The wipe recreates the pruned ranges' partitions one transaction at a time. Stopped after the first one, the
+// next start finds the watermark at 0 and no blocks, so it does not wipe again; the start's ensure fills every
+// gap between block 0 and the highest partition, and ingest goes past the first range.
+func TestAStartFillsThePartitionsAnInterruptedWipeLeftOut(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := legacyPastTheWatermark(t, d)
+	finished, err := d.finishDetached(ctx, cfg)
+	require.NoError(t, err)
+	require.True(t, finished)
+	var lowest uint64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT min(lo) FROM history_partitions WHERE state = 'attached'`).Scan(&lowest))
+	require.NoError(t, d.WipeAllData(ctx))
+
+	// The state of a wipe stopped after its first range: only [0, first) of the ranges below lowest exists.
+	rows, err := d.pool.Query(ctx, `SELECT suffix FROM history_partitions WHERE lo > 0 AND lo < $1`, int64(lowest))
+	require.NoError(t, err)
+	var later []string
+	for rows.Next() {
+		var s string
+		require.NoError(t, rows.Scan(&s))
+		later = append(later, s)
+	}
+	rows.Close()
+	require.NotEmpty(t, later)
+	for _, s := range later {
+		require.NoError(t, d.dropRange(ctx, s, 0))
+	}
+	var first uint64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT hi FROM history_partitions WHERE lo = 0`).Scan(&first))
+	require.Error(t, insertCutTestBlock(d, first), "the interrupted wipe left no partition above its first range")
+
+	_, err = d.EnsurePartitionsAhead(ctx, 0, cfg.PartitionBlocks)
+	require.NoError(t, err)
+	for _, n := range []uint64{0, first, first + cfg.PartitionBlocks, lowest - 1, lowest} {
+		require.NoError(t, insertCutTestBlock(d, n), "block %d after the start's ensure", n)
+	}
+	made, err := d.EnsurePartitionsAhead(ctx, 0, cfg.PartitionBlocks)
+	require.NoError(t, err)
+	require.Zero(t, made, "a second ensure finds no gap")
+}

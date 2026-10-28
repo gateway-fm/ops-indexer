@@ -83,7 +83,74 @@ func (d *DB) EnsurePartitionsAhead(ctx context.Context, head, partitionBlocks ui
 		}
 		size = uint64(*newest)
 	}
-	return d.EnsureHistoryPartitions(ctx, head+2*size, size)
+	filled, err := d.fillHistoryGaps(ctx)
+	if err != nil {
+		return filled, err
+	}
+	made, err := d.EnsureHistoryPartitions(ctx, head+2*size, size)
+	return filled + made, err
+}
+
+// fillHistoryGaps creates the partitions missing between the first retained block (history_from) and the highest
+// partition, in ranges of the newest partition's size, each in its own transaction; the caller holds ensureMu.
+// Below the watermark ranges are dropped on purpose, but above it every block needs a partition: a wipe that
+// recreates the pruned ranges and stops part way leaves gaps that nothing else fills, since the ensure only extends
+// above the highest partition and the next start, finding no blocks and nothing pruned, does not wipe again.
+// Before the cut the legacy partition covers every block.
+func (d *DB) fillHistoryGaps(ctx context.Context) (int, error) {
+	var from int64
+	var size *int64
+	if err := d.pool.QueryRow(ctx, `
+		SELECT history_from(),
+		       (SELECT hi - lo FROM history_partitions WHERE lo IS NOT NULL AND hi IS NOT NULL ORDER BY lo DESC LIMIT 1)`).
+		Scan(&from, &size); err != nil {
+		return 0, err
+	}
+	if size == nil {
+		return 0, nil
+	}
+	rows, err := d.pool.Query(ctx, `SELECT lo, hi FROM history_partitions ORDER BY lo NULLS FIRST`)
+	if err != nil {
+		return 0, err
+	}
+	type gap struct{ lo, hi int64 }
+	var gaps []gap
+	covered := from
+	for rows.Next() {
+		var lo, hi *int64
+		if err := rows.Scan(&lo, &hi); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if hi == nil {
+			rows.Close()
+			return 0, nil
+		}
+		if lo != nil && *lo > covered {
+			gaps = append(gaps, gap{covered, *lo})
+		}
+		covered = max(covered, *hi)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	created := 0
+	for _, g := range gaps {
+		for lo := g.lo; lo < g.hi; {
+			hi := min(lo+*size, g.hi)
+			if lo == g.lo && (g.hi-g.lo)%*size != 0 {
+				hi = lo + (g.hi-g.lo)%*size
+			}
+			if _, err := d.pool.Exec(ctx, `SELECT history_partition_create($1, $2)`, lo, hi); err != nil {
+				return created, fmt.Errorf("create the missing history partition from %d: %w", lo, err)
+			}
+			created++
+			lo = hi
+		}
+		log.Warn("retention: history partitions created in a gap above the watermark", "from", g.lo, "to", g.hi)
+	}
+	return created, nil
 }
 
 // maxPartitionsPerEnsure bounds the partitions one ensure creates. After an outage the head can be hundreds of
@@ -121,9 +188,8 @@ func (d *DB) EnsureHistoryPartitions(ctx context.Context, upto, sizeBlocks uint6
 }
 
 // coverHistoryFromZero gives a wiped database partitions from block 0 again: the ranges past the old watermark
-// are dropped without an archive (their rows are the wiped chain's), and ranges of the newest partition's size are
-// created below the lowest one left, each in its own transaction. Before the cut the legacy partition covers every
-// block, and nothing is done.
+// are dropped without an archive (their rows are the wiped chain's), and fillHistoryGaps creates the ranges below
+// the lowest one left. Stopped part way, the next ensure finishes them.
 func (d *DB) coverHistoryFromZero(ctx context.Context) error {
 	d.ensureMu.Lock()
 	defer d.ensureMu.Unlock()
@@ -157,31 +223,8 @@ func (d *DB) coverHistoryFromZero(ctx context.Context) error {
 		}
 	}
 
-	var lowest, size *int64
-	var legacy bool
-	if err := d.pool.QueryRow(ctx, `
-		SELECT min(lo), COALESCE(bool_or(lo IS NULL), false),
-		       (SELECT hi - lo FROM history_partitions WHERE lo IS NOT NULL AND hi IS NOT NULL ORDER BY lo DESC LIMIT 1)
-		FROM history_partitions`).Scan(&lowest, &legacy, &size); err != nil {
-		return err
-	}
-	if legacy || lowest == nil || *lowest <= 0 || size == nil {
-		return nil
-	}
-	created := 0
-	for lo := int64(0); lo < *lowest; {
-		hi := lo + *size
-		if lo == 0 && *lowest%*size != 0 {
-			hi = *lowest % *size
-		}
-		if _, err := d.pool.Exec(ctx, `SELECT history_partition_create($1, $2)`, lo, hi); err != nil {
-			return fmt.Errorf("create the history partition from %d: %w", lo, err)
-		}
-		created++
-		lo = hi
-	}
-	log.Info("retention: history partitions created from block 0 after a wipe", "count", created, "below", *lowest)
-	return nil
+	_, err = d.fillHistoryGaps(ctx)
+	return err
 }
 
 // RunRetention keeps partitions ahead of the head once the history is cut and, with a window, cuts it and drops
