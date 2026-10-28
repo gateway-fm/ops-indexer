@@ -102,46 +102,54 @@ func (d *DB) repairHistoryCoverage(ctx context.Context) error {
 // fillHistoryGaps creates the partitions missing between the first retained block (history_from) and the highest
 // partition, in ranges of the newest partition's size, each in its own transaction; the caller holds ensureMu.
 // Below the watermark ranges are dropped on purpose, but above it every block needs a partition: a wipe that
-// recreates the pruned ranges and stops part way leaves gaps that nothing else fills, since the ensure only extends
-// above the highest partition and the next start, finding no blocks and nothing pruned, does not wipe again.
-// Before the cut the legacy partition covers every block.
+// recreates the pruned ranges and stops part way leaves gaps, which the next start fills here once it has finished
+// the wipe, and which the ensure would not, since it only extends above the highest partition.
+//
+// Retention prunes and drops ranges meanwhile without ensureMu. The watermark and the ranges are read in one
+// snapshot: read apart, a range pruned and dropped in between looks like a gap above the old watermark. Each
+// partition is then created under a share lock on the watermark's row, which a prune's advance waits for, and only
+// if it still starts at or above the first retained block and overlaps no range.
 func (d *DB) fillHistoryGaps(ctx context.Context) (int, error) {
-	var from int64
-	var size *int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT history_from(),
-		       (SELECT hi - lo FROM history_partitions WHERE lo IS NOT NULL AND hi IS NOT NULL ORDER BY lo DESC LIMIT 1)`).
-		Scan(&from, &size); err != nil {
-		return 0, err
-	}
-	if size == nil {
-		return 0, nil
-	}
-	rows, err := d.pool.Query(ctx, `SELECT lo, hi FROM history_partitions ORDER BY lo NULLS FIRST`)
-	if err != nil {
-		return 0, err
-	}
 	type gap struct{ lo, hi int64 }
 	var gaps []gap
-	covered := from
-	for rows.Next() {
-		var lo, hi *int64
-		if err := rows.Scan(&lo, &hi); err != nil {
-			rows.Close()
-			return 0, err
+	var size *int64
+	if err := pgx.BeginTxFunc(ctx, d.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		var from int64
+		if err := tx.QueryRow(ctx, `
+			SELECT history_from(),
+			       (SELECT hi - lo FROM history_partitions WHERE lo IS NOT NULL AND hi IS NOT NULL ORDER BY lo DESC LIMIT 1)`).
+			Scan(&from, &size); err != nil {
+			return err
 		}
-		if hi == nil {
-			rows.Close()
-			return 0, nil
+		if size == nil {
+			return nil
 		}
-		if lo != nil && *lo > covered {
-			gaps = append(gaps, gap{covered, *lo})
+		rows, err := tx.Query(ctx, `SELECT lo, hi FROM history_partitions ORDER BY lo NULLS FIRST`)
+		if err != nil {
+			return err
 		}
-		covered = max(covered, *hi)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		defer rows.Close()
+		covered := from
+		for rows.Next() {
+			var lo, hi *int64
+			if err := rows.Scan(&lo, &hi); err != nil {
+				return err
+			}
+			if hi == nil {
+				gaps = nil
+				return nil
+			}
+			if lo != nil && *lo > covered {
+				gaps = append(gaps, gap{covered, *lo})
+			}
+			covered = max(covered, *hi)
+		}
+		return rows.Err()
+	}); err != nil {
 		return 0, err
+	}
+	if gapFillHook != nil {
+		gapFillHook()
 	}
 	created := 0
 	for _, g := range gaps {
@@ -150,8 +158,13 @@ func (d *DB) fillHistoryGaps(ctx context.Context) (int, error) {
 			if lo == g.lo && (g.hi-g.lo)%*size != 0 {
 				hi = lo + (g.hi-g.lo)%*size
 			}
-			if _, err := d.pool.Exec(ctx, `SELECT history_partition_create($1, $2)`, lo, hi); err != nil {
+			ok, err := d.createInGap(ctx, lo, hi)
+			if err != nil {
 				return created, fmt.Errorf("create the missing history partition from %d: %w", lo, err)
+			}
+			if !ok {
+				log.Info("retention: a gap changed while it was filled; the next ensure reads it again", "from", lo, "to", hi)
+				return created, nil
 			}
 			created++
 			lo = hi
@@ -160,6 +173,37 @@ func (d *DB) fillHistoryGaps(ctx context.Context) (int, error) {
 	}
 	return created, nil
 }
+
+// createInGap creates the partition [lo, hi) if it still starts at or above the first retained block and overlaps
+// no range, holding the watermark's row so no prune advances past it until the partition is in place.
+func (d *DB) createInGap(ctx context.Context, lo, hi int64) (created bool, err error) {
+	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var from int64
+		if err := tx.QueryRow(ctx, `
+			SELECT CASE WHEN pruned_through > 0 THEN pruned_through + 1 ELSE 0 END FROM prune_state WHERE id = 1 FOR SHARE`).
+			Scan(&from); err != nil {
+			return err
+		}
+		var overlaps bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM history_partitions WHERE COALESCE(lo, $1) < $2 AND COALESCE(hi, $2) > $1)`, lo, hi).
+			Scan(&overlaps); err != nil {
+			return err
+		}
+		if lo < from || overlaps {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `SELECT history_partition_create($1, $2)`, lo, hi); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	return created, err
+}
+
+// gapFillHook, when set by a test, runs inside fillHistoryGaps between its snapshot and its creates.
+var gapFillHook func()
 
 // maxPartitionsPerEnsure bounds the partitions one ensure creates. After an outage the head can be hundreds of
 // ranges past the newest partition; the rest are created by the next calls, a step apart.
@@ -675,14 +719,25 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 	var suffix string
 	var hi *int64
 	var dsw *int64
+	var through int64
 	err := d.pool.QueryRow(ctx, `
-		SELECT suffix, hi, (SELECT last_block FROM daily_stats_watermark WHERE id = 1)
-		FROM history_partitions WHERE state = 'attached' ORDER BY lo NULLS FIRST LIMIT 1`).Scan(&suffix, &hi, &dsw)
+		SELECT suffix, hi, (SELECT last_block FROM daily_stats_watermark WHERE id = 1), pruned_through()
+		FROM history_partitions WHERE state = 'attached' ORDER BY lo NULLS FIRST LIMIT 1`).Scan(&suffix, &hi, &dsw, &through)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	// A range wholly at or below the watermark is pruned history recreated (by an earlier build's gap fill racing a
+	// prune). It ends where no ledger span does, so it would be refused below at every pass and stop retention:
+	// it goes the way of a pruned range.
+	if hi != nil && through > 0 && *hi-1 <= through {
+		if _, err := d.pool.Exec(ctx, `UPDATE history_partitions SET state = 'detaching' WHERE suffix = $1 AND state = 'attached'`, suffix); err != nil {
+			return false, err
+		}
+		log.Warn("retention: a range below the watermark was attached; dropping it", "range", suffix, "below", *hi, "pruned_through", through)
+		return true, nil
 	}
 	head, err := d.GetLatestBlockNumber(ctx)
 	if err != nil {
