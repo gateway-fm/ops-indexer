@@ -13,8 +13,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Wider than prometheus.DefBuckets, which stops at 10s: RefreshTokenStats alone
-// was measured at 2.4s on a 10M-row database and grows with history.
+// Wider than prometheus.DefBuckets, which stops at 10s, so a stage that runs long on a
+// large database still lands in a bucket. (Before 0.5.0, RefreshTokenStats alone took 2.4s
+// on a 10M-row database.)
 var latencyBuckets = []float64{
 	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
 }

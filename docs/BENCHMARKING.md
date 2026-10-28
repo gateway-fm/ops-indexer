@@ -5,13 +5,14 @@ Four measurements, answering different questions. None substitutes for another.
 | | question | needs |
 |---|---|---|
 | [Write-path benchmark](#write-path-benchmark) | did this commit make the inserts faster or slower? | docker, or a Postgres |
-| [Derived-counter benchmarks](#derived-counter-benchmarks) | did it change `RefreshTokenStats`, or the real per-block cost? | same |
+| [Derived-counter benchmarks](#derived-counter-benchmarks) | did it change the per-block cost of the derived counters? | same |
 | [Read-path benchmarks](#read-path-benchmarks) | how slow are the explorer's queries as history grows? | same |
 | [End-to-end ingest](#end-to-end-ingest-on-a-live-chain) | what sustained rate do we actually achieve? | a live chain + the indexer deployed |
 
-**Pick the right one.** `BenchmarkInsertBlockDataBatch` covers the inserts only. On a real
-chain the inserts have been a small fraction of total database time, with derived-counter
-maintenance dominating — so a change to that path moves nothing in the insert benchmark.
+**Pick the right one.** `BenchmarkInsertBlockDataBatch` covers the inserts only. Before
+0.5.0, on a real chain the inserts were a small fraction of total database time, with
+derived-counter maintenance dominating — so a change to that path moved nothing in the insert
+benchmark.
 `BenchmarkBlockCycle` is the number to watch when changing ingest.
 
 ## Write-path benchmark
@@ -251,7 +252,8 @@ Three things worth taking from that table:
 ### What it deliberately excludes
 
 `RefreshTokenStats` is not on this path — it runs a level up, in the indexer — so these
-numbers are insert cost alone. See the next section.
+numbers are insert cost alone. Since 0.5.0 the ERC-20 counters are maintained inside the
+insert batch itself (see the next section).
 
 ## Derived-counter benchmarks
 
@@ -259,19 +261,26 @@ numbers are insert cost alone. See the next section.
 `BenchmarkBlockCycle` times what the indexer actually does per block: the insert batch
 followed by a refresh for each token the block touched.
 
-These matter because the two halves scale on **different axes**:
+Since 0.5.0, for an ERC-20 token, a call is one primary-key read of the token's type:
+`transfer_count` and `total_supply` are applied as per-batch deltas inside
+`InsertBlockDataBatch`, and `holder_count` inside `InsertBalancesBatch`. Only an ERC-721
+token still recounts, its live rows in `nft_tokens`.
+
+Before 0.5.0 the two halves scaled on **different axes**:
 
 - inserts scale with rows written per block, and barely with stored history;
-- `RefreshTokenStats` scales with the history of the token being refreshed, and not at all
+- `RefreshTokenStats` scaled with the history of the token being refreshed, and not at all
   with what the current block wrote.
 
-For an ERC-20 token, one call issues three history-proportional statements — a `COUNT(*)`
+For an ERC-20 token, one call issued three history-proportional statements — a `COUNT(*)`
 over `token_transfers`, a `DISTINCT ON (address)` over `balances`, and a `SUM(...)` over
-`token_transfers` inside the `UPDATE`. None is bounded by the block being processed, so cost
-grows with the token's lifetime. A chain with one dominant token is the worst case, and is
-what these benchmarks seed.
+`token_transfers` inside the `UPDATE`. None was bounded by the block being processed, so cost
+grew with the token's lifetime. A chain with one dominant token is the worst case for that
+design, and is what these benchmarks seed. Run them again for numbers on the current code.
 
-### What this costs, measured
+### What this cost before 0.5.0, measured
+
+These numbers are from before the counters became incremental, and explain why they did.
 
 Same constrained server as above (PG 17, `shared_buffers = 2GB`, 3 CPU, gp3), 250 tx/block,
 one dominant ERC-20:
@@ -290,12 +299,12 @@ statements individually on a settled server gives 2.44 s at 10M — 440 ms for t
 
 Two things follow, and both are structural rather than tuning problems.
 
-**It is linear in history.** Ten times the history costs ten times as much (10.2× then 10.2×
+**It was linear in history.** Ten times the history costs ten times as much (10.2× then 10.2×
 across these three scales), per block, forever. The per-block cycle therefore collapsed **28×**
 between 100k and 10M, and at 10M a single refresh costs around thirty-five times the insert it
 accompanies.
 
-**It is CPU-bound, not I/O-bound.** At 10M only the `SUM` leaves `shared_buffers` at all, and
+**It was CPU-bound, not I/O-bound.** At 10M only the `SUM` leaves `shared_buffers` at all, and
 its disk I/O is ~176 ms of a 1,107 ms statement — the other 84%, and effectively all of the
 other two statements, is CPU spent walking and aggregating rows that are already in memory.
 Raising `shared_buffers` or moving to faster disks will not fix this; not recomputing
