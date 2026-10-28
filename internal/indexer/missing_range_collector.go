@@ -320,34 +320,43 @@ func (c *MissingRangeCollector) scanForward() {
 	fromBlock := c.maxFetchedBlock + 1
 	c.mu.Unlock()
 
-	ranges, err := c.db.FindMissingBlocksInRange(c.ctx, fromBlock, toBlock)
-	if err != nil {
-		log.Error("forward scan failed", "from", fromBlock, "to", toBlock, "error", err)
-		return
-	}
-
-	if len(ranges) > 0 {
-		if err := c.db.SaveMissingRanges(c.ctx, ranges); err != nil {
-			log.Error("failed to save missing ranges", "error", err)
+	// The range can be millions of blocks after a long stall (realtime's cursor jumped ahead). Scan it a batch at a time
+	// and record each batch, so a scan that fails costs one batch and the next tick resumes there.
+	batch := max(c.config.BatchSize, 1)
+	for from := fromBlock; from <= toBlock; from += batch {
+		if c.ctx.Err() != nil {
+			return
+		}
+		to := min(from+batch-1, toBlock)
+		ranges, err := c.db.FindMissingBlocksInRange(c.ctx, from, to)
+		if err != nil {
+			log.Error("forward scan failed, resuming from here on the next tick", "from", from, "to", to, "error", err)
 			return
 		}
 
-		missingCount := uint64(0)
-		for _, r := range ranges {
-			missingCount += r.ToNumber - r.FromNumber + 1
-		}
-		log.Debug("forward scan found gaps",
-			"from", fromBlock,
-			"to", toBlock,
-			"ranges", len(ranges),
-			"missing_blocks", missingCount)
-	}
+		if len(ranges) > 0 {
+			if err := c.db.SaveMissingRanges(c.ctx, ranges); err != nil {
+				log.Error("failed to save missing ranges", "error", err)
+				return
+			}
 
-	c.mu.Lock()
-	c.maxFetchedBlock = toBlock
-	c.chainHead = chainHead
-	c.db.UpdateIndexerProgress(c.ctx, c.minFetchedBlock, c.maxFetchedBlock, c.backfillComplete)
-	c.mu.Unlock()
+			missingCount := uint64(0)
+			for _, r := range ranges {
+				missingCount += r.ToNumber - r.FromNumber + 1
+			}
+			log.Debug("forward scan found gaps",
+				"from", from,
+				"to", to,
+				"ranges", len(ranges),
+				"missing_blocks", missingCount)
+		}
+
+		c.mu.Lock()
+		c.maxFetchedBlock = to
+		c.chainHead = max(c.chainHead, chainHead)
+		c.db.UpdateIndexerProgress(c.ctx, c.minFetchedBlock, c.maxFetchedBlock, c.backfillComplete)
+		c.mu.Unlock()
+	}
 }
 
 func (c *MissingRangeCollector) GetProgress() (minFetched, maxFetched, chainHead uint64, backfillComplete bool) {
