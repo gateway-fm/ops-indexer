@@ -488,3 +488,49 @@ func TestFailedRevertReplaysTheForkWhateverTheDeletesDid(t *testing.T) {
 		}
 	}
 }
+
+// skipNode is a reorgNode whose receipts never come, and skipStore records the blocks recorded as missing.
+type skipNode struct{ *reorgNode }
+
+func (skipNode) FetchReceiptsBatch(context.Context, []common.Hash, int, int, ...uint64) (map[common.Hash]*rpclient.Receipt, error) {
+	return nil, errors.New("receipts not found")
+}
+
+type skipStore struct {
+	*reorgStore
+	requeued []uint64
+}
+
+func (s *skipStore) RequeueMissingBlock(_ context.Context, n uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requeued = append(s.requeued, n)
+	return nil
+}
+
+// Realtime indexes through the prefetch loop, so a block whose receipts never come is checked against its parent
+// before it can be recorded as missing: one from another fork is never moved past, however many ticks it fails.
+func TestRealtimeDoesNotSkipABlockFromAnotherForkWhoseReceiptsNeverCome(t *testing.T) {
+	node := newReorgNode(1000, 7)
+	node.chain[3].ParentHash = common.BytesToHash([]byte{0xf0, 0x2c})
+	node.chain[3].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{3})}}
+	store := &skipStore{reorgStore: newReorgStore(2, node.tick)}
+	rt := NewRealtimeIndexer(store, skipNode{node}, &RealtimeConfig{ConfirmationBlocks: 1, PollInterval: 10 * time.Millisecond},
+		&Config{RPCWorkers: 1, RPCRateLimit: 100}, NewTokenCache(), NewContractCache(), nil, false)
+	rt.SetLastProcessedBlock(2)
+
+	runRealtime(t, rt, node, false, maxReceiptAttempts+2, func() bool { return true })
+
+	if got := writtenNumbers(store.written()); len(got) != 0 {
+		t.Fatalf("written %v, want nothing: block 3's parent is not the stored block 2", got)
+	}
+	store.mu.Lock()
+	requeued := store.requeued
+	store.mu.Unlock()
+	if len(requeued) != 0 {
+		t.Fatalf("recorded %v as missing, want nothing", requeued)
+	}
+	if last := rt.GetLastProcessedBlock(); last != 2 {
+		t.Fatalf("last processed %d, want 2", last)
+	}
+}
