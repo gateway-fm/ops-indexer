@@ -550,3 +550,40 @@ func TestRealtimeAtAnUnstoredCursorDoesNotStartFromTheHighestStoredBlock(t *test
 		t.Fatalf("written %d blocks from %v, want [501 502]", len(got), got[:min(len(got), 3)])
 	}
 }
+
+// Realtime runs through the prefetch loop too, with the same remembered hash for a block skipped for its receipts.
+// When the chain replaces that block, realtime drops the stale hash and goes on with the new chain; the skipped
+// block stays recorded as missing for catch-up.
+func TestRealtimeGoesOnAfterTheChainReplacesASkippedBlock(t *testing.T) {
+	node := newReorgNode(1000, 100)
+	node.chain[100].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{100})}}
+	store := &skipStore{reorgStore: newReorgStore(99, node.tick)}
+	rt := NewRealtimeIndexer(store, skipNode{node}, &RealtimeConfig{ConfirmationBlocks: 1, PollInterval: 10 * time.Millisecond},
+		&Config{RPCWorkers: 1, RPCRateLimit: 100}, NewTokenCache(), NewContractCache(), nil, false)
+	rt.SetLastProcessedBlock(99)
+	for attempt := 0; attempt < maxReceiptAttempts; attempt++ {
+		rt.indexUpTo(context.Background(), rt.GetLastProcessedBlock(), 100)
+	}
+	if last := rt.GetLastProcessedBlock(); last != 100 || fmt.Sprint(store.requeued) != "[100]" {
+		t.Fatalf("setup: cursor %d, recorded missing %v; want block 100 skipped", last, store.requeued)
+	}
+
+	node.mu.Lock()
+	for n := uint64(100); n <= 102; n++ {
+		node.chain[n] = &rpc.RawBlock{Number: (*hexutil.Big)(new(big.Int).SetUint64(n)), Hash: newHash(n), ParentHash: newHash(n - 1)}
+	}
+	node.chain[100].ParentHash = oldHash(99)
+	node.mu.Unlock()
+	for i := 0; i < 3 && rt.GetLastProcessedBlock() < 102; i++ {
+		rt.indexUpTo(context.Background(), rt.GetLastProcessedBlock(), 102)
+	}
+
+	if last := rt.GetLastProcessedBlock(); last != 102 {
+		t.Fatalf("cursor %d after 3 ticks, want 102", last)
+	}
+	for n, h := range store.hashes(101, 102) {
+		if h != node.chain[n].Hash.Hex() {
+			t.Fatalf("block %d stored as %q, want the new chain's", n, h)
+		}
+	}
+}
