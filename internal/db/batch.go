@@ -246,6 +246,9 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			return nil, err
 		}
 		if ct.RowsAffected() == 0 {
+			if err := storedBlockDiffers(ctx, tx, data.Block); err != nil {
+				return nil, err
+			}
 			_ = tx.Rollback(ctx)
 			return &BlockWrite{stored: true}, nil
 		}

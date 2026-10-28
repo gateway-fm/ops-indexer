@@ -25,6 +25,33 @@ func (d *DB) GetLatestBlockNumber(ctx context.Context) (uint64, error) {
 	return *num, nil
 }
 
+// StoredBlockDiffersError is a block write that found a different block stored at its number: a block of a fork the
+// chain has left, which only a revert removes. The same block already stored is not an error; the write is a no-op.
+type StoredBlockDiffersError struct {
+	Number          uint64
+	Stored, Written string
+}
+
+func (e *StoredBlockDiffersError) Error() string {
+	return fmt.Sprintf("block %d is stored with hash %s, not %s", e.Number, e.Stored, e.Written)
+}
+
+// storedBlockDiffers is called when a block's insert wrote no row, and reports a different block stored at its number.
+func storedBlockDiffers(ctx context.Context, tx pgx.Tx, b *types.Block) error {
+	var stored string
+	err := tx.QueryRow(ctx, `SELECT hash FROM blocks WHERE number = $1`, b.Number).Scan(&stored)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(stored, b.Hash) {
+		return &StoredBlockDiffersError{Number: b.Number, Stored: stored, Written: b.Hash}
+	}
+	return nil
+}
+
 func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 	// Tx wrap keeps the chain_counters bump atomic with the row insert.
 	tx, err := d.pool.Begin(ctx)
@@ -42,6 +69,11 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 		b.Size, b.Difficulty, b.TotalDifficulty, b.Nonce, b.Miner, b.ExtraData, b.StateRoot, b.TransactionsRoot, b.ReceiptsRoot)
 	if err != nil {
 		return err
+	}
+	if ct.RowsAffected() == 0 {
+		if err := storedBlockDiffers(ctx, tx, b); err != nil {
+			return err
+		}
 	}
 	if ct.RowsAffected() > 0 {
 		if _, err := tx.Exec(ctx, `

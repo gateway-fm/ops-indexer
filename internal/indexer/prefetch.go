@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -171,6 +172,7 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 		}
 		if err != nil {
 			log.Error("failed to process block", "block", b.number, "error", err)
+			i.revertStaleBlock(ctx, err)
 			return lastIndexed
 		}
 		lastIndexed = b.number
@@ -184,6 +186,22 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 		}
 	}
 	return lastIndexed
+}
+
+// revertStaleBlock reverts from a block the write found stored with another hash: a block of a fork the chain has
+// left, which the reorg check did not read because it was stored above where the check looked (the node had come
+// back below the stored head, as after a failover to a node that is behind). The tick ends there; the next one
+// writes the chain's block. Other write errors are left as they are.
+func (i *Indexer) revertStaleBlock(ctx context.Context, err error) {
+	var differs *db.StoredBlockDiffersError
+	if !errors.As(err, &differs) {
+		return
+	}
+	log.Warn("a block from another fork is stored where the chain's block goes; reverting from it",
+		"block", differs.Number, "stored_hash", differs.Stored, "chain_hash", differs.Written)
+	if err := i.handleReorg(ctx, differs.Number); err != nil {
+		log.Error("failed to revert the stored fork, retrying on the next tick", "block", differs.Number, "error", err)
+	}
 }
 
 // inFlight is a block whose own rows are being written in its own transaction while earlier
@@ -208,6 +226,14 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 	defer cancel()
 
 	var queue []*inFlight
+	// stale is a block write that found another block stored at its number; the revert runs once every open block
+	// transaction has been rolled back.
+	var stale error
+	defer func() {
+		if stale != nil {
+			i.revertStaleBlock(ctx, stale)
+		}
+	}()
 	abort := func() {
 		for _, f := range queue {
 			if r := <-f.begun; r.err == nil {
@@ -222,6 +248,7 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		r := <-f.begun
 		if r.err != nil {
 			log.Error("failed to process block", "block", f.built.blockNumber, "error", r.err)
+			stale = r.err
 			return false
 		}
 		finishStart := time.Now()
@@ -301,6 +328,7 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 			}
 			if err := i.insertEmptyBlock(ctx, b.raw); err != nil {
 				log.Error("failed to process block", "block", b.number, "error", err)
+				stale = err
 				return lastIndexed
 			}
 			lastIndexed = b.number
