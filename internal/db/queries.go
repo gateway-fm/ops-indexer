@@ -292,7 +292,10 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		}
 	}
 
-	// address_stats before chain_counters, the writer's lock order.
+	// nft_tokens, then address_stats, then chain_counters: the writer's lock order.
+	if err := revertNFTTokens(ctx, tx, number); err != nil {
+		return err
+	}
 	forgotten, err := revertAddressStats(ctx, tx, number)
 	if err != nil {
 		return err
