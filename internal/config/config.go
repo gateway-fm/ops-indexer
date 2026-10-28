@@ -381,28 +381,45 @@ func (c *Config) CheckCommitPipeline() error {
 	if c.CommitPipelineDepth <= maxConns-beside {
 		return nil
 	}
-	balanceFlushes, lowerBalanceWorkers := "", ""
+	holders, lower := "", ""
 	if c.EnableAsyncBalance {
-		balanceFlushes = fmt.Sprintf("BALANCE_WORKERS=%d balance flushes, ", c.BalanceWorkers)
-		lowerBalanceWorkers = "lower BALANCE_WORKERS, "
+		holders += fmt.Sprintf("BALANCE_WORKERS=%d balance flushes, ", c.BalanceWorkers)
+		lower += "lower BALANCE_WORKERS, "
+	}
+	if c.CatchupEnabled {
+		holders += fmt.Sprintf("CATCHUP_WORKERS=%d catch-up writes, ", c.CatchupWorkers)
+		lower += "lower CATCHUP_WORKERS, "
+	}
+	holders += "the ledger closer, "
+	if c.PruneRetainBlocks > 0 {
+		holders += "retention, "
 	}
 	return fmt.Errorf("COMMIT_PIPELINE=%d leaves the rest of the indexer too few database connections: the pool has %d "+
 		"(pool_max_conns in DATABASE_URL, default the larger of 4 and the CPU count), the open block writes can hold %d, "+
 		"and %d more are kept for %sthe daily statistics advance and the progress reads, so they are not starved "+
 		"while the pipeline is full. Raise pool_max_conns to %d or more, %sor set COMMIT_PIPELINE to at most %d",
-		c.CommitPipelineDepth, maxConns, c.CommitPipelineDepth, beside, balanceFlushes,
-		c.CommitPipelineDepth+beside, lowerBalanceWorkers, max(1, maxConns-beside))
+		c.CommitPipelineDepth, maxConns, c.CommitPipelineDepth, beside, holders,
+		c.CommitPipelineDepth+beside, lower, max(1, maxConns-beside))
 }
 
 // ConnectionsBesidePipeline is how many database connections the rest of the indexer can hold while the standard
-// loop has COMMIT_PIPELINE block writes open.
+// loop or realtime has COMMIT_PIPELINE block writes open: the balance flushes, the catch-up workers' writes (realtime
+// pipelines beside them), the daily statistics advance, the progress reads, the ledger closer (one for a whole span
+// close; it always runs) and, with retention on, the statements under the history-DDL gate (the gate itself holds a
+// connection outside the pool).
 func (c *Config) ConnectionsBesidePipeline() int {
-	balanceFlushes := 0
+	balanceFlushes, catchupWrites, retention := 0, 0, 0
 	if c.EnableAsyncBalance {
 		balanceFlushes = c.BalanceWorkers
 	}
-	const dailyStatsAdvance, progressReads = 1, 1
-	return balanceFlushes + dailyStatsAdvance + progressReads
+	if c.CatchupEnabled {
+		catchupWrites = c.CatchupWorkers
+	}
+	if c.PruneRetainBlocks > 0 {
+		retention = 1
+	}
+	const dailyStatsAdvance, progressReads, ledgerCloser = 1, 1, 1
+	return balanceFlushes + catchupWrites + dailyStatsAdvance + progressReads + ledgerCloser + retention
 }
 
 func (c *Config) String() string {
