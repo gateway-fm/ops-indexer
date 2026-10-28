@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,34 +17,32 @@ const missingRetryBlocks = 20
 // blocks the head loop skipped for their receipts would wait for the next start, and the ledger, and with it
 // retention, would stop at the first of them.
 //
-// A pass reads the newest recorded ranges (GetMissingRangesBatch) and works through them in block order, writing at
-// most missingRetryBlocks blocks. A block is written only when it extends the stored block below it and the stored
-// block above extends it. A block the node still cannot serve, or that does not fit, ends its range for this pass
-// and puts the range on a doubling pause (missingBackoff); the pass goes on with the next range, so one block that
-// keeps failing never holds up the others.
+// A pass reads the lowest recorded ranges that are not paused (GetLowestMissingRanges), lowest first, since the
+// lowest is what holds the ledger, and works through them in block order, writing at most missingRetryBlocks blocks.
+// A block is written only when it extends the stored block below it and the stored block above extends it. A block
+// the node still cannot serve, or that does not fit, ends its range for this pass and puts the range on a doubling
+// pause (missingBackoff). A paused range is left out of the read, so ranges that keep failing never fill a pass: the
+// next pass reaches the ranges above them, up to the newest.
 func (i *Indexer) retryMissing(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) {
 	if !receipts.recorded || time.Now().Before(i.missingRetryAt) {
 		return
 	}
 	i.missingRetryAt = time.Now().Add(i.missingRetryInterval)
-	ranges, err := i.db.GetMissingRangesBatch(ctx, missingRetryBlocks)
+	paused := i.pausedMissing()
+	ranges, err := i.db.GetLowestMissingRanges(ctx, missingRetryBlocks, paused)
 	if err != nil {
 		log.Error("failed to read the blocks recorded as missing; retrying them later", "error", err)
 		return
 	}
-	if len(ranges) == 0 {
+	if len(ranges) == 0 && len(paused) == 0 {
 		receipts.recorded = false
 		clear(i.missingBackoff)
 		return
 	}
-	sort.Slice(ranges, func(a, b int) bool { return ranges[a].FromNumber < ranges[b].FromNumber })
 	budget := missingRetryBlocks
 	for _, r := range ranges {
 		if r.FromNumber > lastIndexed || budget == 0 {
 			return
-		}
-		if b, ok := i.missingBackoff[r.FromNumber]; ok && time.Now().Before(b.nextTry) {
-			continue
 		}
 		next, failed := r.FromNumber, false
 		for ; next <= r.ToNumber && next <= lastIndexed && budget > 0; next++ {
@@ -78,6 +75,18 @@ func (i *Indexer) retryMissing(ctx context.Context, lastIndexed uint64, receipts
 type missingAttempt struct {
 	failures int
 	nextTry  time.Time
+}
+
+// pausedMissing lists the first blocks of the ranges whose pause has not run out.
+func (i *Indexer) pausedMissing() []uint64 {
+	now := time.Now()
+	var paused []uint64
+	for from, a := range i.missingBackoff {
+		if now.Before(a.nextTry) {
+			paused = append(paused, from)
+		}
+	}
+	return paused
 }
 
 // backOffMissing pauses the range that now starts at block after a failure there: missingRetryInterval, doubling

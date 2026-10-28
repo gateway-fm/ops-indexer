@@ -109,6 +109,11 @@ func (m *MockDatabase) GetMissingRangesBatch(ctx context.Context, batchSize int)
 	return args.Get(0).([]db.BlockRange), args.Error(1)
 }
 
+func (m *MockDatabase) GetLowestMissingRanges(ctx context.Context, limit int, skip []uint64) ([]db.BlockRange, error) {
+	args := m.Called(ctx, limit, skip)
+	return args.Get(0).([]db.BlockRange), args.Error(1)
+}
+
 func (m *MockDatabase) PrunedThrough(ctx context.Context) (uint64, int64, error) {
 	return 0, 0, nil
 }

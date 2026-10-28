@@ -97,6 +97,31 @@ func (d *DB) GetMissingRangesBatch(ctx context.Context, batchSize int) ([]BlockR
 	return ranges, rows.Err()
 }
 
+// GetLowestMissingRanges returns up to limit recorded ranges from history_from() up, lowest first, leaving out the
+// ranges that start at a block in skip.
+func (d *DB) GetLowestMissingRanges(ctx context.Context, limit int, skip []uint64) ([]BlockRange, error) {
+	starts := make([]int64, len(skip))
+	for k, b := range skip {
+		starts[k] = int64(b)
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, from_number, to_number, created_at
+		FROM (SELECT id, GREATEST(from_number, h.lo) AS from_number, to_number, created_at
+		      FROM missing_block_ranges, (SELECT history_from() AS lo) h
+		      WHERE to_number >= h.lo) r
+		WHERE from_number <> ALL($2::bigint[])
+		ORDER BY from_number
+		LIMIT $1`, limit, starts)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (BlockRange, error) {
+		var r BlockRange
+		err := row.Scan(&r.ID, &r.FromNumber, &r.ToNumber, &r.CreatedAt)
+		return r, err
+	})
+}
+
 func (d *DB) DeleteMissingRange(ctx context.Context, id int) error {
 	_, err := d.pool.Exec(ctx, `DELETE FROM missing_block_ranges WHERE id = $1`, id)
 	return err

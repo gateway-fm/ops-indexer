@@ -169,3 +169,52 @@ func TestRetryFillsHigherRangesPastOneThatKeepsFailing(t *testing.T) {
 	}
 	require.Equal(t, before, node.timesAsked(83), "a block that keeps failing waits out its pause instead of being asked every pass")
 }
+
+// More recorded ranges than a pass reads, the newest of them never available: the lowest, which holds the ledger, is
+// still filled within a few passes, and the span holding it closes. With the oldest never available instead, the
+// newest is filled.
+func TestRetryReachesARangeBeyondTheFirstBatch(t *testing.T) {
+	failing := func(from uint64) []uint64 {
+		out := make([]uint64, 0, missingRetryBlocks)
+		for b := from; b < from+missingRetryBlocks; b++ {
+			out = append(out, b)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name      string
+		available uint64
+		failing   []uint64
+	}{
+		{"the lowest available", 60, failing(101)},
+		{"the highest available", 121, failing(60)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d, pool := refillTestDB(t)
+			ctx := context.Background()
+			_, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION prune_floor_gap() RETURNS BIGINT LANGUAGE sql IMMUTABLE AS $f$ SELECT 3::BIGINT $f$`)
+			require.NoError(t, err, "a 3-block reorg floor, so spans of this short chain can close")
+			node := newWithholdingNode(130, append([]uint64{c.available}, c.failing...)...)
+			idx := NewWithConfig(d, node, 5*time.Millisecond, 0, &Config{RPCWorkers: 1, RPCRateLimit: 100})
+			indexChainSkipping(t, idx, pool, 130, missingRetryBlocks+1)
+			closed, err := d.CloseLedgerSpans(ctx, db.LedgerConfig{SpanBlocks: 50}, 10)
+			require.NoError(t, err)
+			require.Equal(t, 1, closed, "only the span below 50 closes while %d is missing", c.available)
+
+			node.withhold(c.available, false)
+			for k := 0; k < 3; k++ {
+				idx.missingRetryAt = time.Time{}
+				idx.retryMissing(ctx, 130, &receiptSkip{recorded: true})
+			}
+			require.EqualValues(t, 1, countWhere(t, pool, `SELECT count(*) FROM blocks WHERE number = $1`, c.available),
+				"%d is filled past %d ranges that keep failing", c.available, len(c.failing))
+			require.EqualValues(t, len(c.failing), countWhere(t, pool, `SELECT count(*) FROM missing_block_ranges`))
+			if c.available < 100 {
+				closed, err = d.CloseLedgerSpans(ctx, db.LedgerConfig{SpanBlocks: 50}, 10)
+				require.NoError(t, err)
+				require.Equal(t, 1, closed, "the span holding %d closes", c.available)
+				require.EqualValues(t, 100, countWhere(t, pool, `SELECT max(hi) FROM ledger_spans`))
+			}
+		})
+	}
+}
