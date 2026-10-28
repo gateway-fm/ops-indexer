@@ -706,7 +706,7 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if deltaBlocks > 0 {
+	if data.Block != nil && (deltaBlocks > 0 || deltaTxs > 0 || deltaTransfers > 0) {
 		w.lateDays.noteBlock(data.Block.Number, data.Block.Timestamp)
 	}
 	return nil
