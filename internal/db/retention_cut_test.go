@@ -42,9 +42,6 @@ func TestAbandonedCutIsReleasedBeforeIngest(t *testing.T) {
 	}
 	require.Error(t, insertCutTestBlock(d, 44_001), "the hazard: ingest is refused at the abandoned cut")
 
-	d.RunRetention(ctx, RetentionConfig{RetainBlocks: 0})
-	require.Equal(t, len(HistoryTables), historyCutChecks(t, d), "retention off returns at once and keeps the check")
-
 	require.NoError(t, d.Migrate(), "a restart: the reconcile runs before ingest")
 	require.Zero(t, historyCutChecks(t, d))
 	require.NoError(t, insertCutTestBlock(d, 44_001), "ingest continues past the old cut")
@@ -200,4 +197,127 @@ func TestPartitionsAreKeptAheadBetweenRetentionPasses(t *testing.T) {
 		}, 5*time.Second, 50*time.Millisecond, "two partitions ahead of %d", from)
 		seedHistory(t, d, from, from+999, 1)
 	}
+}
+
+// holdValidateThenRead starts the cut, holds the VALIDATE of balances_legacy until a reader has opened logs, and
+// returns the cut's result channel and the reader, whose transaction stays open.
+func holdValidateThenRead(t *testing.T, d *DB, cfg RetentionConfig) (<-chan error, *pgx.Conn) {
+	t.Helper()
+	ctx := context.Background()
+	connString := d.pool.Config().ConnConfig.ConnString()
+	blocker, err := pgx.Connect(ctx, connString)
+	require.NoError(t, err)
+	t.Cleanup(func() { blocker.Close(context.Background()) })
+	reader, err := pgx.Connect(ctx, connString)
+	require.NoError(t, err)
+	t.Cleanup(func() { reader.Close(context.Background()) })
+
+	cut := make(chan error, 1)
+	cctx, stop := context.WithCancel(ctx)
+	t.Cleanup(stop)
+	go func() { cut <- d.cutHistory(cctx, cfg) }()
+	deadline := time.Now().Add(30 * time.Second)
+	for historyCutChecks(t, d) < len(HistoryTables) {
+		require.True(t, time.Now().Before(deadline), "the cut never added its checks")
+		time.Sleep(2 * time.Millisecond)
+	}
+	_, err = blocker.Exec(ctx, `BEGIN; LOCK TABLE balances_legacy IN SHARE UPDATE EXCLUSIVE MODE`)
+	require.NoError(t, err)
+	for validating := false; !validating; time.Sleep(10 * time.Millisecond) {
+		require.True(t, time.Now().Before(deadline), "the VALIDATE of balances_legacy never waited")
+		require.NoError(t, d.pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query LIKE 'ALTER TABLE "balances_legacy" VALIDATE%' AND wait_event_type = 'Lock')`).Scan(&validating))
+	}
+	_, err = reader.Exec(ctx, `BEGIN; SELECT count(*) FROM logs`)
+	require.NoError(t, err)
+	time.Sleep(1500 * time.Millisecond)
+	_, err = blocker.Exec(ctx, `COMMIT`)
+	require.NoError(t, err)
+	return cut, reader
+}
+
+// A consumer's query that starts while the cut validates and outlasts the validation delays the cut's finish for as
+// long as the head stays more than a partition below the cut; the cut finishes once the query ends.
+func TestCutWaitsOutALongReaderWhileTheHeadIsFarBelowIt(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 40_001, 1)
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
+	cut, reader := holdValidateThenRead(t, d, cfg)
+
+	select {
+	case err := <-cut:
+		t.Fatalf("the cut gave up while the head was far below it: %v", err)
+	case <-time.After(45 * time.Second):
+	}
+	_, err := reader.Exec(ctx, `COMMIT`)
+	require.NoError(t, err)
+	select {
+	case err := <-cut:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cut did not finish after the reader ended")
+	}
+	done, err := d.HistoryCut(ctx)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.NoError(t, insertCutTestBlock(d, 44_001), "the first partition above the cut takes the block")
+}
+
+// A cut the head comes within a partition of while a reader holds it off is abandoned, and its check goes as soon as
+// the reader ends, without a restart; a restart meanwhile does not fail over the check.
+func TestAbandonedCutsCheckGoesWhenTheReaderEnds(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 40_001, 1)
+	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
+	const cutAt = 40_001 + 2*2_000
+	cut, reader := holdValidateThenRead(t, d, cfg)
+
+	require.NoError(t, insertCutTestBlock(d, cutAt-2_000))
+	select {
+	case err := <-cut:
+		require.Error(t, err, "the head came within a partition of the cut")
+	case <-time.After(120 * time.Second):
+		t.Fatal("the cut did not give up once the head came within a partition of it")
+	}
+	rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	require.NoError(t, d.Reconcile(rctx), "a restart while the reader holds the check goes on")
+
+	release := make(chan struct{})
+	go func() {
+		defer close(release)
+		d.RunRetention(ctx, RetentionConfig{RetainBlocks: 0, EnsureInterval: 100 * time.Millisecond})
+	}()
+	time.Sleep(2 * time.Second)
+	require.Equal(t, len(HistoryTables), historyCutChecks(t, d), "the reader still holds the check")
+	_, err := reader.Exec(ctx, `COMMIT`)
+	require.NoError(t, err)
+	select {
+	case <-release:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the check was not dropped after the reader ended")
+	}
+	require.Zero(t, historyCutChecks(t, d))
+	require.NoError(t, insertCutTestBlock(d, cutAt), "ingest goes past the abandoned cut")
+}
+
+// With retention switched off after a cut was abandoned, retention still drops the cut's check at its start.
+func TestRetentionOffDropsAnAbandonedCutsCheck(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedHistory(t, d, 0, 40_001, 1)
+	_, err := d.pool.Exec(ctx, `SELECT history_cut_constrain(44001)`)
+	require.NoError(t, err)
+	for _, tbl := range HistoryTables {
+		_, err := d.pool.Exec(ctx, `ALTER TABLE `+tbl+`_legacy VALIDATE CONSTRAINT history_cut`)
+		require.NoError(t, err)
+	}
+	d.RunRetention(ctx, RetentionConfig{RetainBlocks: 0})
+	require.Zero(t, historyCutChecks(t, d))
+	require.NoError(t, insertCutTestBlock(d, 44_001))
 }

@@ -199,6 +199,11 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 		case <-time.After(ensureInterval(cfg)):
 		}
 	}
+	if !cut {
+		if err := d.releaseLeftoverCut(ctx); err != nil {
+			return
+		}
+	}
 	if !cut && cfg.RetainBlocks == 0 {
 		return
 	}
@@ -260,7 +265,13 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 		return err
 	}
 	if !cut {
+		if err := d.releaseLeftoverCut(ctx); err != nil {
+			return err
+		}
 		if err := d.cutHistory(ctx, cfg); err != nil {
+			if rerr := d.releaseLeftoverCut(ctx); rerr != nil {
+				return fmt.Errorf("cut: %w; release its check: %v", err, rerr)
+			}
 			return fmt.Errorf("cut: %w", err)
 		}
 	}
@@ -294,7 +305,9 @@ func (d *DB) retentionPass(ctx context.Context, cfg RetentionConfig) error {
 // From the CHECK until the re-attach a legacy row at or above C is refused, so C keeps that much room ahead of
 // ingest; if the head comes within one partition of C while the checks validate, the cut is abandoned and retried.
 // The gate is held for the whole cut and taken before the check exists: waiting for a ledger span with the check in
-// force would let the head reach the cut, where every insert into the legacy partition is refused.
+// force would let the head reach the cut, where every insert into the legacy partition is refused. A transaction
+// that holds a history table off the finish is waited out while the head stays more than a partition below C; past
+// that the cut is abandoned, and retentionPass drops its check, waiting for that transaction as long as it lasts.
 func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
 	if err != nil {
@@ -325,8 +338,8 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	metrics.ObserveRetentionStep("cut_constrain", time.Since(start))
 	defer func() {
 		if err != nil {
-			if rerr := d.dropCutChecks(context.WithoutCancel(ctx)); rerr != nil {
-				log.Error("retention: dropping an abandoned cut's check failed; it is dropped again at the next start", "error", rerr)
+			if rerr := d.dropCutChecks(ctx, func(attempt int) (bool, error) { return attempt <= 20, nil }); rerr != nil {
+				log.Warn("retention: an abandoned cut's check stays for now; retention keeps dropping it", "error", rerr)
 			}
 		}
 	}()
@@ -349,10 +362,26 @@ func (d *DB) cutHistory(ctx context.Context, cfg RetentionConfig) (err error) {
 	log.Info("retention: legacy partitions validated below the cut", "cut_at", cutAt, "elapsed", time.Since(start))
 
 	start = time.Now()
-	if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
+	headNearCut := false
+	if err := d.withLockTimeoutWhile(ctx, func(attempt int) (bool, error) {
+		if attempt == 1 {
+			return true, nil
+		}
+		var herr error
+		if head, herr = d.GetLatestBlockNumber(ctx); herr != nil {
+			return false, herr
+		}
+		headNearCut = head+cfg.PartitionBlocks >= cutAt
+		return !headNearCut, nil
+	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `SELECT history_cut_finish($1, $2)`, int64(cutAt), int64(cfg.PartitionBlocks))
 		return err
 	}); err != nil {
+		if headNearCut {
+			d.cutMargin = nextCutMargin(d.cutMargin, head-headAtStart)
+			return fmt.Errorf("head %d came within a partition of the cut %d before it could finish; retrying with %d more blocks of margin: %w",
+				head, cutAt, d.cutMargin, err)
+		}
 		return err
 	}
 	metrics.ObserveRetentionStep("cut_finish", time.Since(start))
@@ -369,18 +398,47 @@ func nextCutMargin(prev, advanced uint64) uint64 {
 
 // ReleaseAbandonedCut drops the cut's check from the legacy partitions while the history is not cut: a cut that was
 // abandoned (the head came near it, a failure, a restart) leaves a validated "below the cut" check, and once the
-// head reaches it every insert into the legacy partition is refused. After the cut the check stays.
+// head reaches it every insert into the legacy partition is refused. After the cut the check stays. It tries once:
+// while a transaction holds a history table the check stays, and retention, which starts after it, drops it once
+// that transaction ends.
 func (d *DB) ReleaseAbandonedCut(ctx context.Context) error {
 	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
 	if err != nil {
 		return err
 	}
 	defer release()
-	return d.dropCutChecks(ctx)
+	if err := d.dropCutChecks(ctx, func(attempt int) (bool, error) { return attempt == 1, nil }); err != nil && ctx.Err() == nil {
+		log.Warn("retention: an abandoned cut's check stays for now; retention drops it once nothing holds the history tables",
+			"error", err)
+	}
+	return ctx.Err()
 }
 
-// dropCutChecks is ReleaseAbandonedCut for a caller that already holds the history-DDL gate.
-func (d *DB) dropCutChecks(ctx context.Context) error {
+// releaseLeftoverCut drops an abandoned cut's check, waiting for as long as a transaction holds a history table; it
+// takes the history-DDL gate for each round of attempts, so the ledger closer runs in between.
+func (d *DB) releaseLeftoverCut(ctx context.Context) error {
+	for {
+		release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
+		if err == nil {
+			err = d.dropCutChecks(ctx, func(attempt int) (bool, error) { return attempt <= 20, nil })
+			release()
+		}
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		log.Error("retention: an abandoned cut's check cannot be dropped yet; inserts into the legacy partitions at or above it fail until it is",
+			"error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// dropCutChecks is ReleaseAbandonedCut for a caller that already holds the history-DDL gate; more decides, before
+// each attempt, whether to make it.
+func (d *DB) dropCutChecks(ctx context.Context, more func(attempt int) (bool, error)) error {
 	cut, err := d.HistoryCut(ctx)
 	if err != nil || cut {
 		return err
@@ -395,7 +453,7 @@ func (d *DB) dropCutChecks(ctx context.Context) error {
 		if !exists {
 			continue
 		}
-		if err := d.withLockTimeout(ctx, func(tx pgx.Tx) error {
+		if err := d.withLockTimeoutWhile(ctx, more, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS history_cut`, pgx.Identifier{t + "_legacy"}.Sanitize()))
 			return err
 		}); err != nil {
@@ -449,16 +507,30 @@ func (d *DB) holdHistoryDDLGate(ctx context.Context, wait time.Duration) (func()
 	}, nil
 }
 
+// errHistoryHeld: a transaction open for more than a second holds a history table, so DDL was not attempted.
+var errHistoryHeld = errors.New("a transaction holds a history table")
+
 // withLockTimeout runs fn in a transaction that gives up on a lock after 2 s, retrying up to 20 times: a DDL lock
 // waiting in the queue blocks every ingest statement behind it.
 func (d *DB) withLockTimeout(ctx context.Context, fn func(pgx.Tx) error) error {
+	return d.withLockTimeoutWhile(ctx, func(attempt int) (bool, error) { return attempt <= 20, nil }, fn)
+}
+
+// withLockTimeoutWhile is withLockTimeout retrying for as long as more, asked before each attempt, reports true; it
+// returns the last attempt's error once more reports false.
+func (d *DB) withLockTimeoutWhile(ctx context.Context, more func(attempt int) (bool, error), fn func(pgx.Tx) error) error {
 	var err error
-	for attempt := 1; attempt <= 20; attempt++ {
+	for attempt := 1; ; attempt++ {
+		if ok, merr := more(attempt); merr != nil {
+			return merr
+		} else if !ok {
+			return err
+		}
 		if holder, held, herr := d.longHistoryHolder(ctx); herr != nil {
 			err = herr
 		} else if held {
 			// Requesting ACCESS EXCLUSIVE now would queue every insert behind the request until it times out.
-			err = fmt.Errorf("a transaction open for %s holds a history table (pid %d, application %q)", holder.age, holder.pid, holder.app)
+			err = fmt.Errorf("%w: open for %s (pid %d, application %q)", errHistoryHeld, holder.age, holder.pid, holder.app)
 		} else {
 			err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 				if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
@@ -470,14 +542,15 @@ func (d *DB) withLockTimeout(ctx context.Context, fn func(pgx.Tx) error) error {
 		if err == nil || ctx.Err() != nil {
 			return err
 		}
-		log.Warn("retention: DDL attempt failed; retrying", "attempt", attempt, "error", err)
+		if attempt <= 20 || attempt%60 == 0 {
+			log.Warn("retention: DDL attempt failed; retrying", "attempt", attempt, "error", err)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
-	return err
 }
 
 type historyHolder struct {
