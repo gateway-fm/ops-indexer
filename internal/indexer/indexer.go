@@ -51,13 +51,6 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
-	// RetentionEnabled: history below a window is (or will be) pruned.
-	RetentionEnabled bool
-
-	// SkipAddressStatsRebuild skips the address_stats rebuild after the initial catch-up (retention off), which
-	// truncates the table and blocks ingest for as long as it runs (ADDRESS_STATS_REBUILD=false).
-	SkipAddressStatsRebuild bool
-
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration

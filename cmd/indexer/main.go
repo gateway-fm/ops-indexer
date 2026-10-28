@@ -107,10 +107,6 @@ func main() {
 		log.Fatal("failed to build the contracts block index", "error", err)
 	}
 
-	prunedThrough, _, err := database.PrunedThrough(context.Background())
-	if err != nil {
-		log.Fatal("failed to read the prune watermark", "error", err)
-	}
 	// Once the history is cut a block above the newest partition cannot be stored: create them before ingest.
 	if head, err := database.GetLatestBlockNumber(context.Background()); err != nil {
 		log.Fatal("failed to read the stored head", "error", err)
@@ -145,7 +141,6 @@ func main() {
 		BalanceDedupWindow:    cfg.BalanceDedupWindow,
 		BalanceReaderBatch:    cfg.BalanceReaderBatch,
 		BalanceSkipL1:         cfg.BalanceSkipL1,
-		RetentionEnabled:      cfg.PruneRetainBlocks > 0 || prunedThrough > 0,
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 

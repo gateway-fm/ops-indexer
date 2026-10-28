@@ -417,13 +417,11 @@ func TestCatchupIndexer_InitialSyncCompletesOnce(t *testing.T) {
 
 }
 
-// Catch-up writes address_stats deltas whether or not retention is on: nothing rebuilds the table afterwards.
+// Catch-up writes address_stats deltas, retention on or off: nothing rebuilds the table afterwards.
 func TestCatchupIndexer_WritesAddressStatsInEveryMode(t *testing.T) {
-	for _, retention := range []bool{false, true} {
-		c := NewCatchupIndexer(new(MockDatabase), new(MockRPCClient), &CatchupConfig{Workers: 1},
-			&Config{RetentionEnabled: retention}, NewTokenCache(), NewContractCache(), nil, false)
-		require.False(t, c.blockIndexer().config.SkipAddressStats, "retention %v", retention)
-	}
+	c := NewCatchupIndexer(new(MockDatabase), new(MockRPCClient), &CatchupConfig{Workers: 1},
+		&Config{}, NewTokenCache(), NewContractCache(), nil, false)
+	require.False(t, c.blockIndexer().config.SkipAddressStats)
 }
 
 // --- Realtime Indexer Tests ---
