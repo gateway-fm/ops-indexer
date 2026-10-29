@@ -335,8 +335,9 @@ func (d *DB) warnPartlyPrunedReorgDay(ctx context.Context) {
 		log.Warn("retention: could not check for a partly pruned day in the reorg window", "error", err)
 		return
 	}
-	log.Warn("retention: an earlier build pruned part of a UTC day the reorg window reaches; a reorg into it cannot be reverted, and pruning waits until it ends",
-		"day", day.Format(time.DateOnly), "day_ends", day.Add(24*time.Hour).Format(time.RFC3339))
+	log.Warn("retention: an earlier build pruned part of a UTC day the reorg window reaches; a reorg into it cannot be reverted, and pruning resumes once the block floor_gap_blocks below the head is past day_ends",
+		"day", day.Format(time.DateOnly), "day_ends", day.Add(24*time.Hour).Format(time.RFC3339),
+		"floor_gap_blocks", PruneFloorGap)
 }
 
 // nodeHeadTimeout bounds a read of the node's head for retention. A node answers eth_blockNumber from memory in

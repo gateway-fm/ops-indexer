@@ -129,10 +129,11 @@ type AddressStatsDelta struct {
 // BlockWrite is one block's ingest transaction, split so that the rows a block owns can be written
 // while an earlier block's transaction is still open (the pipelined commit).
 //
-// BeginBlockData writes the rows that belong to this block alone -- blocks, transactions, contracts,
-// logs, token_transfers, internal_transactions -- and takes no row lock another block's write can
-// want: every key is this block's own. Finish writes the rows blocks share -- tokens, nft_tokens,
-// address_stats, chain_counters -- and commits. Several BeginBlockData may run at once; Finish must
+// BeginBlockData writes the rows that belong to this block alone -- blocks, transactions, logs,
+// token_transfers, internal_transactions -- and takes no row lock another block's write can want:
+// every key it writes carries this block's own identity. Finish writes the rows blocks can share --
+// contracts first, sorted by address, since two in-flight blocks can create one address (CREATE2),
+// then tokens, nft_tokens, address_stats, chain_counters -- and commits. Several BeginBlockData may run at once; Finish must
 // run in block order, each after the previous block's Finish returned. That keeps the committed
 // blocks a prefix of the chain, and it is what rules out a deadlock Postgres cannot see: a later
 // block never holds a shared row while it waits for an earlier block to commit.
