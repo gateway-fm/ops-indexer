@@ -435,6 +435,7 @@ func TestIndexPipelinedDrainsBeforeServingABlockRequest(t *testing.T) {
 		},
 	}
 	idx := newTestIndexer(store, chain)
+	idx.startBlock = 101
 
 	done := make(chan error, 1)
 	go func() {
