@@ -15,11 +15,12 @@ import (
 // its row; one whose earlier transfers are pruned goes back to the sender of its first transfer in the block, and one
 // the block did not move keeps its owner. token_transfers holds addresses in lower case and nft_tokens in the case the
 // indexer writes them, checksum case, so the transfers are looked up by the lowered collection address and a restored
-// owner is written back in checksum case. Rows are taken one at a time in key order, like the writer.
+// owner is written back in checksum case. Rows are locked in the order the writer locks them, the address and then the
+// decimal id compared byte by byte as Go compares strings ("10" before "9"), whatever the database's collation.
 func revertNFTTokens(ctx context.Context, tx pgx.Tx, number uint64) error {
 	rows, err := tx.Query(ctx, `
 		SELECT token_address, token_id::TEXT FROM nft_tokens WHERE block_number >= $1
-		ORDER BY token_address, token_id FOR UPDATE`, int64(number))
+		ORDER BY token_address COLLATE "C", token_id::TEXT COLLATE "C" FOR UPDATE`, int64(number))
 	if err != nil {
 		return err
 	}

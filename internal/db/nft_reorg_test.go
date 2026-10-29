@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -214,4 +215,71 @@ func TestReorgRevertsNFTOwners(t *testing.T) {
 			require.Equal(t, tc.want.owner, items[0].Owner, "the inventory serves the owner as the indexer writes it")
 		})
 	}
+}
+
+// The revert locks a reverted block's NFTs in the order a block write locks them, addresses and ids compared byte by
+// byte as Go compares strings, whatever the database's collation, so a reorg and a catch-up write moving both cannot
+// deadlock: while a writer holds the first, the revert waits on it without holding the second.
+func TestReorgLocksNFTsInTheWritersOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		collation     string
+		first, second [2]string
+	}{
+		{"ids", "", [2]string{nftCollection, "10"}, [2]string{nftCollection, "9"}},
+		// A linguistic collation, as glibc's en_US, compares the letters before their case.
+		{"collections, linguistic collation", "und-x-icu", [2]string{"0xAc01", "1"}, [2]string{"0xaB01", "1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+			require.Equal(t, -1, strings.Compare(tc.first[0]+" "+tc.first[1], tc.second[0]+" "+tc.second[1]), "the writer locks first first")
+			if tc.collation != "" {
+				_, err := d.pool.Exec(ctx, `ALTER TABLE nft_tokens ALTER COLUMN token_address TYPE TEXT COLLATE "`+tc.collation+`"`)
+				require.NoError(t, err)
+			}
+			for _, k := range [][2]string{tc.first, tc.second} {
+				_, err := d.pool.Exec(ctx, `INSERT INTO nft_tokens (token_address, token_id, owner, block_number) VALUES ($1, $2::NUMERIC, $3, 103)`,
+					k[0], k[1], nftOwnerA)
+				require.NoError(t, err)
+			}
+
+			writer, err := d.pool.Begin(ctx)
+			require.NoError(t, err)
+			defer writer.Rollback(ctx)
+			var held string
+			require.NoError(t, writer.QueryRow(ctx, `SELECT token_id::TEXT FROM nft_tokens WHERE token_address = $1 AND token_id = $2::NUMERIC FOR UPDATE`,
+				tc.first[0], tc.first[1]).Scan(&held))
+
+			reverted := make(chan error, 1)
+			go func() { reverted <- d.DeleteBlock(ctx, 103) }()
+			waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			for countWaitingOnNFTs(t, d) == 0 {
+				require.NoError(t, waitCtx.Err(), "the revert waits on the row the writer holds")
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			other, err := d.pool.Begin(ctx)
+			require.NoError(t, err)
+			var free string
+			err = other.QueryRow(ctx, `SELECT token_id::TEXT FROM nft_tokens WHERE token_address = $1 AND token_id = $2::NUMERIC FOR UPDATE NOWAIT`,
+				tc.second[0], tc.second[1]).Scan(&free)
+			require.NoError(t, other.Rollback(ctx))
+			require.NoError(t, err, "the revert does not hold the second while it waits on the first")
+
+			require.NoError(t, writer.Rollback(ctx))
+			require.NoError(t, <-reverted)
+		})
+	}
+}
+
+func countWaitingOnNFTs(t *testing.T, d *DB) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, d.pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_stat_activity
+		WHERE wait_event_type = 'Lock' AND query LIKE '%FROM nft_tokens WHERE block_number%'`).Scan(&n))
+	return n
 }
