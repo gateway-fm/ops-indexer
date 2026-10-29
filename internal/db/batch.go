@@ -290,23 +290,6 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 		}
 	}
 
-	if len(data.Contracts) > 0 {
-		batch := &pgx.Batch{}
-		for _, c := range data.Contracts {
-			batch.Queue(`
-				INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
-					contract_name, compiler_version, optimization_used, source_code, abi)
-				VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-				ON CONFLICT (address) DO NOTHING`,
-				c.Address, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
-				c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
-		}
-		br := tx.SendBatch(ctx, batch)
-		if err := br.Close(); err != nil {
-			return nil, err
-		}
-	}
-
 	if len(data.Logs) > 0 {
 		batch := &pgx.Batch{}
 		for _, l := range data.Logs {
@@ -430,6 +413,39 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	deltaBlocks, deltaTxs, deltaTransfers := w.deltaBlocks, w.deltaTxs, w.deltaTransfers
 	var deltaTokens, deltaAddresses int64
 	var seedTokens []string
+
+	// Contracts first, in address order. Two blocks can create one address (a factory's CREATE2 again after the child
+	// destroyed itself), so the insert is here rather than in BeginBlockData: the pipeline begins a later block's
+	// write before an earlier one commits, and an earlier block's insert waiting on that uncommitted row would wait for
+	// good. Finish runs in block order, so the earlier block's row is committed by the time a later block meets it.
+	if len(data.Contracts) > 0 {
+		contracts := make(map[string]*types.Contract, len(data.Contracts))
+		for _, c := range data.Contracts {
+			if addr := strings.ToLower(c.Address); contracts[addr] == nil {
+				contracts[addr] = c
+			}
+		}
+		addresses := make([]string, 0, len(contracts))
+		for addr := range contracts {
+			addresses = append(addresses, addr)
+		}
+		sort.Strings(addresses)
+		batch := &pgx.Batch{}
+		for _, addr := range addresses {
+			c := contracts[addr]
+			batch.Queue(`
+				INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
+					contract_name, compiler_version, optimization_used, source_code, abi)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				ON CONFLICT (address) DO NOTHING`,
+				addr, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
+				c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
 
 	// Every tokens row this transaction will lock, taken in one ascending pass
 	// before any of them is touched individually.
