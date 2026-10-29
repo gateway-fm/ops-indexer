@@ -113,14 +113,25 @@ func (l *Lookup) BlockByNumber(ctx context.Context, number uint64) (*Block, erro
 	return v.(*Block), nil
 }
 
-// BlockByHash returns the node's block if it is at or below through, else nil.
+// BlockByHash returns the node's block if it is at or below through, else nil. The hash is resolved to a height and
+// the block fetched by number, so the block found there is served only if it has the hash: a node that keeps an
+// orphan's hash, or backends that disagree, put another block at that height. That block is dropped from the cache,
+// as either view may be the stale one, and the next request asks the node again.
 func (l *Lookup) BlockByHash(ctx context.Context, hash string, through uint64) (*Block, error) {
 	hash = strings.ToLower(hash)
 	number, found, err := l.resolve(ctx, hash, l.hashBlock, l.src.BlockNumberByHash, "eth_getBlockByHash")
 	if err != nil || !found || number > through {
 		return nil, err
 	}
-	return l.BlockByNumber(ctx, number)
+	b, err := l.BlockByNumber(ctx, number)
+	if err != nil || b == nil {
+		return nil, err
+	}
+	if !strings.EqualFold(b.Block.Hash, hash) {
+		l.forget(b)
+		return nil, nil
+	}
+	return b, nil
 }
 
 // Transaction returns the node's transaction if its block is at or below through, else nil.
@@ -251,6 +262,15 @@ func (l *Lookup) store(b *Block) {
 		l.evict(l.order.Back())
 	}
 	metrics.SetNodeLookupCache(l.order.Len(), l.bytes)
+}
+
+func (l *Lookup) forget(b *Block) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e, ok := l.byNumber[b.Block.Number]; ok && e.Value.(*Block) == b {
+		l.evict(e)
+		metrics.SetNodeLookupCache(l.order.Len(), l.bytes)
+	}
 }
 
 func (l *Lookup) evict(e *list.Element) {
