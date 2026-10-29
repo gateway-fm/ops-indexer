@@ -390,9 +390,7 @@ type refillBlockJSON struct {
 }
 
 func (n RefillNode) BlockNumber(ctx context.Context) (uint64, error) {
-	var h hexutil.Uint64
-	err := n.C.CallContext(ctx, &h, "eth_blockNumber")
-	return uint64(h), err
+	return n.C.BlockNumber(ctx)
 }
 
 func (n RefillNode) Blocks(ctx context.Context, numbers []uint64, bodies bool) ([]*RefillBlock, error) {
