@@ -11,7 +11,14 @@ import (
 // first_seen and last_seen that point into the block move to the address's remaining rows (the closed ledger when
 // only pruned history remains), is_contract follows the remaining contract creations, and an address no remaining
 // block has seen loses its row. It returns the number of rows removed.
+// It first adds one to the address_stats_reverts counter, before any address_stats row, which makes a staged repair
+// stale (ApplyAddressStatsRepairBatch).
 func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, error) {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO chain_counters (name, count, updated_at) VALUES ($1, 1, NOW())
+		ON CONFLICT (name) DO UPDATE SET count = chain_counters.count + 1, updated_at = NOW()`, addressStatsRevertsCounter); err != nil {
+		return 0, err
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT c.address, c.txs, c.internal, c.transfers,
 		       EXISTS (SELECT 1 FROM contracts k WHERE k.address = c.address AND k.block_number = $1)

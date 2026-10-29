@@ -8,8 +8,8 @@ import (
 )
 
 // A repair staged before a reorg can hold a correction for an address the reorg then removed (no remaining block had
-// seen it). Applying it does not bring the row back: an address with no rows left has no row, as after the revert.
-// Corrections for addresses that still have rows apply as before.
+// seen it). The repair stages again and does not bring the row back: an address with no rows left has no row, as
+// after the revert. Corrections for addresses that still have rows apply.
 func TestAddressStatsRepairDoesNotRecreateARowAReorgRemoved(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -24,10 +24,7 @@ func TestAddressStatsRepairDoesNotRecreateARowAReorgRemoved(t *testing.T) {
 	require.Equal(t, int64(2), stage.Changes)
 	require.NoError(t, d.DeleteBlock(ctx, 2))
 
-	for done := false; !done; {
-		_, _, done, err = d.ApplyAddressStatsRepairBatch(ctx, 1)
-		require.NoError(t, err)
-	}
+	require.Equal(t, 1, repairUntilDone(t, d), "the reorg made the stage stale")
 
 	var rows int
 	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM address_stats WHERE address = '0xf'`).Scan(&rows))

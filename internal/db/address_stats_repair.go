@@ -56,6 +56,15 @@ const addressStatsRepairTotalTable = "address_stats_repair_total"
 // ErrAddressStatsRepairPending: corrections are staged and not all applied; apply them before staging again.
 var ErrAddressStatsRepairPending = errors.New("a staged address_stats repair is not applied yet")
 
+// addressStatsRevertsCounter is the chain_counters row every reorg revert of address_stats adds one to. A stage
+// records it; a batch that finds it moved knows a revert ran since the stage.
+const addressStatsRevertsCounter = "address_stats_reverts"
+
+// ErrAddressStatsRepairStale: a reorg reverted blocks after the corrections were staged, so the corrections describe a
+// chain that is gone (the revert's subtraction stops at zero, and it moves first_seen and last_seen). The stage is
+// removed; stage again. Batches applied before the revert stay applied: the revert took their blocks off repaired rows.
+var ErrAddressStatsRepairStale = errors.New("a reorg ran after the address_stats repair was staged")
+
 // ErrAddressStatsRepairLost: staged corrections disappeared before they were applied (an unlogged staging table from
 // an earlier build emptied by a crash or a failover, or one dropped by hand). The stage is removed; stage again.
 var ErrAddressStatsRepairLost = errors.New("staged address_stats corrections were lost before they were applied")
@@ -83,7 +92,9 @@ type AddressStatsCorrection struct {
 // for ApplyAddressStatsRepairBatch; a table that still holds unapplied corrections is never restaged over.
 //
 // The corrections are additive: expected minus actual at the snapshot. Ingest only ever adds deltas, for blocks
-// above the snapshot, so a correction stays right whatever ingest commits before or while it is applied.
+// above the snapshot, so a correction stays right whatever ingest commits before or while it is applied. A reorg's
+// revert does not keep them right; the stage records the revert count it saw, and a batch that finds it moved
+// returns ErrAddressStatsRepairStale.
 func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressStatsRepairStage, error) {
 	stage := &AddressStatsRepairStage{}
 	table := AddressStatsRepairTable
@@ -107,9 +118,11 @@ func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressSta
 				return ErrAddressStatsRepairPending
 			}
 		}
+		var reverts int64
 		if err := tx.QueryRow(ctx, `
-			SELECT COALESCE((SELECT max(hi) FROM ledger_spans), 0), COALESCE((SELECT max(number) FROM blocks), 0)`).
-			Scan(&stage.LedgerClosedBelow, &stage.Head); err != nil {
+			SELECT COALESCE((SELECT max(hi) FROM ledger_spans), 0), COALESCE((SELECT max(number) FROM blocks), 0),
+			       COALESCE((SELECT count FROM chain_counters WHERE name = $1), 0)`, addressStatsRevertsCounter).
+			Scan(&stage.LedgerClosedBelow, &stage.Head, &reverts); err != nil {
 			return err
 		}
 		create := `CREATE TABLE ` + table
@@ -151,10 +164,11 @@ func (d *DB) StageAddressStatsRepair(ctx context.Context, dry bool) (*AddressSta
 			return err
 		}
 		if !dry {
-			if _, err := tx.Exec(ctx, `CREATE TABLE `+addressStatsRepairTotalTable+` (staged BIGINT NOT NULL, applied BIGINT NOT NULL)`); err != nil {
+			if _, err := tx.Exec(ctx, `CREATE TABLE `+addressStatsRepairTotalTable+` (
+				staged BIGINT NOT NULL, applied BIGINT NOT NULL, reverts BIGINT NOT NULL)`); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO `+addressStatsRepairTotalTable+` VALUES ($1, 0)`, stage.Changes); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO `+addressStatsRepairTotalTable+` VALUES ($1, 0, $2)`, stage.Changes, reverts); err != nil {
 				return err
 			}
 		}
@@ -200,6 +214,10 @@ var errDryRun = errors.New("dry run")
 // address_stats, under daily_stats_advance's lock: the repair moves first_seen and adds addresses. The last batch
 // first checks that every staged correction was applied; if any is missing it removes the stage and returns
 // ErrAddressStatsRepairLost instead of done, and the repair is staged again.
+// Each batch first takes the revert count FOR SHARE, before any address_stats row. A revert that has not committed
+// holds it, so the batch waits and sees the revert; a revert that comes after waits for the batch and takes its
+// blocks off repaired rows. A count other than the stage's, or a stage that recorded none (an earlier build's),
+// removes the stage and returns ErrAddressStatsRepairStale.
 func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (applied, created int, done bool, err error) {
 	var lost error
 	var handled int
@@ -216,6 +234,28 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 		if !exists {
 			lost = fmt.Errorf("%w: the staging table is gone", ErrAddressStatsRepairLost)
 			_, err := tx.Exec(ctx, `DROP TABLE `+addressStatsRepairTotalTable)
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chain_counters (name, count, updated_at) VALUES ($1, 0, NOW()) ON CONFLICT (name) DO NOTHING`,
+			addressStatsRevertsCounter); err != nil {
+			return err
+		}
+		var reverts int64
+		if err := tx.QueryRow(ctx, `SELECT count FROM chain_counters WHERE name = $1 FOR SHARE`, addressStatsRevertsCounter).
+			Scan(&reverts); err != nil {
+			return err
+		}
+		var stageReverts *int64
+		if totalled {
+			if err := tx.QueryRow(ctx, `SELECT (to_jsonb(t)->>'reverts')::BIGINT FROM `+addressStatsRepairTotalTable+` t`).
+				Scan(&stageReverts); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+		if stageReverts == nil || *stageReverts != reverts {
+			lost = fmt.Errorf("%w: %d reverts now, the stage saw %s", ErrAddressStatsRepairStale, reverts, revertsSeen(stageReverts))
+			_, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable+`; DROP TABLE IF EXISTS `+addressStatsRepairTotalTable)
 			return err
 		}
 		if err := tx.QueryRow(ctx, `
@@ -259,28 +299,16 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 			return err
 		}
 		if handled > 0 {
-			if totalled {
-				_, err := tx.Exec(ctx, `UPDATE `+addressStatsRepairTotalTable+` SET applied = applied + $1`, handled)
-				return err
-			}
-			return nil
+			_, err := tx.Exec(ctx, `UPDATE `+addressStatsRepairTotalTable+` SET applied = applied + $1`, handled)
+			return err
 		}
-		var staged, appliedSoFar int64 = -1, 0
-		if totalled {
-			if err := tx.QueryRow(ctx, `SELECT staged, applied FROM `+addressStatsRepairTotalTable).Scan(&staged, &appliedSoFar); err != nil &&
-				!errors.Is(err, pgx.ErrNoRows) {
-				return err
-			}
+		var staged, appliedSoFar int64
+		if err := tx.QueryRow(ctx, `SELECT staged, applied FROM `+addressStatsRepairTotalTable).Scan(&staged, &appliedSoFar); err != nil {
+			return err
 		}
 		if staged != appliedSoFar {
 			lost = fmt.Errorf("%w: %d staged, %d applied", ErrAddressStatsRepairLost, staged, appliedSoFar)
-			if staged < 0 {
-				lost = fmt.Errorf("%w: the stage has no recorded total, so whether it was all applied is unknown", ErrAddressStatsRepairLost)
-			}
-			if _, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+addressStatsRepairTotalTable)
+			_, err := tx.Exec(ctx, `DROP TABLE `+AddressStatsRepairTable+`; DROP TABLE `+addressStatsRepairTotalTable)
 			return err
 		}
 		done = true
@@ -300,4 +328,11 @@ func (d *DB) ApplyAddressStatsRepairBatch(ctx context.Context, batch int) (appli
 		err = lost
 	}
 	return applied, created, done, err
+}
+
+func revertsSeen(staged *int64) string {
+	if staged == nil {
+		return "none recorded"
+	}
+	return fmt.Sprint(*staged)
 }

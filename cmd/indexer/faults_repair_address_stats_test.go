@@ -122,6 +122,7 @@ func TestFaultRepairFaultAtEachStepThenRerun(t *testing.T) {
 	steps := map[string]string{
 		"stage":       "SELECT e.address, e.txs - COALESCE",
 		"stage-total": "INSERT INTO address_stats_repair_total VALUES",
+		"apply-check": "WHERE name = $1 FOR SHARE",
 		"apply-batch": "DELETE FROM address_stats_repair r",
 		"applied-sum": "UPDATE address_stats_repair_total SET applied",
 		"final-lock":  "pg_advisory_xact_lock(4670",
@@ -247,4 +248,90 @@ func TestFaultRepairNextToLiveIngestWithALostAck(t *testing.T) {
 	require.Equal(t, 0, f.repair(t, "--batch", "2"))
 	<-live
 	f.consistent(t, "next to live ingest")
+}
+
+// A repair staged, then a reorg revert with one fault at its revert-count step or at the stale stage's removal, then
+// the repair run and rerun: the revert either happened or did not, the stage is never applied across it, and
+// address_stats ends equal to the recount.
+func TestFaultRepairAcrossARevertThenRerun(t *testing.T) {
+	steps := map[string]string{
+		"revert-count": "count = chain_counters.count + 1",
+		"stale-drop":   "DROP TABLE address_stats_repair; DROP TABLE IF EXISTS",
+	}
+	actions := map[string]faultkit.Action{"lost-ack": faultkit.LostAck, "fail-commit": faultkit.FailCommit, "kill-before": faultkit.KillBefore}
+	for sname, match := range steps {
+		for aname, action := range actions {
+			t.Run(sname+"/"+aname, func(t *testing.T) {
+				f := newRepairFixture(t)
+				ctx := context.Background()
+				_, err := f.d.StageAddressStatsRepair(ctx, false)
+				require.NoError(t, err)
+				r := f.proxy.Arm(faultkit.Rule{Match: match, Action: action})
+				revertErr := f.d.DeleteBlock(ctx, 400)
+				code := f.repair(t, "--batch", "3")
+				fired := f.proxy.Fired(r)
+				f.proxy.Disarm()
+				t.Logf("%s %s: fired=%d revert err=%v first run exit=%d", sname, aname, fired, revertErr, code)
+				require.Equal(t, 1, fired, "the fault fired")
+				if code == 0 {
+					require.Zero(t, f.wrong(t), "exit 0 with corrections unapplied")
+				}
+				require.Equal(t, 0, f.repair(t, "--batch", "3"), "the rerun finishes")
+				f.consistent(t, sname+"/"+aname)
+			})
+		}
+	}
+}
+
+// Reorgs that keep landing during a repair: every batch finds the stage stale. The run stages again 10 times, then
+// stops with exit 1; once they stop, a rerun finishes.
+func TestFaultRepairStopsWhenReorgsKeepMakingTheStageStale(t *testing.T) {
+	f := newRepairFixture(t)
+	admin := faultkit.Conn(t, f.url)
+	ctx := context.Background()
+	_, err := admin.Exec(ctx, `UPDATE address_stats SET token_transfer_count = token_transfer_count + 1`)
+	require.NoError(t, err)
+	require.Greater(t, f.wrong(t), int64(12))
+	_, err = admin.Exec(ctx, `
+		CREATE FUNCTION reorg_landed() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN UPDATE chain_counters SET count = count + 1 WHERE name = 'address_stats_reverts'; RETURN NULL; END $$;
+		CREATE TRIGGER reorg_landed AFTER INSERT OR UPDATE ON address_stats EXECUTE FUNCTION reorg_landed()`)
+	require.NoError(t, err)
+	require.Equal(t, 1, f.repair(t, "--batch", "1"), "stopped after 10 restages")
+	_, err = admin.Exec(ctx, `DROP TRIGGER reorg_landed ON address_stats`)
+	require.NoError(t, err)
+	require.Equal(t, 0, f.repair(t, "--batch", "1"))
+	f.consistent(t, "reorgs stopped")
+}
+
+// The repair next to the live indexer while the node reorgs: the run finishes (staging again as it needs) and, after
+// ingest stops, address_stats equals the recount.
+func TestFaultRepairNextToLiveIngestThroughAReorg(t *testing.T) {
+	url := faultkit.NewDB(t)
+	proxy := faultkit.NewProxy(t, url)
+	d, err := db.New(proxy.URL())
+	require.NoError(t, err)
+	defer d.Close()
+	require.NoError(t, d.Migrate())
+	node := faultkit.NewNode(t, 200)
+	ingest(t, d, node, 200, url)
+	f := &repairFixture{url: url, proxy: proxy, d: d}
+	f.breakStats(t)
+	admin := faultkit.Conn(t, url)
+	_, err = admin.Exec(context.Background(), `UPDATE address_stats SET token_transfer_count = token_transfer_count + 1`)
+	require.NoError(t, err)
+
+	node.Fork(190, 1)
+	node.SetHead(600)
+	live := make(chan struct{})
+	go func() { defer close(live); ingest(t, d, node, 600, url) }()
+	code := f.repair(t, "--batch", "1")
+	<-live
+	var reverts int64
+	require.NoError(t, admin.QueryRow(context.Background(), `
+		SELECT COALESCE((SELECT count FROM chain_counters WHERE name = 'address_stats_reverts'), 0)`).Scan(&reverts))
+	t.Logf("repair exit %d, reverts %d", code, reverts)
+	require.Positive(t, reverts, "the node's fork was reverted")
+	require.Equal(t, 0, code)
+	f.consistent(t, "next to live ingest through a reorg")
 }

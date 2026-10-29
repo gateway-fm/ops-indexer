@@ -12,11 +12,14 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/log"
 )
 
+// maxStaleRestages is how many times one run stages again after reorgs made its stage stale before it stops.
+const maxStaleRestages = 10
+
 // runRepairAddressStats is `indexer repair-address-stats [--batch N] [--dry-run]` (PRST-5393): address_stats set to
 // what the closed ledger plus the retained rows above it say, as additive corrections in sorted batches, next to
 // the live indexer. --dry-run stages in a rolled-back transaction and prints what would change. A stopped run
 // resumes: its staged corrections stay in address_stats_repair until applied, and a stage that lost corrections
-// before they were applied is staged again.
+// before they were applied is staged again, as is one a reorg made stale.
 func runRepairAddressStats(args []string, database *db.DB) int {
 	fs := flag.NewFlagSet("repair-address-stats", flag.ExitOnError)
 	batch := fs.Int("batch", 1000, "addresses per transaction")
@@ -26,7 +29,7 @@ func runRepairAddressStats(args []string, database *db.DB) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var applied, created, batches int
+	var applied, created, batches, stale int
 	for restaged := 0; ; restaged++ {
 		stage, err := database.StageAddressStatsRepair(ctx, *dry)
 		switch {
@@ -50,10 +53,20 @@ func runRepairAddressStats(args []string, database *db.DB) int {
 		lost := false
 		for {
 			n, c, done, err := database.ApplyAddressStatsRepairBatch(ctx, *batch)
-			if errors.Is(err, db.ErrAddressStatsRepairLost) && restaged < 2 {
+			if errors.Is(err, db.ErrAddressStatsRepairLost) && restaged-stale < 2 {
 				log.Warn("repair-address-stats: staging again", "applied", applied, "error", err)
 				lost = true
 				break
+			}
+			if errors.Is(err, db.ErrAddressStatsRepairStale) {
+				if stale++; stale <= maxStaleRestages {
+					log.Warn("repair-address-stats: a reorg ran since the stage; staging again", "applied", applied, "error", err)
+					lost = true
+					break
+				}
+				log.Error("repair-address-stats: stopped; reorgs kept making the stage stale, rerun", "applied", applied,
+					"restaged", maxStaleRestages, "error", err)
+				return 1
 			}
 			if err != nil {
 				log.Error("repair-address-stats: stopped; rerun to resume", "applied", applied, "error", err)
