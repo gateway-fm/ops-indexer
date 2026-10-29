@@ -15,7 +15,7 @@ func TestHistoryBoundIsEvaluatedOncePerQuery(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
-	seedHistory(t, d, 0, 5_000, 1)
+	seedHistoryAt(t, d, 0, 5_000, 1, 1700000000, 1)
 	_, err := d.pool.Exec(ctx, `DELETE FROM daily_stats_watermark`)
 	require.NoError(t, err)
 

@@ -191,7 +191,8 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 // and counts its blocks into their days: every stored block it passes again was counted before, the unstored ones
 // never were. It never goes below the earliest aggregated day's first block, where a day that was never aggregated
 // would get a partial row. When the reorged day is itself the earliest aggregated day its start cannot be known
-// here: the watermark stays, and refill-daily-stats recounts the day.
+// here: the watermark stays, and refill-daily-stats recounts the day. A watermark on a pruned block is the last block
+// before a day retention pruned up to, which is not missing.
 func keepDailyStatsWatermarkOnStoredBlocks(ctx context.Context, tx pgx.Tx) error {
 	var lowered, stuck bool
 	err := tx.QueryRow(ctx, `
@@ -207,7 +208,8 @@ func keepDailyStatsWatermarkOnStoredBlocks(ctx context.Context, tx pgx.Tx) error
 			RETURNING 1
 		)
 		SELECT EXISTS (SELECT 1 FROM up),
-		       EXISTS (SELECT 1 FROM w WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE number = w.last_block) AND w.last_block >= 0)`).
+		       EXISTS (SELECT 1 FROM w WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE number = w.last_block) AND w.last_block >= 0
+		                                      AND (pruned_through() = 0 OR w.last_block > pruned_through()))`).
 		Scan(&lowered, &stuck)
 	if err != nil {
 		return err

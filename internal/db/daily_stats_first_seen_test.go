@@ -8,11 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// seedHistory stamps block b at 1700000000 + b: blocks 0..6,399 are on 2023-11-14, 6,400.. on 2023-11-15.
+// Block b is at 1700000000 + b: blocks 0..6,399 are on 2023-11-14, 6,400.. on 2023-11-15.
 // address_stats.first_seen is a block number.
 func seedFirstSeen(t *testing.T, d *DB) {
 	t.Helper()
-	seedHistory(t, d, 0, 10_000, 1)
+	seedHistoryAt(t, d, 0, 10_000, 1, 1700000000, 1)
 	_, err := d.pool.Exec(context.Background(), `
 		INSERT INTO address_stats (address, tx_count, first_seen, last_seen, is_contract)
 		VALUES ('0xa', 1, 100, 100, true), ('0xb', 1, 6399, 6399, false),

@@ -28,14 +28,14 @@ func TestDailyStatsWatermarkStartsAboveBlocksCatchupHasNotStored(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	seedHistory(t, d, 60_001, 80_001, 1)
+	seedHistoryAt(t, d, 60_001, 80_001, 1, 1700000000, 1)
 	_, err := d.pool.Exec(ctx, `DELETE FROM daily_stats_watermark`)
 	require.NoError(t, err)
 	_, err = d.AdvanceDailyStats(ctx)
 	require.NoError(t, err)
 	require.Equal(t, int64(80_001), dailyStatsWatermark(t, d), "advanced over the head path's contiguous blocks")
 
-	seedHistory(t, d, 0, 30_000, 1)
+	seedHistoryAt(t, d, 0, 30_000, 1, 1700000000, 1)
 	setDailyStatsWatermark(t, d, 80_001)
 	_, err = d.AdvanceDailyStats(ctx)
 	require.NoError(t, err)
@@ -49,7 +49,7 @@ func TestRetentionNeverPrunesARangeWithMissingBlocks(t *testing.T) {
 	ctx := context.Background()
 	cfg := RetentionConfig{RetainBlocks: 20_000, PartitionBlocks: 2_000}
 
-	seedHistory(t, d, 60_001, 80_001, 1)
+	seedHistoryAt(t, d, 60_001, 80_001, 1, 1700000000, 1)
 	_, err := d.pool.Exec(ctx, `DELETE FROM daily_stats_watermark`)
 	require.NoError(t, err)
 	_, err = d.AdvanceDailyStats(ctx)
@@ -57,9 +57,9 @@ func TestRetentionNeverPrunesARangeWithMissingBlocks(t *testing.T) {
 	require.NoError(t, d.retentionPass(ctx, cfg))
 	require.Equal(t, []string{"legacy:84001:attached", "p84001:86001:attached"}, partitionRanges(t, d))
 
-	seedHistory(t, d, 0, 30_000, 1)
+	seedHistoryAt(t, d, 0, 30_000, 1, 1700000000, 1)
 	ensurePartitions(t, d, 106_001, cfg)
-	seedHistory(t, d, 80_002, 106_001, 1)
+	seedHistoryAt(t, d, 80_002, 106_001, 1, 1700000000, 1)
 	setDailyStatsWatermark(t, d, 80_001)
 	_, err = d.AdvanceDailyStats(ctx)
 	require.NoError(t, err)
@@ -71,7 +71,7 @@ func TestRetentionNeverPrunesARangeWithMissingBlocks(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, wm, "the legacy range is missing blocks 30,001..60,000: nothing may be pruned")
 
-	seedHistory(t, d, 30_001, 60_000, 1)
+	seedHistoryAt(t, d, 30_001, 60_000, 1, 1700000000, 1)
 	setDailyStatsWatermark(t, d, 106_001)
 	_, err = d.pool.Exec(ctx, `INSERT INTO missing_block_ranges (from_number, to_number) VALUES (50000, 50010)`)
 	require.NoError(t, err)

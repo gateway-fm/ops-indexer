@@ -17,7 +17,23 @@ const retentionToken = "0xret0000000000000000000000000000000000001"
 
 // seedHistory writes one block every `step` numbers in [from, to], each with one transaction, one log, one
 // internal call, one mint of 7 units of retentionToken and one balances row, the way the indexer stores them.
+// Block b is at seedTimestamp(b).
 func seedHistory(t *testing.T, d *DB, from, to, step int64) {
+	t.Helper()
+	seedHistoryAt(t, d, from, to, step, seedEpoch, seedBlockSeconds)
+}
+
+// Seeded blocks are 1,000 s apart: a UTC day holds 87 of them, so retention's whole-day rule keeps less than a range
+// beyond what the block window keeps.
+const (
+	seedEpoch        = 1700000000
+	seedBlockSeconds = 1000
+)
+
+func seedTimestamp(number uint64) uint64 { return seedEpoch + seedBlockSeconds*number }
+
+// seedHistoryAt is seedHistory with block b at epoch0 + b*blockSeconds.
+func seedHistoryAt(t *testing.T, d *DB, from, to, step, epoch0, blockSeconds int64) {
 	t.Helper()
 	ctx := context.Background()
 	_, err := d.pool.Exec(ctx, `
@@ -28,7 +44,7 @@ func seedHistory(t *testing.T, d *DB, from, to, step int64) {
 		WITH n AS (SELECT g AS b FROM generate_series($1::bigint, $2::bigint, $3::bigint) g),
 		blk AS (
 			INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
-			SELECT b, 'blk' || b, 'blk' || (b - 1), 1700000000 + b, 1, 1, 1 FROM n RETURNING number
+			SELECT b, 'blk' || b, 'blk' || (b - 1), $5 + b * $6, 1, 1, 1 FROM n RETURNING number
 		),
 		txs AS (
 			INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
@@ -36,7 +52,7 @@ func seedHistory(t *testing.T, d *DB, from, to, step int64) {
 		),
 		lg AS (
 			INSERT INTO logs (tx_hash, log_index, address, topic0, data, block_number, timestamp)
-			SELECT 'tx' || b, 0, $4, '0xddf2', '0x', b, 1700000000 + b FROM n RETURNING id
+			SELECT 'tx' || b, 0, $4, '0xddf2', '0x', b, $5 + b * $6 FROM n RETURNING id
 		),
 		itx AS (
 			INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value, call_type)
@@ -44,10 +60,10 @@ func seedHistory(t *testing.T, d *DB, from, to, step int64) {
 		),
 		tt AS (
 			INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, value, block_number, timestamp)
-			SELECT 'tx' || b, 0, $4, '0x0000000000000000000000000000000000000000', '0xb', 7, b, 1700000000 + b FROM n RETURNING id
+			SELECT 'tx' || b, 0, $4, '0x0000000000000000000000000000000000000000', '0xb', 7, b, $5 + b * $6 FROM n RETURNING id
 		)
 		INSERT INTO balances (address, token_address, block_number, balance)
-		SELECT '0xb', $4, b, 7 * b FROM n`, from, to, step, retentionToken)
+		SELECT '0xb', $4, b, 7 * b FROM n`, from, to, step, retentionToken, epoch0, blockSeconds)
 	require.NoError(t, err)
 	_, err = d.pool.Exec(ctx, `
 		INSERT INTO daily_stats_watermark (id, last_block) VALUES (1, $1)

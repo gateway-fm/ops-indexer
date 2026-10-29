@@ -304,6 +304,7 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 	if !cut && cfg.RetainBlocks == 0 {
 		return
 	}
+	d.warnPartlyPrunedReorgDay(ctx)
 	log.Info("retention started", "retain_blocks", cfg.RetainBlocks, "partition_blocks", cfg.PartitionBlocks,
 		"interval", cfg.Interval, "archive_dir", cfg.ArchiveDir)
 	go d.keepPartitionsAhead(ctx, cfg)
@@ -317,6 +318,25 @@ func (d *DB) RunRetention(ctx context.Context, cfg RetentionConfig) {
 		case <-time.After(cfg.Interval):
 		}
 	}
+}
+
+// warnPartlyPrunedReorgDay warns when an earlier build pruned into a UTC day the reorg window still reaches: a reorg
+// into that day cannot be reverted (daily_stats_invalidate refuses it), and pruning waits until the window has left
+// the day.
+func (d *DB) warnPartlyPrunedReorgDay(ctx context.Context) {
+	var day *time.Time
+	err := d.pool.QueryRow(ctx, `
+		SELECT daily_stats_day(pruned_through_ts)::TIMESTAMP FROM prune_state
+		WHERE id = 1 AND pruned_through > 0 AND pruned_through_ts >= prune_day_floor()`).Scan(&day)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && day == nil) {
+		return
+	}
+	if err != nil {
+		log.Warn("retention: could not check for a partly pruned day in the reorg window", "error", err)
+		return
+	}
+	log.Warn("retention: an earlier build pruned part of a UTC day the reorg window reaches; a reorg into it cannot be reverted, and pruning waits until it ends",
+		"day", day.Format(time.DateOnly), "day_ends", day.Add(24*time.Hour).Format(time.RFC3339))
 }
 
 // nodeHeadTimeout bounds a read of the node's head for retention. A node answers eth_blockNumber from memory in
@@ -749,6 +769,14 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 	}
 	last := uint64(*hi - 1)
 	if last > head-cfg.RetainBlocks || last+PruneFloorGap > head || *hi-1 > *dsw {
+		return false, nil
+	}
+	var beforeReorgDay bool
+	if err := d.pool.QueryRow(ctx, `SELECT history_range_before_reorg_day($1)`, suffix).Scan(&beforeReorgDay); err != nil {
+		return false, err
+	}
+	if !beforeReorgDay {
+		log.Debug("retention: oldest range reaches the UTC day a reorg can revert into; not pruned", "range", suffix, "below", *hi)
 		return false, nil
 	}
 	var closed bool

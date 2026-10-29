@@ -131,6 +131,13 @@ With `PRUNE_RETAIN_BLOCKS` set (0 = off, the default), the indexer keeps only th
 transactions, logs, token transfers, internal transactions, balance history) below its head and drops older ranges.
 Current state (addresses, tokens, holders, balances, NFT inventory, contracts, daily stats) is never pruned.
 
+Retention keeps every UTC day that a reorg can reach whole, because reverting a block recounts its day's daily stats
+from the day's first block. A range is dropped only once all of its blocks are older than the UTC day of the block
+12,800 below the head, so up to one day plus one partition more is kept than `PRUNE_RETAIN_BLOCKS`. On a chain that
+makes more than `PRUNE_RETAIN_BLOCKS` blocks a day, ranges are dropped once a day, a day's worth in one pass. A
+database that a build without this rule pruned into the current UTC day prunes nothing more until that day ends, and
+until then a reorg into that day still stops ingest; the indexer logs a warning naming the day when retention starts.
+
 Reading the history tables with SQL: since migration 014 each is partitioned by block, and a view or foreign key
 created on one before 014 is bound to its first partition, `<table>_legacy`. From the first cut on such a view sees
 no new block, and retention keeps the legacy range on disk, detached, while anything depends on it: it logs the

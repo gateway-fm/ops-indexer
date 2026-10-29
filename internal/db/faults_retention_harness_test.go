@@ -154,5 +154,5 @@ func (f *fk) headInsertable() error {
 }
 
 func insertBlockAt(number uint64) *types.Block {
-	return &types.Block{Number: number, Hash: fmt.Sprintf("fk%d", number), Timestamp: 1_700_000_000 + number}
+	return &types.Block{Number: number, Hash: fmt.Sprintf("fk%d", number), Timestamp: seedTimestamp(number)}
 }

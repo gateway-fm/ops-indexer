@@ -22,7 +22,7 @@ func historyCutChecks(t *testing.T, d *DB) int {
 
 func insertCutTestBlock(d *DB, number uint64) error {
 	return d.InsertBlockDataBatch(context.Background(), &BlockData{
-		Block: &types.Block{Number: number, Hash: fmt.Sprintf("cut%d", number), Timestamp: 1_700_000_000 + number},
+		Block: &types.Block{Number: number, Hash: fmt.Sprintf("cut%d", number), Timestamp: seedTimestamp(number)},
 	})
 }
 
