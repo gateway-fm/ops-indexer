@@ -3,11 +3,22 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/types"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+)
+
+// The indexer writes addresses in checksum case, as these are.
+var (
+	nftCollection = common.HexToAddress("0x4f7abcdef00000000000000000000000000c0de1").Hex()
+	nftOwnerO     = common.HexToAddress("0xabcdef000000000000000000000000000000000a").Hex()
+	nftOwnerA     = common.HexToAddress("0xbeef00000000000000000000000000000000abcd").Hex()
+	nftOwnerB     = common.HexToAddress("0xcafe0000000000000000000000000000000fade1").Hex()
+	nftOwnerC     = common.HexToAddress("0xdead0000000000000000000000000000000bea70").Hex()
 )
 
 type nftMove struct {
@@ -15,7 +26,7 @@ type nftMove struct {
 	uri          *string
 }
 
-// nftForkBlock is block number of fork, with one transaction moving each NFT of the 0x4f7 collection in moves.
+// nftForkBlock is block number of fork, with one transaction moving each NFT of nftCollection in moves.
 func nftForkBlock(fork string, number uint64, moves ...nftMove) *BlockData {
 	hash := func(n uint64) string {
 		if n < 103 {
@@ -24,10 +35,9 @@ func nftForkBlock(fork string, number uint64, moves ...nftMove) *BlockData {
 		return fmt.Sprintf("nft-%s-%d", fork, n)
 	}
 	txHash := "tx-" + hash(number)
-	to := "0x4f7"
 	b := &BlockData{
 		Block:            &types.Block{Number: number, Hash: hash(number), ParentHash: hash(number - 1), Timestamp: 1_700_000_000 + number},
-		Transactions:     []*types.Transaction{{Hash: txHash, BlockNumber: number, From: "0xa", To: &to, Value: "0", Status: 1}},
+		Transactions:     []*types.Transaction{{Hash: txHash, BlockNumber: number, From: nftOwnerO, To: &nftCollection, Value: "0", Status: 1}},
 		SkipAddressStats: true,
 	}
 	for k, m := range moves {
@@ -39,9 +49,9 @@ func nftForkBlock(fork string, number uint64, moves ...nftMove) *BlockData {
 			transferType = types.TransferTypeBurn
 		}
 		id := m.id
-		b.Transfers = append(b.Transfers, &types.TokenTransfer{TxHash: txHash, LogIndex: k, TokenAddress: "0x4f7", From: m.from, To: m.to,
+		b.Transfers = append(b.Transfers, &types.TokenTransfer{TxHash: txHash, LogIndex: k, TokenAddress: nftCollection, From: m.from, To: m.to,
 			Value: "1", BlockNumber: number, TransferType: transferType, TokenType: types.TokenTypeERC721, TokenID: &id})
-		b.NFTTokens = append(b.NFTTokens, &types.NFTToken{TokenAddress: "0x4f7", TokenID: m.id, Owner: m.to, TokenURI: m.uri, BlockNumber: number})
+		b.NFTTokens = append(b.NFTTokens, &types.NFTToken{TokenAddress: nftCollection, TokenID: m.id, Owner: m.to, TokenURI: m.uri, BlockNumber: number})
 	}
 	return b
 }
@@ -56,7 +66,8 @@ func nftRowOf(t *testing.T, d *DB, id string) *nftRow {
 	t.Helper()
 	var r nftRow
 	err := d.pool.QueryRow(context.Background(),
-		`SELECT owner, block_number, token_uri FROM nft_tokens WHERE token_address = '0x4f7' AND token_id = $1`, id).Scan(&r.owner, &r.block, &r.uri)
+		`SELECT owner, block_number, token_uri FROM nft_tokens WHERE LOWER(token_address) = LOWER($1) AND token_id = $2::NUMERIC`,
+		nftCollection, id).Scan(&r.owner, &r.block, &r.uri)
 	if err != nil {
 		require.ErrorContains(t, err, "no rows")
 		return nil
@@ -65,46 +76,73 @@ func nftRowOf(t *testing.T, d *DB, id string) *nftRow {
 }
 
 // A reorg reverts 103..105 and the new chain is written: every NFT ends as the new chain leaves it, whatever the
-// reverted fork did to it.
+// reverted fork did to it, with its owner in the case the indexer writes.
 func TestReorgRevertsNFTOwners(t *testing.T) {
+	require.NotEqual(t, strings.ToLower(nftCollection), nftCollection, "a collection address in mixed case")
 	oldURI, newURI := "ipfs://old", "ipfs://new"
 	for _, tc := range []struct {
 		name        string
 		old, new    map[uint64][]nftMove
 		pruneBefore bool
+		burnBefore  bool
 		reverted    *nftRow
 		want        *nftRow
 	}{{
 		name:     "moved on the reverted fork, moved elsewhere on the new chain",
-		old:      map[uint64][]nftMove{105: {{id: "1", from: "0xo", to: "0xa"}}},
-		new:      map[uint64][]nftMove{104: {{id: "1", from: "0xo", to: "0xb"}}},
-		reverted: &nftRow{owner: "0xo", block: 101},
-		want:     &nftRow{owner: "0xb", block: 104},
+		old:      map[uint64][]nftMove{105: {{id: "1", from: nftOwnerO, to: nftOwnerA}}},
+		new:      map[uint64][]nftMove{104: {{id: "1", from: nftOwnerO, to: nftOwnerB}}},
+		reverted: &nftRow{owner: nftOwnerO, block: 101},
+		want:     &nftRow{owner: nftOwnerB, block: 104},
+	}, {
+		name:     "moved on the reverted fork only",
+		old:      map[uint64][]nftMove{105: {{id: "1", from: nftOwnerO, to: nftOwnerA}}},
+		new:      map[uint64][]nftMove{},
+		reverted: &nftRow{owner: nftOwnerO, block: 101},
+		want:     &nftRow{owner: nftOwnerO, block: 101},
 	}, {
 		name:     "minted on the reverted fork, minted again on the new chain",
-		old:      map[uint64][]nftMove{104: {{id: "2", from: zeroAddress, to: "0xa", uri: &oldURI}}},
-		new:      map[uint64][]nftMove{104: {{id: "2", from: zeroAddress, to: "0xb", uri: &newURI}}},
+		old:      map[uint64][]nftMove{104: {{id: "2", from: zeroAddress, to: nftOwnerA, uri: &oldURI}}},
+		new:      map[uint64][]nftMove{104: {{id: "2", from: zeroAddress, to: nftOwnerB, uri: &newURI}}},
 		reverted: nil,
-		want:     &nftRow{owner: "0xb", block: 104, uri: &newURI},
+		want:     &nftRow{owner: nftOwnerB, block: 104, uri: &newURI},
+	}, {
+		name:     "minted on the reverted fork only",
+		old:      map[uint64][]nftMove{104: {{id: "2", from: zeroAddress, to: nftOwnerA, uri: &oldURI}}},
+		new:      map[uint64][]nftMove{},
+		reverted: nil,
+		want:     nil,
+	}, {
+		name:     "burned on the reverted fork only",
+		old:      map[uint64][]nftMove{105: {{id: "1", from: nftOwnerO, to: zeroAddress}}},
+		new:      map[uint64][]nftMove{},
+		reverted: &nftRow{owner: nftOwnerO, block: 101},
+		want:     &nftRow{owner: nftOwnerO, block: 101},
 	}, {
 		name:     "moved on the reverted fork, burned on the new chain",
-		old:      map[uint64][]nftMove{105: {{id: "1", from: "0xo", to: "0xa"}}},
-		new:      map[uint64][]nftMove{104: {{id: "1", from: "0xo", to: zeroAddress}}},
-		reverted: &nftRow{owner: "0xo", block: 101},
+		old:      map[uint64][]nftMove{105: {{id: "1", from: nftOwnerO, to: nftOwnerA}}},
+		new:      map[uint64][]nftMove{104: {{id: "1", from: nftOwnerO, to: zeroAddress}}},
+		reverted: &nftRow{owner: nftOwnerO, block: 101},
 		want:     &nftRow{owner: zeroAddress, block: 104},
 	}, {
 		name:     "moved twice on the reverted fork, not on the new chain",
-		old:      map[uint64][]nftMove{103: {{id: "1", from: "0xo", to: "0xa"}}, 105: {{id: "1", from: "0xa", to: "0xc"}}},
+		old:      map[uint64][]nftMove{103: {{id: "1", from: nftOwnerO, to: nftOwnerA}}, 105: {{id: "1", from: nftOwnerA, to: nftOwnerC}}},
 		new:      map[uint64][]nftMove{},
-		reverted: &nftRow{owner: "0xo", block: 101},
-		want:     &nftRow{owner: "0xo", block: 101},
+		reverted: &nftRow{owner: nftOwnerO, block: 101},
+		want:     &nftRow{owner: nftOwnerO, block: 101},
+	}, {
+		name:       "burned before the fork, minted again on the reverted fork only",
+		old:        map[uint64][]nftMove{104: {{id: "1", from: zeroAddress, to: nftOwnerA}}},
+		new:        map[uint64][]nftMove{},
+		burnBefore: true,
+		reverted:   &nftRow{owner: zeroAddress, block: 102},
+		want:       &nftRow{owner: zeroAddress, block: 102},
 	}, {
 		name:        "its earlier transfers pruned, moved on the reverted fork, moved elsewhere on the new chain",
-		old:         map[uint64][]nftMove{105: {{id: "1", from: "0xo", to: "0xa"}}},
-		new:         map[uint64][]nftMove{104: {{id: "1", from: "0xo", to: "0xb"}}},
+		old:         map[uint64][]nftMove{105: {{id: "1", from: nftOwnerO, to: nftOwnerA}}},
+		new:         map[uint64][]nftMove{104: {{id: "1", from: nftOwnerO, to: nftOwnerB}}},
 		pruneBefore: true,
-		reverted:    &nftRow{owner: "0xo", block: 102},
-		want:        &nftRow{owner: "0xb", block: 104},
+		reverted:    &nftRow{owner: nftOwnerO, block: 102},
+		want:        &nftRow{owner: nftOwnerB, block: 104},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, cleanup := setupTestDB(t)
@@ -114,7 +152,10 @@ func TestReorgRevertsNFTOwners(t *testing.T) {
 			for n := uint64(100); n <= 102; n++ {
 				var moves []nftMove
 				if n == 101 {
-					moves = []nftMove{{id: "1", from: zeroAddress, to: "0xo", uri: &mintURI}}
+					moves = []nftMove{{id: "1", from: zeroAddress, to: nftOwnerO, uri: &mintURI}}
+				}
+				if n == 102 && tc.burnBefore {
+					moves = []nftMove{{id: "1", from: nftOwnerO, to: zeroAddress}}
 				}
 				require.NoError(t, d.InsertBlockDataBatch(ctx, nftForkBlock("", n, moves...)))
 			}
@@ -131,11 +172,10 @@ func TestReorgRevertsNFTOwners(t *testing.T) {
 				require.NoError(t, d.DeleteBlock(ctx, n), "deleting the block again, after a lost commit acknowledgement, changes nothing")
 			}
 			id := "1"
-			if tc.reverted == nil {
-				id = "2"
-			}
-			for _, m := range tc.new[104] {
-				id = m.id
+			for _, moves := range tc.old {
+				for _, m := range moves {
+					id = m.id
+				}
 			}
 			got := nftRowOf(t, d, id)
 			if tc.reverted == nil {
@@ -150,16 +190,28 @@ func TestReorgRevertsNFTOwners(t *testing.T) {
 				require.NoError(t, d.InsertBlockDataBatch(ctx, nftForkBlock("new", n, tc.new[n]...)))
 			}
 			got = nftRowOf(t, d, id)
+			if tc.want == nil {
+				require.Nil(t, got, "the new chain never minted it")
+				return
+			}
 			require.NotNil(t, got)
 			require.Equal(t, tc.want.owner, got.owner, "the new chain's owner")
 			require.Equal(t, tc.want.block, got.block)
+			require.NotNil(t, got.uri)
 			if id == "1" {
-				require.NotNil(t, got.uri)
 				require.Equal(t, mintURI, *got.uri, "the mint's token URI is kept")
 			} else {
-				require.NotNil(t, got.uri)
 				require.Equal(t, *tc.want.uri, *got.uri, "the new chain's mint's token URI, not the reverted one's")
 			}
+
+			items, total, err := d.GetTokenInventory(ctx, nftCollection, id, 10, 0)
+			require.NoError(t, err)
+			if tc.want.owner == zeroAddress {
+				require.Zero(t, total, "a burned NFT is not listed")
+				return
+			}
+			require.EqualValues(t, 1, total)
+			require.Equal(t, tc.want.owner, items[0].Owner, "the inventory serves the owner as the indexer writes it")
 		})
 	}
 }
