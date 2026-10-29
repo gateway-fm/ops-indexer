@@ -2239,6 +2239,12 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
 		return fmt.Errorf("failed to mark the wipe as in progress: %w", err)
 	}
+	// A refill or repair staged from the old chain must not be applied to the new one. Dropped before chain_counters
+	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count.
+	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable+", "+
+		addressStatsRepairTotalTable); err != nil {
+		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
+	}
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we
 	// list child tables first for clarity.
@@ -2299,13 +2305,10 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"INSERT INTO indexer_progress (min_fetched_block, max_fetched_block, backfill_complete) VALUES (0, 0, false) ON CONFLICT DO NOTHING"); err != nil {
 		return fmt.Errorf("failed to re-seed indexer_progress: %w", err)
 	}
-	// Nothing of the new chain is pruned, and a refill or repair staged from the old chain must not be applied to it.
+	// Nothing of the new chain is pruned.
 	if _, err := d.pool.Exec(ctx,
 		"UPDATE prune_state SET pruned_through = 0, pruned_through_ts = 0, updated_at = now() WHERE id = 1"); err != nil {
 		return fmt.Errorf("failed to reset the prune watermark: %w", err)
-	}
-	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable); err != nil {
-		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
 	}
 	if err := d.coverHistoryFromZero(ctx); err != nil {
 		return err

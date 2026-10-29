@@ -265,3 +265,33 @@ func TestTheRevertCountIsNotAChainTotal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 }
+
+// A wipe removes a staged repair, both tables, before it truncates chain_counters: a wipe stopped there leaves no
+// stage, and the next repair stages against the new chain.
+func TestAWipeRemovesAStagedRepairBeforeTheRevertCount(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(1, "h1", []revertTx{{from: "0xa", to: "0xb"}})))
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = 5`)
+	require.NoError(t, err)
+	_, err = d.StageAddressStatsRepair(ctx, false)
+	require.NoError(t, err)
+
+	_, err = d.pool.Exec(ctx, `CREATE FUNCTION stop_wipe() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'stopped'; END $$;
+		CREATE TRIGGER stop_wipe BEFORE TRUNCATE ON daily_stats EXECUTE FUNCTION stop_wipe()`)
+	require.NoError(t, err)
+	require.ErrorContains(t, d.WipeAllData(ctx), "stopped", "stopped at its first truncate")
+	_, err = d.pool.Exec(ctx, `DROP TRIGGER stop_wipe ON daily_stats`)
+	require.NoError(t, err)
+	var stage bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL OR to_regclass($2) IS NOT NULL`,
+		AddressStatsRepairTable, addressStatsRepairTotalTable).Scan(&stage))
+	require.False(t, stage, "no stage left beside the counters it was made against")
+
+	require.NoError(t, d.WipeAllData(ctx))
+	_, _, done, err := d.ApplyAddressStatsRepairBatch(ctx, 1)
+	require.NoError(t, err)
+	require.True(t, done, "nothing staged")
+}
