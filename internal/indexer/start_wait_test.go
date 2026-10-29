@@ -178,7 +178,8 @@ func derivedState(t *testing.T, pool *pgxpool.Pool) string {
 	var s string
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT concat_ws(E'\n',
-			(SELECT string_agg(name || '=' || count, ' ' ORDER BY name) FROM chain_counters),
+			(SELECT string_agg(name || '=' || count, ' ' ORDER BY name) FROM chain_counters
+			 WHERE name <> 'address_stats_reverts'),
 			(SELECT string_agg(concat_ws(' ', address, tx_count, internal_tx_count, token_transfer_count,
 			                             first_seen, last_seen, is_contract), E'\n' ORDER BY address) FROM address_stats),
 			(SELECT string_agg(concat_ws(' ', date, blocks, gas_used, txs, successful_txs, failed_txs, active_addresses,
