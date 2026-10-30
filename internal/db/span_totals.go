@@ -106,8 +106,9 @@ func stageSpanTotals(ctx context.Context, tx pgx.Tx, lo int64, s *SpanTotals) er
 }
 
 // SettleNodeSpan compares a closed span's stored rows with its totals counted from the node and settles it, as the
-// retained recount does with totals counted from rows. It takes compaction's lock and settles only the span it
-// counted: one compaction merged while the count ran keeps its rows, and its State says so.
+// retained recount does with totals counted from rows. It takes compaction's lock and settles only a stored span that
+// is exactly the range it counted, whatever its source: one compaction widened while the count ran keeps its rows, and
+// its State says so.
 func (d *DB) SettleNodeSpan(ctx context.Context, lo, hi int64, s *SpanTotals, repair bool) (SpanCheck, error) {
 	c := SpanCheck{Lo: lo, Hi: hi}
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
@@ -115,7 +116,7 @@ func (d *DB) SettleNodeSpan(ctx context.Context, lo, hi int64, s *SpanTotals, re
 			return err
 		}
 		var same bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ledger_spans WHERE lo = $1 AND hi = $2 AND source <> 'merged')`,
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ledger_spans WHERE lo = $1 AND hi = $2)`,
 			lo, hi).Scan(&same); err != nil {
 			return err
 		}
