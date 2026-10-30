@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -171,6 +172,10 @@ func (d *DB) CommitBackfillBatch(ctx context.Context, b *BackfillBatch) error {
 			return fmt.Errorf("%w: through %d, batch [%d, %d)", ErrBackfillNotNext, through, b.From, b.To)
 		}
 
+		if err := insertContracts(ctx, tx, b.Contracts); err != nil {
+			return err
+		}
+
 		var blocks, txs, transfers int64
 		deltas := map[string]*tokenStatsDelta{}
 		for _, s := range b.Spans {
@@ -187,9 +192,6 @@ func (d *DB) CommitBackfillBatch(ctx context.Context, b *BackfillBatch) error {
 		}
 		if err := writeSharedRows(ctx, tx, sharedRows{data: b.Shared, blocks: blocks, txs: txs, transfers: transfers,
 			tokenDeltas: deltas}); err != nil {
-			return err
-		}
-		if err := insertContracts(ctx, tx, b.Contracts); err != nil {
 			return err
 		}
 		if err := lowerTokenCreation(ctx, tx, b.TokenFirstSeen); err != nil {
@@ -336,17 +338,31 @@ func lowerTokenCreation(ctx context.Context, tx pgx.Tx, seen map[string]TokenSee
 	return tx.SendBatch(ctx, batch).Close()
 }
 
+// insertContracts takes the batch's contracts before any shared row, sorted by lower-case address and once per
+// address, as ingest's Finish does: a live block creating the same address then never waits on a row this batch holds.
 func insertContracts(ctx context.Context, tx pgx.Tx, contracts []*types.Contract) error {
 	if len(contracts) == 0 {
 		return nil
 	}
-	batch := &pgx.Batch{}
+	first := make(map[string]*types.Contract, len(contracts))
 	for _, c := range contracts {
+		if addr := strings.ToLower(c.Address); first[addr] == nil {
+			first[addr] = c
+		}
+	}
+	addresses := make([]string, 0, len(first))
+	for addr := range first {
+		addresses = append(addresses, addr)
+	}
+	sort.Strings(addresses)
+	batch := &pgx.Batch{}
+	for _, addr := range addresses {
+		c := first[addr]
 		batch.Queue(`
 			INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified)
-			VALUES (LOWER($1), $2, $3, $4, $5, $6, $7)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (address) DO NOTHING`,
-			c.Address, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified)
+			addr, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified)
 	}
 	return tx.SendBatch(ctx, batch).Close()
 }
