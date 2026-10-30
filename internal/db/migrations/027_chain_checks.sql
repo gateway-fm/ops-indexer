@@ -1,6 +1,6 @@
 -- Chain checks against the node: which span's transaction total was last compared with the node's
 -- per-block counts, and how many full running-counter cycles have completed (the nonce sample waits for one, since
--- sent_count is recounted there on databases older than migration 024).
+-- sent_count is recounted there on databases older than migration 025).
 
 ALTER TABLE ledger_spans
     ADD COLUMN chain_checked_at TIMESTAMPTZ,

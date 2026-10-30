@@ -186,9 +186,9 @@ described.
   transaction the address sent, received or took part in through a Transfer event, as `ListTransactions` `by_address`
   returns them. **Correction:** a self-send used to count twice, and an address in Transfer events of several
   transactions of one block once; rows written before this build keep the old count until they are recounted.
-- `GetAddress` `tx_count_out` (`address_stats.sent_count`, migration 024): transactions the address sent of the types
+- `GetAddress` `tx_count_out` (`address_stats.sent_count`, migration 025): transactions the address sent of the types
   that bump its nonce (0-4), so for an EOA indexed from genesis it equals `eth_getTransactionCount`. It was always 0;
-  rows written before 024 read 0 until the ledger reconciliation recounts them. `tx_count_in` still carries the full
+  rows written before 025 read 0 until the ledger reconciliation recounts them. `tx_count_in` still carries the full
   transaction count, as before.
 - The zero address keeps no transfer count (mints and burns): `ListTokenTransfers` `by_address` `total_count` and
   `GetAddress` `token_count` are 0 for it, and its `GetAddress` transaction count leaves out mint and burn transactions

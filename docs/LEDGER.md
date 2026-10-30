@@ -42,7 +42,7 @@ on any drift. The ledger and the checks run with retention on or off.
   the closed spans) is at most 12,800 + 3 × `LEDGER_SPAN_BLOCKS`: before the closer has caught up they would read
   most of history every pass. A span closes only once it is 12,800 blocks (the prune floor gap) below the head, so
   the tail never falls below that.
-- **Address reconciliation** (once per database, after migration 030): with repair on, the drifted addresses of every
+- **Address reconciliation** (once per database, after migration 031): with repair on, the drifted addresses of every
   bucket are set to the closed ledger rows plus the open tail, as the span rebase sets them, and the bucket is then
   recorded done, so a restart resumes at the next bucket. It repairs address_stats left short by a catch-up that did
   not write it (retention off, before catch-up wrote address_stats in every mode), without a rebuild.

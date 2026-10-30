@@ -1,4 +1,4 @@
--- The running diff of one address bucket (027) read every history row above the closed spans and kept the bucket's
+-- The running diff of one address bucket (028) read every history row above the closed spans and kept the bucket's
 -- 1/256 after the union, and read ledger_address from the bucket to the end of the table: about 10 minutes a bucket
 -- on a 6.4M-transaction open tail, for the reconciliation's 256 buckets and every tick of the running check.
 -- The bucket's address range now bounds each history table's address index scan, and ledger_address's
