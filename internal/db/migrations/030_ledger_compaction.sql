@@ -53,12 +53,14 @@ $f$;
 ---- create above / drop below ----
 
 DROP FUNCTION ledger_compact(INT);
-DO $m$
-BEGIN
-    IF EXISTS (SELECT 1 FROM ledger_spans WHERE source = 'merged') THEN
-        RAISE EXCEPTION 'migration 030 cannot be reverted: the ledger holds merged spans';
-    END IF;
-END
-$m$;
+-- A merged span stays: its rows are already the sums of the spans it replaced, so every total is unchanged, and below
+-- 030 it is a closed span like any other. Below 030 nothing reads source; it says where a span's rows were counted.
+-- A merged span wholly below START_BLOCK was counted from the node by the stats backfill ('node'), as every span
+-- there is; any other was counted from stored rows when it closed ('rows').
+UPDATE ledger_spans SET source = CASE
+        WHEN hi <= COALESCE((SELECT target + 1 FROM stats_backfill WHERE id = 1), 0) THEN 'node'
+        ELSE 'rows'
+    END
+WHERE source = 'merged';
 ALTER TABLE ledger_spans DROP CONSTRAINT ledger_spans_source_check;
 ALTER TABLE ledger_spans ADD CONSTRAINT ledger_spans_source_check CHECK (source IN ('rows', 'node'));
