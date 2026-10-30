@@ -420,6 +420,7 @@ func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) err
 			log.Error("realtime: failed to delete block", "block", blockNum, "error", err)
 			return err
 		}
+		refreshBalanceEpoch(ctx, r.db, r.balanceWorkers)
 		log.Debug("realtime: reverted block", "block", blockNum)
 	}
 

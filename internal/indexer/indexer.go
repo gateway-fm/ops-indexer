@@ -445,6 +445,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
 	}
 	if store, ok := i.db.(balanceRereadStore); ok {
+		refreshBalanceEpoch(ctx, i.db, i.balanceWorkers)
 		go i.RunBalanceRereads(ctx, store)
 	}
 
@@ -1001,6 +1002,7 @@ func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
 			log.Error("failed to delete block", "block", blockNum, "error", err)
 			return err
 		}
+		refreshBalanceEpoch(ctx, i.db, i.balanceWorkers)
 		log.Debug("reverted block", "block", blockNum)
 	}
 

@@ -29,13 +29,14 @@ func TestAReadMadeAfterTheRereadIsNotLostToIt(t *testing.T) {
 
 	// The reread is claimed at head 1 and read: A holds 10 on the new chain.
 	reread := reorgBalances(1, [3]string{reorgBalA, reorgBalToken, "10"})
-	reread[0].Reread = seq
+	reread[0].Epoch = seq
 
 	// Then the new chain's block 2 sends 3 from A to X, and A's read for it (7) is flushed before the reread.
 	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(2,
 		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, reorgBalA, reorgBalX, "3", nil))))
-	require.NoError(t, d.InsertBalancesBatch(ctx, reorgBalances(2,
-		[3]string{reorgBalA, reorgBalToken, "7"}, [3]string{reorgBalX, reorgBalToken, "3"})))
+	newRead := reorgBalances(2, [3]string{reorgBalA, reorgBalToken, "7"}, [3]string{reorgBalX, reorgBalToken, "3"})
+	newRead[0].Epoch = currentEpoch(t, d)
+	require.NoError(t, d.InsertBalancesBatch(ctx, newRead))
 	require.NoError(t, d.InsertBalancesBatch(ctx, reread))
 
 	b, _ := currentBalance(t, d, reorgBalToken, reorgBalA)
@@ -60,7 +61,7 @@ func TestAForkReadFlushedAfterTheRereadDoesNotReplaceIt(t *testing.T) {
 	require.NotZero(t, seq)
 
 	answer := reorgBalances(1, [3]string{reorgBalB, reorgBalToken, "0"})
-	answer[0].Reread = seq
+	answer[0].Epoch = seq
 	require.NoError(t, d.InsertBalancesBatch(ctx, answer))
 	require.NoError(t, d.InsertBalancesBatch(ctx, forkRead))
 

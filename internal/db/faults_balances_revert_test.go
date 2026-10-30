@@ -47,9 +47,9 @@ func fkAnswer(t *testing.T, d *DB) error {
 		reorgBalNFT + " " + reorgBalO: "1", reorgBalNFT + " " + reorgBalX: "0",
 	}
 	var answers []*types.Balance
-	for k, seq := range rereads(t, d) {
+	for k, epoch := range rereads(t, d) {
 		b := reorgBalances(1, [3]string{k[len(reorgBalToken)+1:], k[:len(reorgBalToken)], node[k]})[0]
-		b.Reread = seq
+		b.Epoch = epoch
 		answers = append(answers, b)
 	}
 	return d.InsertBalancesBatch(context.Background(), answers)
@@ -63,8 +63,7 @@ func TestFaultBalanceRevertFaults(t *testing.T) {
 		{"delete-history", "DELETE FROM balances WHERE block_number"},
 		{"restore", "prev AS ("},
 		{"requests", "INSERT INTO balance_rereads"},
-		{"answer-current", "SET block_number = k.block_number"},
-		{"answer-clear", "DELETE FROM balance_rereads r USING"},
+		{"answer-close", "UPDATE balance_rereads r SET open = false"},
 	} {
 		for _, act := range []struct {
 			name string

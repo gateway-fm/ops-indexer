@@ -147,8 +147,9 @@ type Balance struct {
 	TokenAddress string     `json:"tokenAddress"`
 	BlockNumber  uint64     `json:"blockNumber"`
 	Balance      JSONString `json:"balance"`
-	// Reread is the balance_rereads request this read answers, 0 for none.
-	Reread int64 `json:"-"`
+	// Epoch is the reorg epoch current when the read was decided (balance_reorg_epoch); 0 when the writer did not
+	// set one, which counts as before every revert.
+	Epoch int64 `json:"-"`
 }
 
 type Counter struct {

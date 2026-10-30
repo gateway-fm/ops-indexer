@@ -19,8 +19,9 @@ type BalanceWork struct {
 	Address      common.Address
 	TokenAddress common.Address
 	BlockNumber  uint64
-	// Reread is the balance_rereads request this read answers, 0 for none. Folded keys keep the highest.
-	Reread int64
+	// Epoch is the reorg epoch current when the read was decided; the pool stamps it when the caller leaves it 0.
+	// Folded keys keep the highest: the read happens after the last of them was decided.
+	Epoch int64
 }
 
 type BalanceWorkerPool struct {
@@ -32,6 +33,9 @@ type BalanceWorkerPool struct {
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	// epoch is the reorg epoch stamped on new work (SetEpoch).
+	epoch atomic.Int64
 
 	// sendMu guards workChan's close against concurrent sends; closed is set under its write lock by Stop.
 	sendMu   sync.RWMutex
@@ -130,6 +134,24 @@ func (p *BalanceWorkerPool) Stop() {
 	})
 }
 
+// SetEpoch moves the reorg epoch the pool stamps on new work forward to e (CurrentBalanceEpoch after a revert).
+func (p *BalanceWorkerPool) SetEpoch(e int64) {
+	for {
+		cur := p.epoch.Load()
+		if e <= cur || p.epoch.CompareAndSwap(cur, e) {
+			return
+		}
+	}
+}
+
+// stamped is work with the pool's current reorg epoch when it carries none.
+func (p *BalanceWorkerPool) stamped(work BalanceWork) BalanceWork {
+	if work.Epoch == 0 {
+		work.Epoch = p.epoch.Load()
+	}
+	return work
+}
+
 // QueueWork returns false if the queue is full (non-blocking).
 func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
 	p.sendMu.RLock()
@@ -138,7 +160,7 @@ func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
 		return false
 	}
 	select {
-	case p.workChan <- work:
+	case p.workChan <- p.stamped(work):
 		return true
 	default:
 		return false
@@ -166,7 +188,7 @@ func (p *BalanceWorkerPool) QueueWorkBatchWait(ctx context.Context, works []Bala
 	queued := 0
 	for _, work := range works {
 		select {
-		case p.workChan <- work:
+		case p.workChan <- p.stamped(work):
 			queued++
 		case <-ctx.Done():
 			return queued
@@ -261,8 +283,8 @@ func (p *BalanceWorkerPool) coalesce() {
 				if work.BlockNumber > h.BlockNumber {
 					h.BlockNumber = work.BlockNumber
 				}
-				if work.Reread > h.Reread {
-					h.Reread = work.Reread
+				if work.Epoch > h.Epoch {
+					h.Epoch = work.Epoch
 				}
 				metrics.BalanceDeduped(1)
 				continue
@@ -361,7 +383,7 @@ func (p *BalanceWorkerPool) fetchBalance(work BalanceWork) (*types.Balance, erro
 		TokenAddress: work.TokenAddress.Hex(),
 		BlockNumber:  work.BlockNumber,
 		Balance:      types.JSONString(balance.String()),
-		Reread:       work.Reread,
+		Epoch:        work.Epoch,
 	}, nil
 }
 
@@ -415,7 +437,7 @@ drain:
 			k := balanceKey{w.Address, w.TokenAddress}
 			if prev, seen := works[k]; seen {
 				prev.BlockNumber = max(prev.BlockNumber, w.BlockNumber)
-				prev.Reread = max(prev.Reread, w.Reread)
+				prev.Epoch = max(prev.Epoch, w.Epoch)
 				works[k] = prev
 				metrics.BalanceDeduped(1)
 				continue
@@ -451,7 +473,7 @@ drain:
 				TokenAddress: w.TokenAddress.Hex(),
 				BlockNumber:  w.BlockNumber,
 				Balance:      types.JSONString(values[i].String()),
-				Reread:       w.Reread,
+				Epoch:        w.Epoch,
 			})
 		}
 	}

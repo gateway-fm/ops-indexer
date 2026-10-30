@@ -325,6 +325,18 @@ var (
 	})
 )
 
+var balanceRereadsAbandoned = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_balance_rereads_abandoned_total",
+	Help: "Balances a reorg revert asked to read again that every attempt failed to read; each stays as the revert restored it until the holder's next transfer.",
+})
+
+// BalanceRereadsAbandoned counts reread requests given up after their last attempt.
+func BalanceRereadsAbandoned(n int) {
+	if n > 0 {
+		balanceRereadsAbandoned.Add(float64(n))
+	}
+}
+
 func BalanceFetchFailed(n int) {
 	if n > 0 {
 		balanceFetchFailed.Add(float64(n))

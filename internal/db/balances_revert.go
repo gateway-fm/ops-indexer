@@ -135,19 +135,30 @@ func positiveBalances(ctx context.Context, tx pgx.Tx, keys []balanceKey) (map[ba
 	return pos, rows.Err()
 }
 
-// recordBalanceRereads asks for every key to be read again at the new head. It is DeleteBlock's last write, after
-// every row lock a balance flush takes, which takes balance_rereads last too.
+// recordBalanceRereads takes a new reorg epoch, records it on every key and opens each key's request to be read again
+// at the new head. It is DeleteBlock's last write, after every row lock a balance flush takes, which takes
+// balance_rereads last too.
 func recordBalanceRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey) error {
 	if len(keys) == 0 {
 		return nil
 	}
 	tokens, addresses := balanceKeyColumns(keys)
 	_, err := tx.Exec(ctx, `
-		INSERT INTO balance_rereads (token_address, address, seq)
-		SELECT token_address, address, nextval('balance_reread_seq')
-		FROM unnest($1::TEXT[], $2::TEXT[]) WITH ORDINALITY AS k(token_address, address, n) ORDER BY n
-		ON CONFLICT (token_address, address) DO UPDATE SET seq = EXCLUDED.seq, attempts = 0`, tokens, addresses)
+		WITH e AS (SELECT nextval('balance_reorg_epoch') AS epoch)
+		INSERT INTO balance_rereads AS r (token_address, address, epoch, open, attempts)
+		SELECT k.token_address, k.address, e.epoch, true, 0
+		FROM unnest($1::TEXT[], $2::TEXT[]) WITH ORDINALITY AS k(token_address, address, n), e ORDER BY k.n
+		ON CONFLICT (token_address, address) DO UPDATE SET epoch = EXCLUDED.epoch, open = true, attempts = 0`,
+		tokens, addresses)
 	return err
+}
+
+// CurrentBalanceEpoch is the epoch of the latest reorg revert, 0 before the first. A balance read decided now carries
+// it.
+func (d *DB) CurrentBalanceEpoch(ctx context.Context) (int64, error) {
+	var e int64
+	err := d.pool.QueryRow(ctx, `SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM balance_reorg_epoch`).Scan(&e)
+	return e, err
 }
 
 func balanceKeyColumns(keys []balanceKey) (tokens, addresses []string) {
@@ -174,30 +185,37 @@ func boolInt(b bool) int {
 	return 0
 }
 
-// pendingRereads returns the open request of each key that has one.
-func pendingRereads(ctx context.Context, tx pgx.Tx, tokens, addresses []string) (map[balanceKey]int64, error) {
+// revertEpoch is a key's latest reorg epoch and whether its request to be read again is still open.
+type revertEpoch struct {
+	epoch int64
+	open  bool
+}
+
+// revertEpochs returns the reorg epoch of each key a revert has touched.
+func revertEpochs(ctx context.Context, tx pgx.Tx, tokens, addresses []string) (map[balanceKey]revertEpoch, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT r.token_address, r.address, r.seq FROM balance_rereads r
+		SELECT r.token_address, r.address, r.epoch, r.open FROM balance_rereads r
 		JOIN unnest($1::TEXT[], $2::TEXT[]) AS k(token_address, address)
 		  ON r.token_address = k.token_address AND r.address = k.address`, tokens, addresses)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	pending := map[balanceKey]int64{}
+	out := map[balanceKey]revertEpoch{}
 	for rows.Next() {
 		var k balanceKey
-		var seq int64
-		if err := rows.Scan(&k.token, &k.address, &seq); err != nil {
+		var e revertEpoch
+		if err := rows.Scan(&k.token, &k.address, &e.epoch, &e.open); err != nil {
 			return nil, err
 		}
-		pending[k] = seq
+		out[k] = e
 	}
-	return pending, rows.Err()
+	return out, rows.Err()
 }
 
-// clearRereads removes the requests a flush answered, in key order.
-func clearRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey) error {
+// closeRereads closes the requests a flush answered, in key order. The rows stay: their epoch keeps dropping reads
+// decided before the revert.
+func closeRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -209,23 +227,23 @@ func clearRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey) error {
 	})
 	tokens, addresses := balanceKeyColumns(keys)
 	_, err := tx.Exec(ctx, `
-		DELETE FROM balance_rereads r USING unnest($1::TEXT[], $2::TEXT[]) AS k(token_address, address)
+		UPDATE balance_rereads r SET open = false FROM unnest($1::TEXT[], $2::TEXT[]) AS k(token_address, address)
 		WHERE r.token_address = k.token_address AND r.address = k.address`, tokens, addresses)
 	return err
 }
 
-// BalanceReread is one open request: read the holder's balance of the token again at the head.
+// BalanceReread is one open request: read the holder's balance of the token again at the head, at Epoch or later.
 type BalanceReread struct {
 	Token, Address string
-	Seq            int64
+	Epoch          int64
 }
 
 // MaxBalanceRereadAttempts is how many times a request is handed out before it is dropped: a token whose
 // balanceOf(holder) never answers would otherwise be asked about forever.
 const MaxBalanceRereadAttempts = 20
 
-// ClaimBalanceRereads hands out up to limit open requests, oldest first, counting an attempt on each, and drops the
-// ones that ran out of attempts, which it returns separately.
+// ClaimBalanceRereads hands out up to limit open requests, counting an attempt on each, and closes the ones that ran
+// out of attempts, which it returns separately (their epoch still drops reads decided before the revert).
 func (d *DB) ClaimBalanceRereads(ctx context.Context, limit int) (claimed, dropped []BalanceReread, err error) {
 	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		collect := func(rows pgx.Rows, err error) ([]BalanceReread, error) {
@@ -234,19 +252,20 @@ func (d *DB) ClaimBalanceRereads(ctx context.Context, limit int) (claimed, dropp
 			}
 			return pgx.CollectRows(rows, func(r pgx.CollectableRow) (BalanceReread, error) {
 				var b BalanceReread
-				return b, r.Scan(&b.Token, &b.Address, &b.Seq)
+				return b, r.Scan(&b.Token, &b.Address, &b.Epoch)
 			})
 		}
 		if dropped, err = collect(tx.Query(ctx, `
-			DELETE FROM balance_rereads WHERE attempts >= $1
-			RETURNING token_address, address, seq`, MaxBalanceRereadAttempts)); err != nil {
+			UPDATE balance_rereads SET open = false WHERE open AND attempts >= $1
+			RETURNING token_address, address, epoch`, MaxBalanceRereadAttempts)); err != nil {
 			return err
 		}
 		claimed, err = collect(tx.Query(ctx, `
 			UPDATE balance_rereads r SET attempts = r.attempts + 1
-			FROM (SELECT token_address, address FROM balance_rereads ORDER BY seq LIMIT $1 FOR UPDATE SKIP LOCKED) o
+			FROM (SELECT token_address, address FROM balance_rereads WHERE open
+			      ORDER BY epoch LIMIT $1 FOR UPDATE SKIP LOCKED) o
 			WHERE r.token_address = o.token_address AND r.address = o.address
-			RETURNING r.token_address, r.address, r.seq`, limit))
+			RETURNING r.token_address, r.address, r.epoch`, limit))
 		return err
 	})
 	return claimed, dropped, err

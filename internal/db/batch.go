@@ -897,9 +897,9 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 	}
 	defer tx.Rollback(ctx)
 
-	// Phase 0: advisory locks on every key, then the reverts' requests for them (balance_rereads, written under the
-	// same locks). While a key has one, only the read that answers it is written: any other read of the key may have
-	// been made before the revert, on the fork.
+	// Phase 0: advisory locks on every key, then the reorg epoch of each key a revert touched (balance_rereads, written
+	// under the same locks). A read decided before its key's last revert (a lower epoch) may hold the fork's value and
+	// is not written; a read at the key's epoch or later answers its open request.
 	lockTok := make([]string, len(ordered))
 	lockAddr := make([]string, len(ordered))
 	for i, b := range ordered {
@@ -908,22 +908,26 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(lockTok, lockAddr)); err != nil {
 		return fmt.Errorf("lock balance keys: %w", err)
 	}
-	pending, err := pendingRereads(ctx, tx, lockTok, lockAddr)
+	epochs, err := revertEpochs(ctx, tx, lockTok, lockAddr)
 	if err != nil {
-		return fmt.Errorf("read balance rereads: %w", err)
+		return fmt.Errorf("read reorg epochs: %w", err)
 	}
 	var answered []balanceKey
-	if len(pending) > 0 {
+	if len(epochs) > 0 {
 		kept := ordered[:0:0]
+		closing := map[balanceKey]bool{}
 		for _, b := range ordered {
 			k := balanceKey{token: strings.ToLower(b.TokenAddress), address: strings.ToLower(b.Address)}
-			seq, ok := pending[k]
+			e, reverted := epochs[k]
 			switch {
-			case !ok:
+			case !reverted:
 				kept = append(kept, b)
-			case b.Reread == seq:
+			case b.Epoch >= e.epoch:
 				kept = append(kept, b)
-				answered = append(answered, k)
+				if e.open && !closing[k] {
+					closing[k] = true
+					answered = append(answered, k)
+				}
 			}
 		}
 		ordered = kept
@@ -1030,26 +1034,6 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 		}
 	}
 
-	// A read that answers a revert's request is the node's value after the revert, whatever block a row holds: the
-	// current row's block is brought down to the read's, so the highest-block guard takes it.
-	if len(answered) > 0 {
-		at := make(map[balanceKey]int64, len(answered))
-		for i := range curTok {
-			at[balanceKey{token: curTok[i], address: curAddr[i]}] = curBlk[i]
-		}
-		rt, ra, rb := make([]string, 0, len(answered)), make([]string, 0, len(answered)), make([]int64, 0, len(answered))
-		for _, k := range answered {
-			rt, ra, rb = append(rt, k.token), append(ra, k.address), append(rb, at[k])
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE token_balances_current c SET block_number = k.block_number
-			FROM unnest($1::TEXT[], $2::TEXT[], $3::BIGINT[]) AS k(token_address, address, block_number)
-			WHERE c.token_address = k.token_address AND c.address = k.address AND c.block_number > k.block_number`,
-			rt, ra, rb); err != nil {
-			return fmt.Errorf("let rereads replace current balances: %w", err)
-		}
-	}
-
 	// Phase 2: the current rows, returning (token, delta) for every key written.
 	holderDelta := make(map[string]int, 4)
 	drows, err := tx.Query(ctx, tbcUpsertDeltaSQL, curTok, curAddr, curBal, curBlk, curOld)
@@ -1105,7 +1089,7 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 	}
 
 	// Last phase: the requests these reads answer.
-	if err := clearRereads(ctx, tx, answered); err != nil {
+	if err := closeRereads(ctx, tx, answered); err != nil {
 		return fmt.Errorf("clear balance rereads: %w", err)
 	}
 	return tx.Commit(ctx)
