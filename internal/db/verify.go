@@ -171,6 +171,20 @@ func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool, workMem strin
 			if _, err := tx.Exec(ctx, `SELECT ledger_stage_from_rows($1, $2)`, c.Lo, c.Hi); err != nil {
 				return err
 			}
+			if retainedRecountStagedHook != nil {
+				retainedRecountStagedHook(c.Lo)
+			}
+			// The span's row, locked: a compaction that merged it since the snapshot makes this a serialization failure
+			// and the recount starts over; one that comes later waits for this settle.
+			var hi int64
+			var source string
+			if err := tx.QueryRow(ctx, `SELECT hi, source FROM ledger_spans WHERE lo = $1 FOR UPDATE`, c.Lo).Scan(&hi, &source); err != nil {
+				return err
+			}
+			if hi != c.Hi || source == "merged" {
+				c.State = "changed"
+				return nil
+			}
 			var retained bool
 			var blocks int64
 			if err := tx.QueryRow(ctx, `
@@ -197,6 +211,9 @@ func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool, workMem strin
 		return c, ok, err
 	}
 }
+
+// retainedRecountStagedHook, when a test sets it, runs after a retained span's recount staged its totals.
+var retainedRecountStagedHook func(lo int64)
 
 func settleSpan(ctx context.Context, tx pgx.Tx, c *SpanCheck, repair bool) error {
 	drifts, err := collectDrifts(ctx, tx, `SELECT family, key, counter, stored::TEXT, recount::TEXT FROM ledger_span_diff($1)`, c.Lo)
