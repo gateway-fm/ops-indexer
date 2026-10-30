@@ -63,6 +63,26 @@ func TestChainChecksPassOnKnownGoodAndFailOnEachSabotage(t *testing.T) {
 	require.True(t, strings.HasPrefix(checker.lastToken, "0x"), "the supply check walks the tokens")
 }
 
+// A restart of a deployment indexed from genesis with retention raises the ingest start above the prune watermark.
+// The chain checks still count from the configured start: blocks_total against every block from genesis, and the
+// nonce sample, which needs every sent transaction counted.
+func TestTheChainChecksCountFromTheConfiguredStartAfterPruning(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 14_000, busy: 1_000}
+	idx := newTestIndexer(store, chain)
+	ingestChain(t, idx, store, sql, chain)
+	require.NoError(t, store.Migrate(), "the startup re-seed counts the filler blocks")
+	_, err := sql.Exec(ctx, `UPDATE prune_state SET pruned_through = 999;
+		UPDATE ledger_verify_state SET value = 1 WHERE name = 'running_cycles'`)
+	require.NoError(t, err)
+	idx.startBlock = 1000 // what Start does above the watermark
+	r, err := idx.newChainChecker(store, ChainCheckConfig{RPS: 1_000_000, Sample: 50}).pass(ctx)
+	require.NoError(t, err)
+	require.Zero(t, r.BlocksDrift)
+	require.Equal(t, 1, r.NoncesChecked, "the nonce sample still runs")
+}
+
 // Block 0 stored and counted, then span 0 pruned with it: the blocks check still counts from genesis, as span 0's
 // ledger did, instead of finding blocks_total one above the head.
 func TestTheBlocksCheckCountsGenesisAfterItsSpanIsPruned(t *testing.T) {

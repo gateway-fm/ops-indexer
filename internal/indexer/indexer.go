@@ -94,6 +94,9 @@ type Indexer struct {
 	rpc          RPCClient
 	pollInterval time.Duration
 	startBlock   uint64
+	// countFrom is the configured start block, where the chain's totals start. startBlock is raised above the prune
+	// watermark at start, for ingest; the totals still count from here.
+	countFrom uint64
 
 	// missingRetryInterval is how often the standard loop retries the blocks it recorded as missing (retryMissing).
 	missingRetryInterval time.Duration
@@ -272,6 +275,7 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		rpc:                  rpcClient,
 		pollInterval:         pollInterval,
 		startBlock:           startBlock,
+		countFrom:            startBlock,
 		missingRetryInterval: defaultMissingRetryInterval,
 		indexRequests:        make(chan indexRequest, 100),
 		config:               cfg,

@@ -69,7 +69,7 @@ func (c *chainChecker) pass(ctx context.Context) (ChainCheckResult, error) {
 		return r, err
 	}
 	r.BlocksApplicable = blocks.Applicable
-	first := int64(c.idx.startBlock)
+	first := int64(c.idx.countFrom)
 	if blocks.FromGenesis {
 		first = 0
 	}
