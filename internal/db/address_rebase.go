@@ -123,6 +123,9 @@ func rebaseAddressBatch(ctx context.Context, d *DB, batch, create []string,
 	return r, err
 }
 
+// spanRebaseStagedHook, when a test sets it, runs between a span rebase's stage (its read) and its first batch.
+var spanRebaseStagedHook func(lo int64)
+
 // rebaseReadHook, when a test sets it, runs between a batch's read and its first write.
 var rebaseReadHook func(batch []string)
 
@@ -402,6 +405,9 @@ func (d *DB) rebaseSpans(ctx context.Context, los []int64, workMem string) error
 		staged, err := stageSpanRebase(ctx, conn.Conn(), lo, workMem)
 		if err != nil {
 			return err
+		}
+		if spanRebaseStagedHook != nil {
+			spanRebaseStagedHook(lo)
 		}
 		var result RebaseResult
 		for {
