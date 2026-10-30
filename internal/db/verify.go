@@ -132,30 +132,70 @@ func inRepeatableRead(ctx context.Context, d *DB, fn func(pgx.Tx) error) error {
 
 // RecountRetainedSpan recounts, from its history rows, the closed retained span checked longest ago and settles it
 // (ledger_span_settle); ok is false when there is none.
+//
+// It holds the history-DDL gate shared from before its snapshot to its commit, as the closer does, so retention
+// cannot detach or drop the span's range under the count: a range detached after the snapshot reads as no rows,
+// and the settle would have written zeros over the span's counts. A span retention has pruned meanwhile is left
+// to the node recount, and a recount whose blocks_total is not the span's width is never settled.
 func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool, workMem string) (c SpanCheck, ok bool, err error) {
-	err = inRepeatableRead(ctx, d, func(tx pgx.Tx) error {
-		if workMem != "" {
-			if _, err := tx.Exec(ctx, `SELECT set_config('work_mem', $1, true)`, workMem); err != nil {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return c, false, err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock_shared($1, 1)`, historyDDLGate); err != nil {
+		return c, false, err
+	}
+	defer func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock_shared($1, 1)`, historyDDLGate)
+	}()
+	for attempt := 1; ; attempt++ {
+		c, ok = SpanCheck{}, false
+		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+			if workMem != "" {
+				if _, err := tx.Exec(ctx, `SELECT set_config('work_mem', $1, true)`, workMem); err != nil {
+					return err
+				}
+			}
+			err := tx.QueryRow(ctx, `
+				SELECT lo, hi FROM ledger_spans
+				WHERE lo >= (SELECT history_from()) AND check_state <> 'quarantined'
+				ORDER BY checked_at NULLS FIRST, lo LIMIT 1`).Scan(&c.Lo, &c.Hi)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
 				return err
 			}
+			ok = true
+			if _, err := tx.Exec(ctx, `SELECT ledger_stage_from_rows($1, $2)`, c.Lo, c.Hi); err != nil {
+				return err
+			}
+			var retained bool
+			var blocks int64
+			if err := tx.QueryRow(ctx, `
+				SELECT $1 >= history_from(), COALESCE((SELECT value FROM ledger_stage_chain WHERE lo = $1 AND name = 'blocks_total'), 0)`,
+				c.Lo).Scan(&retained, &blocks); err != nil {
+				return err
+			}
+			if !retained {
+				c.State = "pruned"
+				return nil
+			}
+			if blocks != c.Hi-c.Lo && !(c.Lo == 0 && blocks == c.Hi-1) {
+				log.Warn("ledger: a retained span's recount is missing blocks; not settled", "lo", c.Lo, "hi", c.Hi,
+					"blocks", blocks)
+				c.State = "incomplete"
+				return nil
+			}
+			return settleSpan(ctx, tx, &c, repair)
+		})
+		var pgErr *pgconn.PgError
+		if attempt < 5 && errors.As(err, &pgErr) && pgErr.Code == "40001" {
+			continue
 		}
-		err := tx.QueryRow(ctx, `
-			SELECT lo, hi FROM ledger_spans
-			WHERE lo >= (SELECT history_from()) AND check_state <> 'quarantined'
-			ORDER BY checked_at NULLS FIRST, lo LIMIT 1`).Scan(&c.Lo, &c.Hi)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		ok = true
-		if _, err := tx.Exec(ctx, `SELECT ledger_stage_from_rows($1, $2)`, c.Lo, c.Hi); err != nil {
-			return err
-		}
-		return settleSpan(ctx, tx, &c, repair)
-	})
-	return c, ok, err
+		return c, ok, err
+	}
 }
 
 func settleSpan(ctx context.Context, tx pgx.Tx, c *SpanCheck, repair bool) error {
