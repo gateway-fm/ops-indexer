@@ -335,6 +335,16 @@ func (d *DB) rebasePendingSpans(ctx context.Context, workMem string) error {
 	if err != nil || len(los) == 0 {
 		return err
 	}
+	// The spans run on one connection, given back before the day recount takes one: a pool of a single connection,
+	// which startup accepts, would otherwise wait for itself.
+	if err := d.rebaseSpans(ctx, los, workMem); err != nil {
+		return err
+	}
+	return d.recountPendingDays(ctx)
+}
+
+// rebaseSpans rebases the given closed spans, oldest first, on one connection holding the rebase lock.
+func (d *DB) rebaseSpans(ctx context.Context, los []int64, workMem string) error {
 	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return err
@@ -393,7 +403,7 @@ func (d *DB) rebasePendingSpans(ctx context.Context, workMem string) error {
 			"wrong_transfers", staged.Transfers, "wrong_first_seen", staged.FirstSeen, "wrong_last_seen", staged.LastSeen,
 			"missing", staged.Created, "no_truth", staged.NoTruth)
 	}
-	return d.recountPendingDays(ctx)
+	return nil
 }
 
 // spanCorrections counts what a span's rebase staged: rows, and the rows whose each column differs from the truth,

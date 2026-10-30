@@ -652,3 +652,25 @@ func TestSpanStagingUsesTheLedgerWorkMem(t *testing.T) {
 		return nil
 	}))
 }
+
+// A pool of one connection, which startup accepts with COMMIT_PIPELINE=1: the span rebase gives its connection back
+// before the day recount asks the pool for one, so the close finishes.
+func TestASpanRebaseFinishesOnAPoolOfOneConnection(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for n := 1; n <= 150; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(151, 13000) g`)
+	require.NoError(t, err)
+	one := withPoolSize(t, d, 1)
+	closed, err := one.CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 100, FirstBlock: 1, WorkMem: "64MB"}, 1)
+	require.NoError(t, err, "the close finished on one connection")
+	require.Equal(t, 1, closed)
+	_, err = one.CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 100, FirstBlock: 1, WorkMem: "64MB"}, 1)
+	require.NoError(t, err, "the next close rebases the first span on one connection")
+}
