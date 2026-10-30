@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -287,6 +289,16 @@ func (d *DB) CheckRunning(ctx context.Context, bucket int, repair bool) ([]Drift
 // by its drift in one transaction; a drifted address is rebased, its ledger_repairs rows written in the rebase batch's
 // transaction, so a rebase that fails leaves no repair on record to quarantine the address at the next check.
 func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
+	// Tokens rows by address, then chain_counters: the writers' order (a block write takes its tokens rows and
+	// chain_counters last), so a repair never holds a counter a block write waits for while it waits for a token.
+	drifts = slices.Clone(drifts)
+	rank := map[string]int{"token": 0, "chain": 1, "address": 2}
+	sort.SliceStable(drifts, func(i, j int) bool {
+		if rank[drifts[i].Family] != rank[drifts[j].Family] {
+			return rank[drifts[i].Family] < rank[drifts[j].Family]
+		}
+		return drifts[i].Key < drifts[j].Key
+	})
 	byAddress := map[string][]Drift{}
 	var addresses []string
 	if err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
