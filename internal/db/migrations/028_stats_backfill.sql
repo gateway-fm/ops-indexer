@@ -25,7 +25,7 @@ CREATE TABLE stats_backfill_balance_keys (
 ALTER TABLE ledger_stage_chain SET LOGGED;
 ALTER TABLE ledger_stage_token SET LOGGED;
 ALTER TABLE ledger_stage_address SET LOGGED;
-CREATE INDEX ledger_token_token ON ledger_token (token);
+-- ledger_token's token index is built CONCURRENTLY after startup (EnsureLedgerIndexes), as ledger_address's is.
 
 -- The lo of the backfill's span in progress; NULL when no backfill runs.
 CREATE FUNCTION stats_backfill_open_span() RETURNS BIGINT LANGUAGE sql STABLE AS $f$
@@ -297,7 +297,7 @@ FROM ledger_token t JOIN ledger_spans s USING (lo)
 WHERE s.hi <= (SELECT history_from())
 GROUP BY t.token;
 DROP FUNCTION stats_backfill_open_span();
-DROP INDEX ledger_token_token;
+DROP INDEX IF EXISTS ledger_token_token;
 ALTER TABLE ledger_stage_address SET UNLOGGED;
 ALTER TABLE ledger_stage_token SET UNLOGGED;
 ALTER TABLE ledger_stage_chain SET UNLOGGED;

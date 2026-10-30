@@ -64,6 +64,9 @@ func (d *DB) Migrate() error {
 	if err := d.MigrateSchema(); err != nil {
 		return err
 	}
+	if err := d.EnsureLedgerIndexes(context.Background()); err != nil {
+		return err
+	}
 	return d.Reconcile(context.Background())
 }
 

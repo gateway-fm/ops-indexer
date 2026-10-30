@@ -375,6 +375,9 @@ func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 // retention on or off.
 func (d *DB) RunVerify(ctx context.Context, cfg VerifyConfig) {
 	log.Info("ledger verification started", "interval", cfg.RecountInterval, "repair", cfg.Repair)
+	if !d.waitLedgerIndexes(ctx, "ledger verification", cfg.RecountInterval) {
+		return
+	}
 	bucket := 0
 	recountCycle, runningCycle := time.Now(), time.Now()
 	reconciled := !cfg.Repair

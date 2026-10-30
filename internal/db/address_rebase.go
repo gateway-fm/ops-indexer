@@ -364,6 +364,9 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 // span of a million addresses took about a day. The whole span runs under the rebase lock, held on one
 // connection; a stage left by a crash is counted again, since another rebase may have applied it since.
 func (d *DB) rebasePendingSpans(ctx context.Context, workMem string) error {
+	if !d.ledgerIndexesReadyFor(ctx, "span rebase") {
+		return nil
+	}
 	if err := d.recountPendingDays(ctx); err != nil {
 		return err
 	}

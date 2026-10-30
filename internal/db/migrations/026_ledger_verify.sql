@@ -10,7 +10,8 @@ ALTER TABLE ledger_spans
         CHECK (check_state IN ('unchecked', 'ok', 'drift', 'repaired', 'quarantined')),
     ADD COLUMN repairs INT NOT NULL DEFAULT 0;
 CREATE INDEX ledger_spans_checked ON ledger_spans (checked_at NULLS FIRST, lo);
-CREATE INDEX ledger_address_address ON ledger_address (address);
+-- ledger_address's address index is built CONCURRENTLY after startup (EnsureLedgerIndexes): built here it held
+-- ledger_address against writes, and ingest and gRPC waited for the migration, for as long as the table took.
 
 CREATE UNLOGGED TABLE ledger_stage_chain (LIKE ledger_chain INCLUDING ALL);
 CREATE UNLOGGED TABLE ledger_stage_token (LIKE ledger_token INCLUDING ALL);
@@ -397,6 +398,6 @@ DROP TABLE ledger_repairs;
 DROP TABLE ledger_stage_address;
 DROP TABLE ledger_stage_token;
 DROP TABLE ledger_stage_chain;
-DROP INDEX ledger_address_address;
+DROP INDEX IF EXISTS ledger_address_address;
 DROP INDEX ledger_spans_checked;
 ALTER TABLE ledger_spans DROP COLUMN repairs, DROP COLUMN check_state, DROP COLUMN checked_at;
