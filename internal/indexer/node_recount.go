@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -16,6 +17,10 @@ type prunedSpanStore interface {
 	SettleNodeSpan(ctx context.Context, lo, hi int64, s *db.SpanTotals, repair bool) (db.SpanCheck, error)
 	DeferPrunedSpan(ctx context.Context, lo int64) error
 }
+
+// nodeRecountFailuresBeforeDefer is how many recounts of a span in a row may fail before the span goes to the back of
+// the queue. Each recount already tries every block's reads spanBlockReads times.
+const nodeRecountFailuresBeforeDefer = 2
 
 type NodeRecountConfig struct {
 	// RPS is the recount's node budget: every call waits for a token of it, and a batch call that falls back to one
@@ -49,7 +54,28 @@ func (i *Indexer) RecountPrunedSpan(ctx context.Context, store prunedSpanStore, 
 		return db.SpanCheck{Lo: lo, Hi: hi, State: "undecided"}, true, nil
 	}
 	if err != nil {
-		return db.SpanCheck{}, false, err
+		if ctx.Err() != nil {
+			return db.SpanCheck{}, false, err
+		}
+		metrics.NodeRecountFailed()
+		if counter.failingLo != lo {
+			counter.failingLo, counter.failures = lo, 0
+		}
+		counter.failures++
+		if counter.failures < nodeRecountFailuresBeforeDefer {
+			return db.SpanCheck{}, false, err
+		}
+		// A span whose count fails every time (a trace past the node's tracer timeout, state the node dropped) would
+		// stay the span checked longest ago and hold the recount on it: it goes to the back of the queue instead.
+		counter.failures = 0
+		if derr := store.DeferPrunedSpan(ctx, lo); derr != nil {
+			return db.SpanCheck{}, false, errors.Join(err, derr)
+		}
+		return db.SpanCheck{}, false, fmt.Errorf("span [%d, %d) failed %d recounts in a row, left unchecked: %w",
+			lo, hi, nodeRecountFailuresBeforeDefer, err)
+	}
+	if counter.failingLo == lo {
+		counter.failures = 0
 	}
 	c, err := store.SettleNodeSpan(ctx, lo, hi, totals, repair)
 	return c, err == nil, err

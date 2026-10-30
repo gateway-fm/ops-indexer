@@ -18,6 +18,9 @@ type spanCounter struct {
 	limiter *rate.Limiter
 	// retry is the wait before a block's second read; it doubles for each read after.
 	retry time.Duration
+	// failingLo is the span whose count failed last, failures how many times in a row.
+	failingLo int64
+	failures  int
 }
 
 func (i *Indexer) newSpanCounter(rps int) *spanCounter {

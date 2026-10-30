@@ -339,6 +339,14 @@ func SetLedgerIndexesReady(ready bool) {
 	}
 }
 
+var nodeRecountFailures = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_ledger_node_recount_failures_total",
+	Help: "Pruned-span recounts from the node that failed; a span that fails twice in a row goes to the back of the queue unchecked.",
+})
+
+// NodeRecountFailed counts a failed pruned-span recount.
+func NodeRecountFailed() { nodeRecountFailures.Inc() }
+
 var balanceRereadsAbandoned = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "indexer_balance_rereads_abandoned_total",
 	Help: "Balances a reorg revert asked to read again that every attempt failed to read; each stays as the revert restored it until the holder's next transfer.",
