@@ -18,10 +18,6 @@ func repairUntilDone(t *testing.T, d *DB) RebaseResult {
 		require.NoError(t, err)
 		total.add(r)
 	}
-	r, left, err := d.RepairRevertedAddresses(ctx, AddressRepairBatch)
-	require.NoError(t, err)
-	require.Zero(t, left)
-	total.add(r)
 	return total
 }
 
@@ -116,8 +112,6 @@ func TestAddressStatsRepairStagedBeforeAReorgBetweenBatches(t *testing.T) {
 		_, err := d.RepairAddressBucket(ctx, bucket, 1)
 		require.NoError(t, err)
 	}
-	_, _, err = d.RepairRevertedAddresses(ctx, 1)
-	require.NoError(t, err)
 
 	require.Equal(t, seenRow{txs: 1, first: 1, last: 1}, addressSeen(t, d, "0xa"), "repaired before the reorg, then reverted")
 	require.Equal(t, seenRow{txs: 1, first: 1, last: 1}, addressSeen(t, d, "0xb"), "repaired across the reorg")

@@ -70,16 +70,6 @@ func runRepairAddressStats(args []string, database *db.DB) int {
 				"created", r.Created, "removed", r.Removed)
 		}
 	}
-	r, left, err := database.RepairRevertedAddresses(ctx, *batch)
-	total.Changed, total.Created, total.Removed = total.Changed+r.Changed, total.Created+r.Created, total.Removed+r.Removed
-	if err != nil {
-		log.Error("repair-address-stats: stopped; rerun to resume", "step", "reverted addresses", "error", err)
-		return 1
-	}
-	if left > 0 {
-		log.Warn("repair-address-stats: reverts kept landing; the next span close rebases the addresses they recorded",
-			"addresses", left)
-	}
 	if err := database.FinishAddressRepair(ctx); err != nil {
 		log.Error("repair-address-stats: stopped; rerun to resume", "step", "finish", "error", err)
 		return 1

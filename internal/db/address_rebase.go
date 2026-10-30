@@ -166,11 +166,51 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 	})
 }
 
+// revertedSinceRead locks the batch's rows in byte order and returns the addresses a revert has recorded since the
+// read (a ledger_reverted_address version the read did not see). A revert subtracts its block from the row and from
+// the truth, but its subtraction stops at zero and it moves first_seen and last_seen, so a correction read before it
+// can overshoot; those rows are counted again under their locks, and a row missing at the read is not created from
+// them. A revert still in progress holds the rows, so the lock waits for it and the versions read after it are its.
+func revertedSinceRead(ctx context.Context, tx pgx.Tx, read []rebaseRow) (map[string]bool, error) {
+	addresses := make([]string, len(read))
+	seen := make(map[string]*string, len(read))
+	for i, v := range read {
+		addresses[i] = v.address
+		seen[v.address] = v.reverted
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM address_stats WHERE address = ANY($1) ORDER BY address FOR UPDATE`, addresses); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT a, (SELECT r.xmin::TEXT FROM ledger_reverted_address r WHERE r.address = a)
+		FROM unnest($1::TEXT[]) a`, addresses)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stale := map[string]bool{}
+	for rows.Next() {
+		var address string
+		var version *string
+		if err := rows.Scan(&address, &version); err != nil {
+			return nil, err
+		}
+		if version != nil && (seen[address] == nil || *seen[address] != *version) {
+			stale[address] = true
+		}
+	}
+	return stale, rows.Err()
+}
+
 // applyRebaseRows applies the corrections of rows read in one snapshot, in one transaction, taking the rows in byte
 // order (ingest's order); after, if not nil, runs in the same transaction.
 func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after func(ctx context.Context, tx pgx.Tx) error) (RebaseResult, error) {
 	var r RebaseResult
 	sort.Slice(read, func(i, j int) bool { return read[i].address < read[j].address })
+	stale, err := revertedSinceRead(ctx, tx, read)
+	if err != nil {
+		return r, err
+	}
 	writes := &pgx.Batch{}
 	var kinds []rebaseWrite
 	var revertedAddresses, revertedVersions []string
@@ -180,10 +220,10 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 			revertedVersions = append(revertedVersions, *v.reverted)
 		}
 		switch {
-		case v.present && !v.seen:
+		case v.present && (!v.seen || stale[v.address]):
 			// Taken first, in its own statement, so the next statement's truth follows any write that held the row:
 			// the row goes if the address still has none, and is set to it otherwise. Only rows without a truth at the
-			// snapshot pay for this count.
+			// snapshot, and rows a revert changed since it, pay for this count.
 			writes.Queue(`SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, v.address)
 			kinds = append(kinds, rebaseCorrect)
 			writes.Queue(`
@@ -227,7 +267,7 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 					updated_at = NOW()
 				WHERE address = $1`, v.address, v.wantTxs-v.txs, v.wantSent-v.sent, v.wantInternal-v.internal,
 				v.wantTransf-v.transfers, v.firstSeen, v.wantFirst, v.lastSeen, v.wantLast)
-		case !v.present && v.seen && v.creatable && v.differs():
+		case !v.present && v.seen && v.creatable && v.differs() && !stale[v.address]:
 			kinds = append(kinds, rebaseCreate)
 			writes.Queue(`
 				INSERT INTO address_stats AS s (address, tx_count, sent_count, internal_tx_count, token_transfer_count,
@@ -257,7 +297,7 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 	if writes.Len() == 0 && len(revertedAddresses) == 0 && after == nil {
 		return r, nil
 	}
-	err := func() error {
+	err = func() error {
 		if writes.Len() > 0 {
 			results := tx.SendBatch(ctx, writes)
 			for _, kind := range kinds {

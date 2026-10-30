@@ -121,45 +121,6 @@ func (d *DB) repairAddresses(ctx context.Context, addresses []string) (RebaseRes
 	return first, err
 }
 
-// maxRevertedPasses bounds how many times RepairRevertedAddresses goes over the reverted addresses while reverts keep
-// recording more; what is left then is the next span close's.
-const maxRevertedPasses = 10
-
-// RepairRevertedAddresses rebases the addresses reverts recorded in ledger_reverted_address, as the next span close
-// would. A revert that lands between a batch's read and its writes subtracts its block from a row the batch is about to
-// correct: when the row was below its truth the subtraction stops at zero, and the batch's correction then overshoots.
-// The revert recorded the address, and the batch, which did not read that entry, left it; this pass sets the row to
-// its truth. It returns how many addresses are still recorded after maxRevertedPasses passes.
-func (d *DB) RepairRevertedAddresses(ctx context.Context, batch int) (RebaseResult, int, error) {
-	var total RebaseResult
-	for pass := 0; pass < maxRevertedPasses; pass++ {
-		rows, err := d.pool.Query(ctx, `SELECT address FROM ledger_reverted_address ORDER BY address`)
-		if err != nil {
-			return total, 0, err
-		}
-		addresses, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			return total, 0, err
-		}
-		if len(addresses) == 0 {
-			return total, 0, nil
-		}
-		for start := 0; start < len(addresses); start += batch {
-			r, err := d.repairAddresses(ctx, addresses[start:min(start+batch, len(addresses))])
-			total.add(r)
-			if err != nil {
-				return total, 0, err
-			}
-		}
-		if err := d.recountPendingDays(ctx); err != nil {
-			return total, 0, err
-		}
-	}
-	var left int
-	err := d.pool.QueryRow(ctx, `SELECT count(*) FROM ledger_reverted_address`).Scan(&left)
-	return total, left, err
-}
-
 // AddressRepairNext is the bucket an unfinished repair resumes at, 0 when none is unfinished.
 func (d *DB) AddressRepairNext(ctx context.Context) (int, error) {
 	var next int
@@ -170,8 +131,7 @@ func (d *DB) AddressRepairNext(ctx context.Context) (int, error) {
 	return next, err
 }
 
-// SetAddressRepairNext records that the buckets below next are repaired. At AddressBuckets every bucket is, and only
-// the reverted addresses are left.
+// SetAddressRepairNext records that the buckets below next are repaired.
 func (d *DB) SetAddressRepairNext(ctx context.Context, next int) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO ledger_verify_state (name, value) VALUES ($1, $2)

@@ -113,9 +113,6 @@ func TestAddressStatsRepairAndRebaseEndAtTheTruth(t *testing.T) {
 			_, err := d.RepairAddressBucket(context.Background(), bucket, 2)
 			require.NoError(t, err)
 		}
-		_, left, err := d.RepairRevertedAddresses(context.Background(), 2)
-		require.NoError(t, err)
-		require.Zero(t, left)
 	}
 	rebase := func(t *testing.T, d *DB) {
 		_, err := d.CloseLedgerSpans(context.Background(), repairLedger, 1)
@@ -258,10 +255,7 @@ func TestAddressStatsRepairResumesWhereItStopped(t *testing.T) {
 	}
 	next, err = d.AddressRepairNext(ctx)
 	require.NoError(t, err)
-	require.Equal(t, AddressBuckets, next, "every bucket done; the reverted addresses are next")
-	_, left, err := d.RepairRevertedAddresses(ctx, AddressRepairBatch)
-	require.NoError(t, err)
-	require.Zero(t, left)
+	require.Equal(t, AddressBuckets, next, "every bucket done")
 	require.NoError(t, d.FinishAddressRepair(ctx))
 	next, err = d.AddressRepairNext(ctx)
 	require.NoError(t, err)
