@@ -9,6 +9,7 @@ import (
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 )
 
 // spanCounter counts a span of blocks from the node with the head path's own block builder, writing nothing, under
@@ -21,6 +22,37 @@ type spanCounter struct {
 	// failingLo is the span whose count failed last, failures how many times in a row.
 	failingLo int64
 	failures  int
+	// unchecked is the pruned spans this recount left unchecked, by lo, and why: "undecided" or "failing".
+	unchecked map[int64]string
+}
+
+// leftUnchecked records why the span at lo was left unchecked, and publishes the count of such spans.
+func (c *spanCounter) leftUnchecked(lo int64, why string) {
+	if c.unchecked == nil {
+		c.unchecked = map[int64]string{}
+	}
+	c.unchecked[lo] = why
+	c.publishUnchecked()
+}
+
+// checked forgets the spans in [lo, hi): a settle checked them, merged into one or not.
+func (c *spanCounter) checked(lo, hi int64) {
+	for k := range c.unchecked {
+		if k >= lo && k < hi {
+			delete(c.unchecked, k)
+		}
+	}
+	c.publishUnchecked()
+}
+
+func (c *spanCounter) publishUnchecked() {
+	n := map[string]int{"undecided": 0, "failing": 0}
+	for _, why := range c.unchecked {
+		n[why]++
+	}
+	for why, k := range n {
+		metrics.SetNodeSpansUnchecked(why, k)
+	}
 }
 
 func (i *Indexer) newSpanCounter(rps int) *spanCounter {

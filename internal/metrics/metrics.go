@@ -347,6 +347,16 @@ var nodeRecountFailures = promauto.NewCounter(prometheus.CounterOpts{
 // NodeRecountFailed counts a failed pruned-span recount.
 func NodeRecountFailed() { nodeRecountFailures.Inc() }
 
+var nodeSpansUnchecked = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "indexer_ledger_node_spans_unchecked",
+	Help: "Pruned spans the node recount left unchecked since it started, by reason: undecided (the node cannot judge a contract creation) or failing (its recount failed twice in a row).",
+}, []string{"reason"})
+
+// SetNodeSpansUnchecked sets indexer_ledger_node_spans_unchecked for one reason.
+func SetNodeSpansUnchecked(reason string, n int) {
+	nodeSpansUnchecked.WithLabelValues(reason).Set(float64(n))
+}
+
 var balanceRereadsAbandoned = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "indexer_balance_rereads_abandoned_total",
 	Help: "Balances a reorg revert asked to read again that every attempt failed to read; each stays as the revert restored it until the holder's next transfer.",

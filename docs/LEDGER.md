@@ -38,6 +38,12 @@ on any drift. The ledger and the checks run with retention on or off.
 | `chain_nonce` | A sample of non-contract senders: `sent_count` against `eth_getTransactionCount` at the stored head. `sent_count` counts the types 0-4 only; on chains with system or deposit types (OP Stack 126, Arbitrum 100-106) some of those raise a nonce too, so only senders whose stored transactions are all of those types are sampled, with at most 10,000 of them. Transactions no longer stored (pruned, or counted by the stats backfill) are not checked: on such a chain a sender with another type among them can show as drifted. It starts once a full `running` cycle has recounted `sent_count`. | Alert only. |
 | `chain_span_txs` | One closed span per pass, retained or pruned: its ledger transaction total against the sum of `eth_getBlockTransactionCountByNumber`. | Alert only (`node` repairs the span). |
 
+The `node` check needs an archive node in practice. It judges a contract creation by the code at the creation's
+block, or, failing that, by code at the head; a node without old state cannot serve the first, and a contract that
+self-destructed has none at the head. Such a span stays undecided: it goes to the back of the queue unchecked. On a
+non-archive node most pruned spans can stay undecided, which `indexer_ledger_node_spans_unchecked{reason="undecided"}`
+shows.
+
 - The `running` check, and the one-off address reconciliation below, wait until the open tail (stored blocks above
   the closed spans) is at most 12,800 + 3 × `LEDGER_SPAN_BLOCKS`: before the closer has caught up they would read
   most of history every pass. A span closes only once it is 12,800 blocks (the prune floor gap) below the head, so
@@ -143,6 +149,7 @@ waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-u
 |---|---|
 | `indexer_ledger_indexes_ready` | 1 once the ledger's lookup indexes (built after startup, CONCURRENTLY) exist; while 0 the span rebase, the checks and `repair-address-stats` wait. Alert when it stays 0: a build that keeps failing keeps them off. |
 | `indexer_ledger_node_recount_failures_total` | Pruned-span recounts from the node that failed. A span whose recount fails twice in a row goes to the back of the `node` check's queue unchecked, so one block the node cannot serve does not hold the check. |
+| `indexer_ledger_node_spans_unchecked{reason}` | Pruned spans the `node` check has left unchecked since the indexer started: `undecided` (the node cannot judge a contract creation in the span) or `failing` (its recount failed twice in a row). A span leaves the count once a later recount settles it. |
 | `indexer_ledger_closed_through` | Every block at or below this is in a closed span. |
 | `indexer_ledger_close_seconds` | Time to close one span from its rows. |
 | `indexer_stats_backfill_through` | Every block at or below this is counted by the stats backfill. |

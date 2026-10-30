@@ -51,6 +51,7 @@ func (i *Indexer) RecountPrunedSpan(ctx context.Context, store prunedSpanStore, 
 		if err := store.DeferPrunedSpan(ctx, lo); err != nil {
 			return db.SpanCheck{}, false, err
 		}
+		counter.leftUnchecked(lo, "undecided")
 		return db.SpanCheck{Lo: lo, Hi: hi, State: "undecided"}, true, nil
 	}
 	if err != nil {
@@ -71,6 +72,7 @@ func (i *Indexer) RecountPrunedSpan(ctx context.Context, store prunedSpanStore, 
 		if derr := store.DeferPrunedSpan(ctx, lo); derr != nil {
 			return db.SpanCheck{}, false, errors.Join(err, derr)
 		}
+		counter.leftUnchecked(lo, "failing")
 		return db.SpanCheck{}, false, fmt.Errorf("span [%d, %d) failed %d recounts in a row, left unchecked: %w",
 			lo, hi, nodeRecountFailuresBeforeDefer, err)
 	}
@@ -78,6 +80,9 @@ func (i *Indexer) RecountPrunedSpan(ctx context.Context, store prunedSpanStore, 
 		counter.failures = 0
 	}
 	c, err := store.SettleNodeSpan(ctx, lo, hi, totals, repair)
+	if err == nil && c.State != "changed" {
+		counter.checked(lo, hi)
+	}
 	return c, err == nil, err
 }
 
