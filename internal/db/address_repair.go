@@ -99,17 +99,31 @@ func (d *DB) RepairAddressBucket(ctx context.Context, bucket, batch int) (Rebase
 	return total, d.recountPendingDays(ctx)
 }
 
-// repairAddresses rebases addresses in one transaction bounded by AddressRepairBatchTimeout, halving the batch on
-// a timeout.
+// repairAddresses rebases addresses in one transaction: the rebase lock with no deadline, then the count and the
+// writes bounded by AddressRepairBatchTimeout, halving the batch when they ran out of time.
 func (d *DB) repairAddresses(ctx context.Context, addresses []string) (RebaseResult, error) {
-	batchCtx, cancel := context.WithTimeout(ctx, repairBatchTimeout)
-	r, err := rebaseAddressBatch(batchCtx, d, addresses, addresses, nil)
-	cancel()
-	if err == nil || ctx.Err() != nil || batchCtx.Err() == nil {
+	var r RebaseResult
+	var countErr error
+	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		// The rebase lock first, with no deadline: a span close holds it for as long as its rebase takes, and a batch
+		// that only waited for it has not run long.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, 1)`, rebaseLock); err != nil {
+			return err
+		}
+		batchCtx, cancel := context.WithTimeout(ctx, repairBatchTimeout)
+		defer cancel()
+		var err error
+		r, err = rebaseAddressBatchLocked(batchCtx, tx, addresses, addresses, nil)
+		if err != nil && batchCtx.Err() != nil && ctx.Err() == nil {
+			countErr = err
+		}
+		return err
+	})
+	if err == nil || countErr == nil {
 		return r, err
 	}
 	if len(addresses) == 1 {
-		return r, fmt.Errorf("address %s: its rebase ran longer than %s: %w", addresses[0], repairBatchTimeout, err)
+		return r, fmt.Errorf("address %s: its rebase ran longer than %s: %w", addresses[0], repairBatchTimeout, countErr)
 	}
 	half := len(addresses) / 2
 	first, err := d.repairAddresses(ctx, addresses[:half])
