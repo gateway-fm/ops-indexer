@@ -51,8 +51,8 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
-	// CountersOnly builds blocks for their counters alone (stats backfill, recount of a pruned span): no token
-	// metadata or tokenURI fetches, and a failed trace fetch fails the block instead of dropping its internal calls.
+	// CountersOnly builds blocks for their counters alone (the recount of a pruned span): no token metadata or
+	// tokenURI fetches, and a creation is judged by its code at the block (contractCode).
 	CountersOnly bool
 	// StrictTraces fails a block whose traces are incomplete, a transaction's trace missing or failed, instead of
 	// leaving its internal calls out: for the counts that replace or extend the ledger (the stats backfill and the
