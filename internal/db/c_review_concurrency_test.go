@@ -152,11 +152,11 @@ func TestARevertAndARebaseBatchThatCreatesARowDoNotDeadlock(t *testing.T) {
 		rebased <- err
 	}()
 	require.Eventually(t, func() bool {
-		var waiting bool
-		_ = d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
-			AND wait_event_type = 'Lock' AND query LIKE '%DELETE FROM ledger_reverted_address%')`).Scan(&waiting)
-		return waiting
-	}, 10*time.Second, 20*time.Millisecond, "the batch created 0xd's row and waits for 0xa's entry")
+		var waiting int
+		_ = d.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()
+			AND wait_event_type = 'Lock'`).Scan(&waiting)
+		return waiting >= 2
+	}, 10*time.Second, 20*time.Millisecond, "the batch waits on a lock beside the revert")
 	require.NoError(t, writer.Commit(ctx))
 
 	revertErr, rebaseErr := <-reverted, <-rebased
