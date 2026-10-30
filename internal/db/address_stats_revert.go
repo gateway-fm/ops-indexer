@@ -47,6 +47,12 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 
 	var forgotten int64
 	for _, c := range all {
+		// The row first, in address order like every writer: the decision below then sees what a writer that held it
+		// (a stats backfill batch adding the address's earlier blocks) committed, and nothing changes it until this
+		// revert commits.
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, c.address); err != nil {
+			return 0, err
+		}
 		var first, last *int64
 		var stillSeen bool
 		if err := tx.QueryRow(ctx, `
@@ -78,10 +84,13 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 			continue
 		}
 		if last == nil {
+			// The closed ledger's rows, or the stats backfill's open span, which has not closed yet.
 			if err := tx.QueryRow(ctx, `
-				SELECT a.last_seen FROM ledger_spans s
-				CROSS JOIN LATERAL (SELECT last_seen FROM ledger_address WHERE lo = s.lo AND address = $1) a
-				ORDER BY s.lo DESC LIMIT 1`, c.address).Scan(&last); err != nil && err != pgx.ErrNoRows {
+				SELECT max(last_seen) FROM (
+					SELECT last_seen FROM ledger_address WHERE address = $1
+					UNION ALL
+					SELECT last_seen FROM ledger_stage_address WHERE lo = stats_backfill_open_span() AND address = $1
+				) l`, c.address).Scan(&last); err != nil {
 				return 0, err
 			}
 		}
