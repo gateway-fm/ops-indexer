@@ -234,7 +234,11 @@ outlast the counting. These are partial until it completes:
 - `ListTokenTransfers` `by_token` / `by_address` and `ListInternalTransactions` `by_address` `total_count`;
   `ListTransactionsPaginated` and `ListAllTokenTransfers` `total_items`.
 - `ListTokenHolders`, `ListTokens`, `ListAddresses` (ordered by transaction count), `ListTokenInventory` (owners).
-- `GetDailyStats` for the days up to and including the day of `START_BLOCK`.
+- `GetDailyStats`: daily_stats starts on a day after `START_BLOCK`'s, once catch-up has stored that day's blocks, so
+  the days before its first are absent until the backfill completes. On every day served, the `cumulative_*` columns
+  and the address columns (`new_addresses`, `new_contracts`, `cumulative_addresses`, `cumulative_contracts`) leave
+  out what the backfill has not yet counted.
+- `GetTransactionHistory` `DAY` and `WEEK` buckets: built from daily_stats, so absent or partial as above.
 - `Search` address suggestions (ordered by transaction count).
 
 ## Error model

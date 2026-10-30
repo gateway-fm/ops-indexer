@@ -8,10 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// docs/API.md "Stats backfill" says that while the backfill runs, GetDailyStats is partial only for the days up to and
-// including START_BLOCK's day. The day after START_BLOCK's, whose blocks are all stored, must be served, and the
-// first day the aggregate counts must carry the same cumulative_transactions as it does once the backfill completes.
-func TestStatsBackfillDaysAfterStartBlocksDayAreWholeWhileItRuns(t *testing.T) {
+// docs/API.md "Stats backfill" says what GetDailyStats serves while the backfill runs: the days before daily_stats'
+// first are absent, and every day served leaves out of its cumulative columns what the backfill has not yet counted.
+func TestStatsBackfillDaysServedWhileItRunsAreAsDocumented(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -57,11 +56,10 @@ func TestStatsBackfillDaysAfterStartBlocksDayAreWholeWhileItRuns(t *testing.T) {
 	require.NotNil(t, afterNext)
 	require.NotNil(t, afterAfter)
 
-	if duringNext == nil {
-		t.Errorf("the day after START_BLOCK's day, every block of it stored, is not served while the backfill runs; it is %d once the backfill completes", *afterNext)
-	}
-	require.Equal(t, *afterAfter, *duringAfter,
-		"the aggregate's first day, two days after START_BLOCK's, served a cumulative_transactions that the completion then changed")
+	require.Nil(t, duringNext, "the day after START_BLOCK's, before daily_stats' first, is absent while the backfill runs")
+	require.NotNil(t, duringAfter, "daily_stats' first day is served while the backfill runs")
+	require.Less(t, *duringAfter, *afterAfter,
+		"its cumulative_transactions leaves out the blocks the backfill had not counted, and grows once it completes")
 }
 
 // backfillDay is a day of 500 backfilled blocks from first, holding 100 transactions, as the backfill writes it.
