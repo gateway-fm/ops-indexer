@@ -89,3 +89,61 @@ func TestAddressStatsRepairWaitsOutASpanCloseRebase(t *testing.T) {
 	}
 	requireAddressStatsIsExactlyTheTruth(t, d)
 }
+
+// A reorg reverts the head block, the only retained block of an address that the stats backfill is counting below
+// START_BLOCK in the same moment. The revert reads that the address has no other block and deletes its row; the
+// delete waits for the backfill batch, which holds the row it has just added the address's earlier counts to, and
+// then deletes the row with those counts in it. The address keeps its backfilled history in the ledger stage and has
+// no address_stats row.
+func TestARevertKeepsTheCountsABackfillBatchAddsMeanwhile(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	require.NoError(t, d.InitStatsBackfill(ctx, 99, 1_700_000_099))
+	for n := 100; n <= 105; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	dormant := rebaseNewAddress(105)
+
+	first := NewSpanTotals()
+	first.Blocks = 10
+	require.NoError(t, d.CommitBackfillBatch(ctx, &BackfillBatch{From: 0, To: 10,
+		Shared: &BlockData{AddressStats: map[string]*AddressStatsDelta{}},
+		Spans:  map[uint64]*SpanTotals{0: first}, SpanHi: map[uint64]uint64{0: 100}}))
+
+	// Holds the batch below after it wrote address_stats, as a long batch takes time over its stage and days.
+	blocker, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer blocker.Rollback(context.Background())
+	_, err = blocker.Exec(ctx, `SELECT 1 FROM ledger_stage_chain WHERE lo = 0 FOR UPDATE`)
+	require.NoError(t, err)
+
+	second := NewSpanTotals()
+	second.Blocks, second.Transactions = 10, 1
+	second.Addresses[dormant] = &AddressTotals{Txs: 1, Sent: 1, FirstSeen: 15, LastSeen: 15}
+	backfilled := make(chan error, 1)
+	go func() {
+		backfilled <- d.CommitBackfillBatch(ctx, &BackfillBatch{From: 10, To: 20,
+			Shared: &BlockData{AddressStats: map[string]*AddressStatsDelta{
+				dormant: {Address: dormant, TxCountDelta: 1, SentDelta: 1, BlockNumber: 15}}},
+			Spans: map[uint64]*SpanTotals{0: second}, SpanHi: map[uint64]uint64{0: 100}})
+	}()
+	require.Eventually(t, func() bool { return lockWaiters(t, d) == 1 }, 20*time.Second, 20*time.Millisecond,
+		"the backfill batch holds the dormant address's row")
+
+	reverted := make(chan error, 1)
+	go func() { reverted <- d.DeleteBlock(ctx, 105) }()
+	require.Eventually(t, func() bool { return lockWaiters(t, d) == 2 }, 20*time.Second, 20*time.Millisecond,
+		"the revert waits for the batch's row")
+	require.NoError(t, blocker.Rollback(ctx))
+	require.NoError(t, <-backfilled)
+	require.NoError(t, <-reverted)
+
+	var txs, sent, firstSeen, lastSeen int64
+	err = d.pool.QueryRow(ctx, `SELECT tx_count, sent_count, first_seen, last_seen FROM address_stats WHERE address = $1`, dormant).
+		Scan(&txs, &sent, &firstSeen, &lastSeen)
+	require.NoError(t, err, "the dormant address keeps a row for what the backfill counted below START_BLOCK")
+	require.Equal(t, []int64{1, 1, 15, 15}, []int64{txs, sent, firstSeen, lastSeen})
+	requireAddressStatsIsExactlyTheTruth(t, d)
+}
