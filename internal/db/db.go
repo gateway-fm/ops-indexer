@@ -3,11 +3,13 @@ package db
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math/big"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
 
@@ -98,11 +100,29 @@ func (d *DB) MigrateSchema() error {
 	count := len(migrator.Migrations)
 	log.Info("migrations loaded", "count", count)
 
-	if err = migrator.Migrate(ctx); err != nil {
+	for attempt, wait := 1, migrateLockRetryWait; ; attempt, wait = attempt+1, min(2*wait, migrateLockRetryMaxWait) {
+		err = migrator.Migrate(ctx)
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "55P03" || attempt == migrateLockRetries {
+			break
+		}
+		log.Warn("a migration gave up waiting for a table lock that a reader holds; retrying", "attempt", attempt,
+			"wait", wait, "error", err)
+		time.Sleep(wait)
+	}
+	if err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 	return nil
 }
+
+// A migration that sets lock_timeout gives up a lock a reader holds rather than queue every later reader behind it
+// (SQLSTATE 55P03); MigrateSchema runs it again, up to migrateLockRetries times, waiting longer each time.
+var (
+	migrateLockRetries      = 10
+	migrateLockRetryWait    = 2 * time.Second
+	migrateLockRetryMaxWait = 30 * time.Second
+)
 
 // Reconcile re-derives the stored counters and the current-balance cache from
 // the history tables. It must run before ingest starts: its absolute writes
