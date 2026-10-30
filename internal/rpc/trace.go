@@ -36,9 +36,12 @@ type TraceConfig struct {
 	Tracer string `json:"tracer"`
 }
 
+// TraceBlockResult is one transaction's entry in a block trace. A node reports a transaction whose own trace failed
+// with an error and no result.
 type TraceBlockResult struct {
-	TxHash string    `json:"txHash"`
-	Result CallFrame `json:"result"`
+	TxHash string     `json:"txHash"`
+	Result *CallFrame `json:"result"`
+	Error  string     `json:"error"`
 }
 
 // methodAbsentSignals are the error substrings that mean the node genuinely
@@ -78,23 +81,19 @@ func (c *Client) CheckTracingSupport(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string]*CallFrame, error) {
+func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string]TraceBlockResult, error) {
 	blockHex := fmt.Sprintf("0x%x", blockNumber)
 
-	var results []struct {
-		TxHash string    `json:"txHash"`
-		Result CallFrame `json:"result"`
-	}
+	var results []TraceBlockResult
 
 	err := c.raw.CallContext(ctx, &results, "debug_traceBlockByNumber", blockHex, &TraceConfig{Tracer: "callTracer"})
 	if err != nil {
 		return nil, fmt.Errorf("debug_traceBlockByNumber failed: %w", err)
 	}
 
-	traces := make(map[string]*CallFrame)
+	traces := make(map[string]TraceBlockResult)
 	for _, r := range results {
-		result := r.Result // Copy to avoid pointer issues
-		traces[r.TxHash] = &result
+		traces[r.TxHash] = r
 	}
 
 	return traces, nil
@@ -217,14 +216,14 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 		ts := timestamp
 
 		for _, txHash := range txHashes {
-			frame, ok := blockTraces[txHash.Hex()]
-			if !ok {
+			entry, ok := blockTraces[txHash.Hex()]
+			if !ok || entry.Error != "" || entry.Result == nil {
 				if strict {
-					return nil, fmt.Errorf("block %d: no trace for transaction %s", blockNumber, txHash.Hex())
+					return nil, fmt.Errorf("block %d: no trace for transaction %s: %q", blockNumber, txHash.Hex(), entry.Error)
 				}
 				continue
 			}
-			internalTxs := FlattenCallFrame(frame, txHash.Hex(), blockNumber, &ts)
+			internalTxs := FlattenCallFrame(entry.Result, txHash.Hex(), blockNumber, &ts)
 			if len(internalTxs) > 1 { // skip root call
 				allInternalTxs = append(allInternalTxs, internalTxs[1:]...)
 			}
