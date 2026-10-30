@@ -317,10 +317,7 @@ func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
 				byAddress[dr.Key] = append(byAddress[dr.Key], dr)
 				continue
 			}
-			if err := logRepair(ctx, tx, dr); err != nil {
-				return err
-			}
-			if err := applyRunning(ctx, tx, dr); err != nil {
+			if err := settleRunning(ctx, tx, dr); err != nil {
 				return err
 			}
 		}
@@ -383,20 +380,83 @@ func logRepair(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	return err
 }
 
-func applyRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
-	expected := dr.Recount
-	if expected == nil {
-		zero := "0"
-		expected = &zero
-	}
+// runningTruth is a chain or token counter's truth: its closed ledger rows, the open stats backfill span's, and the
+// open tail's history rows, read in one statement, as ledger_running_diff_chain_token reads them for every key.
+var runningTruth = map[string]string{
+	"chain": `
+		SELECT COALESCE(sum(v), 0) FROM (
+			SELECT value AS v FROM ledger_chain WHERE name = $1
+			UNION ALL SELECT value FROM ledger_stage_chain WHERE lo = stats_backfill_open_span() AND name = $1
+			UNION ALL SELECT count(*) FROM blocks WHERE $1 = 'blocks_total' AND number >= ledger_closed_through()
+			UNION ALL SELECT count(*) FROM transactions
+				WHERE $1 = 'transactions_total' AND block_number >= ledger_closed_through()
+			UNION ALL SELECT count(*) FROM token_transfers
+				WHERE $1 = 'transfers_total' AND block_number >= ledger_closed_through()
+		) u`,
+	"token": `
+		SELECT CASE $2 WHEN 'transfers' THEN COALESCE(sum(transfers), 0) ELSE COALESCE(sum(supply), 0) END FROM (
+			SELECT transfers, supply FROM ledger_token WHERE token = $1
+			UNION ALL SELECT transfers, supply FROM ledger_stage_token WHERE lo = stats_backfill_open_span() AND token = $1
+			UNION ALL
+			SELECT count(*),
+			       COALESCE(SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+			              - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END), 0)
+			FROM token_transfers WHERE token_address = $1 AND block_number >= ledger_closed_through()
+		) u`,
+}
+
+// settleRunning puts a chain or token counter's repair on record, then sets the counter to its truth, read under the
+// counter's row lock. Moving it by the drift the check read would overshoot after a reorg revert in between, which
+// lowers the counter (stopping at zero), and the next check would quarantine the key. Every write that moves the
+// counter takes that row lock, so none commits between the read and the write. A counter that already is its truth
+// takes its repair off the record.
+func settleRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	column, ok := runningColumns[dr.Family][dr.Counter]
 	if !ok {
 		return fmt.Errorf("ledger: no running column for %s %s", dr.Family, dr.Counter)
 	}
+	var logged string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO ledger_repairs (family, key, counter, stored, repaired) VALUES ($1, $2, $3, $4::NUMERIC, $5::NUMERIC)
+		RETURNING ctid::TEXT`, dr.Family, dr.Key, dr.Counter, dr.Stored, dr.Recount).Scan(&logged); err != nil {
+		return err
+	}
 	t := runningTables[dr.Family]
 	col := pgx.Identifier{column}.Sanitize()
-	_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET %s = COALESCE(%s, 0) + ($2::NUMERIC - COALESCE($3::NUMERIC, 0)) WHERE %s = $1`,
-		t.table, col, col, t.key), dr.Key, *expected, dr.Stored)
+	var running string
+	err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT COALESCE(%s, 0)::TEXT FROM %s WHERE %s = $1 FOR UPDATE`, col, t.table, t.key),
+		dr.Key).Scan(&running)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx, `DELETE FROM ledger_repairs WHERE ctid = $1::TID`, logged)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	args := []any{dr.Key}
+	if dr.Family == "token" {
+		args = append(args, dr.Counter)
+	}
+	var truth string
+	if err := tx.QueryRow(ctx, `SELECT t::TEXT FROM (`+runningTruth[dr.Family]+`) AS truth(t)`, args...).Scan(&truth); err != nil {
+		return err
+	}
+	var same bool
+	if err := tx.QueryRow(ctx, `SELECT $1::NUMERIC = $2::NUMERIC`, running, truth).Scan(&same); err != nil {
+		return err
+	}
+	if same {
+		log.Info("ledger: a running counter was already right when its repair ran (a reorg revert in between); no repair",
+			"family", dr.Family, "key", dr.Key, "counter", dr.Counter)
+		_, err := tx.Exec(ctx, `DELETE FROM ledger_repairs WHERE ctid = $1::TID`, logged)
+		return err
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET %s = $2::NUMERIC WHERE %s = $1`, t.table, col, t.key),
+		dr.Key, truth); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE ledger_repairs SET stored = $2::NUMERIC, repaired = $3::NUMERIC WHERE ctid = $1::TID`,
+		logged, running, truth)
 	return err
 }
 
