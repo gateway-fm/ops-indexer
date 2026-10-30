@@ -115,7 +115,7 @@ SELECT (SELECT row(tx_count, sent_count, internal_tx_count, token_transfer_count
 | `LEDGER_COMPACT_SPANS` | 0 (off) | When 2 or more: per interval, that many consecutive pruned spans the `node` check verified are merged into one. Totals do not move; per-address rows shrink where an address is active in several of them; the merged span is recounted from the node over its larger range. |
 | `VERIFY_RECOUNT_INTERVAL` | 1m | One retained span and one address bucket per interval (`recount`, `running`). |
 | `VERIFY_REPAIR` | true | Whether `recount`, `running` and `node` repair. |
-| `VERIFY_NODE_RECOUNT_RPS` | 50 | Node calls per second of the `node` recount; 0 turns it off. A span costs about two calls per block, plus traces. |
+| `VERIFY_NODE_RECOUNT_RPS` | 50 | Node calls per second of the `node` recount; 0 turns it off. Every call waits for it; a receipts or trace call that falls back to one request per transaction runs those at the same rate, so the recount stays under twice the budget while one does. A span costs about two calls per block, plus traces and `eth_getCode` per contract creation. |
 | `VERIFY_CHAIN_RPS` | 20 | Node calls per second of the chain checks; 0 turns them off. |
 | `VERIFY_CHAIN_SAMPLE` | 20 | Balances and senders sampled per pass. |
 | `VERIFY_CHAIN_INTERVAL` | 1m | One chain-check pass per interval. |
@@ -133,7 +133,7 @@ waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-u
 
 | variable | default | bounds |
 |---|---|---|
-| `STATS_BACKFILL_RPS` | 100 | Node calls per second of the backfill: about two per block (block, receipts), plus traces with internal transactions indexed, `eth_getCode` per contract creation, token metadata per new token, `tokenURI` per NFT mint. The head path's `RPC_RATE_LIMIT` is separate. |
+| `STATS_BACKFILL_RPS` | 100 | Node calls per second of the backfill: about two per block (block, receipts), plus traces with internal transactions indexed, `eth_getCode` per contract creation, token metadata per new token, `tokenURI` per NFT mint. Every call waits for it; a receipts or trace call that falls back to one request per transaction runs those at the budget divided by `STATS_BACKFILL_WORKERS`, so the backfill stays under twice the budget while fallbacks run. The head path's `RPC_RATE_LIMIT` is separate. |
 | `STATS_BACKFILL_WORKERS` | 4 | Parallelism of the block fetches and of the balance reads, under that budget. |
 | `STATS_BACKFILL_BATCH_BLOCKS` | 1000 | Blocks per transaction; a restart resumes after the last committed batch. |
 

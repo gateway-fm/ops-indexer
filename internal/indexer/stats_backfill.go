@@ -35,7 +35,9 @@ const balanceKeysPerRead = 1000
 const completionRecheck = time.Minute
 
 type StatsBackfillConfig struct {
-	// RPS bounds every node call of the backfill; Workers is its fetch and balance-read parallelism under that budget.
+	// RPS is the backfill's node budget: every call waits for a token of it, and a batch call that falls back to one
+	// request per transaction runs at RPS/Workers, so the backfill stays under twice RPS while fallbacks run.
+	// Workers is its fetch and balance-read parallelism under that budget.
 	RPS, Workers int
 	BatchBlocks  uint64
 	SpanBlocks   uint64
@@ -61,10 +63,11 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	c.RPCRateLimit, c.TraceRateLimit = cfg.RPS, cfg.RPS
 	c.RPCWorkers, c.TraceWorkers, c.TokenMetadataWorkers = 1, 1, 1
 	c.StrictTraces = true
+	limiter := rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1))
 	return &backfiller{
-		idx: &Indexer{db: i.db, rpc: i.rpc, config: &c, tokenCache: i.tokenCache, contractCache: i.contractCache,
-			tracingSupported: i.tracingSupported},
-		store: store, cfg: cfg, limiter: rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1)),
+		idx: &Indexer{db: i.db, rpc: newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers), config: &c,
+			tokenCache: i.tokenCache, contractCache: i.contractCache, tracingSupported: i.tracingSupported},
+		store: store, cfg: cfg, limiter: limiter,
 	}
 }
 
@@ -86,15 +89,9 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 	g.SetLimit(max(b.cfg.Workers, 1))
 	for n := from; n < to; n++ {
 		g.Go(func() error {
-			if err := b.limiter.Wait(gctx); err != nil {
-				return err
-			}
 			raw, err := b.idx.rpc.RawBlockByNumber(gctx, n)
 			if err != nil {
 				return fmt.Errorf("block %d: %w", n, err)
-			}
-			if err := b.limiter.Wait(gctx); err != nil {
-				return err
 			}
 			receipts, err := b.idx.rpc.FetchReceiptsBatch(gctx, b.idx.receiptTxHashes(raw), 1, b.cfg.RPS, n)
 			if err != nil {
@@ -257,9 +254,6 @@ func (b *backfiller) readBalances(ctx context.Context, n int) (int, error) {
 	g.SetLimit(max(b.cfg.Workers, 1))
 	for i, k := range keys {
 		g.Go(func() error {
-			if err := b.limiter.Wait(gctx); err != nil {
-				return err
-			}
 			data := append(append([]byte{}, balanceOfSelector...), common.LeftPadBytes(common.HexToAddress(k.Address).Bytes(), 32)...)
 			out, err := b.idx.rpc.CallContract(gctx, common.HexToAddress(k.Token), data)
 			switch {

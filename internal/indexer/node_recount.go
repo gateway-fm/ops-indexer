@@ -16,7 +16,8 @@ type prunedSpanStore interface {
 }
 
 type NodeRecountConfig struct {
-	// RPS bounds every call the recount makes to the node.
+	// RPS is the recount's node budget: every call waits for a token of it, and a batch call that falls back to one
+	// request per transaction runs at RPS too, so the recount stays under twice RPS while a fallback runs.
 	RPS    int
 	Repair bool
 	// Idle is the wait when nothing is pruned or a recount failed.

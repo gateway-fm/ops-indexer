@@ -12,7 +12,7 @@ import (
 )
 
 // spanCounter counts a span of blocks from the node with the head path's own block builder, writing nothing, under
-// its own RPC budget.
+// its own RPC budget: every call its builder makes waits on limiter (limitedRPC).
 type spanCounter struct {
 	idx     *Indexer
 	limiter *rate.Limiter
@@ -25,10 +25,11 @@ func (i *Indexer) newSpanCounter(rps int) *spanCounter {
 	cfg.CountersOnly, cfg.StrictTraces = true, true
 	cfg.RPCRateLimit, cfg.TraceRateLimit = rps, rps
 	cfg.RPCWorkers, cfg.TraceWorkers = min(cfg.RPCWorkers, 4), min(cfg.TraceWorkers, 4)
+	limiter := rate.NewLimiter(rate.Limit(rps), 1)
 	return &spanCounter{
-		idx: &Indexer{db: i.db, rpc: i.rpc, config: &cfg, tokenCache: i.tokenCache, contractCache: i.contractCache,
-			tracingSupported: i.tracingSupported},
-		limiter: rate.NewLimiter(rate.Limit(rps), 1),
+		idx: &Indexer{db: i.db, rpc: newLimitedRPC(i.rpc, limiter, rps, 1), config: &cfg, tokenCache: i.tokenCache,
+			contractCache: i.contractCache, tracingSupported: i.tracingSupported},
+		limiter: limiter,
 		retry:   time.Second,
 	}
 }
@@ -65,15 +66,9 @@ func (c *spanCounter) count(ctx context.Context, lo, hi uint64) (*db.SpanTotals,
 
 // block reads and builds block n as the head path does.
 func (c *spanCounter) block(ctx context.Context, n uint64) (*db.BlockData, error) {
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
 	raw, err := c.idx.rpc.RawBlockByNumber(ctx, n)
 	if err != nil {
 		return nil, fmt.Errorf("block %d: %w", n, err)
-	}
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
 	}
 	receipts, err := c.idx.rpc.FetchReceiptsBatch(ctx, c.idx.receiptTxHashes(raw), c.idx.config.RPCWorkers, c.idx.config.RPCRateLimit, n)
 	if err != nil {
