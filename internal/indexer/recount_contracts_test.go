@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
@@ -93,4 +94,37 @@ func TestARecountJudgesAContractByItsCodeAtTheBlock(t *testing.T) {
 			require.Equal(t, c.contract, counted)
 		})
 	}
+}
+
+// deferStore is one pruned span [0, 10) to recount; it records what the recount did with it.
+type deferStore struct {
+	deferred []int64
+	settled  int
+}
+
+func (s *deferStore) NextPrunedSpan(context.Context) (int64, int64, bool, error) { return 0, 10, true, nil }
+func (s *deferStore) PrunedSpanFrom(_ context.Context, lo, _ int64) (int64, error) { return lo, nil }
+func (s *deferStore) SettleNodeSpan(context.Context, int64, int64, *db.SpanTotals, bool) (db.SpanCheck, error) {
+	s.settled++
+	return db.SpanCheck{}, nil
+}
+func (s *deferStore) DeferPrunedSpan(_ context.Context, lo int64) error {
+	s.deferred = append(s.deferred, lo)
+	return nil
+}
+
+// A span whose creation this node cannot judge (no old state, no code at the head) would fail the same way on every
+// try; it is put at the back of the queue unsettled, so the recount goes on to the other pruned spans.
+func TestARecountDefersASpanItCannotJudge(t *testing.T) {
+	chain := &creationChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 20, busy: 21}}
+	idx := NewWithConfig(nil, chain, 0, 0, &Config{RPCWorkers: 1, RPCRateLimit: 1000})
+	store := &deferStore{}
+	counter := idx.newSpanCounter(1000)
+	counter.retry = 0
+	c, ok, err := idx.RecountPrunedSpan(context.Background(), store, counter, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "undecided", c.State)
+	require.Equal(t, []int64{0}, store.deferred)
+	require.Zero(t, store.settled, "nothing settled from a guess")
 }

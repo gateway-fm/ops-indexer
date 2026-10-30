@@ -131,6 +131,13 @@ func (d *DB) SettleNodeSpan(ctx context.Context, lo, hi int64, s *SpanTotals, re
 	return c, err
 }
 
+// DeferPrunedSpan puts a pruned span its recount could not settle at the back of the recount's queue, leaving its
+// rows and its state as they are.
+func (d *DB) DeferPrunedSpan(ctx context.Context, lo int64) error {
+	_, err := d.pool.Exec(ctx, `UPDATE ledger_spans SET checked_at = now() WHERE lo = $1`, lo)
+	return err
+}
+
 // NextPrunedSpan is the pruned span checked longest ago (quarantined ones excepted); ok is false when none is pruned.
 func (d *DB) NextPrunedSpan(ctx context.Context) (lo, hi int64, ok bool, err error) {
 	err = d.pool.QueryRow(ctx, `
