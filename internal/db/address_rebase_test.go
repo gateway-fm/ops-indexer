@@ -394,10 +394,9 @@ func TestTwoRebasesOfOneAddressCorrectItOnce(t *testing.T) {
 	requireAddressStatsIsTheTruth(t, d)
 }
 
-// repair-address-stats: its corrections are staged at one snapshot and applied by later runs, and in this
-// version rebases run in between, so a stage left by an earlier run may hold corrections a rebase has applied since.
-// A new run stages again instead of applying it.
-func TestRepairAddressStatsStagesAgainAfterARebase(t *testing.T) {
+// A stage an earlier release's repair left may hold corrections a rebase has applied since: applying it would correct
+// the row twice. The repair drops it and recounts every address against its truth.
+func TestRepairAddressStatsAfterARebaseCorrectsOnce(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -406,18 +405,14 @@ func TestRepairAddressStatsStagesAgainAfterARebase(t *testing.T) {
 	}
 	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = $1`, rebaseHot)
 	require.NoError(t, err)
-	_, err = d.StageAddressStatsRepair(ctx, false)
-	require.NoError(t, err, "an earlier run staged the correction and stopped")
+	stageAsTheEarlierRelease(t, d)
 	_, err = d.RebaseAddresses(ctx, []string{rebaseHot}, nil)
 	require.NoError(t, err, "a span close corrected the row since")
 
-	_, err = d.StageAddressStatsRepair(ctx, false)
-	require.NoError(t, err, "the next run stages again")
-	for done := false; !done; {
-		_, _, done, err = d.ApplyAddressStatsRepairBatch(ctx, 100)
-		require.NoError(t, err)
-	}
-	requireAddressStatsIsTheTruth(t, d)
+	require.NoError(t, d.DropAddressStatsRepairStage(ctx))
+	r := repairUntilDone(t, d)
+	require.Zero(t, r.Changed+r.Created+r.Removed, "nothing left to correct")
+	requireAddressStatsIsExactlyTheTruth(t, d)
 }
 
 // A first_seen already too low (1, against a first block of 4) stays put when catch-up stores the address's

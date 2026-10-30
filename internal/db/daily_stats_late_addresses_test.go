@@ -149,11 +149,6 @@ func TestRepairAddressStatsRecountsTheDaysAddressColumns(t *testing.T) {
 		require.NoError(t, d.InsertBlockDataBatch(ctx, data))
 	}
 	advanceUntilStable(t, d)
-	_, err := d.StageAddressStatsRepair(ctx, false)
-	require.NoError(t, err)
-	for done := false; !done; {
-		_, _, done, err = d.ApplyAddressStatsRepairBatch(ctx, 7)
-		require.NoError(t, err)
-	}
+	repairUntilDone(t, d)
 	requireAddressColumnsFollowTheBlocks(t, d)
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"os"
 	"os/signal"
@@ -12,83 +11,102 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/log"
 )
 
-// maxStaleRestages is how many times one run stages again after reorgs made its stage stale before it stops.
-const maxStaleRestages = 10
-
-// runRepairAddressStats is `indexer repair-address-stats [--batch N] [--dry-run]` (PRST-5393): address_stats set to
-// what the closed ledger plus the retained rows above it say, as additive corrections in sorted batches, next to
-// the live indexer. --dry-run stages in a rolled-back transaction and prints what would change. A stopped run
-// resumes: its staged corrections stay in address_stats_repair until applied, and a stage that lost corrections
-// before they were applied is staged again, as is one a reorg made stale.
+// runRepairAddressStats is `indexer repair-address-stats [--batch N] [--dry-run]` (PRST-5393): every address_stats row
+// set to its truth, the closed ledger plus the open stats backfill span plus the rows above the closed spans, bucket
+// by bucket through the span rebase, next to the live indexer. A row is created for an address with a truth and
+// removed for one without. A stopped run resumes at the bucket it stopped in. --dry-run reads and prints what each
+// bucket would change, and writes nothing.
 func runRepairAddressStats(args []string, database *db.DB) int {
 	fs := flag.NewFlagSet("repair-address-stats", flag.ExitOnError)
-	batch := fs.Int("batch", 1000, "addresses per transaction")
-	dry := fs.Bool("dry-run", false, "print how many addresses would change and the largest corrections; change nothing")
+	batch := fs.Int("batch", db.AddressRepairBatch, "addresses per transaction (1-1000)")
+	dry := fs.Bool("dry-run", false, "print what each address bucket would change; write nothing")
 	_ = fs.Parse(args)
+	if *batch < 1 || *batch > 1000 {
+		log.Error("repair-address-stats: --batch must be 1-1000", "batch", *batch)
+		return 1
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	release, err := database.HoldRebaseLock(ctx)
+	staged, err := database.AddressStatsRepairStageExists(ctx)
 	if err != nil {
-		log.Error("repair-address-stats: could not take the rebase lock", "error", err)
+		log.Error("repair-address-stats: could not check for an earlier release's stage", "error", err)
 		return 1
 	}
-	defer release()
-
-	var applied, created, batches, stale int
-	for restaged := 0; ; restaged++ {
-		stage, err := database.StageAddressStatsRepair(ctx, *dry)
-		switch {
-		case err != nil:
-			log.Error("repair-address-stats: staging failed", "error", err)
+	if *dry {
+		return dryRunRepairAddressStats(ctx, database, staged)
+	}
+	if staged {
+		if err := database.DropAddressStatsRepairStage(ctx); err != nil {
+			log.Error("repair-address-stats: could not drop an earlier release's stage", "error", err)
 			return 1
-		default:
-			log.Info("repair-address-stats: staged", "dry_run", *dry, "ledger_closed_below", stage.LedgerClosedBelow, "head", stage.Head,
-				"addresses_to_change", stage.Changes, "missing_rows", stage.Missing, "rows_unknown_to_ledger_left_as_is", stage.Untouched)
-			for _, c := range stage.Largest {
-				log.Info("repair-address-stats: correction", "address", c.Address, "tx_count", c.Txs, "internal_tx_count", c.Internal,
-					"token_transfer_count", c.Transfers, "first_seen", c.FirstSeen, "last_seen", c.LastSeen, "missing", c.Missing)
-			}
-			if *dry {
-				return 0
-			}
 		}
+		log.Warn("repair-address-stats: dropped an earlier release's stage; this run recounts every address instead")
+	}
 
-		lost := false
-		for {
-			n, c, done, err := database.ApplyAddressStatsRepairBatch(ctx, *batch)
-			if errors.Is(err, db.ErrAddressStatsRepairLost) && restaged-stale < 2 {
-				log.Warn("repair-address-stats: staging again", "applied", applied, "error", err)
-				lost = true
-				break
-			}
-			if errors.Is(err, db.ErrAddressStatsRepairStale) {
-				if stale++; stale <= maxStaleRestages {
-					log.Warn("repair-address-stats: a reorg ran since the stage; staging again", "applied", applied, "error", err)
-					lost = true
-					break
-				}
-				log.Error("repair-address-stats: stopped; reorgs kept making the stage stale, rerun", "applied", applied,
-					"restaged", maxStaleRestages, "error", err)
-				return 1
-			}
-			if err != nil {
-				log.Error("repair-address-stats: stopped; rerun to resume", "applied", applied, "error", err)
-				return 1
-			}
-			applied, created, batches = applied+n, created+c, batches+1
-			if done {
-				break
-			}
-			if batches%100 == 0 {
-				log.Info("repair-address-stats: progress", "applied", applied, "created", created)
-			}
+	from, err := database.AddressRepairNext(ctx)
+	if err != nil {
+		log.Error("repair-address-stats: could not read where an earlier run stopped", "error", err)
+		return 1
+	}
+	if from > 0 {
+		log.Info("repair-address-stats: resuming", "bucket", from)
+	}
+	var total db.RebaseResult
+	for bucket := from; bucket < db.AddressBuckets; bucket++ {
+		r, err := database.RepairAddressBucket(ctx, bucket, *batch)
+		total.Changed, total.Created, total.Removed = total.Changed+r.Changed, total.Created+r.Created, total.Removed+r.Removed
+		if err != nil {
+			log.Error("repair-address-stats: stopped; rerun to resume", "bucket", bucket, "error", err)
+			return 1
 		}
-		if !lost {
-			break
+		if err := database.SetAddressRepairNext(ctx, bucket+1); err != nil {
+			log.Error("repair-address-stats: stopped; rerun to resume", "bucket", bucket, "error", err)
+			return 1
+		}
+		if r.Changed+r.Created+r.Removed > 0 || bucket%16 == 15 {
+			log.Info("repair-address-stats: bucket repaired", "bucket", bucket, "corrected", r.Changed-r.Created,
+				"created", r.Created, "removed", r.Removed)
 		}
 	}
-	log.Info("repair-address-stats: done", "applied", applied, "created", created)
+	r, left, err := database.RepairRevertedAddresses(ctx, *batch)
+	total.Changed, total.Created, total.Removed = total.Changed+r.Changed, total.Created+r.Created, total.Removed+r.Removed
+	if err != nil {
+		log.Error("repair-address-stats: stopped; rerun to resume", "step", "reverted addresses", "error", err)
+		return 1
+	}
+	if left > 0 {
+		log.Warn("repair-address-stats: reverts kept landing; the next span close rebases the addresses they recorded",
+			"addresses", left)
+	}
+	if err := database.FinishAddressRepair(ctx); err != nil {
+		log.Error("repair-address-stats: stopped; rerun to resume", "step", "finish", "error", err)
+		return 1
+	}
+	log.Info("repair-address-stats: done", "corrected", total.Changed-total.Created, "created", total.Created,
+		"removed", total.Removed)
+	return 0
+}
+
+func dryRunRepairAddressStats(ctx context.Context, database *db.DB, staged bool) int {
+	if staged {
+		log.Warn("repair-address-stats: an earlier release left a repair stage; a run drops it")
+	}
+	var changed, missing, noTruth int
+	for bucket := 0; bucket < db.AddressBuckets; bucket++ {
+		drift, err := database.AddressRepairDriftIn(ctx, bucket)
+		if err != nil {
+			log.Error("repair-address-stats: dry run failed", "bucket", bucket, "error", err)
+			return 1
+		}
+		changed, missing, noTruth = changed+drift.Changed, missing+drift.Missing, noTruth+drift.NoTruth
+		if len(drift.Addresses) > 0 {
+			log.Info("repair-address-stats: bucket would change", "bucket", bucket, "rows_to_correct", drift.Changed,
+				"rows_to_create", drift.Missing, "rows_to_remove", drift.NoTruth)
+		}
+	}
+	log.Info("repair-address-stats: dry run", "rows_to_correct", changed, "rows_to_create", missing,
+		"rows_to_remove", noTruth)
 	return 0
 }

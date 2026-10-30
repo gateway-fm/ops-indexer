@@ -66,6 +66,7 @@ func revertTestBlock(number uint64, hash string, txs []revertTx) *BlockData {
 		for address := range touched {
 			delta(address).TxCountDelta++
 		}
+		delta(tx.from).SentDelta++
 		if tx.creates != "" {
 			bd.Contracts = append(bd.Contracts, &types.Contract{Address: tx.creates, Creator: tx.from, CreationTx: txHash, BlockNumber: number})
 			delta(tx.creates).IsContract = true

@@ -161,7 +161,8 @@ func TestAddressStatsRepairRestoresBothErrorsFromTheLedger(t *testing.T) {
 	require.Positive(t, wm, "history below the window is pruned")
 
 	_, err = d.pool.Exec(ctx, `
-		WITH ranked AS (SELECT address, row_number() OVER (ORDER BY address) AS r FROM address_stats)
+		WITH ranked AS (SELECT address, row_number() OVER (ORDER BY address) AS r FROM address_stats
+		                WHERE address <> '0x0000000000000000000000000000000000000000')
 		UPDATE address_stats a SET
 			tx_count = CASE WHEN r <= 20 THEN a.tx_count - 1 - r % 3 ELSE a.tx_count + 3 END,
 			token_transfer_count = CASE WHEN r <= 20 THEN a.token_transfer_count ELSE a.token_transfer_count + 2 END,
@@ -183,39 +184,39 @@ func TestAddressStatsRepairRestoresBothErrorsFromTheLedger(t *testing.T) {
 	require.Len(t, deleted, 5)
 	broken := addressStatsNow(t, d)
 
-	dry, err := d.StageAddressStatsRepair(ctx, true)
-	require.NoError(t, err)
-	require.EqualValues(t, 35, dry.Changes, "20 undercounted, 10 double counted, 5 missing")
-	require.EqualValues(t, 5, dry.Missing)
-	require.Zero(t, dry.Untouched)
-	require.Len(t, dry.Largest, 10)
+	dryRun := func() AddressRepairDrift {
+		var all AddressRepairDrift
+		for bucket := 0; bucket < AddressBuckets; bucket++ {
+			drift, err := d.AddressRepairDriftIn(ctx, bucket)
+			require.NoError(t, err)
+			all.Changed, all.Missing, all.NoTruth = all.Changed+drift.Changed, all.Missing+drift.Missing, all.NoTruth+drift.NoTruth
+		}
+		return all
+	}
+	require.Equal(t, AddressRepairDrift{Changed: 30, Missing: 5}, dryRun(), "20 undercounted, 10 double counted, 5 missing")
 	require.Equal(t, broken, addressStatsNow(t, d), "a dry run changes nothing")
 
-	stage, err := d.StageAddressStatsRepair(ctx, false)
-	require.NoError(t, err)
-	require.EqualValues(t, 35, stage.Changes)
-	stage, err = d.StageAddressStatsRepair(ctx, false)
-	require.NoError(t, err)
-	require.EqualValues(t, 35, stage.Changes, "an earlier run's stage is staged again, the same while nothing applied it")
+	created := 0
+	for bucket := 0; bucket < AddressBuckets/2; bucket++ {
+		r, err := d.RepairAddressBucket(ctx, bucket, 7)
+		require.NoError(t, err)
+		created += r.Created
+	}
 
 	seedVariedHistory(t, d, 80_002, 80_002)
 	ingested := countsFromRows(t, d, 80_002, 80_003)
 	addCounts(t, d, ingested)
+	_, err = d.pool.Exec(ctx, `
+		UPDATE address_stats a SET sent_count = a.sent_count + x.n
+		FROM (SELECT from_address, count(*) AS n FROM transactions WHERE block_number = 80002 AND tx_type BETWEEN 0 AND 4
+		      GROUP BY from_address) x
+		WHERE a.address = x.from_address`)
+	require.NoError(t, err, "ingest counts the block's senders' transactions")
 
-	for i := 0; i < 2; i++ {
-		applied, _, done, err := d.ApplyAddressStatsRepairBatch(ctx, 7)
+	for bucket := AddressBuckets / 2; bucket < AddressBuckets; bucket++ {
+		r, err := d.RepairAddressBucket(ctx, bucket, 7)
 		require.NoError(t, err)
-		require.Equal(t, 7, applied)
-		require.False(t, done)
-	}
-	created := 0
-	for {
-		_, c, done, err := d.ApplyAddressStatsRepairBatch(ctx, 7)
-		require.NoError(t, err)
-		created += c
-		if done {
-			break
-		}
+		created += r.Created
 	}
 	require.Equal(t, merged(truth, ingested), addressStatsNow(t, d), "equal to a full recount, with the block ingested meanwhile")
 	recreatedByIngest := 0
@@ -230,7 +231,5 @@ func TestAddressStatsRepairRestoresBothErrorsFromTheLedger(t *testing.T) {
 		SELECT (SELECT count FROM chain_counters WHERE name = 'addresses_total'), (SELECT count(*) FROM address_stats)`).Scan(&total, &stored))
 	require.Equal(t, stored, total, "the restored addresses are counted")
 
-	again, err := d.StageAddressStatsRepair(ctx, true)
-	require.NoError(t, err)
-	require.Zero(t, again.Changes, "a second repair finds nothing")
+	require.Equal(t, AddressRepairDrift{}, dryRun(), "a second repair finds nothing")
 }

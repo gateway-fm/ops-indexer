@@ -13,7 +13,7 @@ import (
 // rebaseBatch is how many addresses one rebase transaction recounts.
 const rebaseBatch = 1000
 
-// rebaseLock serializes rebases, and repair-address-stats, among themselves (advisory lock key).
+// rebaseLock serializes rebases among themselves (advisory lock key).
 const rebaseLock = 4674
 
 // RebaseResult is what a rebase changed: rows set to a different value, rows it created, rows it removed, and the
@@ -123,6 +123,9 @@ func rebaseAddressBatch(ctx context.Context, d *DB, batch, create []string,
 	return r, err
 }
 
+// rebaseReadHook, when a test sets it, runs between a batch's read and its first write.
+var rebaseReadHook func(batch []string)
+
 func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []string,
 	inBatch func(ctx context.Context, tx pgx.Tx, batch []string) error) (RebaseResult, error) {
 	creatable := make(map[string]bool, len(create))
@@ -151,6 +154,9 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 	})
 	if err != nil {
 		return RebaseResult{}, err
+	}
+	if rebaseReadHook != nil {
+		rebaseReadHook(batch)
 	}
 	return applyRebaseRows(ctx, tx, read, func(ctx context.Context, tx pgx.Tx) error {
 		if inBatch == nil {
@@ -305,24 +311,6 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 		return nil
 	}()
 	return r, err
-}
-
-// HoldRebaseLock takes the rebase lock for the caller's whole run, on a connection of its own, and returns its
-// release: repair-address-stats stages corrections at one snapshot and applies them batch by batch afterwards, so a
-// rebase in between would correct the same rows again.
-func (d *DB) HoldRebaseLock(ctx context.Context) (release func(), err error) {
-	conn, err := d.pool.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, 1)`, rebaseLock); err != nil {
-		conn.Release()
-		return nil, err
-	}
-	return func() {
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, 1)`, rebaseLock)
-		conn.Release()
-	}, nil
 }
 
 // rebasePendingSpans rebases the addresses of every closed span not rebased yet, oldest first, together with the

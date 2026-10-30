@@ -36,11 +36,15 @@ func countersExact(t *testing.T, url, label string) {
 	d, err := db.New(url)
 	require.NoError(t, err)
 	defer d.Close()
-	s, err := d.StageAddressStatsRepair(ctx, true)
-	require.NoError(t, err)
-	t.Logf("%s: counters off=%v address_stats wrong=%d", label, bad, s.Changes)
+	wrong := 0
+	for bucket := 0; bucket < db.AddressBuckets; bucket++ {
+		drift, err := d.AddressRepairDriftIn(ctx, bucket)
+		require.NoError(t, err)
+		wrong += len(drift.Addresses)
+	}
+	t.Logf("%s: counters off=%v address_stats wrong=%d", label, bad, wrong)
 	require.Empty(t, bad, label)
-	require.Zero(t, s.Changes, "%s: address_stats equals the recount", label)
+	require.Zero(t, wrong, "%s: address_stats equals the recount", label)
 }
 
 // Block writes whose COMMIT ack is lost, or that fail before committing, while the indexer ingests (catch-up on a

@@ -2243,10 +2243,14 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		return fmt.Errorf("failed to mark the wipe as in progress: %w", err)
 	}
 	// A refill or repair staged from the old chain must not be applied to the new one. Dropped before chain_counters
-	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count.
+	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count; and an
+	// unfinished repair of the old chain's addresses is not resumed part way into the new one.
 	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable+", "+
 		addressStatsRepairTotalTable); err != nil {
 		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
+	}
+	if _, err := d.pool.Exec(ctx, `DELETE FROM ledger_verify_state WHERE name = $1`, addressRepairCursor); err != nil {
+		return fmt.Errorf("failed to forget an unfinished address_stats repair: %w", err)
 	}
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we

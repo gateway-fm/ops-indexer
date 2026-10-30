@@ -1,0 +1,288 @@
+package db
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/require"
+)
+
+// addressStatsAgainstTheTruth lists every address whose address_stats row and truth disagree: a row with no truth, a
+// truth with no row, or any counter or block that differs. The addresses are read from the rows, the closed ledger
+// and every history table, not from the repair's own diff.
+func addressStatsAgainstTheTruth(t *testing.T, d *DB) []string {
+	t.Helper()
+	rows, err := d.pool.Query(context.Background(), `
+		WITH c AS (
+			SELECT array_agg(DISTINCT address) AS all FROM (
+				SELECT address FROM address_stats UNION ALL SELECT address FROM ledger_address
+				UNION ALL SELECT from_address FROM transactions UNION ALL SELECT to_address FROM transactions
+				UNION ALL SELECT from_address FROM token_transfers UNION ALL SELECT to_address FROM token_transfers
+				UNION ALL SELECT from_address FROM internal_transactions UNION ALL SELECT to_address FROM internal_transactions
+				UNION ALL SELECT address FROM contracts
+			) u WHERE address IS NOT NULL AND address <> '0x0000000000000000000000000000000000000000'
+		), t AS (SELECT x.* FROM c, ledger_address_truth(c.all) x)
+		SELECT concat_ws(' ', COALESCE(s.address, t.address),
+		                 'row', s.tx_count, s.sent_count, s.internal_tx_count, s.token_transfer_count, s.first_seen, s.last_seen,
+		                 'truth', t.txs, t.sent, t.internal, t.transfers, t.first_seen, t.last_seen)
+		FROM (SELECT * FROM address_stats WHERE address <> '0x0000000000000000000000000000000000000000') s
+		FULL JOIN t ON t.address = s.address
+		WHERE s.address IS NULL OR t.address IS NULL
+		   OR (s.tx_count, s.sent_count, s.internal_tx_count, s.token_transfer_count, s.first_seen, s.last_seen)
+		      IS DISTINCT FROM (t.txs, t.sent, t.internal, t.transfers, t.first_seen, t.last_seen)
+		ORDER BY 1`)
+	require.NoError(t, err)
+	differ, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	return differ
+}
+
+func requireAddressStatsIsExactlyTheTruth(t *testing.T, d *DB) {
+	t.Helper()
+	require.Empty(t, addressStatsAgainstTheTruth(t, d))
+}
+
+// repairFixture is blocks 1..250 with two closed spans below 201, a retained tail above, block 13501 at the head
+// (the one a reorg can reach), and five kinds of drift:
+// an overcount, an undercount (one of them at the head), sent_count alone, a missing row and a row no block backs.
+func repairFixture(t *testing.T) (*DB, context.Context) {
+	t.Helper()
+	d, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	for n := 1; n <= 250; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, rebaseBlock(n)))
+	}
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xempty' || g, '0xempty' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(251, 13500) g`)
+	require.NoError(t, err)
+	head := rebaseBlock(13501)
+	head.Block.ParentHash = "0xempty13500"
+	require.NoError(t, d.InsertBlockDataBatch(ctx, head))
+	closed, err := d.CloseLedgerSpans(ctx, repairLedger, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, closed)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+
+	_, err = d.pool.Exec(ctx, fmt.Sprintf(`
+		UPDATE address_stats SET tx_count = tx_count + 5 WHERE address = '%s';
+		UPDATE address_stats SET tx_count = tx_count - 1, last_seen = 1 WHERE address = '%s';
+		UPDATE address_stats SET sent_count = sent_count + 3 WHERE address = '%s';
+		DELETE FROM address_stats WHERE address = '%s';
+		UPDATE address_stats SET tx_count = 0 WHERE address = '%s';
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
+		VALUES ('0x00000000000000000000000000000000000dead0', 4, 0, 0, 2, 7, 9, false, NOW())`,
+		rebaseHot, rebaseNewAddress(10), rebaseNewAddress(20), rebaseNewAddress(240), rebaseNewAddress(13501)))
+	require.NoError(t, err)
+	require.Len(t, addressStatsAgainstTheTruth(t, d), 6)
+	return d, ctx
+}
+
+// replacementHash is the hash of the block reorgTail stores in place of the head.
+const replacementHash = "0xrbfork13501"
+
+var repairLedger = LedgerConfig{SpanBlocks: 100, FirstBlock: 1, WorkMem: "64MB"}
+
+// reorgTail reverts the head, block 13501, and stores a replacement whose second transaction comes from another address.
+func reorgTail(t *testing.T, d *DB) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, d.DeleteBlock(ctx, 13501))
+	replacement := rebaseBlock(13501)
+	other := fmt.Sprintf("0x%040x", 0x2000+13501)
+	replacement.Block.Hash = replacementHash
+	replacement.Transactions[0].Hash, replacement.Transactions[1].Hash = "0xrtfork13501a", "0xrtfork13501b"
+	replacement.Transactions[0].To, replacement.Transactions[1].From = &other, other
+	delete(replacement.AddressStats, rebaseNewAddress(13501))
+	replacement.AddressStats[other] = &AddressStatsDelta{Address: other, TxCountDelta: 2, SentDelta: 1, BlockNumber: 13501}
+	require.NoError(t, d.InsertBlockDataBatch(ctx, replacement))
+}
+
+// After any order of the repair and a span rebase, with a reorg at any point of the repair, address_stats is the truth
+// for every address, and stays it through the next block and the next reorg.
+func TestAddressStatsRepairAndRebaseEndAtTheTruth(t *testing.T) {
+	repair := func(t *testing.T, d *DB) {
+		for bucket := 0; bucket < AddressBuckets; bucket++ {
+			_, err := d.RepairAddressBucket(context.Background(), bucket, 2)
+			require.NoError(t, err)
+		}
+		_, left, err := d.RepairRevertedAddresses(context.Background(), 2)
+		require.NoError(t, err)
+		require.Zero(t, left)
+	}
+	rebase := func(t *testing.T, d *DB) {
+		_, err := d.CloseLedgerSpans(context.Background(), repairLedger, 1)
+		require.NoError(t, err)
+	}
+	orders := map[string]func(t *testing.T, d *DB){
+		"repair then rebase": func(t *testing.T, d *DB) { repair(t, d); rebase(t, d) },
+		"rebase then repair": func(t *testing.T, d *DB) { rebase(t, d); repair(t, d) },
+		"together": func(t *testing.T, d *DB) {
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); repair(t, d) }()
+			go func() { defer wg.Done(); rebase(t, d) }()
+			wg.Wait()
+		},
+	}
+	reorgs := map[string]func(t *testing.T, d *DB){
+		"no reorg": func(*testing.T, *DB) {},
+		"before":   reorgTail,
+		"between batches": func(t *testing.T, d *DB) {
+			var mu sync.Mutex
+			reads := 0
+			rebaseReadHook = func([]string) {
+				mu.Lock()
+				defer mu.Unlock()
+				if reads++; reads == 3 {
+					reorgTail(t, d)
+				}
+			}
+		},
+		"between a batch's read and its writes": func(t *testing.T, d *DB) {
+			onceBetweenReadAndWrite(t, func() { reorgTail(t, d) })
+		},
+	}
+	for order, run := range orders {
+		for when, reorg := range reorgs {
+			t.Run(order+", reorg "+when, func(t *testing.T) {
+				d, ctx := repairFixture(t)
+				t.Cleanup(func() { rebaseReadHook = nil })
+				reorg(t, d)
+				run(t, d)
+				rebaseReadHook = nil
+				requireAddressStatsIsExactlyTheTruth(t, d)
+
+				next := rebaseBlock(13502)
+				next.Block.ParentHash = replacementHash
+				require.NoError(t, d.InsertBlockDataBatch(ctx, next))
+				requireAddressStatsIsExactlyTheTruth(t, d)
+				require.NoError(t, d.DeleteBlock(ctx, 13502))
+				requireAddressStatsIsExactlyTheTruth(t, d)
+			})
+		}
+	}
+}
+
+// The repair corrects every kind of drift: the row no block backs is removed and the missing row created.
+func TestAddressStatsRepairCorrectsEveryKindOfDrift(t *testing.T) {
+	d, ctx := repairFixture(t)
+	r := repairUntilDone(t, d)
+	require.Equal(t, RebaseResult{Changed: 5, Created: 1, Removed: 1}, RebaseResult{Changed: r.Changed, Created: r.Created, Removed: r.Removed},
+		"four rows corrected and one created are written; one removed")
+	requireAddressStatsIsExactlyTheTruth(t, d)
+	var drifted int
+	for bucket := 0; bucket < AddressBuckets; bucket++ {
+		drift, err := d.AddressRepairDriftIn(ctx, bucket)
+		require.NoError(t, err)
+		drifted += len(drift.Addresses)
+	}
+	require.Zero(t, drifted)
+}
+
+// tableChecksums is an md5 of every row of every table in the schema, by table.
+func tableChecksums(t *testing.T, d *DB) map[string]string {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := d.pool.Query(ctx, `SELECT tablename FROM pg_tables WHERE schemaname = current_schema() ORDER BY 1`)
+	require.NoError(t, err)
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	sums := map[string]string{}
+	for _, table := range tables {
+		var sum string
+		require.NoError(t, d.pool.QueryRow(ctx, fmt.Sprintf(
+			`SELECT COALESCE(md5(string_agg(x::TEXT, '|' ORDER BY x::TEXT)), '') FROM %s x`, pgx.Identifier{table}.Sanitize())).Scan(&sum))
+		sums[table] = sum
+	}
+	return sums
+}
+
+// --dry-run reads only: every table is byte-identical after it, a stage an earlier release left included.
+func TestAddressStatsRepairDryRunWritesNothing(t *testing.T) {
+	d, ctx := repairFixture(t)
+	stageAsTheEarlierRelease(t, d)
+	require.NoError(t, d.SetAddressRepairNext(ctx, 7))
+	before := tableChecksums(t, d)
+	var found AddressRepairDrift
+	for bucket := 0; bucket < AddressBuckets; bucket++ {
+		drift, err := d.AddressRepairDriftIn(ctx, bucket)
+		require.NoError(t, err)
+		found.Changed, found.Missing, found.NoTruth = found.Changed+drift.Changed, found.Missing+drift.Missing, found.NoTruth+drift.NoTruth
+	}
+	require.Equal(t, AddressRepairDrift{Changed: 4, Missing: 1, NoTruth: 1}, found)
+	require.Equal(t, before, tableChecksums(t, d))
+}
+
+// A stage the earlier release left, half applied when its process died, is dropped; the repair then corrects what the
+// applied half did along with everything else.
+func TestAddressStatsRepairDropsAnEarlierReleasesStage(t *testing.T) {
+	d, ctx := repairFixture(t)
+	stageAsTheEarlierRelease(t, d)
+	_, err := d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count - 4 WHERE address = $1`, rebaseNewAddress(30))
+	require.NoError(t, err, "the half the earlier run applied")
+	require.True(t, repairStageExists(t, d))
+
+	require.NoError(t, d.DropAddressStatsRepairStage(ctx))
+	require.False(t, repairStageExists(t, d))
+	repairUntilDone(t, d)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+}
+
+// A repair stopped part way resumes at the bucket after the last one it finished, and its place is forgotten once it
+// has walked every bucket.
+func TestAddressStatsRepairResumesWhereItStopped(t *testing.T) {
+	d, ctx := repairFixture(t)
+	next, err := d.AddressRepairNext(ctx)
+	require.NoError(t, err)
+	require.Zero(t, next)
+	for bucket := 0; bucket < 100; bucket++ {
+		_, err := d.RepairAddressBucket(ctx, bucket, AddressRepairBatch)
+		require.NoError(t, err)
+		require.NoError(t, d.SetAddressRepairNext(ctx, bucket+1))
+	}
+	next, err = d.AddressRepairNext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 100, next)
+	for bucket := next; bucket < AddressBuckets; bucket++ {
+		_, err := d.RepairAddressBucket(ctx, bucket, AddressRepairBatch)
+		require.NoError(t, err)
+		require.NoError(t, d.SetAddressRepairNext(ctx, bucket+1))
+	}
+	next, err = d.AddressRepairNext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, AddressBuckets, next, "every bucket done; the reverted addresses are next")
+	_, left, err := d.RepairRevertedAddresses(ctx, AddressRepairBatch)
+	require.NoError(t, err)
+	require.Zero(t, left)
+	require.NoError(t, d.FinishAddressRepair(ctx))
+	next, err = d.AddressRepairNext(ctx)
+	require.NoError(t, err)
+	require.Zero(t, next)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+}
+
+// A batch that runs past AddressRepairBatchTimeout is split and run again; it is never left half applied.
+func TestAddressStatsRepairSplitsABatchThatRunsOutOfTime(t *testing.T) {
+	d, ctx := repairFixture(t)
+	repairBatchTimeout = 300 * time.Millisecond
+	slow := 0
+	rebaseReadHook = func(batch []string) {
+		if len(batch) > 1 {
+			slow++
+			time.Sleep(2 * repairBatchTimeout)
+		}
+	}
+	t.Cleanup(func() { rebaseReadHook, repairBatchTimeout = nil, AddressRepairBatchTimeout })
+	for bucket := 0; bucket < AddressBuckets; bucket++ {
+		_, err := d.RepairAddressBucket(ctx, bucket, 2)
+		require.NoError(t, err)
+	}
+	require.NotZero(t, slow)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+}

@@ -13,8 +13,8 @@ import (
 // block has seen loses its row. Every address is recorded for the next span rebase, which corrects whatever the
 // subtraction could not; an address already recorded is recorded again, as a new row version, so a rebase that read the
 // earlier one does not clear it. It returns the number of rows removed.
-// It first adds one to the address_stats_reverts counter, before any address_stats row, which makes a staged repair
-// stale (ApplyAddressStatsRepairBatch).
+// It first adds one to the address_stats_reverts counter, before any address_stats row: after a rollback to the
+// earlier release, its staged repair compares that counter (addressStatsRevertsCounter).
 func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, error) {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO chain_counters (name, count, updated_at) VALUES ($1, 1, NOW())
