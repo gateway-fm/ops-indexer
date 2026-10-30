@@ -34,8 +34,11 @@ type BalanceWorkerPool struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 
-	// epoch is the reorg epoch stamped on new work (SetEpoch).
-	epoch atomic.Int64
+	// epoch is the reorg epoch stamped on new work (SetEpoch). epochGate is held for writing from the start of a
+	// revert until its epoch is read, and for reading while work is stamped, so no work is stamped with the epoch from
+	// before a revert once the revert has begun.
+	epoch     atomic.Int64
+	epochGate sync.RWMutex
 
 	// sendMu guards workChan's close against concurrent sends; closed is set under its write lock by Stop.
 	sendMu   sync.RWMutex
@@ -144,12 +147,24 @@ func (p *BalanceWorkerPool) SetEpoch(e int64) {
 	}
 }
 
-// stamped is work with the pool's current reorg epoch when it carries none.
+// stamped is work with the pool's current reorg epoch when it carries none; it waits while a revert's epoch is being
+// read.
 func (p *BalanceWorkerPool) stamped(work BalanceWork) BalanceWork {
 	if work.Epoch == 0 {
+		p.epochGate.RLock()
 		work.Epoch = p.epoch.Load()
+		p.epochGate.RUnlock()
 	}
 	return work
+}
+
+// holdEpoch makes new work wait for its stamp until releaseEpoch: a revert is under way and its epoch is not read yet.
+func (p *BalanceWorkerPool) holdEpoch() { p.epochGate.Lock() }
+
+// releaseEpoch moves the epoch to e and lets new work be stamped again.
+func (p *BalanceWorkerPool) releaseEpoch(e int64) {
+	p.SetEpoch(e)
+	p.epochGate.Unlock()
 }
 
 // QueueWork returns false if the queue is full (non-blocking).

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -18,19 +19,55 @@ type balanceRereadStore interface {
 	CurrentBalanceEpoch(ctx context.Context) (int64, error)
 }
 
-// refreshBalanceEpoch moves the balance pool's reorg epoch to the database's, after a revert or at start, so the reads
-// it queues from now on are not taken for ones decided before the revert.
-func refreshBalanceEpoch(ctx context.Context, d Database, pool *BalanceWorkerPool) {
+// loadBalanceEpoch sets the balance pool's reorg epoch from the database at start. Without it every read of a key a
+// revert ever touched would be dropped for the whole run, so a failure fails the start.
+func loadBalanceEpoch(ctx context.Context, d Database, pool *BalanceWorkerPool) error {
 	store, ok := d.(balanceRereadStore)
 	if !ok || pool == nil {
-		return
+		return nil
 	}
 	e, err := store.CurrentBalanceEpoch(ctx)
 	if err != nil {
-		log.Warn("balance rereads: could not read the reorg epoch; the reread requests cover the reverted keys", "error", err)
-		return
+		return fmt.Errorf("read the balance reorg epoch: %w", err)
 	}
 	pool.SetEpoch(e)
+	return nil
+}
+
+// epochRetry is the first wait before the reorg epoch is read again after a failed read; it doubles to a minute.
+var epochRetry = time.Second
+
+// holdBalanceEpoch makes the balance pool's new work wait for its stamp for the length of a revert, and returns the
+// release, which reads the revert's epoch, retrying until it is read, and only then lets new work be stamped with
+// it. Work stamped meanwhile with the epoch from before the revert would be dropped for every key the revert touched,
+// for good.
+func holdBalanceEpoch(d Database, pool *BalanceWorkerPool) (release func(ctx context.Context)) {
+	store, ok := d.(balanceRereadStore)
+	if !ok || pool == nil {
+		return func(context.Context) {}
+	}
+	pool.holdEpoch()
+	return func(ctx context.Context) {
+		wait := epochRetry
+		for {
+			e, err := store.CurrentBalanceEpoch(ctx)
+			if err == nil {
+				pool.releaseEpoch(e)
+				return
+			}
+			if ctx.Err() != nil {
+				pool.releaseEpoch(0)
+				return
+			}
+			log.Warn("balance rereads: could not read the reorg epoch after a revert; new balance reads wait for it",
+				"retry_in", wait, "error", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(wait):
+			}
+			wait = min(2*wait, time.Minute)
+		}
+	}
 }
 
 // balanceRereadInterval is how often the open requests are handed to the balance reads.

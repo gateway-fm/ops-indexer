@@ -102,7 +102,9 @@ type deferStore struct {
 	settled  int
 }
 
-func (s *deferStore) NextPrunedSpan(context.Context) (int64, int64, bool, error) { return 0, 10, true, nil }
+func (s *deferStore) NextPrunedSpan(context.Context) (int64, int64, bool, error) {
+	return 0, 10, true, nil
+}
 func (s *deferStore) PrunedSpanFrom(_ context.Context, lo, _ int64) (int64, error) { return lo, nil }
 func (s *deferStore) SettleNodeSpan(context.Context, int64, int64, *db.SpanTotals, bool) (db.SpanCheck, error) {
 	s.settled++

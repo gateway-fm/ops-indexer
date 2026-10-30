@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -98,7 +99,7 @@ func TestAReadDecidedAfterARevertIsAppliedThroughEveryPath(t *testing.T) {
 		store, sql, ctx := setup(t)
 		idx := NewWithConfig(store, chain(), time.Second, 0, &Config{RPCWorkers: 1, RPCRateLimit: 100})
 		idx.balanceWorkers = NewBalanceWorkerPool(store, chain(), 2, 1000)
-		refreshBalanceEpoch(ctx, store, idx.balanceWorkers)
+		require.NoError(t, loadBalanceEpoch(ctx, store, idx.balanceWorkers))
 		idx.balanceWorkers.Start()
 		defer idx.balanceWorkers.Stop()
 		require.True(t, idx.balanceWorkers.QueueWork(BalanceWork{Address: holder, TokenAddress: token, BlockNumber: 10}))
@@ -153,4 +154,71 @@ func TestAnAbandonedRereadIsCounted(t *testing.T) {
 	var open bool
 	require.NoError(t, sql.QueryRow(ctx, `SELECT open FROM balance_rereads`).Scan(&open))
 	require.False(t, open, "closed; its epoch still drops reads decided before the revert")
+}
+
+// flakyEpochStore fails its first reads of the reorg epoch.
+type flakyEpochStore struct {
+	*db.DB
+	fails int
+}
+
+func (s *flakyEpochStore) CurrentBalanceEpoch(ctx context.Context) (int64, error) {
+	if s.fails > 0 {
+		s.fails--
+		return 0, errors.New("connection reset")
+	}
+	return s.DB.CurrentBalanceEpoch(ctx)
+}
+
+// After a revert the epoch read fails twice: a read queued meanwhile waits for its stamp, is stamped with the revert's
+// epoch once the read succeeds, and is applied; it is not stamped with the epoch from before the revert and dropped.
+func TestAReadQueuedWhileARevertsEpochIsUnreadWaitsAndApplies(t *testing.T) {
+	holder := common.HexToAddress("0x00000000000000000000000000000000000000a4")
+	token := common.HexToAddress("0x00000000000000000000000000000000000070c4")
+	store, sql := setupPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 10, balances: map[string]*big.Int{holder.Hex(): big.NewInt(5)}}
+	pool := NewBalanceWorkerPool(store, chain, 2, 1000)
+	require.NoError(t, loadBalanceEpoch(ctx, store, pool))
+	pool.Start()
+	defer pool.Stop()
+	defer func(w time.Duration) { epochRetry = w }(epochRetry)
+	epochRetry = 20 * time.Millisecond
+
+	flaky := &flakyEpochStore{DB: store, fails: 2}
+	release := holdBalanceEpoch(flaky, pool)
+	_, err := sql.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		VALUES (10, '0xb10', '0xb9', 1700000600, 0, 1, 0);
+		INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number, holder_count)
+		VALUES ('`+lower(token)+`', 'T', 'T', 18, 'ERC20', 1, 0);
+		INSERT INTO balance_rereads (token_address, address, epoch, open)
+		VALUES ('`+lower(token)+`', '`+lower(holder)+`', nextval('balance_reorg_epoch'), false)`)
+	require.NoError(t, err, "the revert recorded the key's epoch")
+
+	queued := make(chan bool, 1)
+	go func() { queued <- pool.QueueWork(BalanceWork{Address: holder, TokenAddress: token, BlockNumber: 10}) }()
+	select {
+	case <-queued:
+		t.Fatal("the read was stamped before the revert's epoch was read")
+	case <-time.After(200 * time.Millisecond):
+	}
+	release(ctx)
+	require.True(t, <-queued)
+	require.Zero(t, flaky.fails, "the epoch read was retried until it succeeded")
+	require.Eventually(t, func() bool {
+		var b string
+		_ = sql.QueryRow(ctx, `SELECT balance::TEXT FROM token_balances_current WHERE address = $1`, lower(holder)).Scan(&b)
+		return b == "5"
+	}, 20*time.Second, 50*time.Millisecond, "the read is applied")
+}
+
+// The start fails when it cannot read the reorg epoch: the pool would otherwise stamp 0 for the whole run and every
+// read of a key a revert ever touched would be dropped.
+func TestTheStartFailsWhenItCannotReadTheReorgEpoch(t *testing.T) {
+	store, _ := setupPostgres(t)
+	pool := NewBalanceWorkerPool(store, &fakeChain{MockRPCClient: new(MockRPCClient)}, 1, 1000)
+	require.ErrorContains(t, loadBalanceEpoch(context.Background(), &flakyEpochStore{DB: store, fails: 1}, pool),
+		"connection reset")
 }

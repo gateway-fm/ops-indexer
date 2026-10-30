@@ -450,7 +450,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
 	}
 	if store, ok := i.db.(balanceRereadStore); ok {
-		refreshBalanceEpoch(ctx, i.db, i.balanceWorkers)
+		if err := loadBalanceEpoch(ctx, i.db, i.balanceWorkers); err != nil {
+			return err
+		}
 		go i.RunBalanceRereads(ctx, store)
 	}
 
@@ -1029,12 +1031,13 @@ func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
 	}
 	metrics.ReorgDetected()
 
+	release := holdBalanceEpoch(i.db, i.balanceWorkers)
+	defer release(ctx)
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
 		if err := i.db.DeleteBlock(ctx, blockNum); err != nil {
 			log.Error("failed to delete block", "block", blockNum, "error", err)
 			return err
 		}
-		refreshBalanceEpoch(ctx, i.db, i.balanceWorkers)
 		log.Debug("reverted block", "block", blockNum)
 	}
 
