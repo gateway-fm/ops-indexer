@@ -96,19 +96,32 @@ type SenderSample struct {
 	Head    uint64
 }
 
+// senderProbeTxs bounds the transactions of a sender the nonce sample reads to find its types.
+const senderProbeTxs = 10_000
+
+const senderSampleSQL = `
+	WITH head AS (SELECT max(number) AS n FROM blocks),
+	ready AS (SELECT (SELECT value FROM ledger_verify_state WHERE name = 'running_cycles') > 0
+	                 AND NOT EXISTS (SELECT 1 FROM missing_block_ranges) AS ok),
+	pct AS (SELECT LEAST(100, GREATEST(0.01, 400.0 * $1 / GREATEST(reltuples, 1)))::FLOAT4 AS p
+	        FROM pg_class WHERE oid = 'address_stats'::regclass)
+	SELECT a.address, a.sent_count, head.n
+	FROM address_stats a TABLESAMPLE BERNOULLI ((SELECT p FROM pct)), head, ready
+	WHERE ready.ok AND a.sent_count > 0 AND NOT a.is_contract AND a.tx_count <= $2
+	  AND (pruned_through() = 0 OR a.first_seen > pruned_through())
+	  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.from_address = a.address AND t.tx_type NOT BETWEEN 0 AND 4)
+	LIMIT $1`
+
 // SampleSenders samples about n non-contract addresses that sent transactions, with the stored head their count
 // reflects. None until a full running-counter cycle has recounted sent_count, or while a missing range is open.
+//
+// sent_count counts the types 0-4 only. On chains with system or deposit transaction types (OP Stack 126, Arbitrum
+// 100-106) some of those also raise the sender's nonce, so only senders that never sent another type are sampled,
+// and only those whose every transaction is still stored (first seen above the prune watermark). Each sampled
+// sender's transactions are read through the from_address index, which does not carry the type, so a sender with
+// more than senderProbeTxs transactions is not sampled: the probe stays bounded.
 func (d *DB) SampleSenders(ctx context.Context, n int) ([]SenderSample, error) {
-	rows, err := d.pool.Query(ctx, `
-		WITH head AS (SELECT max(number) AS n FROM blocks),
-		ready AS (SELECT (SELECT value FROM ledger_verify_state WHERE name = 'running_cycles') > 0
-		                 AND NOT EXISTS (SELECT 1 FROM missing_block_ranges) AS ok),
-		pct AS (SELECT LEAST(100, GREATEST(0.01, 400.0 * $1 / GREATEST(reltuples, 1)))::FLOAT4 AS p
-		        FROM pg_class WHERE oid = 'address_stats'::regclass)
-		SELECT a.address, a.sent_count, head.n
-		FROM address_stats a TABLESAMPLE BERNOULLI ((SELECT p FROM pct)), head, ready
-		WHERE ready.ok AND a.sent_count > 0 AND NOT a.is_contract
-		LIMIT $1`, n)
+	rows, err := d.pool.Query(ctx, senderSampleSQL, n, senderProbeTxs)
 	if err != nil {
 		return nil, err
 	}

@@ -64,8 +64,7 @@ func TestChainChecksPassOnKnownGoodAndFailOnEachSabotage(t *testing.T) {
 }
 
 // A restart of a deployment indexed from genesis with retention raises the ingest start above the prune watermark.
-// The chain checks still count from the configured start: blocks_total against every block from genesis, and the
-// nonce sample, which needs every sent transaction counted.
+// The chain checks still count blocks_total from the configured start, every block from genesis.
 func TestTheChainChecksCountFromTheConfiguredStartAfterPruning(t *testing.T) {
 	store, sql := setupPostgres(t)
 	ctx := context.Background()
@@ -80,7 +79,6 @@ func TestTheChainChecksCountFromTheConfiguredStartAfterPruning(t *testing.T) {
 	r, err := idx.newChainChecker(store, ChainCheckConfig{RPS: 1_000_000, Sample: 50}).pass(ctx)
 	require.NoError(t, err)
 	require.Zero(t, r.BlocksDrift)
-	require.Equal(t, 1, r.NoncesChecked, "the nonce sample still runs")
 }
 
 // Block 0 stored and counted, then span 0 pruned with it: the blocks check still counts from genesis, as span 0's

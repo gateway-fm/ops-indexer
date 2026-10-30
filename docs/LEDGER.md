@@ -35,7 +35,7 @@ on any drift. The ledger and the checks run with retention on or off.
 | `chain_blocks` | `blocks_total` against the stored head + 1 − `START_BLOCK`, while no missing range is open. | Alert only. |
 | `chain_supply` | One token per pass: `total_supply` against `totalSupply()` at the stored head. A token minted or burned without Transfer events differs legitimately. | Alert only. |
 | `chain_balance` | A sample of current balances with no later transfer, against `balanceOf()` at the stored head; a key counts as drifted when it differs on two passes. This also covers `holder_count`. | Alert only. |
-| `chain_nonce` | A sample of non-contract senders: `sent_count` against `eth_getTransactionCount` at the stored head. It starts once a full `running` cycle has recounted `sent_count`. | Alert only. |
+| `chain_nonce` | A sample of non-contract senders: `sent_count` against `eth_getTransactionCount` at the stored head. `sent_count` counts the types 0-4 only; on chains with system or deposit types (OP Stack 126, Arbitrum 100-106) some of those raise a nonce too, so only senders that never sent another type are sampled, with every transaction still stored and at most 10,000 of them. It starts once a full `running` cycle has recounted `sent_count`. | Alert only. |
 | `chain_span_txs` | One closed span per pass, retained or pruned: its ledger transaction total against the sum of `eth_getBlockTransactionCountByNumber`. | Alert only (`node` repairs the span). |
 
 - The `running` check, and the one-off address reconciliation below, wait until the open tail (stored blocks above

@@ -186,8 +186,9 @@ described.
   transaction the address sent, received or took part in through a Transfer event, as `ListTransactions` `by_address`
   returns them. **Correction:** a self-send used to count twice, and an address in Transfer events of several
   transactions of one block once; rows written before this build keep the old count until they are recounted.
-- `GetAddress` `tx_count_out` (`address_stats.sent_count`, migration 025): transactions the address sent of the types
-  that bump its nonce (0-4), so for an EOA indexed from genesis it equals `eth_getTransactionCount`. It was always 0;
+- `GetAddress` `tx_count_out` (`address_stats.sent_count`, migration 025): transactions of types 0-4 sent by the
+  address. On chains with system or deposit transaction types, such as OP Stack (126) and Arbitrum (100-106), it can be
+  below `eth_getTransactionCount`, since some of those raise the sender's nonce too. It was always 0;
   rows written before 025 read 0 until the ledger reconciliation recounts them. `tx_count_in` is now the rest of the
   address's transactions (received, in a Transfer event, or sent of another type), so `tx_count_in + tx_count_out` is
   its transaction count, each transaction once; a self-send counts in `tx_count_out` only. **Change:** `tx_count_in`
