@@ -167,6 +167,20 @@ func (p *BalanceWorkerPool) releaseEpoch(e int64) {
 	p.epochGate.Unlock()
 }
 
+// folded is one key's two work items as one read: the block of the item at the higher epoch, the higher block at the
+// same epoch. An item from before a revert (a lower epoch) may carry a reverted block above the new chain's, which
+// the highest-block guard would then let win over the new chain's next read.
+func folded(a, b BalanceWork) BalanceWork {
+	switch {
+	case b.Epoch > a.Epoch:
+		return b
+	case b.Epoch < a.Epoch:
+		return a
+	}
+	a.BlockNumber = max(a.BlockNumber, b.BlockNumber)
+	return a
+}
+
 // QueueWork returns false if the queue is full (non-blocking).
 func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
 	p.sendMu.RLock()
@@ -295,12 +309,7 @@ func (p *BalanceWorkerPool) coalesce() {
 			}
 			k := balanceKey{address: work.Address, token: work.TokenAddress}
 			if h, ok := held[k]; ok {
-				if work.BlockNumber > h.BlockNumber {
-					h.BlockNumber = work.BlockNumber
-				}
-				if work.Epoch > h.Epoch {
-					h.Epoch = work.Epoch
-				}
+				*h = folded(*h, work)
 				metrics.BalanceDeduped(1)
 				continue
 			}
@@ -451,9 +460,7 @@ drain:
 			}
 			k := balanceKey{w.Address, w.TokenAddress}
 			if prev, seen := works[k]; seen {
-				prev.BlockNumber = max(prev.BlockNumber, w.BlockNumber)
-				prev.Epoch = max(prev.Epoch, w.Epoch)
-				works[k] = prev
+				works[k] = folded(prev, w)
 				metrics.BalanceDeduped(1)
 				continue
 			}

@@ -222,3 +222,46 @@ func TestTheStartFailsWhenItCannotReadTheReorgEpoch(t *testing.T) {
 	require.ErrorContains(t, loadBalanceEpoch(context.Background(), &flakyEpochStore{DB: store, fails: 1}, pool),
 		"connection reset")
 }
+
+// A depth-3 reorg reverts blocks 10 to 12. A read of a key decided on the fork for block 12 and one decided after the
+// revert for the new chain's block 10 fold into one read: it takes the post-revert item's block, so the new chain's
+// read for block 11 is not refused by the highest-block guard.
+func TestFoldedWorkTakesTheBlockOfItsLatestEpoch(t *testing.T) {
+	holder := common.HexToAddress("0x00000000000000000000000000000000000000a5")
+	token := common.HexToAddress("0x00000000000000000000000000000000000070c5")
+	fork := BalanceWork{Address: holder, TokenAddress: token, BlockNumber: 12, Epoch: 1}
+	after := BalanceWork{Address: holder, TokenAddress: token, BlockNumber: 10, Epoch: 2}
+	require.Equal(t, after, folded(fork, after))
+	require.Equal(t, after, folded(after, fork))
+	require.Equal(t, uint64(11), folded(after, BalanceWork{BlockNumber: 11, Epoch: 2}).BlockNumber, "same epoch: the higher block")
+
+	store, sql := setupPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := sql.Exec(ctx, `
+		INSERT INTO tokens (address, symbol, name, decimals, token_type, block_number, holder_count)
+		VALUES ('`+lower(token)+`', 'T', 'T', 18, 'ERC20', 1, 0);
+		SELECT nextval('balance_reorg_epoch');
+		INSERT INTO balance_rereads (token_address, address, epoch, open)
+		VALUES ('`+lower(token)+`', '`+lower(holder)+`', nextval('balance_reorg_epoch'), false)`)
+	require.NoError(t, err, "the key's revert was epoch 2")
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 12, balances: map[string]*big.Int{holder.Hex(): big.NewInt(5)}}
+	pool := NewBalanceWorkerPool(store, chain, 1, 1000)
+	pool.SetDedupWindow(300 * time.Millisecond)
+	pool.Start()
+	defer pool.Stop()
+	require.True(t, pool.QueueWork(fork))
+	require.True(t, pool.QueueWork(after))
+	written := func(block int64) bool {
+		var n int64
+		_ = sql.QueryRow(ctx, `SELECT COALESCE(max(block_number), -1) FROM token_balances_current WHERE address = $1`,
+			lower(holder)).Scan(&n)
+		return n == block
+	}
+	require.Eventually(t, func() bool { return written(10) }, 20*time.Second, 50*time.Millisecond,
+		"one read, at the post-revert item's block")
+	chain.balances[holder.Hex()] = big.NewInt(4)
+	require.True(t, pool.QueueWork(BalanceWork{Address: holder, TokenAddress: token, BlockNumber: 11, Epoch: 2}))
+	require.Eventually(t, func() bool { return written(11) }, 20*time.Second, 50*time.Millisecond,
+		"the new chain's block 11 read is written")
+}
