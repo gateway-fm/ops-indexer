@@ -55,6 +55,7 @@ func TestRetainedRecountOfASpanRetentionPrunesMeanwhile(t *testing.T) {
 		FROM ledger_spans s WHERE s.lo >= history_from() ORDER BY s.checked_at NULLS FIRST, s.lo LIMIT 1`).Scan(&lo, &blocks, &txs))
 	require.Equal(t, int64(60_001), lo)
 	require.Equal(t, int64(999), blocks)
+	truth := spanTotalsFromLedger(t, d, lo)
 
 	// The span's token_transfers read is slow (here: held up by a lock on its partition).
 	admin, err := pgx.Connect(ctx, d.pool.Config().ConnConfig.ConnString())
@@ -100,6 +101,9 @@ func TestRetainedRecountOfASpanRetentionPrunesMeanwhile(t *testing.T) {
 	_, err = d.CheckRunning(ctx, 0, true)
 	require.NoError(t, err)
 	t.Logf("the running check then moves blocks_total %d -> %d (blocks stored or pruned: 82002)", before, counter())
+	node, err := d.SettleNodeSpan(ctx, lo, r.c.Hi, truth, true)
+	require.NoError(t, err)
+	t.Logf("the node recount of the now pruned span, which counts it right: drifted=%d state=%s", node.Drifted, node.State)
 	require.Equal(t, blocks, gotBlocks, "the span's blocks_total in the ledger")
 	require.Equal(t, txs, gotTxs, "the span's transactions_total in the ledger")
 	require.Zero(t, r.c.Drifted, "the span was counted right when it closed")
