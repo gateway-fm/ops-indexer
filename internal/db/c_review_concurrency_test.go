@@ -108,3 +108,59 @@ func TestRetainedRecountOfASpanRetentionPrunesMeanwhile(t *testing.T) {
 	require.Equal(t, txs, gotTxs, "the span's transactions_total in the ledger")
 	require.Zero(t, r.c.Drifted, "the span was counted right when it closed")
 }
+
+// A revert records its addresses in ledger_reverted_address after their address_stats rows and before chain_counters;
+// a rebase batch (the running check's repair, the reconciliation, repair-address-stats, the span rebase) moves
+// addresses_total when it creates or removes a row and only then takes the ledger_reverted_address entries it read.
+// When the revert's block touches an address the batch read an entry for but did not correct, and the batch creates a
+// row, each holds what the other needs next. Here the revert reaches chain_counters while a catch-up write holds
+// blocks_total, as it does while committing a block.
+func TestARevertAndARebaseBatchThatCreatesARowDoNotDeadlock(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(1, "h1", []revertTx{{from: "0xa", to: "0xb"}, {from: "0xd", to: "0xe"}})))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(2, "h2", []revertTx{{from: "0xa", to: "0xc"}})))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(3, "h3", []revertTx{{from: "0xa", to: "0xf"}})))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(4, "h4", []revertTx{{from: "0xa", to: "0xg"}})))
+	require.NoError(t, d.DeleteBlock(ctx, 4), "an earlier revert recorded 0xa")
+	// 0xd's row is missing (the drift a reconciliation or repair is run for).
+	_, err := d.pool.Exec(ctx, `DELETE FROM address_stats WHERE address = '0xd'`)
+	require.NoError(t, err)
+
+	admin, err := pgx.Connect(ctx, d.pool.Config().ConnConfig.ConnString())
+	require.NoError(t, err)
+	defer admin.Close(context.Background())
+	writer, err := admin.Begin(ctx)
+	require.NoError(t, err)
+	_, err = writer.Exec(ctx, `SELECT 1 FROM chain_counters WHERE name = 'blocks_total' FOR UPDATE`)
+	require.NoError(t, err, "a block write holds blocks_total")
+
+	reverted := make(chan error, 1)
+	go func() { reverted <- d.DeleteBlock(ctx, 3) }()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		_ = d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+			AND wait_event_type = 'Lock' AND query LIKE '%INSERT INTO chain_counters (name, count, updated_at) VALUES%blocks_total%')`).Scan(&waiting)
+		return waiting
+	}, 10*time.Second, 20*time.Millisecond, "the revert has recorded 0xa and waits for blocks_total")
+
+	rebased := make(chan error, 1)
+	go func() {
+		_, err := d.RebaseAddresses(ctx, []string{"0xa", "0xd"}, []string{"0xa", "0xd"})
+		rebased <- err
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		_ = d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+			AND wait_event_type = 'Lock' AND query LIKE '%DELETE FROM ledger_reverted_address%')`).Scan(&waiting)
+		return waiting
+	}, 10*time.Second, 20*time.Millisecond, "the batch created 0xd's row and waits for 0xa's entry")
+	require.NoError(t, writer.Commit(ctx))
+
+	revertErr, rebaseErr := <-reverted, <-rebased
+	t.Logf("revert: %v; rebase batch: %v", revertErr, rebaseErr)
+	require.NoError(t, revertErr, "the reorg revert")
+	require.NoError(t, rebaseErr, "the rebase batch")
+}
