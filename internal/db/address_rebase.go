@@ -16,8 +16,10 @@ const rebaseBatch = 1000
 // rebaseLock serializes rebases among themselves (advisory lock key).
 const rebaseLock = 4674
 
-// RebaseResult is what a rebase changed: rows set to a different value, rows it created, rows it removed, and the
-// earliest first_seen block, old or new, of a row whose first_seen moved or that was removed (nil when none did).
+// RebaseResult is what a rebase changed: Changed counts the rows it wrote, those it created included and those it
+// removed not (a removal that found the row in use again and set it instead counts as changed); Created and Removed
+// count the rows it created and removed. FirstSeenFrom is the earliest first_seen block, old or new, of a row whose
+// first_seen moved or that was removed (nil when none did).
 type RebaseResult struct {
 	Changed, Created, Removed int
 	FirstSeenFrom             *int64
