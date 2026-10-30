@@ -14,8 +14,12 @@ message Address {
   string address = 1;
   bool is_contract = 2;
 
-  uint64 tx_count_in = 3;   // txs where address is `to`
-  uint64 tx_count_out = 4;  // txs where address is `from`
+  // tx_count_in + tx_count_out is every transaction the address took part in: as sender, as recipient, or in a
+  // Transfer event, each transaction once. tx_count_out is the transactions it sent of types 0-4; a self-send counts
+  // there only. tx_count_in is the rest: transactions it received or appears in through a Transfer event, and any it
+  // sent of another type.
+  uint64 tx_count_in = 3;
+  uint64 tx_count_out = 4;
   uint64 token_count = 5;   // distinct tokens held or interacted with
 
   google.protobuf.Timestamp first_seen_at = 6;

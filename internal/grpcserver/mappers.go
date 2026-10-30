@@ -358,7 +358,7 @@ func mapAddressStats(a *types.AddressStats) *indexerv1.Address {
 	return &indexerv1.Address{
 		Address:          a.Address,
 		IsContract:       a.IsContract,
-		TxCountIn:        uint64(a.TxCount), // schema doesn't split in/out; full total stored as TxCount
+		TxCountIn:        txCountIn(a),
 		TxCountOut:       uint64(a.SentCount),
 		TokenCount:       uint64(a.TokenTransferCount), // closest available proxy
 		FirstSeenAt:      unixPtrToProto(a.FirstSeen),
@@ -367,6 +367,16 @@ func mapAddressStats(a *types.AddressStats) *indexerv1.Address {
 		LastSeenBlock:    ptrUint64OrZero(a.LastSeen),
 		NativeBalance:    &indexerv1.BigInt{}, // not tracked by this store; consumers can fetch balance via separate mechanism
 	}
+}
+
+// txCountIn is the transactions the address took part in other than those counted as sent, so that tx_count_in +
+// tx_count_out is its transaction count. A sent count above the transaction count is drift in the row (the running
+// check and the span rebase correct it); the address then serves 0 in and its sent count out rather than wrap.
+func txCountIn(a *types.AddressStats) uint64 {
+	if a.SentCount > int64(a.TxCount) {
+		return 0
+	}
+	return uint64(int64(a.TxCount) - a.SentCount)
 }
 
 func mapAddressStatsList(rows []types.AddressStats) []*indexerv1.Address {

@@ -188,8 +188,11 @@ described.
   transactions of one block once; rows written before this build keep the old count until they are recounted.
 - `GetAddress` `tx_count_out` (`address_stats.sent_count`, migration 025): transactions the address sent of the types
   that bump its nonce (0-4), so for an EOA indexed from genesis it equals `eth_getTransactionCount`. It was always 0;
-  rows written before 025 read 0 until the ledger reconciliation recounts them. `tx_count_in` still carries the full
-  transaction count, as before.
+  rows written before 025 read 0 until the ledger reconciliation recounts them. `tx_count_in` is now the rest of the
+  address's transactions (received, in a Transfer event, or sent of another type), so `tx_count_in + tx_count_out` is
+  its transaction count, each transaction once; a self-send counts in `tx_count_out` only. **Change:** `tx_count_in`
+  carried the full transaction count before, so a consumer that summed the two counted every sent transaction
+  twice.
 - The zero address keeps no transfer count (mints and burns): `ListTokenTransfers` `by_address` `total_count` and
   `GetAddress` `token_count` are 0 for it, and its `GetAddress` transaction count leaves out mint and burn transactions
   it is not the sender or recipient of.
