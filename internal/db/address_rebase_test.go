@@ -674,3 +674,42 @@ func TestASpanRebaseFinishesOnAPoolOfOneConnection(t *testing.T) {
 	_, err = one.CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 100, FirstBlock: 1, WorkMem: "64MB"}, 1)
 	require.NoError(t, err, "the next close rebases the first span on one connection")
 }
+
+// A recount that read the pending count before it took the lock could clear a count another recount had reset and a
+// later rebase had raised again to the same value, losing that rebase's recount. The count is read under the lock.
+func TestADayRecountClearsOnlyTheCountItSawUnderTheLock(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	set := func(v int) {
+		_, err := d.pool.Exec(ctx, `UPDATE ledger_verify_state SET value = $1 WHERE name = 'address_days_recount'`, v)
+		require.NoError(t, err)
+	}
+	pendingNow := func() int {
+		var v int
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_days_recount'`).Scan(&v))
+		return v
+	}
+	set(1)
+	held, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer held.Rollback(context.Background())
+	_, err = held.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`)
+	require.NoError(t, err, "another recount holds the lock")
+
+	raised := false
+	daysRecountHook = func() { set(pendingNow() + 1); raised = true }
+	defer func() { daysRecountHook = nil }()
+	done := make(chan error, 1)
+	go func() { done <- d.recountPendingDays(ctx) }()
+	time.Sleep(300 * time.Millisecond)
+	_, err = held.Exec(ctx, `UPDATE ledger_verify_state SET value = 0 WHERE name = 'address_days_recount'`)
+	require.NoError(t, err, "the other recount clears the count it read")
+	require.NoError(t, held.Commit(ctx))
+	require.NoError(t, <-done)
+	if !raised {
+		set(pendingNow() + 1)
+	}
+	require.Equal(t, 1, pendingNow(), "the rebase that moved a first_seen after the recount's snapshot stays pending")
+}

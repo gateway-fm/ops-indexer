@@ -530,23 +530,31 @@ func stageSpanRebase(ctx context.Context, conn *pgx.Conn, lo int64, workMem stri
 // recountPendingDays recounts the days' address columns from address_stats if a rebase has moved a first_seen since
 // the last recount, under daily_stats_advance's lock and holding no address_stats row. A batch that moves one counts
 // it in ledger_verify_state in its own transaction, and the recount clears only the count it read, so a recount that
-// fails, or a rebase that commits while it runs, leaves it pending for the next.
+// fails, or a rebase that commits while it runs, leaves it pending for the next. The count is read under the lock:
+// only a recount, which holds it, sets the count back, so while the lock is held the count only grows, and a count
+// equal to the one read means nothing moved since.
 func (d *DB) recountPendingDays(ctx context.Context) error {
-	var pending int64
-	if err := d.pool.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_days_recount'`).Scan(&pending); err != nil {
-		return err
-	}
-	if pending == 0 {
-		return nil
-	}
 	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
 			return err
 		}
+		var pending int64
+		if err := tx.QueryRow(ctx, `SELECT value FROM ledger_verify_state WHERE name = 'address_days_recount'`).Scan(&pending); err != nil {
+			return err
+		}
+		if pending == 0 {
+			return nil
+		}
 		if err := recountDailyAddressColumns(ctx, tx); err != nil {
 			return err
+		}
+		if daysRecountHook != nil {
+			daysRecountHook()
 		}
 		_, err := tx.Exec(ctx, `UPDATE ledger_verify_state SET value = 0 WHERE name = 'address_days_recount' AND value = $1`, pending)
 		return err
 	})
 }
+
+// daysRecountHook, when a test sets it, runs between a day recount and its clearing of the pending count.
+var daysRecountHook func()
