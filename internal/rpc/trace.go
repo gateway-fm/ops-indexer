@@ -197,6 +197,16 @@ type TraceResult struct {
 }
 
 func (c *Client) FetchTracesBatch(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int) ([]*explorerTypes.InternalTransaction, error) {
+	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, false)
+}
+
+// FetchTracesBatchStrict is FetchTracesBatch for counts that replace or extend the ledger: a transaction whose trace
+// is missing from the block's traces, or whose own trace fails, fails the batch instead of being left out.
+func (c *Client) FetchTracesBatchStrict(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int) ([]*explorerTypes.InternalTransaction, error) {
+	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, true)
+}
+
+func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int, strict bool) ([]*explorerTypes.InternalTransaction, error) {
 	if len(txHashes) == 0 {
 		return nil, nil
 	}
@@ -209,6 +219,9 @@ func (c *Client) FetchTracesBatch(ctx context.Context, txHashes []common.Hash, b
 		for _, txHash := range txHashes {
 			frame, ok := blockTraces[txHash.Hex()]
 			if !ok {
+				if strict {
+					return nil, fmt.Errorf("block %d: no trace for transaction %s", blockNumber, txHash.Hex())
+				}
 				continue
 			}
 			internalTxs := FlattenCallFrame(frame, txHash.Hex(), blockNumber, &ts)
@@ -237,11 +250,17 @@ func (c *Client) FetchTracesBatch(ctx context.Context, txHashes []common.Hash, b
 		hash := hash
 		g.Go(func() error {
 			if err := limiter.Wait(ctx); err != nil {
+				if strict {
+					return err
+				}
 				return nil // Don't fail the whole batch
 			}
 
 			frame, err := c.TraceTransaction(ctx, hash)
 			if err != nil {
+				if strict {
+					return fmt.Errorf("trace of transaction %s: %w", hash.Hex(), err)
+				}
 				log.Warn("failed to trace tx", "tx", hash.Hex(), "error", err)
 				return nil
 			}
@@ -257,6 +276,8 @@ func (c *Client) FetchTracesBatch(ctx context.Context, txHashes []common.Hash, b
 		})
 	}
 
-	g.Wait()
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
 	return results, nil
 }

@@ -54,6 +54,10 @@ type Config struct {
 	// CountersOnly builds blocks for their counters alone (stats backfill, recount of a pruned span): no token
 	// metadata or tokenURI fetches, and a failed trace fetch fails the block instead of dropping its internal calls.
 	CountersOnly bool
+	// StrictTraces fails a block whose traces are incomplete, a transaction's trace missing or failed, instead of
+	// leaving its internal calls out: for the counts that replace or extend the ledger (the stats backfill and the
+	// recount of a pruned span).
+	StrictTraces bool
 
 	// NodeRecountRPS bounds the recount of pruned spans from the node; 0 turns it off. VerifyRepair lets it
 	// replace a drifted span's ledger rows.
@@ -1108,6 +1112,12 @@ type builtBlock struct {
 	codeErr error
 }
 
+// strictTracer fetches a block's traces failing on any transaction whose trace is missing or failed.
+type strictTracer interface {
+	FetchTracesBatchStrict(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int,
+		rateLimit int) ([]*types.InternalTransaction, error)
+}
+
 // codeAtReader reads an account's code after a given block, where the node keeps that block's state.
 type codeAtReader interface {
 	GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error)
@@ -1438,8 +1448,11 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	if i.tracingSupported && len(txHashes) > 0 {
-		internalTxs, err := i.rpc.FetchTracesBatch(ctx, txHashes, blockNumber, blockTimestamp,
-			i.config.TraceWorkers, i.config.TraceRateLimit)
+		fetch := i.rpc.FetchTracesBatch
+		if s, ok := i.rpc.(strictTracer); ok && i.config.StrictTraces {
+			fetch = s.FetchTracesBatchStrict
+		}
+		internalTxs, err := fetch(ctx, txHashes, blockNumber, blockTimestamp, i.config.TraceWorkers, i.config.TraceRateLimit)
 		if err != nil {
 			tracesErr = err
 			log.Warn("failed to fetch traces for block", "block", blockNumber, "error", err)

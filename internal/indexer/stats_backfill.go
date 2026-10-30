@@ -60,6 +60,7 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	c := *i.config
 	c.RPCRateLimit, c.TraceRateLimit = cfg.RPS, cfg.RPS
 	c.RPCWorkers, c.TraceWorkers, c.TokenMetadataWorkers = 1, 1, 1
+	c.StrictTraces = true
 	return &backfiller{
 		idx: &Indexer{db: i.db, rpc: i.rpc, config: &c, tokenCache: i.tokenCache, contractCache: i.contractCache,
 			tracingSupported: i.tracingSupported},
