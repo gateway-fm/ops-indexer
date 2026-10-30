@@ -71,7 +71,7 @@ func holdBalanceEpoch(d Database, pool *BalanceWorkerPool) (release func(ctx con
 }
 
 // balanceRereadInterval is how often the open requests are handed to the balance reads.
-const balanceRereadInterval = 5 * time.Second
+var balanceRereadInterval = 5 * time.Second
 
 // RunBalanceRereads reads again, at the stored head, every balance a reorg revert could not restore with certainty.
 // Each read carries the key's reorg epoch, so it is not taken for a read decided before the revert, and the first such

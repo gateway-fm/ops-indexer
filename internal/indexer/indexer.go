@@ -450,11 +450,8 @@ func (i *Indexer) Start(ctx context.Context) error {
 		i.balanceWorkers.Start()
 	}
 
-	if store, ok := i.db.(balanceRereadStore); ok {
-		if err := loadBalanceEpoch(ctx, i.db, i.balanceWorkers); err != nil {
-			return err
-		}
-		go i.RunBalanceRereads(ctx, store)
+	if err := loadBalanceEpoch(ctx, i.db, i.balanceWorkers); err != nil {
+		return err
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)
@@ -553,8 +550,12 @@ func (i *Indexer) Start(ctx context.Context) error {
 	}
 
 	// After the start's wipe, if any: the backfill job ends once its backfill is complete or absent, and a wipe
-	// prepares the new chain's; the node recount and the chain checks would otherwise check rows the wipe removes.
+	// prepares the new chain's; the node recount and the chain checks would otherwise check rows the wipe removes, and
+	// the balance rereads would write the old chain's balances after it.
 	close(i.pastWipe)
+	if store, ok := i.db.(balanceRereadStore); ok {
+		go i.RunBalanceRereads(ctx, store)
+	}
 	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
 		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
 	}
