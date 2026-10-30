@@ -108,7 +108,6 @@ const senderSampleSQL = `
 	SELECT a.address, a.sent_count, head.n
 	FROM address_stats a TABLESAMPLE BERNOULLI ((SELECT p FROM pct)), head, ready
 	WHERE ready.ok AND a.sent_count > 0 AND NOT a.is_contract AND a.tx_count <= $2
-	  AND (pruned_through() = 0 OR a.first_seen > pruned_through())
 	  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.from_address = a.address AND t.tx_type NOT BETWEEN 0 AND 4)
 	LIMIT $1`
 
@@ -116,10 +115,11 @@ const senderSampleSQL = `
 // reflects. None until a full running-counter cycle has recounted sent_count, or while a missing range is open.
 //
 // sent_count counts the types 0-4 only. On chains with system or deposit transaction types (OP Stack 126, Arbitrum
-// 100-106) some of those also raise the sender's nonce, so only senders that never sent another type are sampled,
-// and only those whose every transaction is still stored (first seen above the prune watermark). Each sampled
-// sender's transactions are read through the from_address index, which does not carry the type, so a sender with
-// more than senderProbeTxs transactions is not sampled: the probe stays bounded.
+// 100-106) some of those also raise the sender's nonce, so only senders whose stored transactions are all of the
+// counted types are sampled. Transactions no longer stored (pruned, or counted by the stats backfill) cannot be
+// checked: on such a chain a sender with another type among them can show as drifted (the check only alerts). Each
+// sampled sender's transactions are read through the from_address index, which does not carry the type, so a sender
+// with more than senderProbeTxs transactions is not sampled: the probe stays bounded.
 func (d *DB) SampleSenders(ctx context.Context, n int) ([]SenderSample, error) {
 	rows, err := d.pool.Query(ctx, senderSampleSQL, n, senderProbeTxs)
 	if err != nil {
