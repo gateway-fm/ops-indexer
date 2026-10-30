@@ -108,6 +108,8 @@ type Indexer struct {
 	missingBackoff       map[uint64]missingAttempt
 
 	indexRequests chan indexRequest
+	// pastWipe closes once Start has passed its FORCE_REINDEX wipe, or found none to do (PastWipe).
+	pastWipe chan struct{}
 	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
 	onIndexed func(uint64)
 	// cursorMayBeUnstored is set for realtime's batches (see anchor).
@@ -282,6 +284,7 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		countFrom:            startBlock,
 		missingRetryInterval: defaultMissingRetryInterval,
 		indexRequests:        make(chan indexRequest, 100),
+		pastWipe:             make(chan struct{}),
 		config:               cfg,
 		tokenCache:           NewTokenCache(),
 		contractCache:        NewContractCache(),
@@ -403,6 +406,10 @@ func (i *Indexer) publishProgressMetrics(ctx context.Context) {
 	}
 }
 
+// PastWipe is closed once Start has passed its FORCE_REINDEX wipe, or found none to do. A worker that reads or writes
+// what a wipe removes (the ledger, the checks, retention) starts after it.
+func (i *Indexer) PastWipe() <-chan struct{} { return i.pastWipe }
+
 func (i *Indexer) Start(ctx context.Context) error {
 	// Blocks at or below the prune watermark are gone on purpose: gap counting, the missing-range collector
 	// and catch-up all start above it, or they would fetch the pruned history back. A wipe resets the watermark,
@@ -443,12 +450,6 @@ func (i *Indexer) Start(ctx context.Context) error {
 		i.balanceWorkers.Start()
 	}
 
-	if store, ok := i.db.(prunedSpanStore); ok && i.config.NodeRecountRPS > 0 {
-		go i.RunNodeRecount(ctx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
-	}
-	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
-		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
-	}
 	if store, ok := i.db.(balanceRereadStore); ok {
 		if err := loadBalanceEpoch(ctx, i.db, i.balanceWorkers); err != nil {
 			return err
@@ -551,10 +552,17 @@ func (i *Indexer) Start(ctx context.Context) error {
 		}
 	}
 
-	// After the start's wipe, if any: the job ends once its backfill is complete or absent, and a wipe prepares the
-	// new chain's.
+	// After the start's wipe, if any: the backfill job ends once its backfill is complete or absent, and a wipe
+	// prepares the new chain's; the node recount and the chain checks would otherwise check rows the wipe removes.
+	close(i.pastWipe)
 	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
 		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
+	}
+	if store, ok := i.db.(prunedSpanStore); ok && i.config.NodeRecountRPS > 0 {
+		go i.RunNodeRecount(ctx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
+	}
+	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
+		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
 	}
 	go i.publishProgressMetrics(ctx)
 

@@ -194,21 +194,21 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(5)
 
-	reconciled := make(chan struct{})
-	afterReconcile := func() bool {
+	afterStartWipe := func() bool {
 		select {
-		case <-reconciled:
+		case <-idx.PastWipe():
 			return true
 		case <-ctx.Done():
 			return false
 		}
 	}
 
-	// The checks wait for the startup reconcile like the ledger and retention: the address reconciliation creates and
-	// removes address_stats rows and moves addresses_total, which the reconcile's re-seed writes absolutely.
+	// The checks wait for the startup reconcile and the start's wipe like the ledger and retention: the address
+	// reconciliation creates and removes address_stats rows and moves addresses_total, which the reconcile's re-seed
+	// writes absolutely, and a wipe truncates what they read.
 	go func() {
 		defer wg.Done()
-		if !afterReconcile() {
+		if !afterStartWipe() {
 			return
 		}
 		database.RunVerify(ctx, db.VerifyConfig{RecountInterval: cfg.VerifyRecountInterval, Repair: cfg.VerifyRepair,
@@ -217,7 +217,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		if !afterReconcile() {
+		if !afterStartWipe() {
 			return
 		}
 		database.RunLedger(ctx, db.LedgerConfig{
@@ -243,7 +243,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		if !afterReconcile() {
+		if !afterStartWipe() {
 			return
 		}
 		database.RunRetention(ctx, db.RetentionConfig{
@@ -261,7 +261,6 @@ func main() {
 		if err := indexer.ReconcileForStart(ctx, database, rpcClient, cfg.StartBlock, backfill); err != nil {
 			log.Fatal("failed to reconcile counters or prepare the stats backfill", "error", err)
 		}
-		close(reconciled)
 		log.Info("starting indexer worker")
 		if err := idx.Start(ctx); err != nil {
 			stop.fail("indexer worker error", err)
