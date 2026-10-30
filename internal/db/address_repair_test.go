@@ -286,3 +286,75 @@ func TestAddressStatsRepairSplitsABatchThatRunsOutOfTime(t *testing.T) {
 	require.NotZero(t, slow)
 	requireAddressStatsIsExactlyTheTruth(t, d)
 }
+
+// PRST-5540: a revert takes the revert count, then address_stats rows, then the daily-stats lock (4670); the
+// earlier release's final repair batch took the daily-stats lock after the revert count, and the two deadlocked. The
+// repair takes neither in that order now. Order 1: a revert holds the count and its rows while a repair of other
+// addresses runs to the end, day recount included. Order 2: the repair's day recount holds the daily-stats lock
+// while a revert waits for it holding the count; the recount needs nothing the revert holds and commits, and the
+// revert then finishes.
+func TestARevertAndTheRepairDoNotDeadlockInEitherOrder(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(1, "h1", []revertTx{{from: "0xa", to: "0xb"}, {from: "0xd", to: "0xe"}})))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(2, "h2", []revertTx{{from: "0xa", to: "0xc"}})))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(3, "h3", []revertTx{{from: "0xa", to: "0xf"}})))
+	_, err := d.pool.Exec(ctx, `SELECT daily_stats_advance()`)
+	require.NoError(t, err)
+	drift := func() {
+		_, err := d.pool.Exec(ctx, `
+			UPDATE address_stats SET tx_count = tx_count + 2 WHERE address = '0xe';
+			UPDATE address_stats SET first_seen = 2 WHERE address = '0xd';
+			UPDATE ledger_verify_state SET value = value + 1 WHERE name = 'address_days_recount'`)
+		require.NoError(t, err)
+	}
+
+	t.Run("revert first", func(t *testing.T) {
+		drift()
+		revert, err := d.pool.Begin(ctx)
+		require.NoError(t, err)
+		defer revert.Rollback(context.Background())
+		_, err = revertAddressStats(ctx, revert, 3)
+		require.NoError(t, err, "the revert holds the count and 0xa's and 0xf's rows")
+		for bucket := 0; bucket < AddressBuckets; bucket++ {
+			drifted, err := d.AddressRepairDriftIn(ctx, bucket)
+			require.NoError(t, err)
+			if len(drifted.Addresses) == 0 {
+				continue
+			}
+			for _, a := range drifted.Addresses {
+				require.Contains(t, []string{"0xd", "0xe"}, a)
+			}
+			_, err = d.RepairAddressBucket(ctx, bucket, AddressRepairBatch)
+			require.NoError(t, err, "bucket %d beside an open revert", bucket)
+		}
+		_, err = revert.Exec(ctx, `SELECT daily_stats_invalidate(3)`)
+		require.NoError(t, err)
+		require.NoError(t, revert.Rollback(ctx))
+	})
+
+	t.Run("repair's day recount first", func(t *testing.T) {
+		recount, err := d.pool.Begin(ctx)
+		require.NoError(t, err)
+		defer recount.Rollback(context.Background())
+		_, err = recount.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`)
+		require.NoError(t, err)
+		reverted := make(chan error, 1)
+		go func() { reverted <- d.DeleteBlock(ctx, 3) }()
+		require.Eventually(t, func() bool {
+			var waiting int
+			_ = d.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND datname = current_database()`).Scan(&waiting)
+			return waiting == 1
+		}, 10*time.Second, 20*time.Millisecond, "the revert waits for the daily-stats lock")
+		require.NoError(t, recountDailyAddressColumns(ctx, recount), "the recount needs nothing the waiting revert holds")
+		require.NoError(t, recount.Commit(ctx))
+		require.NoError(t, <-reverted)
+	})
+
+	drift()
+	repairUntilDone(t, d)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+}
