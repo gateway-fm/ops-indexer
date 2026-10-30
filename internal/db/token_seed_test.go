@@ -30,8 +30,8 @@ func TestTokenCreatedAfterAPruneIsSeededFromTheLedgerToo(t *testing.T) {
 
 	ts := uint64(1_700_080_002)
 	require.NoError(t, d.InsertBlockDataBatch(ctx, &BlockData{
-		Block:     &types.Block{Number: 80_002, Hash: "blk80002", ParentHash: "blk80001", Timestamp: ts},
-		Tokens:    []*types.Token{{Address: retentionToken, Symbol: "RET", TokenType: types.TokenTypeERC20, BlockNumber: 80_002}},
+		Block:  &types.Block{Number: 80_002, Hash: "blk80002", ParentHash: "blk80001", Timestamp: ts},
+		Tokens: []*types.Token{{Address: retentionToken, Symbol: "RET", TokenType: types.TokenTypeERC20, BlockNumber: 80_002}},
 		Transfers: []*types.TokenTransfer{{TxHash: "late", LogIndex: 0, TokenAddress: retentionToken, From: zeroAddress, To: "0xb",
 			Value: "7", BlockNumber: 80_002, Timestamp: &ts, TokenType: types.TokenTypeERC20}},
 	}))

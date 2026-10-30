@@ -109,8 +109,8 @@ type AddressStatsDelta struct {
 	SentDelta            int
 	IsContract           bool
 	// LastBlock, when above BlockNumber, is the newest block of a delta merged over several (the stats backfill).
-	LastBlock uint64
-	BlockNumber          uint64
+	LastBlock   uint64
+	BlockNumber uint64
 }
 
 // BlockWrite is one block's ingest transaction, split so that the rows a block owns can be written
