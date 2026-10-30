@@ -199,12 +199,6 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(5)
 
-	go func() {
-		defer wg.Done()
-		database.RunVerify(ctx, db.VerifyConfig{RecountInterval: cfg.VerifyRecountInterval, Repair: cfg.VerifyRepair,
-			WorkMem: cfg.LedgerWorkMem, MaxOpenTail: db.MaxOpenTail(cfg.LedgerSpanBlocks)})
-	}()
-
 	reconciled := make(chan struct{})
 	afterReconcile := func() bool {
 		select {
@@ -214,6 +208,17 @@ func main() {
 			return false
 		}
 	}
+
+	// The checks wait for the startup reconcile like the ledger and retention: the address reconciliation creates and
+	// removes address_stats rows and moves addresses_total, which the reconcile's re-seed writes absolutely.
+	go func() {
+		defer wg.Done()
+		if !afterReconcile() {
+			return
+		}
+		database.RunVerify(ctx, db.VerifyConfig{RecountInterval: cfg.VerifyRecountInterval, Repair: cfg.VerifyRepair,
+			WorkMem: cfg.LedgerWorkMem, MaxOpenTail: db.MaxOpenTail(cfg.LedgerSpanBlocks)})
+	}()
 
 	go func() {
 		defer wg.Done()
