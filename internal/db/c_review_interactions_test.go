@@ -147,3 +147,48 @@ func TestARevertKeepsTheCountsABackfillBatchAddsMeanwhile(t *testing.T) {
 	require.Equal(t, []int64{1, 1, 15, 15}, []int64{txs, sent, firstSeen, lastSeen})
 	requireAddressStatsIsExactlyTheTruth(t, d)
 }
+
+// The running check reads a token's transfer_count below its truth and repairs it by the drift it read. A reorg that
+// reverts a block of the token's transfers in between floors the counter at zero, so the drift added afterwards
+// overshoots; the next check finds the token drifting again after a repair and quarantines it, and the counter stays
+// wrong.
+func TestARunningCheckRepairAcrossARevertLeavesTheTokenRightAndUnquarantined(t *testing.T) {
+	d, cleanup := verifiedDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	require.Empty(t, checkAllBuckets(t, d, false))
+	_, err := d.pool.Exec(ctx, `UPDATE tokens SET transfer_count = 0 WHERE address = '`+retentionToken+`'`)
+	require.NoError(t, err)
+
+	// Delays the repair between its read and its write, as any scheduling may.
+	blocker, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer blocker.Rollback(context.Background())
+	_, err = blocker.Exec(ctx, `LOCK TABLE ledger_repairs IN EXCLUSIVE MODE`)
+	require.NoError(t, err)
+	checked := make(chan error, 1)
+	go func() {
+		_, err := d.CheckRunning(ctx, 0, true)
+		checked <- err
+	}()
+	require.Eventually(t, func() bool {
+		var n int
+		_ = d.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&n)
+		return n == 1
+	}, 20*time.Second, 20*time.Millisecond, "the repair has read the drift")
+
+	require.NoError(t, d.DeleteBlock(ctx, 14_000), "a reorg reverts the head block and its transfer")
+	require.NoError(t, blocker.Rollback(ctx))
+	require.NoError(t, <-checked)
+
+	_, err = d.CheckRunning(ctx, 0, true)
+	require.NoError(t, err)
+	var transfers, quarantined int64
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT transfer_count, (SELECT count(*) FROM ledger_quarantine)
+		FROM tokens WHERE address = '`+retentionToken+`'`).Scan(&transfers, &quarantined))
+	require.Equal(t, []int64{14_000, 0}, []int64{transfers, quarantined},
+		"transfer_count is the 14,000 transfers left, and the token is not quarantined")
+}
