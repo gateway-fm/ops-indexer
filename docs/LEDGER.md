@@ -163,3 +163,9 @@ waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-u
 | `indexer_verify_cycle_seconds{check}`, `indexer_verify_last_full_cycle_timestamp{check}` | The last full cycle over every span or bucket. |
 
 Suggested alert: `increase(indexer_verify_ranges_drifted_total[1h]) > 0 or indexer_verify_quarantined > 0`.
+
+On OP Stack and Arbitrum chains, expect `chain_nonce` to report some senders as drifted for good: those whose early
+transactions are no longer stored (pruned, or counted by the stats backfill) and included a system or deposit type
+that raised the nonce. Leave `chain_nonce` out of the alert above there, and alert on a sustained drifted share of
+its samples instead, with a threshold above the chain's own baseline:
+`rate(indexer_verify_ranges_drifted_total{check="chain_nonce"}[6h]) / rate(indexer_verify_ranges_checked_total{check="chain_nonce"}[6h])`.
