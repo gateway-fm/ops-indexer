@@ -47,9 +47,12 @@ func revertTestBlock(number uint64, hash string, txs []revertTx) *BlockData {
 		for j, tr := range tx.transfers {
 			bd.Transfers = append(bd.Transfers, &types.TokenTransfer{TxHash: txHash, LogIndex: i*10 + j, TokenAddress: tx.to,
 				From: tr[0], To: tr[1], Value: "1", BlockNumber: number, Timestamp: &ts, TokenType: types.TokenTypeERC20})
-			delta(tr[0]).TokenTransferDelta++
-			touched[tr[0]] = true
-			if tr[1] != tr[0] {
+			// As ingest counts them: the zero address takes no part in a token transfer.
+			if tr[0] != zeroAddress {
+				delta(tr[0]).TokenTransferDelta++
+				touched[tr[0]] = true
+			}
+			if tr[1] != tr[0] && tr[1] != zeroAddress {
 				delta(tr[1]).TokenTransferDelta++
 				touched[tr[1]] = true
 			}

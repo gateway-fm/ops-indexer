@@ -54,6 +54,56 @@ on any drift. The ledger and the checks run with retention on or off.
   either done or not, and the next pass changes nothing a done batch set.
 - The span rebase is not a repair: it is not logged in `ledger_repairs` and never quarantines.
 
+## Checking address_stats against the ledger by hand
+
+After `repair-address-stats`, or at any time, these confirm that every address_stats row equals its truth: the
+closed ledger rows, the open stats backfill span's staged rows and the rows above the closed spans
+(`ledger_address_truth`). Ingest keeps writing meanwhile, so run them on a quiet database, or expect the addresses of
+the newest blocks to differ until the next block's write.
+
+Per bucket, cheap (the same diff the `running` check reads; each bucket reads only its own addresses). No rows means
+no drift. The zero address is in bucket 0 (addresses `0x00…` to `0x01…`), compared like any other since migration 036.
+
+```sql
+SELECT b AS bucket, count(DISTINCT key) AS drifted_addresses
+FROM generate_series(0, 255) AS b, ledger_running_diff_address(b)
+GROUP BY b ORDER BY b;
+```
+
+Every address at once, the zero address included. No rows means no drift. It reads every history table in full, so
+expect it to take as long as a scan of transactions, token_transfers and internal_transactions.
+
+```sql
+WITH c AS (
+    SELECT array_agg(DISTINCT address) AS all FROM (
+        SELECT address FROM address_stats UNION ALL SELECT address FROM ledger_address
+        UNION ALL SELECT from_address FROM transactions UNION ALL SELECT to_address FROM transactions
+        UNION ALL SELECT from_address FROM token_transfers UNION ALL SELECT to_address FROM token_transfers
+        UNION ALL SELECT from_address FROM internal_transactions UNION ALL SELECT to_address FROM internal_transactions
+        UNION ALL SELECT address FROM contracts
+    ) u WHERE address IS NOT NULL
+), t AS (SELECT x.* FROM c, ledger_address_truth(c.all) x)
+SELECT COALESCE(s.address, t.address) AS address,
+       s.tx_count, t.txs, s.sent_count, t.sent, s.internal_tx_count, t.internal,
+       s.token_transfer_count, t.transfers, s.first_seen, t.first_seen, s.last_seen, t.last_seen
+FROM address_stats s FULL JOIN t ON t.address = s.address
+WHERE s.address IS NULL OR t.address IS NULL
+   OR (s.tx_count, s.sent_count, s.internal_tx_count, s.token_transfer_count, s.first_seen, s.last_seen)
+      IS DISTINCT FROM (t.txs, t.sent, t.internal, t.transfers, t.first_seen, t.last_seen)
+ORDER BY 1;
+```
+
+The zero address alone, a quick check. It has a row like any address: transactions sent to it and internal calls to
+and from it count, token transfers from or to it do not, in ingest and in the ledger alike. `true` means equal.
+
+```sql
+SELECT (SELECT row(tx_count, sent_count, internal_tx_count, token_transfer_count, first_seen, last_seen)
+        FROM address_stats WHERE address = '0x0000000000000000000000000000000000000000')
+       IS NOT DISTINCT FROM
+       (SELECT row(txs::BIGINT, sent::BIGINT, internal::BIGINT, transfers::BIGINT, first_seen, last_seen)
+        FROM ledger_address_truth(ARRAY['0x0000000000000000000000000000000000000000'])) AS zero_address_ok;
+```
+
 ## Knobs (one budget per job)
 
 | variable | default | bounds |

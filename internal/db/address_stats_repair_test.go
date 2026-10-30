@@ -96,6 +96,17 @@ func addCounts(t *testing.T, d *DB, counts map[string]addressCounts) {
 	}
 }
 
+// addSent adds the sent transactions of blocks [lo, hi) to their senders, as ingest's deltas do (types 0-4).
+func addSent(t *testing.T, d *DB, lo, hi int64) {
+	t.Helper()
+	_, err := d.pool.Exec(context.Background(), `
+		UPDATE address_stats a SET sent_count = a.sent_count + x.n
+		FROM (SELECT from_address, count(*) AS n FROM transactions
+		      WHERE block_number >= $1 AND block_number < $2 AND tx_type BETWEEN 0 AND 4 GROUP BY from_address) x
+		WHERE a.address = x.from_address`, lo, hi)
+	require.NoError(t, err)
+}
+
 func merged(a, b map[string]addressCounts) map[string]addressCounts {
 	out := map[string]addressCounts{}
 	for k, v := range a {
@@ -153,6 +164,7 @@ func TestAddressStatsRepairRestoresBothErrorsFromTheLedger(t *testing.T) {
 	require.NoError(t, err)
 	truth := countsFromRows(t, d, 0, 80_002)
 	addCounts(t, d, truth)
+	addSent(t, d, 0, 80_002)
 
 	closeLedger(t, d)
 	require.NoError(t, d.retentionPass(ctx, cfg))
@@ -206,12 +218,7 @@ func TestAddressStatsRepairRestoresBothErrorsFromTheLedger(t *testing.T) {
 	seedVariedHistory(t, d, 80_002, 80_002)
 	ingested := countsFromRows(t, d, 80_002, 80_003)
 	addCounts(t, d, ingested)
-	_, err = d.pool.Exec(ctx, `
-		UPDATE address_stats a SET sent_count = a.sent_count + x.n
-		FROM (SELECT from_address, count(*) AS n FROM transactions WHERE block_number = 80002 AND tx_type BETWEEN 0 AND 4
-		      GROUP BY from_address) x
-		WHERE a.address = x.from_address`)
-	require.NoError(t, err, "ingest counts the block's senders' transactions")
+	addSent(t, d, 80_002, 80_003)
 
 	for bucket := AddressBuckets / 2; bucket < AddressBuckets; bucket++ {
 		r, err := d.RepairAddressBucket(ctx, bucket, 7)

@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +14,8 @@ import (
 )
 
 // addressStatsAgainstTheTruth lists every address whose address_stats row and truth disagree: a row with no truth, a
-// truth with no row, or any counter or block that differs. The addresses are read from the rows, the closed ledger
-// and every history table, not from the repair's own diff.
+// truth with no row, or any counter or block that differs, the zero address included. The addresses are read from the
+// rows, the closed ledger and every history table, not from the repair's own diff.
 func addressStatsAgainstTheTruth(t *testing.T, d *DB) []string {
 	t.Helper()
 	rows, err := d.pool.Query(context.Background(), `
@@ -24,12 +26,12 @@ func addressStatsAgainstTheTruth(t *testing.T, d *DB) []string {
 				UNION ALL SELECT from_address FROM token_transfers UNION ALL SELECT to_address FROM token_transfers
 				UNION ALL SELECT from_address FROM internal_transactions UNION ALL SELECT to_address FROM internal_transactions
 				UNION ALL SELECT address FROM contracts
-			) u WHERE address IS NOT NULL AND address <> '0x0000000000000000000000000000000000000000'
+			) u WHERE address IS NOT NULL
 		), t AS (SELECT x.* FROM c, ledger_address_truth(c.all) x)
 		SELECT concat_ws(' ', COALESCE(s.address, t.address),
 		                 'row', s.tx_count, s.sent_count, s.internal_tx_count, s.token_transfer_count, s.first_seen, s.last_seen,
 		                 'truth', t.txs, t.sent, t.internal, t.transfers, t.first_seen, t.last_seen)
-		FROM (SELECT * FROM address_stats WHERE address <> '0x0000000000000000000000000000000000000000') s
+		FROM address_stats s
 		FULL JOIN t ON t.address = s.address
 		WHERE s.address IS NULL OR t.address IS NULL
 		   OR (s.tx_count, s.sent_count, s.internal_tx_count, s.token_transfer_count, s.first_seen, s.last_seen)
@@ -357,4 +359,96 @@ func TestARevertAndTheRepairDoNotDeadlockInEitherOrder(t *testing.T) {
 	drift()
 	repairUntilDone(t, d)
 	requireAddressStatsIsExactlyTheTruth(t, d)
+}
+
+// The zero address has a row like any address: ingest and the ledger count the transactions sent to it and the
+// internal calls to and from it, and no token transfer for it. Ingest and the span close keep it equal to its truth;
+// drift on it is in bucket 0's diff, which the repair corrects. 036 down leaves it out of the diff, up puts it back.
+func TestTheZeroAddressIsComparedAndRepairedLikeAnyAddress(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	zero := zeroAddress
+	for n := uint64(1); n <= 4; n++ {
+		require.NoError(t, d.InsertBlockDataBatch(ctx, revertTestBlock(n, fmt.Sprintf("hz%d", n), []revertTx{
+			{from: "0xa", to: zero, transfers: [][2]string{{zero, "0xa"}, {"0xa", zero}}, internal: [][2]string{{"0xa", zero}}}})))
+	}
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, 'hz' || g, 'hz' || (g - 1), 1700000000 + g, 0, 30000000, 0 FROM generate_series(5, 13200) g`)
+	require.NoError(t, err)
+	_, err = d.CloseLedgerSpans(ctx, LedgerConfig{SpanBlocks: 100, FirstBlock: 1, WorkMem: "64MB"}, 1)
+	require.NoError(t, err)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+	var txs int64
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT tx_count FROM address_stats WHERE address = $1`, zero).Scan(&txs))
+	require.EqualValues(t, 4, txs, "four transactions sent to the zero address")
+
+	_, err = d.pool.Exec(ctx, `UPDATE address_stats SET tx_count = tx_count + 9, internal_tx_count = 0 WHERE address = $1`, zero)
+	require.NoError(t, err)
+	inBucket0 := func() bool {
+		drift, err := d.AddressRepairDriftIn(ctx, 0)
+		require.NoError(t, err)
+		for _, a := range drift.Addresses {
+			if a == zero {
+				return true
+			}
+		}
+		return false
+	}
+	require.True(t, inBucket0(), "bucket 0 reports the zero address")
+
+	pool := d.pool
+	migrateTo(t, pool, 35)
+	require.False(t, inBucket0(), "before 036 the diff left it out")
+	migrateTo(t, pool, -1)
+	require.True(t, inBucket0())
+
+	r, err := d.RepairAddressBucket(ctx, 0, AddressRepairBatch)
+	require.NoError(t, err)
+	require.Equal(t, 1, r.Changed)
+	requireAddressStatsIsExactlyTheTruth(t, d)
+}
+
+// The operator checks in docs/LEDGER.md ("Checking address_stats against the ledger by hand"), run as written: they
+// find the drift the fixture holds, and nothing once the repair has run.
+func TestTheLedgerDocsAddressStatsChecksRunAsWritten(t *testing.T) {
+	doc, err := os.ReadFile("../../docs/LEDGER.md")
+	require.NoError(t, err)
+	section := string(doc)[strings.Index(string(doc), "## Checking address_stats against the ledger by hand"):]
+	var queries []string
+	for _, part := range strings.Split(section, "```sql\n")[1:] {
+		queries = append(queries, part[:strings.Index(part, "```")])
+	}
+	require.Len(t, queries, 3, "per bucket, every address, the zero address")
+
+	d, ctx := repairFixture(t)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
+		VALUES ($1, 3, 0, 0, 0, 5, 5, false, NOW())`, zeroAddress)
+	require.NoError(t, err, "a zero-address row no block backs")
+	rowsOf := func(q string) int {
+		rows, err := d.pool.Query(ctx, q)
+		require.NoError(t, err)
+		n := 0
+		for rows.Next() {
+			n++
+		}
+		require.NoError(t, rows.Err())
+		rows.Close()
+		return n
+	}
+	zeroOK := func() bool {
+		var ok *bool
+		require.NoError(t, d.pool.QueryRow(ctx, queries[2]).Scan(&ok))
+		return ok != nil && *ok
+	}
+	require.NotZero(t, rowsOf(queries[0]))
+	require.Equal(t, 7, rowsOf(queries[1]), "the fixture's six drifts and the zero address")
+	require.False(t, zeroOK())
+
+	repairUntilDone(t, d)
+	require.Zero(t, rowsOf(queries[0]))
+	require.Zero(t, rowsOf(queries[1]))
+	require.True(t, zeroOK())
 }
