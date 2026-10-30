@@ -449,9 +449,6 @@ func (i *Indexer) Start(ctx context.Context) error {
 	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
 		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
 	}
-	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
-		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
-	}
 	if store, ok := i.db.(balanceRereadStore); ok {
 		refreshBalanceEpoch(ctx, i.db, i.balanceWorkers)
 		go i.RunBalanceRereads(ctx, store)
@@ -488,8 +485,8 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 	wipe := func() error {
 		log.Warn("FORCE_REINDEX=true: wiping indexed data and re-indexing from scratch")
-		if err := i.db.WipeAllData(ctx); err != nil {
-			return fmt.Errorf("failed to wipe data for reindex: %w", err)
+		if err := i.wipeForReindex(ctx, configuredStart); err != nil {
+			return err
 		}
 		i.startBlock = configuredStart
 		lastIndexed = 0
@@ -552,6 +549,11 @@ func (i *Indexer) Start(ctx context.Context) error {
 		}
 	}
 
+	// After the start's wipe, if any: the job ends once its backfill is complete or absent, and a wipe prepares the
+	// new chain's.
+	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
+		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
+	}
 	go i.publishProgressMetrics(ctx)
 
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
@@ -767,6 +769,28 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 			i.retryMissing(ctx, lastIndexed, &receipts)
 		}
 	}
+}
+
+// wipeForReindex wipes every indexed row for FORCE_REINDEX. A stats backfill the old chain had is prepared again for
+// the new one once the wipe has removed it; the backfill job starts after the start's wipe.
+func (i *Indexer) wipeForReindex(ctx context.Context, configuredStart uint64) error {
+	init, backfills := i.db.(backfillInitStore)
+	if backfills {
+		state, err := init.StatsBackfillState(ctx)
+		if err != nil {
+			return fmt.Errorf("read the stats backfill before the wipe: %w", err)
+		}
+		backfills = state.Exists
+	}
+	if err := i.db.WipeAllData(ctx); err != nil {
+		return fmt.Errorf("failed to wipe data for reindex: %w", err)
+	}
+	if backfills {
+		if err := PrepareStatsBackfill(ctx, init, i.rpc, configuredStart); err != nil {
+			return fmt.Errorf("prepare the stats backfill again after the wipe: %w", err)
+		}
+	}
+	return nil
 }
 
 // standardTick reverts a reorg at the stored head, then indexes up to latestOnChain, and returns the new last

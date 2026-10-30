@@ -512,3 +512,20 @@ func gauge(t *testing.T, name string) float64 {
 	t.Fatalf("no gauge %s", name)
 	return 0
 }
+
+// A FORCE_REINDEX wipe of a database whose stats backfill had completed prepares a new backfill for the new chain,
+// rather than leave the new chain's totals without [0, START_BLOCK) or keep the old chain's.
+func TestAWipeForReindexPreparesTheStatsBackfillAgain(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000))
+	_, err := sql.Exec(ctx, `UPDATE stats_backfill SET through = target, completed_at = now(), daily_done = true`)
+	require.NoError(t, err, "the old chain's backfill had completed")
+
+	idx := NewWithConfig(store, chain, time.Second, 5_000, &Config{RPCWorkers: 1, RPCRateLimit: 100})
+	require.NoError(t, idx.wipeForReindex(ctx, 5_000))
+	s, err := store.StatsBackfillState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, db.BackfillState{Exists: true, Target: 4_999, Through: -1}, s, "a new backfill, from the start")
+}

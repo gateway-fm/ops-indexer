@@ -2289,6 +2289,15 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 	if _, err := d.pool.Exec(ctx, `DELETE FROM ledger_verify_state WHERE name = $1`, addressRepairCursor); err != nil {
 		return fmt.Errorf("failed to forget an unfinished address_stats repair: %w", err)
 	}
+	// The ledger checks' progress starts over with the new chain: the reconciliation runs again, no recount is pending,
+	// and no running cycle is complete. A span rebase's stage is the old chain's.
+	if _, err := d.pool.Exec(ctx, `
+		UPDATE ledger_verify_state SET value = 0 WHERE name IN ('address_reconcile_next', 'address_days_recount', 'running_cycles')`); err != nil {
+		return fmt.Errorf("failed to reset the ledger checks' progress: %w", err)
+	}
+	if _, err := d.pool.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
+		return fmt.Errorf("failed to drop a span rebase's stage: %w", err)
+	}
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we
 	// list child tables first for clarity.
@@ -2336,6 +2345,19 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"history_archives",
 		// A request to re-read a balance of the wiped chain.
 		"balance_rereads",
+		// The ledger's checks, stats backfill and staging of the wiped chain. The stage tables are logged and carry no
+		// foreign key to ledger_spans, so its cascade does not reach them. A backfill row left behind would be taken
+		// for the new chain's, and the new chain's totals would miss [0, START_BLOCK).
+		"ledger_stage_address",
+		"ledger_stage_token",
+		"ledger_stage_chain",
+		"ledger_repairs",
+		"ledger_quarantine",
+		"ledger_reverted_address",
+		"stats_backfill_balance_keys",
+		"stats_backfill",
+		"daily_stats_base",
+		"daily_active_base",
 	}
 	for _, table := range tables {
 		if _, err := d.pool.Exec(ctx, "TRUNCATE TABLE "+table+" CASCADE"); err != nil {
