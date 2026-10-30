@@ -84,10 +84,14 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 			continue
 		}
 		if last == nil {
-			// The closed ledger's rows, or the stats backfill's open span, which has not closed yet.
+			// The newest closed span holding the address, read span by span through the ledger's primary key (its
+			// address index is built after startup, and a revert must not wait for it or scan the ledger), and the
+			// stats backfill's open span, which has not closed yet.
 			if err := tx.QueryRow(ctx, `
 				SELECT max(last_seen) FROM (
-					SELECT last_seen FROM ledger_address WHERE address = $1
+					(SELECT a.last_seen FROM ledger_spans s
+					 CROSS JOIN LATERAL (SELECT last_seen FROM ledger_address WHERE lo = s.lo AND address = $1) a
+					 ORDER BY s.lo DESC LIMIT 1)
 					UNION ALL
 					SELECT last_seen FROM ledger_stage_address WHERE lo = stats_backfill_open_span() AND address = $1
 				) l`, c.address).Scan(&last); err != nil {
