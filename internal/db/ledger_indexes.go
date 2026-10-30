@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
+	"github.com/gateway-fm/chain-indexer/internal/metrics"
 )
 
 // ledgerIndexes are the ledger's lookup indexes that grow with the table: ledger_address by address (the span
@@ -46,7 +47,8 @@ func (d *DB) EnsureLedgerIndexes(ctx context.Context) error {
 		}
 		log.Info("ledger index built", "index", ix.name, "duration", time.Since(start).Round(time.Millisecond))
 	}
-	return nil
+	_, err := d.LedgerIndexesReady(ctx)
+	return err
 }
 
 // LedgerIndexesReady reports whether every ledger index exists and is valid.
@@ -59,6 +61,9 @@ func (d *DB) LedgerIndexesReady(ctx context.Context) (bool, error) {
 	err := d.pool.QueryRow(ctx, `
 		SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
 		WHERE c.relname = ANY ($1) AND c.relnamespace = current_schema()::regnamespace AND i.indisvalid`, names).Scan(&ready)
+	if err == nil {
+		metrics.SetLedgerIndexesReady(ready == len(ledgerIndexes))
+	}
 	return ready == len(ledgerIndexes), err
 }
 

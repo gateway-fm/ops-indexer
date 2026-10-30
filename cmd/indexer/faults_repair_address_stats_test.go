@@ -402,3 +402,27 @@ func TestFaultRepairDryRunWritesNothing(t *testing.T) {
 	require.Equal(t, before, checksum())
 	require.EqualValues(t, 7, f.wrong(t), "the dry run left the drift as it was")
 }
+
+// Right after an upgrade the indexer is still building the ledger's address index: the repair waits for it, bounded
+// by --wait-indexes, and gives up with exit 1 rather than read the whole ledger per bucket; once built, it runs.
+func TestFaultRepairWaitsForTheLedgerIndexes(t *testing.T) {
+	f := newRepairFixture(t)
+	admin := faultkit.Conn(t, f.url)
+	ctx := context.Background()
+	_, err := admin.Exec(ctx, `DROP INDEX ledger_address_address`)
+	require.NoError(t, err)
+	require.Equal(t, 1, f.repair(t, "--wait-indexes", "1s"), "the index is not built")
+	require.EqualValues(t, 7, f.wrong(t), "nothing repaired")
+
+	done := make(chan int, 1)
+	go func() { done <- f.repair(t, "--wait-indexes", "2m") }()
+	time.Sleep(2 * time.Second)
+	require.NoError(t, f.d.EnsureLedgerIndexes(ctx))
+	select {
+	case code := <-done:
+		require.Equal(t, 0, code)
+	case <-time.After(90 * time.Second):
+		t.Fatal("the repair did not start once the index was built")
+	}
+	f.consistent(t, "after the index was built")
+}

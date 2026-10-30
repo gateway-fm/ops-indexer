@@ -141,6 +141,7 @@ waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-u
 
 | metric | meaning |
 |---|---|
+| `indexer_ledger_indexes_ready` | 1 once the ledger's lookup indexes (built after startup, CONCURRENTLY) exist; while 0 the span rebase, the checks and `repair-address-stats` wait. Alert when it stays 0: a build that keeps failing keeps them off. |
 | `indexer_ledger_closed_through` | Every block at or below this is in a closed span. |
 | `indexer_ledger_close_seconds` | Time to close one span from its rows. |
 | `indexer_stats_backfill_through` | Every block at or below this is counted by the stats backfill. |

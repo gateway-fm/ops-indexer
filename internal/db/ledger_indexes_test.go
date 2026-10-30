@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -76,4 +77,29 @@ func TestTheLedgerIndexesAreBuiltAfterStartupAndTheirReadersWaitForThem(t *testi
 	ready, err = d.LedgerIndexesReady(ctx)
 	require.NoError(t, err)
 	require.True(t, ready, "the invalid index is replaced")
+}
+
+// indexer_ledger_indexes_ready follows the indexes: 0 while one is missing, 1 once they are built.
+func TestTheLedgerIndexesReadyGaugeFollowsTheIndexes(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	gauge := func() float64 {
+		families, err := prometheus.DefaultGatherer.Gather()
+		require.NoError(t, err)
+		for _, f := range families {
+			if f.GetName() == "indexer_ledger_indexes_ready" {
+				return f.GetMetric()[0].GetGauge().GetValue()
+			}
+		}
+		return -1
+	}
+	_, err := d.pool.Exec(ctx, `DROP INDEX ledger_address_address`)
+	require.NoError(t, err)
+	ready, err := d.LedgerIndexesReady(ctx)
+	require.NoError(t, err)
+	require.False(t, ready)
+	require.Equal(t, float64(0), gauge())
+	require.NoError(t, d.EnsureLedgerIndexes(ctx))
+	require.Equal(t, float64(1), gauge())
 }

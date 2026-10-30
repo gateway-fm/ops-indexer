@@ -325,6 +325,20 @@ var (
 	})
 )
 
+var ledgerIndexesReady = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "indexer_ledger_indexes_ready",
+	Help: "1 once the ledger's lookup indexes are built; 0 while they are not, and the span rebase, the ledger checks and repair-address-stats wait.",
+})
+
+// SetLedgerIndexesReady sets indexer_ledger_indexes_ready.
+func SetLedgerIndexesReady(ready bool) {
+	if ready {
+		ledgerIndexesReady.Set(1)
+	} else {
+		ledgerIndexesReady.Set(0)
+	}
+}
+
 var balanceRereadsAbandoned = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "indexer_balance_rereads_abandoned_total",
 	Help: "Balances a reorg revert asked to read again that every attempt failed to read; each stays as the revert restored it until the holder's next transfer.",
