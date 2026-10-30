@@ -1317,6 +1317,10 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			contractAddr := receipt.ContractAddress.Hex()
 			// Set the contract address on the transaction so it shows in the UI
 			blockData.Transactions[len(blockData.Transactions)-1].ContractAddress = &contractAddr
+		}
+		// A reverted creation deployed nothing, whatever code the node keeps or has lost.
+		if receipt != nil && rawTx.To == nil && receipt.ContractAddress != (common.Address{}) && receipt.Status != 0 {
+			contractAddr := receipt.ContractAddress.Hex()
 			code, err := i.contractCode(ctx, receipt.ContractAddress, blockNumber)
 			if err != nil && i.config.CountersOnly {
 				codeErr = errors.Join(codeErr, err)
