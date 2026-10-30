@@ -103,6 +103,11 @@ func (c *Client) GetCode(ctx context.Context, address common.Address) ([]byte, e
 	return c.raw.CodeAt(ctx, address, nil)
 }
 
+// GetCodeAt is an account's code after the given block; a node without that block's state answers with an error.
+func (c *Client) GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
+	return c.raw.CodeAt(ctx, address, new(big.Int).SetUint64(block))
+}
+
 func (c *Client) ChainID(ctx context.Context) (*big.Int, error) {
 	return c.raw.ChainID(ctx)
 }

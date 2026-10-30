@@ -1104,6 +1104,40 @@ type builtBlock struct {
 	blockNumber    uint64
 	blockTimestamp uint64
 	tracesErr      error
+	// codeErr is why a recount (CountersOnly) could not decide whether a creation of the block is a contract.
+	codeErr error
+}
+
+// codeAtReader reads an account's code after a given block, where the node keeps that block's state.
+type codeAtReader interface {
+	GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error)
+}
+
+// errContractUndecided: a recount cannot tell whether a creation is a contract.
+var errContractUndecided = errors.New("the node does not serve the code at the creation's block, and has none for it at the head")
+
+// contractCode is the code a creation in block is judged by. Ingest reads it at latest, soon after the block, and an
+// error or no code means no contract. A recount (CountersOnly) has to judge an old block as ingest did then: the code
+// after that block where the node keeps its state, else the code at latest when there is some. An error, or no code
+// at latest (never deployed, or destroyed since: the two cannot be told apart), is returned, so the block fails rather
+// than lose the contract.
+func (i *Indexer) contractCode(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
+	if !i.config.CountersOnly {
+		return i.rpc.GetCode(ctx, address)
+	}
+	if r, ok := i.rpc.(codeAtReader); ok {
+		if code, err := r.GetCodeAt(ctx, address, block); err == nil {
+			return code, nil
+		}
+	}
+	code, err := i.rpc.GetCode(ctx, address)
+	if err != nil {
+		return nil, fmt.Errorf("code of %s: %w", address.Hex(), err)
+	}
+	if len(code) == 0 {
+		return nil, fmt.Errorf("contract %s created in block %d: %w", address.Hex(), block, errContractUndecided)
+	}
+	return code, nil
 }
 
 func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) *builtBlock {
@@ -1146,7 +1180,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	newTokenAddresses := make([]common.Address, 0)
 	newTokenTxHashes := make(map[common.Address]string)
 	addressTxs := make(map[string]map[int]struct{})
-	var tracesErr error
+	var tracesErr, codeErr error
 	balanceWork := make([]BalanceWork, 0)
 
 	// NFT instances touched this block, and (for mints) the tokenURI fetches to
@@ -1246,7 +1280,10 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			contractAddr := receipt.ContractAddress.Hex()
 			// Set the contract address on the transaction so it shows in the UI
 			blockData.Transactions[len(blockData.Transactions)-1].ContractAddress = &contractAddr
-			code, err := i.rpc.GetCode(ctx, receipt.ContractAddress)
+			code, err := i.contractCode(ctx, receipt.ContractAddress, blockNumber)
+			if err != nil && i.config.CountersOnly {
+				codeErr = errors.Join(codeErr, err)
+			}
 			if err == nil && len(code) > 0 {
 				bytecodeHash := common.BytesToHash(common.FromHex(common.Bytes2Hex(code))).Hex()
 				blockData.Contracts = append(blockData.Contracts, &types.Contract{
@@ -1416,7 +1453,13 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 				}
 			}
 			for _, it := range internalCreations(internalTxs) {
-				c := contractFromCreation(ctx, i.rpc.GetCode, it, blockNumber)
+				c := contractFromCreation(ctx, func(ctx context.Context, a common.Address) ([]byte, error) {
+					code, err := i.contractCode(ctx, a, blockNumber)
+					if err != nil && i.config.CountersOnly {
+						codeErr = errors.Join(codeErr, err)
+					}
+					return code, err
+				}, it, blockNumber)
 				if c == nil {
 					continue
 				}
@@ -1481,7 +1524,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	return &builtBlock{raw: rawBlock, data: blockData, balanceWork: balanceWork, discovered: discovered,
-		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp, tracesErr: tracesErr}
+		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp, tracesErr: tracesErr, codeErr: codeErr}
 }
 
 func (i *Indexer) afterCommit(ctx context.Context, b *builtBlock) {

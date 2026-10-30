@@ -83,5 +83,8 @@ func (c *spanCounter) block(ctx context.Context, n uint64) (*db.BlockData, error
 	if b.tracesErr != nil {
 		return nil, fmt.Errorf("block %d traces: %w", n, b.tracesErr)
 	}
+	if b.codeErr != nil {
+		return nil, fmt.Errorf("block %d: %w", n, b.codeErr)
+	}
 	return b.data, nil
 }
