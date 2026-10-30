@@ -45,10 +45,16 @@ type MissingRangeCollector struct {
 
 	// Chain head
 	chainHead uint64
+	// ceiling, when set, is realtime's cursor: the forward scan stops there, since the blocks above are realtime's
+	// to write and catch-up chasing them races it at the tip.
+	ceiling func() uint64
 
 	// State
 	backfillComplete bool
 	initialScanDone  bool
+	// unscanned holds the startup scan's batches that failed; the forward scanner scans them again on its next
+	// pass, so their gaps are queued without a restart.
+	unscanned []db.BlockRange
 
 	// Coordination
 	mu     sync.RWMutex
@@ -159,19 +165,15 @@ func (c *MissingRangeCollector) initialScan(ctx context.Context, lastBlock uint6
 			toBlock = lastBlock
 		}
 
-		ranges, err := c.db.FindMissingBlocksInRange(ctx, fromBlock, toBlock)
+		found, err := c.scanBatch(ctx, fromBlock, toBlock)
 		if err != nil {
-			log.Error("failed to find missing blocks", "from", fromBlock, "to", toBlock, "error", err)
+			log.Error("initial gap scan batch failed, retrying on a later pass", "from", fromBlock, "to", toBlock, "error", err)
+			c.mu.Lock()
+			c.unscanned = append(c.unscanned, db.BlockRange{FromNumber: fromBlock, ToNumber: toBlock})
+			c.mu.Unlock()
 			continue
 		}
-
-		if len(ranges) > 0 {
-			if err := c.db.SaveMissingRanges(ctx, ranges); err != nil {
-				log.Error("failed to save missing ranges", "error", err)
-				continue
-			}
-			totalRanges += len(ranges)
-		}
+		totalRanges += found
 
 		if toBlock%100000 == 0 || toBlock == lastBlock {
 			log.Info("initial scan progress",
@@ -181,12 +183,56 @@ func (c *MissingRangeCollector) initialScan(ctx context.Context, lastBlock uint6
 	}
 
 	totalMissing, _ := c.db.GetTotalMissingBlocks(ctx)
+	c.mu.RLock()
+	unscanned := len(c.unscanned)
+	c.mu.RUnlock()
 	log.Info("initial scan complete",
 		"ranges_found", totalRanges,
-		"total_missing_blocks", totalMissing)
+		"total_missing_blocks", totalMissing,
+		"batches_to_retry", unscanned)
 
 	c.initialScanDone = true
 	return nil
+}
+
+// scanBatch finds the missing blocks in [from, to] and saves them as ranges, returning how many it saved.
+func (c *MissingRangeCollector) scanBatch(ctx context.Context, from, to uint64) (int, error) {
+	ranges, err := c.db.FindMissingBlocksInRange(ctx, from, to)
+	if err != nil {
+		return 0, err
+	}
+	if len(ranges) > 0 {
+		if err := c.db.SaveMissingRanges(ctx, ranges); err != nil {
+			return 0, err
+		}
+	}
+	return len(ranges), nil
+}
+
+// rescanFailed scans again the startup scan's batches that failed, oldest first, and stops at the first that fails
+// again.
+func (c *MissingRangeCollector) rescanFailed() {
+	for {
+		c.mu.RLock()
+		if len(c.unscanned) == 0 {
+			c.mu.RUnlock()
+			return
+		}
+		r := c.unscanned[0]
+		c.mu.RUnlock()
+		if c.ctx.Err() != nil {
+			return
+		}
+		found, err := c.scanBatch(c.ctx, r.FromNumber, r.ToNumber)
+		if err != nil {
+			log.Error("initial gap scan batch failed again, retrying on a later pass", "from", r.FromNumber, "to", r.ToNumber, "error", err)
+			return
+		}
+		log.Info("initial gap scan batch rescanned", "from", r.FromNumber, "to", r.ToNumber, "ranges_found", found)
+		c.mu.Lock()
+		c.unscanned = c.unscanned[1:]
+		c.mu.Unlock()
+	}
 }
 
 func (c *MissingRangeCollector) backwardScanner() {
@@ -285,51 +331,77 @@ func (c *MissingRangeCollector) scanBackward() {
 	c.mu.Unlock()
 }
 
+// SetCeiling bounds the forward scan at ceiling().
+func (c *MissingRangeCollector) SetCeiling(ceiling func() uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ceiling = ceiling
+}
+
 func (c *MissingRangeCollector) scanForward() {
+	c.rescanFailed()
+
 	chainHead, err := c.rpc.BlockNumber(c.ctx)
 	if err != nil {
 		log.Error("failed to get chain head", "error", err)
 		return
 	}
 
+	c.mu.RLock()
+	ceiling := c.ceiling
+	c.mu.RUnlock()
+	toBlock := chainHead
+	if ceiling != nil {
+		toBlock = min(toBlock, ceiling())
+	}
+
 	c.mu.Lock()
-	if chainHead <= c.maxFetchedBlock {
+	if toBlock <= c.maxFetchedBlock {
+		c.chainHead = max(c.chainHead, chainHead)
 		c.mu.Unlock()
 		return
 	}
 
 	fromBlock := c.maxFetchedBlock + 1
-	toBlock := chainHead
 	c.mu.Unlock()
 
-	ranges, err := c.db.FindMissingBlocksInRange(c.ctx, fromBlock, toBlock)
-	if err != nil {
-		log.Error("forward scan failed", "from", fromBlock, "to", toBlock, "error", err)
-		return
-	}
-
-	if len(ranges) > 0 {
-		if err := c.db.SaveMissingRanges(c.ctx, ranges); err != nil {
-			log.Error("failed to save missing ranges", "error", err)
+	// The range can be millions of blocks after a long stall (realtime's cursor jumped ahead). Scan it a batch at a time
+	// and record each batch, so a scan that fails costs one batch and the next tick resumes there.
+	batch := max(c.config.BatchSize, 1)
+	for from := fromBlock; from <= toBlock; from += batch {
+		if c.ctx.Err() != nil {
+			return
+		}
+		to := min(from+batch-1, toBlock)
+		ranges, err := c.db.FindMissingBlocksInRange(c.ctx, from, to)
+		if err != nil {
+			log.Error("forward scan failed, resuming from here on the next tick", "from", from, "to", to, "error", err)
 			return
 		}
 
-		missingCount := uint64(0)
-		for _, r := range ranges {
-			missingCount += r.ToNumber - r.FromNumber + 1
-		}
-		log.Debug("forward scan found gaps",
-			"from", fromBlock,
-			"to", toBlock,
-			"ranges", len(ranges),
-			"missing_blocks", missingCount)
-	}
+		if len(ranges) > 0 {
+			if err := c.db.SaveMissingRanges(c.ctx, ranges); err != nil {
+				log.Error("failed to save missing ranges", "error", err)
+				return
+			}
 
-	c.mu.Lock()
-	c.maxFetchedBlock = toBlock
-	c.chainHead = chainHead
-	c.db.UpdateIndexerProgress(c.ctx, c.minFetchedBlock, c.maxFetchedBlock, c.backfillComplete)
-	c.mu.Unlock()
+			missingCount := uint64(0)
+			for _, r := range ranges {
+				missingCount += r.ToNumber - r.FromNumber + 1
+			}
+			log.Debug("forward scan found gaps",
+				"from", from,
+				"to", to,
+				"ranges", len(ranges),
+				"missing_blocks", missingCount)
+		}
+
+		c.mu.Lock()
+		c.maxFetchedBlock = to
+		c.chainHead = max(c.chainHead, chainHead)
+		c.db.UpdateIndexerProgress(c.ctx, c.minFetchedBlock, c.maxFetchedBlock, c.backfillComplete)
+		c.mu.Unlock()
+	}
 }
 
 func (c *MissingRangeCollector) GetProgress() (minFetched, maxFetched, chainHead uint64, backfillComplete bool) {

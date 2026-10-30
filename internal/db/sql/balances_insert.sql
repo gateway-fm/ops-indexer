@@ -8,7 +8,11 @@
 --
 -- Was one INSERT per row (0.12 ms x ~97 per block under a 500 tx/s load, 24.8% of database
 -- time once holder_count was incremental). Semantics unchanged: last write wins for an identical key.
+--
+-- A row for a pruned block has no partition to go to; it is left out here, and its current balance is still
+-- applied.
 INSERT INTO balances (address, token_address, block_number, balance)
 SELECT LOWER(a), LOWER(t), b, v
 FROM unnest($1::text[], $2::text[], $3::bigint[], $4::numeric[]) AS r(a, t, b, v)
+WHERE b >= (SELECT history_from())
 ON CONFLICT (address, token_address, block_number) DO UPDATE SET balance = EXCLUDED.balance

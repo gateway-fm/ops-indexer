@@ -19,6 +19,14 @@ message ChainStats {
   // Moving average over the last N blocks (N is indexer config).
   float avg_block_time_seconds = 7;
   float avg_tx_per_block = 8;
+
+  // Every block at or below it was pruned by the retention window (0: nothing pruned); history reads at or below it answer OUT_OF_RANGE, or with PRUNED_LOOKUP on, blocks and transactions are served from the node; totals still count it.
+  uint64 pruned_through_block = 9;
+  // Timestamp of pruned_through_block (unset: nothing pruned).
+  google.protobuf.Timestamp pruned_through_timestamp = 10;
+  // 11 and 12 are left free for the stats backfill's fields.
+  // Tokens the indexer has discovered (chain_counters tokens_total).
+  uint64 total_tokens = 13;
 }
 
 // TransactionHistoryBucket is one bin in a tx-count-over-time histogram.

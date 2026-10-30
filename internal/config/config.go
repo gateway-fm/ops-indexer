@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -10,8 +11,10 @@ import (
 )
 
 type Config struct {
-	RPCURL      string `mapstructure:"rpc_url"`
-	DatabaseURL string `mapstructure:"database_url"`
+	RPCURL string `mapstructure:"rpc_url"`
+	// RPCTimeout bounds every call to the node, from the request to the last byte of the reply.
+	RPCTimeout  time.Duration `mapstructure:"rpc_timeout"`
+	DatabaseURL string        `mapstructure:"database_url"`
 	// GRPCListenAddr is the address the chain-indexer gRPC server binds to,
 	// e.g. ":50051". Required.
 	GRPCListenAddr string        `mapstructure:"grpc_listen_addr"`
@@ -28,6 +31,22 @@ type Config struct {
 	// transaction hash (0.4.0 had one); false spares ingest its random writes.
 	TxHashIndexes bool   `mapstructure:"tx_hash_indexes"`
 	StartBlock    uint64 `mapstructure:"start_block"`
+	// PruneRetainBlocks keeps this many blocks below the stored head and drops older history by whole partitions;
+	// 0 (the default) keeps everything. PartitionBlocks 0 is PruneRetainBlocks / 10.
+	PruneRetainBlocks   uint64        `mapstructure:"prune_retain_blocks"`
+	PartitionBlocks     uint64        `mapstructure:"partition_blocks"`
+	PruneInterval       time.Duration `mapstructure:"prune_interval"`
+	PruneArchiveDir     string        `mapstructure:"prune_archive_dir"`
+	LedgerSpanBlocks    uint64        `mapstructure:"ledger_span_blocks"`
+	LedgerCloseInterval time.Duration `mapstructure:"ledger_close_interval"`
+	LedgerWorkMem       string        `mapstructure:"ledger_work_mem"`
+	// PrunedLookup serves blocks and transactions below the prune watermark from the node (PRST-5375).
+	PrunedLookup            bool          `mapstructure:"pruned_lookup"`
+	PrunedLookupCacheBlocks int           `mapstructure:"pruned_lookup_cache_blocks"`
+	PrunedLookupCacheMB     int           `mapstructure:"pruned_lookup_cache_mb"`
+	PrunedLookupTimeout     time.Duration `mapstructure:"pruned_lookup_timeout"`
+	PrunedLookupConcurrency int           `mapstructure:"pruned_lookup_concurrency"`
+	LedgerMaxHeadLag        uint64        `mapstructure:"ledger_max_head_lag_blocks"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -55,6 +74,9 @@ type Config struct {
 	CatchupWorkers   int  `mapstructure:"catchup_workers"`
 	CatchupBatchSize int  `mapstructure:"catchup_batch_size"`
 	CatchupQueueSize int  `mapstructure:"catchup_queue_size"`
+	// RealtimeMaxBehind: realtime further behind the node than this jumps to the head and hands the skipped blocks
+	// to catch-up. 0 never jumps.
+	RealtimeMaxBehind uint64 `mapstructure:"realtime_max_behind_blocks"`
 
 	// Set PRIVACY_PROXY_URL to enable proxy mode (auth + privacy enforcement).
 	// Leave empty for standalone mode (direct DB/RPC access).
@@ -87,6 +109,7 @@ type Config struct {
 
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("rpc_url", "http://127.0.0.1:8545")
+	v.SetDefault("rpc_timeout", "60s")
 	v.SetDefault("database_url", "postgres://postgres:postgres@localhost:5432/chain_indexer?sslmode=disable")
 	v.SetDefault("grpc_listen_addr", ":50051")
 	v.SetDefault("api_port", 8080)
@@ -98,6 +121,19 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("balance_skip_l1", false)
 	v.SetDefault("tx_hash_indexes", true)
 	v.SetDefault("start_block", 0)
+	v.SetDefault("prune_retain_blocks", 0)
+	v.SetDefault("partition_blocks", 0)
+	v.SetDefault("prune_interval", "1m")
+	v.SetDefault("prune_archive_dir", "")
+	v.SetDefault("ledger_span_blocks", 100000)
+	v.SetDefault("ledger_close_interval", "10s")
+	v.SetDefault("ledger_work_mem", "512MB")
+	v.SetDefault("pruned_lookup", false)
+	v.SetDefault("pruned_lookup_cache_blocks", 2000)
+	v.SetDefault("pruned_lookup_cache_mb", 256)
+	v.SetDefault("pruned_lookup_timeout", "5s")
+	v.SetDefault("pruned_lookup_concurrency", 4)
+	v.SetDefault("ledger_max_head_lag_blocks", 0)
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -125,6 +161,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("catchup_workers", 10)
 	v.SetDefault("catchup_batch_size", 100)
 	v.SetDefault("catchup_queue_size", 1000)
+	v.SetDefault("realtime_max_behind_blocks", 0)
 
 	v.SetDefault("privacy_proxy_url", "")
 	v.SetDefault("privacy_proxy_public_url", "")
@@ -160,6 +197,7 @@ func Load() (*Config, error) {
 
 	cfg := &Config{}
 	cfg.RPCURL = v.GetString("rpc_url")
+	cfg.RPCTimeout = v.GetDuration("rpc_timeout")
 	cfg.DatabaseURL = v.GetString("database_url")
 	cfg.GRPCListenAddr = v.GetString("grpc_listen_addr")
 	cfg.APIPort = v.GetInt("api_port")
@@ -171,6 +209,22 @@ func Load() (*Config, error) {
 	cfg.BalanceSkipL1 = v.GetBool("balance_skip_l1")
 	cfg.TxHashIndexes = v.GetBool("tx_hash_indexes")
 	cfg.StartBlock = v.GetUint64("start_block")
+	cfg.PruneRetainBlocks = v.GetUint64("prune_retain_blocks")
+	cfg.PartitionBlocks = v.GetUint64("partition_blocks")
+	if cfg.PartitionBlocks == 0 {
+		cfg.PartitionBlocks = cfg.PruneRetainBlocks / 10
+	}
+	cfg.PruneInterval = v.GetDuration("prune_interval")
+	cfg.PruneArchiveDir = v.GetString("prune_archive_dir")
+	cfg.LedgerSpanBlocks = v.GetUint64("ledger_span_blocks")
+	cfg.LedgerCloseInterval = v.GetDuration("ledger_close_interval")
+	cfg.LedgerWorkMem = v.GetString("ledger_work_mem")
+	cfg.PrunedLookup = v.GetBool("pruned_lookup")
+	cfg.PrunedLookupCacheBlocks = v.GetInt("pruned_lookup_cache_blocks")
+	cfg.PrunedLookupCacheMB = v.GetInt("pruned_lookup_cache_mb")
+	cfg.PrunedLookupTimeout = v.GetDuration("pruned_lookup_timeout")
+	cfg.PrunedLookupConcurrency = v.GetInt("pruned_lookup_concurrency")
+	cfg.LedgerMaxHeadLag = v.GetUint64("ledger_max_head_lag_blocks")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")
@@ -198,6 +252,7 @@ func Load() (*Config, error) {
 	cfg.CatchupWorkers = v.GetInt("catchup_workers")
 	cfg.CatchupBatchSize = v.GetInt("catchup_batch_size")
 	cfg.CatchupQueueSize = v.GetInt("catchup_queue_size")
+	cfg.RealtimeMaxBehind = v.GetUint64("realtime_max_behind_blocks")
 
 	cfg.PrivacyProxyURL = v.GetString("privacy_proxy_url")
 	cfg.PrivacyProxyPublicURL = v.GetString("privacy_proxy_public_url")
@@ -225,9 +280,40 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// ReorgFloorBlocks is the minimum retention window: nothing within 100x the deepest reorg the indexer reverts is
+// ever pruned (db.PruneFloorGap, prune_floor_gap()).
+const ReorgFloorBlocks = 12800
+
+// The retention and ledger minimums are derived for a chain of up to MaxChainBlocksPerSecond (100 ms blocks), with
+// catchUpHeadroom to spare: the ledger and the partitions keep ahead of such a chain ten times over, so a backlog
+// left by an outage shrinks at nine times the chain's rate instead of never.
+const (
+	MaxChainBlocksPerSecond = 10
+	catchUpHeadroom         = 10
+	// MinPollInterval bounds how often the retention pass and the ledger closer poll. Either finds work only once
+	// the head has moved by a span or a range, at least MinLedgerSpanBlocks(MinPollInterval) blocks; polling more
+	// often than once a second only reads the database for nothing.
+	MinPollInterval = time.Second
+	// partitionKeeperInterval is how often retention keeps partitions ahead of the head (the db package's
+	// ensureInterval).
+	partitionKeeperInterval = 10 * time.Second
+	// MinPartitionBlocks: the two partitions kept ahead of the head cover what the chain makes between two keeper
+	// checks, with the headroom: 2 x MinPartitionBlocks = 10 blocks/s x 10 x 10 s.
+	MinPartitionBlocks = MaxChainBlocksPerSecond * catchUpHeadroom * uint64(partitionKeeperInterval/time.Second) / 2
+)
+
+// MinLedgerSpanBlocks is the smallest LEDGER_SPAN_BLOCKS for a close interval: the closer closes one span per
+// interval, so a span must hold what the chain makes in one, with the headroom.
+func MinLedgerSpanBlocks(closeInterval time.Duration) uint64 {
+	return uint64(math.Ceil(MaxChainBlocksPerSecond * catchUpHeadroom * closeInterval.Seconds()))
+}
+
 func (c *Config) Validate() error {
 	if c.RPCURL == "" {
 		return fmt.Errorf("RPC_URL is required")
+	}
+	if c.RPCTimeout <= 0 {
+		return fmt.Errorf("RPC_TIMEOUT must be greater than 0, got %s", c.RPCTimeout)
 	}
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
@@ -246,6 +332,36 @@ func (c *Config) Validate() error {
 	}
 	if err := c.CheckCommitPipeline(); err != nil {
 		return err
+	}
+	if c.PruneRetainBlocks > 0 && c.PruneRetainBlocks < ReorgFloorBlocks {
+		return fmt.Errorf("PRUNE_RETAIN_BLOCKS %d is inside the reorg floor (%d blocks)", c.PruneRetainBlocks, ReorgFloorBlocks)
+	}
+	if c.LedgerSpanBlocks == 0 {
+		return fmt.Errorf("LEDGER_SPAN_BLOCKS must be greater than 0")
+	}
+	if c.PruneInterval < MinPollInterval {
+		return fmt.Errorf("PRUNE_INTERVAL=%s would run the retention pass back to back against the database: set it to at least %s",
+			c.PruneInterval, MinPollInterval)
+	}
+	if c.LedgerCloseInterval < MinPollInterval {
+		return fmt.Errorf("LEDGER_CLOSE_INTERVAL=%s would run the ledger closer back to back against the database: set it to at least %s",
+			c.LedgerCloseInterval, MinPollInterval)
+	}
+	if minSpan := MinLedgerSpanBlocks(c.LedgerCloseInterval); c.LedgerSpanBlocks < minSpan {
+		return fmt.Errorf("LEDGER_SPAN_BLOCKS=%d with LEDGER_CLOSE_INTERVAL=%s closes at most %.0f blocks/s, too slow to keep up with "+
+			"a chain of up to %d blocks/s with %dx headroom, and nothing is pruned while the ledger is behind: "+
+			"set LEDGER_SPAN_BLOCKS to at least %d, or shorten LEDGER_CLOSE_INTERVAL",
+			c.LedgerSpanBlocks, c.LedgerCloseInterval, float64(c.LedgerSpanBlocks)/c.LedgerCloseInterval.Seconds(),
+			MaxChainBlocksPerSecond, catchUpHeadroom, minSpan)
+	}
+	if c.PruneRetainBlocks > 0 && c.PartitionBlocks < MinPartitionBlocks {
+		return fmt.Errorf("PARTITION_BLOCKS=%d with retention on: two partitions are kept ahead of the head every %s, and partitions "+
+			"this small let a chain of up to %d blocks/s outrun them; set PARTITION_BLOCKS to at least %d",
+			c.PartitionBlocks, partitionKeeperInterval, MaxChainBlocksPerSecond, MinPartitionBlocks)
+	}
+	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
+		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+
+			"every total would leave those blocks out. Set START_BLOCK=0, or PRUNE_RETAIN_BLOCKS=0 to keep totals from START_BLOCK", c.StartBlock, c.PruneRetainBlocks)
 	}
 	if c.EnableOPDeposits {
 		if c.L1RPCURL == "" {
@@ -272,28 +388,45 @@ func (c *Config) CheckCommitPipeline() error {
 	if c.CommitPipelineDepth <= maxConns-beside {
 		return nil
 	}
-	balanceFlushes, lowerBalanceWorkers := "", ""
+	holders, lower := "", ""
 	if c.EnableAsyncBalance {
-		balanceFlushes = fmt.Sprintf("BALANCE_WORKERS=%d balance flushes, ", c.BalanceWorkers)
-		lowerBalanceWorkers = "lower BALANCE_WORKERS, "
+		holders += fmt.Sprintf("BALANCE_WORKERS=%d balance flushes, ", c.BalanceWorkers)
+		lower += "lower BALANCE_WORKERS, "
+	}
+	if c.CatchupEnabled {
+		holders += fmt.Sprintf("CATCHUP_WORKERS=%d catch-up writes, ", c.CatchupWorkers)
+		lower += "lower CATCHUP_WORKERS, "
+	}
+	holders += "the ledger closer, "
+	if c.PruneRetainBlocks > 0 {
+		holders += "retention, "
 	}
 	return fmt.Errorf("COMMIT_PIPELINE=%d leaves the rest of the indexer too few database connections: the pool has %d "+
 		"(pool_max_conns in DATABASE_URL, default the larger of 4 and the CPU count), the open block writes can hold %d, "+
 		"and %d more are kept for %sthe daily statistics advance and the progress reads, so they are not starved "+
 		"while the pipeline is full. Raise pool_max_conns to %d or more, %sor set COMMIT_PIPELINE to at most %d",
-		c.CommitPipelineDepth, maxConns, c.CommitPipelineDepth, beside, balanceFlushes,
-		c.CommitPipelineDepth+beside, lowerBalanceWorkers, max(1, maxConns-beside))
+		c.CommitPipelineDepth, maxConns, c.CommitPipelineDepth, beside, holders,
+		c.CommitPipelineDepth+beside, lower, max(1, maxConns-beside))
 }
 
 // ConnectionsBesidePipeline is how many database connections the rest of the indexer can hold while the standard
-// loop has COMMIT_PIPELINE block writes open.
+// loop or realtime has COMMIT_PIPELINE block writes open: the balance flushes, the catch-up workers' writes (realtime
+// pipelines beside them), the daily statistics advance, the progress reads, the ledger closer (one for a whole span
+// close; it always runs) and, with retention on, the statements under the history-DDL gate (the gate itself holds a
+// connection outside the pool).
 func (c *Config) ConnectionsBesidePipeline() int {
-	balanceFlushes := 0
+	balanceFlushes, catchupWrites, retention := 0, 0, 0
 	if c.EnableAsyncBalance {
 		balanceFlushes = c.BalanceWorkers
 	}
-	const dailyStatsAdvance, progressReads = 1, 1
-	return balanceFlushes + dailyStatsAdvance + progressReads
+	if c.CatchupEnabled {
+		catchupWrites = c.CatchupWorkers
+	}
+	if c.PruneRetainBlocks > 0 {
+		retention = 1
+	}
+	const dailyStatsAdvance, progressReads, ledgerCloser = 1, 1, 1
+	return balanceFlushes + catchupWrites + dailyStatsAdvance + progressReads + ledgerCloser + retention
 }
 
 func (c *Config) String() string {

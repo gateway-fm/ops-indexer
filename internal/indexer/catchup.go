@@ -28,6 +28,9 @@ type CatchupIndexer struct {
 	// Missing range collector (shared with main indexer)
 	collector *MissingRangeCollector
 
+	// realtimeBehind, when set, is how far realtime is behind the node; catch-up yields to it (yieldToRealtime).
+	realtimeBehind func() uint64
+
 	// Caches (shared with main indexer)
 	tokenCache    *TokenCache
 	contractCache *ContractCache
@@ -49,7 +52,8 @@ type CatchupIndexer struct {
 	// Progress tracking
 	processedBlocks int64
 	totalMissing    int64
-	lastLogTime     time.Time
+	// lastLogNanos is when the progress line was last logged (UnixNano); every worker reads it, one claims each.
+	lastLogNanos atomic.Int64
 
 	// Coordination
 	wg     sync.WaitGroup
@@ -73,7 +77,7 @@ func NewCatchupIndexer(
 	tracingSupported bool,
 ) *CatchupIndexer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &CatchupIndexer{
+	c := &CatchupIndexer{
 		db:               database,
 		rpc:              rpcClient,
 		config:           cfg,
@@ -85,9 +89,10 @@ func NewCatchupIndexer(
 		workQueue:        make(chan uint64, cfg.QueueSize),
 		ctx:              ctx,
 		cancel:           cancel,
-		lastLogTime:      time.Now(),
 		pollInterval:     5 * time.Second,
 	}
+	c.lastLogNanos.Store(time.Now().UnixNano())
+	return c
 }
 
 // SetDailyStatsThrottle shares the main indexer's day-aggregate throttle with
@@ -111,6 +116,35 @@ func (c *CatchupIndexer) SetCollector(collector *MissingRangeCollector) {
 // Start runs continuously, polling for missing ranges from the collector.
 // It processes existing gaps and continues monitoring for new gaps
 // that appear when the chain head advances.
+// SetRealtimeBehind makes catch-up yield to realtime: see yieldToRealtime.
+func (c *CatchupIndexer) SetRealtimeBehind(behind func() uint64) {
+	c.realtimeBehind = behind
+}
+
+// Catch-up pauses while realtime is more than catchupYieldAbove blocks behind the node, until it is within
+// catchupResumeBelow.
+const (
+	catchupYieldAbove  = 64
+	catchupResumeBelow = 16
+)
+
+// yieldToRealtime holds a catch-up worker while realtime is behind. Catch-up's workers otherwise take every pool
+// connection: in a load test after a 20-min stall they committed ~45 blocks/s while realtime managed 1.6, so the head
+// fell behind again and realtime jumped three more times. Realtime alone is the head; catch-up gets the rest.
+func (c *CatchupIndexer) yieldToRealtime(id int) {
+	if c.realtimeBehind == nil || c.realtimeBehind() <= catchupYieldAbove {
+		return
+	}
+	log.Debug("catchup: yielding to realtime", "worker", id, "realtime_behind", c.realtimeBehind())
+	for c.realtimeBehind() > catchupResumeBelow {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func (c *CatchupIndexer) Start(ctx context.Context, fromBlock, toBlock uint64) error {
 	if c.collector != nil {
 		total, _ := c.collector.GetTotalMissingBlocks(ctx)
@@ -178,20 +212,11 @@ func (c *CatchupIndexer) blockProducerFromRanges() {
 			idleCount++
 
 			// Call completion callback once after being idle for a while
-			// This triggers address_stats rebuild but doesn't stop catchup
 			if !completionCalled && idleCount >= 3 {
 				processed := atomic.LoadInt64(&c.processedBlocks)
 				if processed > 0 {
 					log.Info("catchup: initial sync complete, continuing to monitor for new gaps",
 						"processed", processed)
-
-					// Rebuild address stats after initial catchup
-					log.Info("catchup: rebuilding address_stats table")
-					if err := c.db.RebuildAddressStats(context.Background()); err != nil {
-						log.Error("catchup: failed to rebuild address_stats", "error", err)
-					} else {
-						log.Info("catchup: address_stats rebuild complete")
-					}
 
 					if c.onComplete != nil {
 						c.onComplete()
@@ -266,6 +291,16 @@ func (c *CatchupIndexer) IsRunning() bool {
 	}
 }
 
+// catchupRetryWait is the first wait before a dequeued block is tried again; each failure doubles it, up to
+// catchupRetryWaitMax. After catchupAttempts tries in memory the block is only recorded as missing again, which
+// catch-up's next poll picks up.
+var catchupRetryWait = 100 * time.Millisecond
+
+const (
+	catchupRetryWaitMax = 5 * time.Second
+	catchupAttempts     = 5
+)
+
 func (c *CatchupIndexer) worker(id int) {
 	defer c.wg.Done()
 
@@ -281,56 +316,96 @@ func (c *CatchupIndexer) worker(id int) {
 			// skip a block still drain the queue.
 			metrics.SetQueueDepth(metrics.QueueCatchup, len(c.workQueue))
 
-			// Block may have been indexed by another process in the meantime
-			exists, err := c.db.HasBlock(c.ctx, blockNum)
-			if err != nil {
-				log.Error("catchup: failed to check block existence", "block", blockNum, "error", err)
-				continue
-			}
-			if exists {
-				if c.collector != nil {
-					c.collector.MarkBlockProcessed(c.ctx, blockNum)
-				}
-				atomic.AddInt64(&c.processedBlocks, 1)
-				continue
-			}
-
-			if err := c.processBlock(blockNum); err != nil {
-				log.Error("catchup: failed to process block", "worker", id, "block", blockNum, "error", err)
-				// Re-insert into missing_block_ranges so the block is retried on next
-				// poll. Without this, the block is permanently lost: the parent range
-				// is already deleted from missing_block_ranges when the first sibling
-				// block succeeds, so a failed block would never be retried.
-				if requeueErr := c.db.RequeueMissingBlock(c.ctx, blockNum); requeueErr != nil {
-					log.Error("catchup: failed to requeue block after error", "block", blockNum, "error", requeueErr)
-				}
-				continue
-			}
-
-			if c.collector != nil {
-				c.collector.MarkBlockProcessed(c.ctx, blockNum)
-			} else {
-				c.db.DeleteMissingRangeByBlock(c.ctx, blockNum)
-			}
-
-			processed := atomic.AddInt64(&c.processedBlocks, 1)
-
-			if time.Since(c.lastLogTime) > 5*time.Second {
-				c.lastLogTime = time.Now()
-
-				var remaining int64
-				if c.collector != nil {
-					remaining, _ = c.collector.GetTotalMissingBlocks(c.ctx)
-				} else {
-					remaining, _ = c.db.GetTotalMissingBlocks(c.ctx)
-				}
-
-				log.Info("catchup: queue drain",
-					"blocks_processed_since_start", processed,
-					"queue_remaining", remaining)
-			}
+			c.yieldToRealtime(id)
+			c.indexBlock(id, blockNum)
 		}
 	}
+}
+
+// indexBlock stores a dequeued block, or records it as missing again, and does not return before one of the two has
+// happened (or the indexer stops). Its range row is already gone and the collector's scans do not come back to it, so
+// a block dropped here would stay missing until the next start. An existence check or a write that fails is tried
+// again in memory; after catchupAttempts tries the block is only recorded as missing, retried until that succeeds.
+func (c *CatchupIndexer) indexBlock(id int, blockNum uint64) {
+	wait := catchupRetryWait
+	for attempt := 1; ; attempt++ {
+		if attempt > catchupAttempts {
+			err := c.db.RequeueMissingBlock(c.ctx, blockNum)
+			if err == nil {
+				return
+			}
+			log.Error("catchup: failed to record block as missing; retrying", "block", blockNum, "error", err)
+		} else if c.tryBlock(id, blockNum, attempt) {
+			return
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, catchupRetryWaitMax)
+	}
+}
+
+// claimProgressLog reports whether the caller logs the progress line now: at most one worker per 5 s, however many
+// reach it at once.
+func (c *CatchupIndexer) claimProgressLog(now time.Time) bool {
+	last := c.lastLogNanos.Load()
+	return now.Sub(time.Unix(0, last)) > 5*time.Second && c.lastLogNanos.CompareAndSwap(last, now.UnixNano())
+}
+
+// tryBlock checks, writes and accounts for one block once, and reports whether the block is done with: stored (by
+// this worker or another writer), or recorded as missing again after a failed write.
+func (c *CatchupIndexer) tryBlock(id int, blockNum uint64, attempt int) bool {
+	// Block may have been indexed by another process in the meantime
+	exists, err := c.db.HasBlock(c.ctx, blockNum)
+	if err != nil {
+		log.Error("catchup: failed to check block existence; retrying", "block", blockNum, "attempt", attempt, "error", err)
+		return false
+	}
+	if exists {
+		if c.collector != nil {
+			c.collector.MarkBlockProcessed(c.ctx, blockNum)
+		}
+		atomic.AddInt64(&c.processedBlocks, 1)
+		return true
+	}
+
+	if err := c.processBlock(blockNum); err != nil {
+		log.Error("catchup: failed to process block", "worker", id, "block", blockNum, "error", err)
+		// Re-insert into missing_block_ranges so the block is retried on next
+		// poll. Without this, the block is permanently lost: the parent range
+		// is already deleted from missing_block_ranges when the first sibling
+		// block succeeds, so a failed block would never be retried.
+		if requeueErr := c.db.RequeueMissingBlock(c.ctx, blockNum); requeueErr != nil {
+			log.Error("catchup: failed to requeue block after error; retrying", "block", blockNum, "error", requeueErr)
+			return false
+		}
+		return true
+	}
+
+	if c.collector != nil {
+		c.collector.MarkBlockProcessed(c.ctx, blockNum)
+	} else {
+		c.db.DeleteMissingRangeByBlock(c.ctx, blockNum)
+	}
+
+	processed := atomic.AddInt64(&c.processedBlocks, 1)
+
+	if c.claimProgressLog(time.Now()) {
+
+		var remaining int64
+		if c.collector != nil {
+			remaining, _ = c.collector.GetTotalMissingBlocks(c.ctx)
+		} else {
+			remaining, _ = c.db.GetTotalMissingBlocks(c.ctx)
+		}
+
+		log.Info("catchup: queue drain",
+			"blocks_processed_since_start", processed,
+			"queue_remaining", remaining)
+	}
+	return true
 }
 
 func (c *CatchupIndexer) processBlock(number uint64) error {
@@ -353,12 +428,6 @@ func (c *CatchupIndexer) processBlockRaw(number uint64) error {
 
 func (c *CatchupIndexer) blockIndexer() *Indexer {
 	catchupConfig := *c.idxCfg
-	// Catchup never writes address_stats incrementally — the realtime indexer is
-	// the primary path that keeps it current. Trade-off: a block processed by
-	// catchup after the initial-sync rebuild (e.g. one realtime missed via an RPC
-	// blip and requeued) stays stale in address_stats until the next process
-	// restart. Acceptable, since post-sync catchup only handles rare gaps.
-	catchupConfig.SkipAddressStats = true
 
 	return &Indexer{
 		db:               c.db,

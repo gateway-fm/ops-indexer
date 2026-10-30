@@ -47,8 +47,8 @@ type Client struct {
 // ~1,000 requests/s the pod ran out of ephemeral ports ("connect: cannot assign requested address").
 // Up to 256 idle connections are now kept per host, more than twice the default worker total. A larger
 // pool costs nothing: a connection only sits idle if that many requests ran at once, and it is closed after
-// the default 90 s. There is no per-host cap, as before: with no response timeout on RPCs, a cap would let
-// requests stuck on a dead node block every other call. Same requests, fewer sockets.
+// the default 90 s. There is no per-host cap, as before: a cap would let requests stuck on a dead node, each until
+// its response timeout, block every other call. Same requests, fewer sockets.
 func newTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.MaxIdleConns = 256
@@ -57,8 +57,15 @@ func newTransport() *http.Transport {
 }
 
 func New(url string) (*Client, error) {
+	return NewWithTimeout(url, rpclient.DefaultTimeout)
+}
+
+// NewWithTimeout is New with every call to the node bounded by timeout, from the request to the last byte of the
+// reply: a node that accepts a request and never answers fails the call with an error instead of holding it.
+func NewWithTimeout(url string, timeout time.Duration) (*Client, error) {
 	httpClient := &http.Client{
 		Transport: &authTransport{underlying: newTransport()},
+		Timeout:   timeout,
 	}
 
 	raw := rpclient.New(url, httpClient)

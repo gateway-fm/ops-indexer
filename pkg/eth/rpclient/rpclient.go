@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -44,15 +45,25 @@ type Client struct {
 	nextID     atomic.Uint64
 }
 
+// DefaultTimeout bounds a node call, from the request to the last byte of the reply, when the caller sets no other
+// (RPC_TIMEOUT). A call past it fails with an error, as a refused connection does.
+const DefaultTimeout = 60 * time.Second
+
+// New uses httpClient, or one bounded by DefaultTimeout when it is nil.
 func New(url string, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: DefaultTimeout}
 	}
 	return &Client{url: url, httpClient: httpClient}
 }
 
 func Dial(url string) *Client {
-	return New(url, nil)
+	return DialTimeout(url, DefaultTimeout)
+}
+
+// DialTimeout is Dial with every call bounded by timeout.
+func DialTimeout(url string, timeout time.Duration) *Client {
+	return New(url, &http.Client{Timeout: timeout})
 }
 
 type jsonrpcRequest struct {
@@ -268,10 +279,19 @@ type Subscription interface {
 	Unsubscribe()
 }
 
+// BlockNumber is the node's head. A null or empty result is an error, not head 0: hexutil decodes both as 0, and a
+// head of 0 read from a node that answered nothing would make a stored chain look far ahead of it.
 func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
-	var result hexutil.Uint64
-	if err := c.CallContext(ctx, &result, "eth_blockNumber"); err != nil {
+	var raw json.RawMessage
+	if err := c.CallContext(ctx, &raw, "eth_blockNumber"); err != nil {
 		return 0, err
+	}
+	if s := strings.TrimSpace(string(raw)); s == "" || s == "null" || s == `""` || s == `"0x"` {
+		return 0, fmt.Errorf("eth_blockNumber returned %q, not a block number", s)
+	}
+	var result hexutil.Uint64
+	if err := result.UnmarshalJSON(raw); err != nil {
+		return 0, fmt.Errorf("eth_blockNumber: %w", err)
 	}
 	return uint64(result), nil
 }

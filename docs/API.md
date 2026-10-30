@@ -125,6 +125,90 @@ proto3 semantics by default — unset primitive fields default to zero / empty. 
 - When the proto uses `oneof` for mutually exclusive filters (e.g., `ListTransactionsRequest.filter`), exactly one option is allowed.
 - Filters that require at least one criterion (e.g., `ListLogsRequest`) return `InvalidArgument` if none is provided. This prevents accidental full-table scans.
 
+## History retention
+
+With `PRUNE_RETAIN_BLOCKS` set (0 = off, the default), the indexer keeps only that many blocks of history (blocks,
+transactions, logs, token transfers, internal transactions, balance history) below its head and drops older ranges.
+Current state (addresses, tokens, holders, balances, NFT inventory, contracts, daily stats) is never pruned.
+
+Retention keeps every UTC day that a reorg can reach whole, because reverting a block recounts its day's daily stats
+from the day's first block. A range is dropped only once all of its blocks are older than the UTC day of the block
+12,800 below the head, so up to one day plus one partition more is kept than `PRUNE_RETAIN_BLOCKS`. On a chain that
+makes more than `PRUNE_RETAIN_BLOCKS` blocks a day, ranges are dropped once a day, a day's worth in one pass. A
+database that a build without this rule pruned into a UTC day the reorg window reaches prunes nothing more until the
+block 12,800 below the head is on a later day, that is, until the head is 12,800 blocks past the end of that day; until
+then a reorg into that day still stops ingest. The indexer logs a warning naming the day when retention starts.
+
+Reading the history tables with SQL: since migration 014 each is partitioned by block, and a view or foreign key
+created on one before 014 is bound to its first partition, `<table>_legacy`. From the first cut on such a view sees
+no new block, and retention keeps the legacy range on disk, detached, while anything depends on it: it logs the
+objects, at the cut and at every pass. Re-create them on `<table>` and the next pass drops the range.
+
+`GetChainStats` reports the watermark: `pruned_through_block` is the newest pruned block (every block at or below it
+is gone; 0 = nothing pruned) and `pruned_through_timestamp` its timestamp (unset when nothing is pruned). With nothing
+pruned, every call behaves as before.
+
+**`OutOfRange`** answers explicit block targets at or below the watermark:
+
+- `GetBlock` by number.
+- `ListTransactions` and `ListInternalTransactions` `by_block` by number.
+- `BatchGetBlockTransactionCounts` when any requested block is at or below it.
+- `ListBlocks` when its upper bound (`before_number` or the cursor, exclusive) is at most watermark + 1.
+- `ListTransactions` and `ListTokenTransfers` `by_address` with `block_range.to_block` (exclusive) at most
+  watermark + 1 and no cursor.
+- `ListLogs` with `by_address` + `topic0` and `block_range.to_block` at or below the watermark: this path treats
+  `to_block` as **inclusive**. `ListLogs` honours `block_range` on that path only.
+
+**Hash lookups stay `NotFound`.** `GetBlock` by hash, `GetTransaction`, and `by_block` by hash cannot tell a pruned
+entity from one that never existed; while anything is pruned, the message ends with
+`(history at or below block W is pruned)`. `by_tx_hash` lists of a pruned transaction return empty.
+
+Lists that run into the watermark while paging (the feeds, `by_address` lists, deep offset pages) just end: no error.
+
+**With `PRUNED_LOOKUP=true`** a pruned target is served from the node instead: `GetBlock` by number or hash,
+`GetTransaction`, and `ListTransactions` `by_block` by number or hash, at or below the watermark, answer with the
+node's block or transaction, and the response carries the header `x-indexer-source: node`. When the node is busy or
+does not answer they return `Unavailable`. The other calls above still answer `OutOfRange`, `NotFound` or end as
+described.
+
+**Totals count pruned history**, from counters the writer keeps (never a `COUNT(*)` over retained rows):
+
+- `GetChainStats` totals, `GetAddress`, `BatchGetAddressTransactionCounts`, `GetToken`.
+- `ListTransactionsPaginated` `total_items` (`transactions_total`), when no hidden tx types are configured.
+- `ListAllTokenTransfers` `total_items` without a `token_type` filter (`transfers_total`).
+- `ListTokenTransfers` `by_token` `total_count` (`tokens.transfer_count`).
+- `ListTokenTransfers` `by_address` `total_count` (`address_stats.token_transfer_count`) and
+  `ListInternalTransactions` `by_address` `total_count` (`address_stats.internal_tx_count`). Each counts a transfer or
+  internal call once per address, whichever sides it is on, so `total_count` equals the rows the list returns.
+  **Correction:** before migration 017 a self-transfer or self-call counted twice, here and in `GetAddress`; 017 subtracts
+  the extra side from existing rows (it refuses on a pruned database).
+- `GetAddress` and `BatchGetAddressTransactionCounts` transaction counts (`address_stats.tx_count`): one per
+  transaction the address sent, received or took part in through a Transfer event, as `ListTransactions` `by_address`
+  returns them. **Correction:** a self-send used to count twice, and an address in Transfer events of several
+  transactions of one block once; rows written before this build keep the old count until they are recounted.
+- The zero address keeps no transfer count (mints and burns): `ListTokenTransfers` `by_address` `total_count` and
+  `GetAddress` `token_count` are 0 for it, and its `GetAddress` transaction count leaves out mint and burn transactions
+  it is not the sender or recipient of.
+- `ListTokenHolders` (`tokens.holder_count`), `ListTokens`, `ListAddresses`, `ListTokenInventory`, `GetDailyStats`:
+  current state, unaffected by pruning.
+- `GetDailyStats` `new_addresses`, `new_contracts`, `cumulative_addresses`, `cumulative_contracts` count an address on
+  the day of the block it was first seen in. **Correction (migration 021):** they compared that block number with epoch
+  seconds, so `new_addresses` and `new_contracts` were 0 on every day and the cumulative columns counted every address
+  known when the row was written. 021 rewrites every stored day (it refuses on a pruned database); values can rise or
+  fall per day, and the cumulative columns now grow day by day to the totals in `GetChainStats`.
+
+**Within retention** (counts or rows limited to retained history):
+
+- `ListLogs` `total_count` by address, by topic0, by address + topic0, and by range.
+- `ListAllTokenTransfers` `total_items` when filtered by `token_type`.
+- `ListTransactionsPaginated` `total_items` when hidden tx types are configured.
+- `GetTransactionHistory` `HOUR` buckets when the retention window is shorter than 168 h.
+- `Search` block and transaction suggestions.
+- `by_tx_hash` lists (`ListLogs`, `ListTokenTransfers`, `ListInternalTransactions`): their `total_count` is the row
+  count, 0 for a pruned transaction.
+- `GetGasPrices` samples the latest 10,000 transactions; a window holding fewer samples fewer.
+- The rows of every list: they end at the watermark.
+
 ## Error model
 
 Standard gRPC status codes:
@@ -134,6 +218,7 @@ Standard gRPC status codes:
 | `OK` | Success. |
 | `NotFound` | Entity does not exist in the index (e.g., `GetBlock` on an unseen number). |
 | `InvalidArgument` | Malformed address / hash / cursor, missing required filter, page size out of range. |
+| `OutOfRange` | An explicit block target is at or below the retention watermark: that history was pruned on purpose (see [History retention](#history-retention)). |
 | `Unavailable` | Feature gated off for this indexer's chain (e.g., OP-Stack RPCs on a non-OP chain), or indexer is still syncing through startup. |
 | `FailedPrecondition` | Indexer is not yet ready to serve (e.g., migration not applied, DB unreachable). |
 | `ResourceExhausted` | Server-side cap hit (rare; typically a symptom of a client not using pagination). |

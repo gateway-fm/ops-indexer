@@ -1,4 +1,7 @@
-FROM golang:1.26-alpine AS builder
+# The builder runs natively and cross-compiles: under QEMU an arm64 builder emulated the whole Go compile.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+
+ARG TARGETOS TARGETARCH
 
 # Upgrade system packages
 RUN apk update --no-cache && apk upgrade --no-cache
@@ -10,7 +13,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /indexer ./cmd/indexer
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /indexer ./cmd/indexer
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb01479f054c8056d0f74cc2c6000df5240
 

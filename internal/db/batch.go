@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"math/big"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -128,14 +129,18 @@ type AddressStatsDelta struct {
 // BlockWrite is one block's ingest transaction, split so that the rows a block owns can be written
 // while an earlier block's transaction is still open (the pipelined commit).
 //
-// BeginBlockData writes the rows that belong to this block alone -- blocks, transactions, contracts,
-// logs, token_transfers, internal_transactions -- and takes no row lock another block's write can
-// want: every key is this block's own. Finish writes the rows blocks share -- tokens, nft_tokens,
-// address_stats, chain_counters -- and commits. Several BeginBlockData may run at once; Finish must
+// BeginBlockData writes the rows that belong to this block alone -- blocks, transactions, logs,
+// token_transfers, internal_transactions -- and takes no row lock another block's write can want:
+// every key it writes carries this block's own identity. Finish writes the rows blocks can share --
+// contracts first, sorted by address, since two in-flight blocks can create one address (CREATE2),
+// then tokens, nft_tokens, address_stats, chain_counters -- and commits. Several BeginBlockData may run at once; Finish must
 // run in block order, each after the previous block's Finish returned. That keeps the committed
 // blocks a prefix of the chain, and it is what rules out a deadlock Postgres cannot see: a later
 // block never holds a shared row while it waits for an earlier block to commit.
 type BlockWrite struct {
+	// stored: another writer had committed this block (realtime and catch-up meet at the tip); its rows and
+	// deltas are in, so this write is dropped.
+	stored                                bool
 	tx                                    pgx.Tx
 	data                                  *BlockData
 	deltaBlocks, deltaTxs, deltaTransfers int64
@@ -153,6 +158,9 @@ func (d *DB) InsertBlockDataBatch(ctx context.Context, data *BlockData) error {
 
 // Rollback abandons a write that will not be finished.
 func (w *BlockWrite) Rollback(ctx context.Context) {
+	if w.stored {
+		return
+	}
 	_ = w.tx.Rollback(ctx)
 }
 
@@ -230,7 +238,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 				size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-			ON CONFLICT (number) DO NOTHING`,
+			ON CONFLICT DO NOTHING`,
 			data.Block.Number, data.Block.Hash, data.Block.ParentHash, data.Block.Timestamp,
 			data.Block.GasUsed, data.Block.GasLimit, data.Block.BaseFeePerGas, data.Block.TransactionCount,
 			data.Block.Size, data.Block.Difficulty, data.Block.TotalDifficulty, data.Block.Nonce,
@@ -238,7 +246,14 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 		if err != nil {
 			return nil, err
 		}
-		deltaBlocks += ct.RowsAffected()
+		if ct.RowsAffected() == 0 {
+			if err := storedBlockDiffers(ctx, tx, data.Block); err != nil {
+				return nil, err
+			}
+			_ = tx.Rollback(ctx)
+			return &BlockWrite{stored: true}, nil
+		}
+		deltaBlocks++
 	}
 
 	if len(data.Transactions) > 0 {
@@ -258,7 +273,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 					gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
 				VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-				ON CONFLICT (hash) DO NOTHING`,
+				ON CONFLICT DO NOTHING`,
 				t.Hash, t.BlockNumber, blockTimestamp, t.TxIndex, t.From, t.To, t.Value, t.GasUsed, t.GasPrice,
 				t.GasLimit, t.MaxFeePerGas, t.MaxPriorityFeePerGas, t.Nonce, t.TxType, t.InputData, t.Status, t.Error, t.RevertReason, categories)
 		}
@@ -271,23 +286,6 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 			}
 			deltaTxs += ct.RowsAffected()
 		}
-		if err := br.Close(); err != nil {
-			return nil, err
-		}
-	}
-
-	if len(data.Contracts) > 0 {
-		batch := &pgx.Batch{}
-		for _, c := range data.Contracts {
-			batch.Queue(`
-				INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
-					contract_name, compiler_version, optimization_used, source_code, abi)
-				VALUES (LOWER($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-				ON CONFLICT (address) DO NOTHING`,
-				c.Address, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
-				c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
-		}
-		br := tx.SendBatch(ctx, batch)
 		if err := br.Close(); err != nil {
 			return nil, err
 		}
@@ -393,7 +391,7 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 				INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 					gas, gas_used, input, output, call_type, error, timestamp)
 				VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
-				ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
+				ON CONFLICT DO NOTHING`,
 				it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 				it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
 		}
@@ -408,11 +406,47 @@ func (d *DB) BeginBlockData(ctx context.Context, data *BlockData) (w *BlockWrite
 }
 
 func (w *BlockWrite) Finish(ctx context.Context) error {
+	if w.stored {
+		return nil
+	}
 	tx, data, tokenDeltas := w.tx, w.data, w.tokenDeltas
 	defer tx.Rollback(ctx)
 	deltaBlocks, deltaTxs, deltaTransfers := w.deltaBlocks, w.deltaTxs, w.deltaTransfers
 	var deltaTokens, deltaAddresses int64
 	var seedTokens []string
+
+	// Contracts first, in address order. Two blocks can create one address (a factory's CREATE2 again after the child
+	// destroyed itself), so the insert is here rather than in BeginBlockData: the pipeline begins a later block's
+	// write before an earlier one commits, and an earlier block's insert waiting on that uncommitted row would wait for
+	// good. Finish runs in block order, so the earlier block's row is committed by the time a later block meets it.
+	if len(data.Contracts) > 0 {
+		contracts := make(map[string]*types.Contract, len(data.Contracts))
+		for _, c := range data.Contracts {
+			if addr := strings.ToLower(c.Address); contracts[addr] == nil {
+				contracts[addr] = c
+			}
+		}
+		addresses := make([]string, 0, len(contracts))
+		for addr := range contracts {
+			addresses = append(addresses, addr)
+		}
+		sort.Strings(addresses)
+		batch := &pgx.Batch{}
+		for _, addr := range addresses {
+			c := contracts[addr]
+			batch.Queue(`
+				INSERT INTO contracts (address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
+					contract_name, compiler_version, optimization_used, source_code, abi)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				ON CONFLICT (address) DO NOTHING`,
+				addr, c.Bytecode, c.BytecodeHash, c.Creator, c.CreationTx, c.BlockNumber, c.IsVerified,
+				c.ContractName, c.CompilerVersion, c.OptimizationUsed, c.SourceCode, c.ABI)
+		}
+		br := tx.SendBatch(ctx, batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+	}
 
 	// Every tokens row this transaction will lock, taken in one ascending pass
 	// before any of them is touched individually.
@@ -570,17 +604,29 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	}
 
 	if len(data.NFTTokens) > 0 {
+		// In key order, as address_stats: concurrent catch-up writers moving the same NFTs would otherwise deadlock.
+		// Stable, so repeated moves of one NFT keep their order.
+		nfts := slices.Clone(data.NFTTokens)
+		sort.SliceStable(nfts, func(i, j int) bool {
+			if nfts[i].TokenAddress != nfts[j].TokenAddress {
+				return nfts[i].TokenAddress < nfts[j].TokenAddress
+			}
+			return nfts[i].TokenID < nfts[j].TokenID
+		})
 		batch := &pgx.Batch{}
-		for _, n := range data.NFTTokens {
+		for _, n := range nfts {
 			batch.Queue(`
 				INSERT INTO nft_tokens (token_address, token_id, owner, token_uri, block_number)
 				VALUES ($1, $2, $3, $4, $5)
 				ON CONFLICT (token_address, token_id) DO UPDATE SET
-					owner = EXCLUDED.owner,
+					-- The owner is the latest block's: a block written after a later one (catch-up filling a gap
+					-- out of order, the standard loop retrying a recorded block) does not move it back. The same
+					-- block again (>=) is a later move within the block, or the block written anew after a reorg.
+					owner = CASE WHEN EXCLUDED.block_number >= nft_tokens.block_number THEN EXCLUDED.owner ELSE nft_tokens.owner END,
 					-- tokenURI is captured once at mint; a later transfer carries
 					-- no URI, so keep the existing value rather than nulling it.
 					token_uri = COALESCE(nft_tokens.token_uri, EXCLUDED.token_uri),
-					block_number = EXCLUDED.block_number,
+					block_number = GREATEST(nft_tokens.block_number, EXCLUDED.block_number),
 					updated_at = NOW()`,
 				n.TokenAddress, n.TokenID, n.Owner, n.TokenURI, n.BlockNumber)
 		}
@@ -655,8 +701,14 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	}
 
 	if len(data.AddressStats) > 0 && !data.SkipAddressStats {
+		addresses := make([]string, 0, len(data.AddressStats))
+		for addr := range data.AddressStats {
+			addresses = append(addresses, addr)
+		}
+		sort.Strings(addresses)
 		batch := &pgx.Batch{}
-		for _, s := range data.AddressStats {
+		for _, addr := range addresses {
+			s := data.AddressStats[addr]
 			batch.Queue(`
 				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
 				VALUES (LOWER($1), $2, $3, $4, $5, $5, $6, NOW())
@@ -664,8 +716,9 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 					tx_count = address_stats.tx_count + $2,
 					internal_tx_count = address_stats.internal_tx_count + $3,
 					token_transfer_count = address_stats.token_transfer_count + $4,
-					last_seen = $5,
-					is_contract = COALESCE(EXCLUDED.is_contract, address_stats.is_contract),
+					first_seen = LEAST(address_stats.first_seen, EXCLUDED.first_seen),
+					last_seen = GREATEST(address_stats.last_seen, EXCLUDED.last_seen),
+					is_contract = COALESCE(address_stats.is_contract, false) OR EXCLUDED.is_contract,
 					updated_at = NOW()
 				RETURNING (xmax = 0)`,
 				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract)
@@ -712,8 +765,18 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	return nil
 }
 
-// RebuildAddressStats rebuilds address_stats after catchup completes.
+// ErrHistoryPruned refuses a recount of history that pruning has made partial.
+var ErrHistoryPruned = errors.New("history is pruned: a recount from the retained rows would drop the pruned counts")
+
+// RebuildAddressStats rebuilds address_stats from the stored history, then recounts the days' address columns from it.
+// It refuses once anything was pruned. The indexer no longer calls it (catch-up writes address_stats itself); it stays
+// as the tests' oracle for what the writer counts.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
+	if wm, _, err := d.PrunedThrough(ctx); err != nil {
+		return err
+	} else if wm > 0 {
+		return ErrHistoryPruned
+	}
 	// All address keys are lowercased so duplicate-case rows from past
 	// writes (some checksum-cased, some lowercase) collapse to one row per
 	// address. Ongoing delta writes already lowercase the key, so this
@@ -774,11 +837,11 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				FROM (
 					SELECT LOWER(from_address) as address, hash as tx_hash, block_number FROM transactions
 					UNION ALL
-					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS NOT NULL
+					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
 					UNION ALL
 					SELECT LOWER(tt.from_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
 					UNION ALL
-					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
+					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt WHERE tt.to_address IS DISTINCT FROM tt.from_address
 				) t
 				GROUP BY address
 			) tx ON a.address = tx.address
@@ -787,7 +850,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				FROM (
 					SELECT LOWER(from_address) as address, block_number FROM internal_transactions
 					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS NOT NULL
+					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
 				) t
 				GROUP BY address
 			) it ON a.address = it.address
@@ -796,7 +859,7 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 				FROM (
 					SELECT LOWER(from_address) as address, block_number FROM token_transfers
 					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM token_transfers
+					SELECT LOWER(to_address) as address, block_number FROM token_transfers WHERE to_address IS DISTINCT FROM from_address
 				) t
 				GROUP BY address
 			) tt ON a.address = tt.address
@@ -809,7 +872,23 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	// The days' address columns were counted from the address_stats this replaced (migration 021 reads 0.4.0's), so
+	// they are recounted from the rebuilt one, under daily_stats_advance's lock. A separate transaction: waiting for
+	// that lock while holding address_stats would deadlock with an advance reading it.
+	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
+			return err
+		}
+		return recountDailyAddressColumns(ctx, tx)
+	})
+	if err != nil {
+		return fmt.Errorf("address_stats is rebuilt, but recounting the days' address columns failed "+
+			"(refill-daily-stats --recompute-only repeats it): %w", err)
+	}
+	return nil
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {

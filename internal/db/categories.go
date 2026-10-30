@@ -69,3 +69,8 @@ func buildTokenTransferTxSet(transfers []*types.TokenTransfer) map[string]struct
 	}
 	return m
 }
+
+// TxCategoryNames is the category list the database serves for tx, for a transaction that is not in it.
+func TxCategoryNames(tx *types.Transaction, hasTokenTransfer bool) []string {
+	return buildCategoriesFromBits(tx.TxType, computeTxCategories(tx, hasTokenTransfer))
+}

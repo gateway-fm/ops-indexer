@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -95,6 +96,10 @@ func (b *RawBlock) BaseFeeU64() *uint64 {
 	return &v
 }
 
+// ErrBlockNotAvailable is a block the node does not have yet (it answered null), as a node behind the others in a
+// load-balanced pool does: not a different chain.
+var ErrBlockNotAvailable = errors.New("not available from the node")
+
 func (c *Client) RawBlockByNumber(ctx context.Context, number uint64) (*RawBlock, error) {
 	var raw RawBlock
 	err := c.raw.CallContext(ctx, &raw, "eth_getBlockByNumber", toHex(number), true)
@@ -116,7 +121,7 @@ func (c *Client) RawBlockHash(ctx context.Context, number uint64) (string, error
 		return "", fmt.Errorf("raw block hash fetch for %d: %w", number, err)
 	}
 	if raw.Hash == (common.Hash{}) {
-		return "", fmt.Errorf("block %d not available from the node", number)
+		return "", fmt.Errorf("block %d %w", number, ErrBlockNotAvailable)
 	}
 	return raw.Hash.Hex(), nil
 }

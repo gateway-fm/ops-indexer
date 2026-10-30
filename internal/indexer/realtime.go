@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/events"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
@@ -40,11 +42,17 @@ type RealtimeIndexer struct {
 
 	// State tracking
 	lastProcessedBlock uint64
-	mu                 sync.RWMutex
-	receipts           receiptSkip
+	// behind is how many blocks realtime has left before the node's safe head; catch-up yields to it (Behind).
+	behind   atomic.Uint64
+	lastSafe atomic.Uint64
+	mu       sync.RWMutex
+	receipts receiptSkip
 	// failedRevertFrom is the fork point of a revert that returned an error, until the next tick has checked what it
 	// left stored; 0 when there is none.
 	failedRevertFrom uint64
+
+	// revertPending is set while a reorg revert keeps failing: realtime stays on the stale block and does not jump.
+	revertPending atomic.Bool
 
 	// Coordination
 	ctx    context.Context
@@ -167,7 +175,8 @@ func (r *RealtimeIndexer) runSubscriptionMode(ctx context.Context, headers <-cha
 			latestBlock := header.Number.Uint64()
 			safeBlock := latestBlock - uint64(r.config.ConfirmationBlocks)
 
-			r.indexUpTo(ctx, safeBlock)
+			lastProcessed := r.jumpIfFarBehind(ctx, safeBlock)
+			r.indexUpTo(ctx, lastProcessed, safeBlock)
 		}
 	}
 }
@@ -197,64 +206,61 @@ func (r *RealtimeIndexer) runPollingMode(ctx context.Context) error {
 			}
 
 			safeBlock := latestOnChain - uint64(r.config.ConfirmationBlocks)
-			r.indexUpTo(ctx, safeBlock)
+			lastProcessed := r.jumpIfFarBehind(ctx, safeBlock)
+			r.indexUpTo(ctx, lastProcessed, safeBlock)
 		}
 	}
 }
 
-// indexUpTo indexes the blocks after the last processed one up to safeBlock. When stored blocks no longer match the
-// chain it reverts them and goes on from the fork point in the same pass. It returns at the first block it cannot
-// index, or when a reorg cannot be reverted, and the next tick starts again from the last processed block.
-func (r *RealtimeIndexer) indexUpTo(ctx context.Context, safeBlock uint64) {
-	if !r.resumeAfterFailedRevert(ctx) {
+// indexUpTo indexes lastProcessed+1..safeBlock. The reorg check runs once, on the block realtime stands on; the
+// blocks are then read up to blockPrefetchDepth ahead while earlier ones commit, each checked against its parent
+// (indexPrefetched), with the cursor and Behind updated per block. Walking block by block, with detectReorg's ten
+// hash reads before each, held realtime to ~3.8 blocks/s in a load test against a chain at ~8.4 (PRST-5438): after a
+// stall it could never catch up on its own.
+func (r *RealtimeIndexer) indexUpTo(ctx context.Context, lastProcessed, safeBlock uint64) {
+	if r.failedRevertFrom != 0 {
+		if !r.resumeAfterFailedRevert(ctx) {
+			return
+		}
+		lastProcessed = r.GetLastProcessedBlock()
+	}
+	if safeBlock <= lastProcessed {
 		return
 	}
-	reverted := false
-	for blockNum := r.GetLastProcessedBlock() + 1; blockNum <= safeBlock; blockNum++ {
-		select {
-		case req := <-r.indexRequests:
-			err := r.processBlock(ctx, req.blockNumber)
-			req.done <- err
-		default:
+	if lastProcessed > 0 {
+		depth, err := r.detectReorg(ctx, lastProcessed)
+		if err != nil {
+			log.Error("realtime: failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", depth)
+			return
 		}
-
-		if blockNum > 0 {
-			reorgDepth, err := r.detectReorg(ctx, blockNum-1)
-			if err != nil {
-				log.Error("realtime: failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+		if depth > 0 {
+			log.Warn("realtime: detected reorg", "depth", depth)
+			if err := r.handleReorg(ctx, lastProcessed+1-depth); err != nil {
+				log.Error("realtime: failed to handle reorg; staying on the stale block to retry", "error", err)
+				r.revertPending.Store(true)
+				r.failedRevertFrom = lastProcessed + 1 - depth
 				return
 			}
-			if reorgDepth > 0 {
-				if reverted {
-					return
-				}
-				fork := blockNum - reorgDepth
-				log.Warn("realtime: detected reorg", "depth", reorgDepth)
-				if err := r.handleReorg(ctx, fork); err != nil {
-					log.Error("realtime: failed to handle reorg", "error", err)
-					r.failedRevertFrom = fork
-					return
-				}
-				reverted = true
-				r.SetLastProcessedBlock(fork - 1)
-				blockNum = fork - 1
-				continue
-			}
+			r.revertPending.Store(false)
+			r.SetLastProcessedBlock(lastProcessed - depth)
+			return
 		}
-
-		if err := r.processBlock(ctx, blockNum); err != nil {
-			log.Error("realtime: failed to process block", "block", blockNum, "error", err)
-			if !r.receipts.skip(ctx, r.db, blockNum, err) {
-				return
-			}
-		}
-
-		r.SetLastProcessedBlock(blockNum)
-
-		if blockNum%10 == 0 {
-			r.db.UpdateSyncStatus(ctx, blockNum, true)
-		}
+		// No fork under the cursor: a revert that failed earlier left nothing to revert (its delete committed and
+		// only the acknowledgement was lost, or the node went back to the stored fork).
+		r.revertPending.Store(false)
 	}
+	idx := r.blockIndexer()
+	idx.indexRequests = r.indexRequests
+	idx.cursorMayBeUnstored = true
+	idx.onIndexed = func(n uint64) {
+		r.SetLastProcessedBlock(n)
+		r.behind.Store(safeBlock - n)
+	}
+	if depth := r.idxCfg.CommitPipelineDepth; depth > 1 {
+		r.SetLastProcessedBlock(idx.indexPipelined(ctx, lastProcessed, safeBlock, depth, &r.receipts))
+		return
+	}
+	r.SetLastProcessedBlock(idx.indexPrefetched(ctx, lastProcessed, safeBlock, &r.receipts))
 }
 
 // resumeAfterFailedRevert moves the cursor down to what a failed revert left stored. A delete that reported an error
@@ -305,6 +311,47 @@ func (r *RealtimeIndexer) blockIndexer() *Indexer {
 		eventBus:         r.eventBus,
 		dailyStats:       r.dailyStats,
 	}
+}
+
+// Behind is how many blocks realtime had left before the node's safe head when it last looked: 0 once caught up.
+func (r *RealtimeIndexer) Behind() uint64 {
+	if r.GetLastProcessedBlock() >= r.lastSafe.Load() {
+		return 0
+	}
+	return r.behind.Load()
+}
+
+// jumpIfFarBehind returns where realtime continues from. More than RealtimeMaxBehind blocks behind safeBlock (a long
+// stall), it moves to just below safeBlock, as a fresh start does, and registers the blocks it skips with catch-up:
+// walked one by one, they kept the explorer's head minutes old while the chain moved on. It does not jump while a
+// revert is pending, nor over a head the node has replaced: catch-up fills only the skipped blocks and never
+// compares the stale fork below them.
+func (r *RealtimeIndexer) jumpIfFarBehind(ctx context.Context, safeBlock uint64) uint64 {
+	lastProcessed := r.GetLastProcessedBlock()
+	r.lastSafe.Store(safeBlock)
+	if safeBlock > lastProcessed {
+		r.behind.Store(safeBlock - lastProcessed)
+	}
+	limit := r.idxCfg.RealtimeMaxBehind
+	if limit == 0 || safeBlock <= lastProcessed+limit || r.revertPending.Load() {
+		return lastProcessed
+	}
+	// A head the node has replaced is reverted from where it stands first: the jump would leave it below the cursor,
+	// where nothing compares it again.
+	if lastProcessed > 0 {
+		if depth, err := r.detectReorg(ctx, lastProcessed); err != nil || depth > 0 {
+			return lastProcessed
+		}
+	}
+	skipped := db.BlockRange{FromNumber: lastProcessed + 1, ToNumber: safeBlock - 1}
+	if err := r.db.SaveMissingRanges(ctx, []db.BlockRange{skipped}); err != nil {
+		log.Error("realtime: registering the blocks a jump to the head would skip failed; walking them instead", "error", err)
+		return lastProcessed
+	}
+	log.Warn("realtime: far behind the node; jumping to the head, catch-up fills the skipped blocks",
+		"from", skipped.FromNumber, "to", skipped.ToNumber, "max_behind", limit)
+	r.SetLastProcessedBlock(safeBlock - 1)
+	return safeBlock - 1
 }
 
 // detectReorg: see Indexer.detectReorg. Same walk, same fix (PRST-5320): it

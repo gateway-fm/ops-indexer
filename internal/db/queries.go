@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/jackc/pgx/v5"
@@ -24,6 +25,33 @@ func (d *DB) GetLatestBlockNumber(ctx context.Context) (uint64, error) {
 	return *num, nil
 }
 
+// StoredBlockDiffersError is a block write that found a different block stored at its number: a block of a fork the
+// chain has left, which only a revert removes. The same block already stored is not an error; the write is a no-op.
+type StoredBlockDiffersError struct {
+	Number          uint64
+	Stored, Written string
+}
+
+func (e *StoredBlockDiffersError) Error() string {
+	return fmt.Sprintf("block %d is stored with hash %s, not %s", e.Number, e.Stored, e.Written)
+}
+
+// storedBlockDiffers is called when a block's insert wrote no row, and reports a different block stored at its number.
+func storedBlockDiffers(ctx context.Context, tx pgx.Tx, b *types.Block) error {
+	var stored string
+	err := tx.QueryRow(ctx, `SELECT hash FROM blocks WHERE number = $1`, b.Number).Scan(&stored)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(stored, b.Hash) {
+		return &StoredBlockDiffersError{Number: b.Number, Stored: stored, Written: b.Hash}
+	}
+	return nil
+}
+
 func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 	// Tx wrap keeps the chain_counters bump atomic with the row insert.
 	tx, err := d.pool.Begin(ctx)
@@ -36,11 +64,16 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 			size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-		ON CONFLICT (number) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		b.Number, b.Hash, b.ParentHash, b.Timestamp, b.GasUsed, b.GasLimit, b.BaseFeePerGas, b.TransactionCount,
 		b.Size, b.Difficulty, b.TotalDifficulty, b.Nonce, b.Miner, b.ExtraData, b.StateRoot, b.TransactionsRoot, b.ReceiptsRoot)
 	if err != nil {
 		return err
+	}
+	if ct.RowsAffected() == 0 {
+		if err := storedBlockDiffers(ctx, tx, b); err != nil {
+			return err
+		}
 	}
 	if ct.RowsAffected() > 0 {
 		if _, err := tx.Exec(ctx, `
@@ -137,10 +170,8 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 // DeleteBlock removes one block and everything that hangs off it. Used to
 // revert a reorg, one block at a time from the head down.
 //
-// The block's token_transfers and logs are deleted here by block_number:
-// migration 013 dropped their foreign keys to transactions, so no cascade
-// reaches them. Its transactions go with the block, through
-// transactions.block_number REFERENCES blocks(number) ON DELETE CASCADE.
+// It deletes the block's rows from every history table itself (no foreign keys
+// cascade since migration 014), the block's token_transfers rows included.
 // That makes this a writer of token_transfers, and every writer has to maintain
 // tokens.transfer_count and tokens.total_supply -- nothing recomputes them from
 // history per block any more.
@@ -153,6 +184,42 @@ func (d *DB) GetBlocks(ctx context.Context, limit int, beforeBlock *uint64) ([]t
 // would otherwise suppress a re-delivery does not fire, so the same transfers
 // are counted twice. Nothing but a process restart would repair it. See
 // PRST-4493.
+// keepDailyStatsWatermarkOnStoredBlocks lowers the daily_stats watermark, after daily_stats_invalidate, when the
+// block it names is not stored. The invalidate sets it below the day's first *stored* block; with the day's start in
+// a catch-up gap that is mid-day, and the gap's blocks, stored later, would never be counted (PRST-5436, the same
+// fault as the first run's). The watermark goes to the last stored block below it, so the advance waits for the gap
+// and counts its blocks into their days: every stored block it passes again was counted before, the unstored ones
+// never were. It never goes below the earliest aggregated day's first block, where a day that was never aggregated
+// would get a partial row. When the reorged day is itself the earliest aggregated day its start cannot be known
+// here: the watermark stays, and refill-daily-stats recounts the day. A watermark on a pruned block is the last block
+// before a day retention pruned up to, which is not missing.
+func keepDailyStatsWatermarkOnStoredBlocks(ctx context.Context, tx pgx.Tx) error {
+	var lowered, stuck bool
+	err := tx.QueryRow(ctx, `
+		WITH w AS (SELECT last_block FROM daily_stats_watermark WHERE id = 1),
+		below AS (SELECT max(number) AS n FROM blocks, w WHERE number <= w.last_block),
+		floor AS (SELECT min(first_block) - 1 AS n FROM daily_stats_acc WHERE first_block IS NOT NULL
+		          AND first_block <= (SELECT last_block FROM w)),
+		target AS (SELECT GREATEST(below.n, floor.n) AS n FROM below, floor
+		           WHERE below.n IS NOT NULL AND floor.n IS NOT NULL),
+		up AS (
+			UPDATE daily_stats_watermark d SET last_block = target.n FROM target, w
+			WHERE d.id = 1 AND target.n < w.last_block
+			RETURNING 1
+		)
+		SELECT EXISTS (SELECT 1 FROM up),
+		       EXISTS (SELECT 1 FROM w WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE number = w.last_block) AND w.last_block >= 0
+		                                      AND (pruned_through() = 0 OR w.last_block > pruned_through()))`).
+		Scan(&lowered, &stuck)
+	if err != nil {
+		return err
+	}
+	if stuck && !lowered {
+		log.Warn("daily_stats: a reorg left the watermark on a block that is not stored; recount the day with refill-daily-stats")
+	}
+	return nil
+}
+
 func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
@@ -162,6 +229,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 
 	// The block's day is re-aggregated from its first block on the next advance (migration 012).
 	if _, err := tx.Exec(ctx, `SELECT daily_stats_invalidate($1)`, number); err != nil {
+		return err
+	}
+	if err := keepDailyStatsWatermarkOnStoredBlocks(ctx, tx); err != nil {
 		return err
 	}
 
@@ -224,22 +294,28 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		}
 	}
 
+	// nft_tokens, then address_stats, then chain_counters: the writer's lock order. The revert takes the
+	// address_stats_reverts row, which the writer never takes, before address_stats (revertAddressStats).
+	if err := revertNFTTokens(ctx, tx, number); err != nil {
+		return err
+	}
+	forgotten, err := revertAddressStats(ctx, tx, number)
+	if err != nil {
+		return err
+	}
+
 	// chain_counters is maintained by the same delta discipline on the insert
 	// side and had the same gap on this path. All three counters the cascade
 	// invalidates are reverted together: compensating only transfers_total left
 	// blocks_total and transactions_total drifting, which is the same
 	// fix-one-site mistake one level up.
 	//
-	// addresses_total is untouched because address_stats has no foreign key
-	// into transactions, so the cascade does not reach it -- an address seen in
-	// a reverted block has still been seen.
+	// addresses_total drops by the address_stats rows the revert removed:
+	// addresses no remaining block has seen.
 	//
-	// tokens_total is deliberately not reverted here. tokens.creation_tx
-	// REFERENCES transactions(hash) ON DELETE CASCADE, so reverting a token's
-	// creating block deletes the token row itself, and a warm token cache then
-	// stops it ever being recreated. That is a separate defect on this path and
-	// decrementing the counter for it would encode the broken behaviour rather
-	// than repair it.
+	// tokens_total is not reverted: the tokens row outlives its creating
+	// block (migration 014 dropped tokens.creation_tx's cascade), so a token
+	// seen in a reverted block stays counted, like an address.
 	var revertedTransfers int64
 	for _, r := range doomed {
 		revertedTransfers += r.count
@@ -260,15 +336,16 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		revertedBlocks = 1
 	}
 
-	if revertedBlocks|revertedTxs|revertedTransfers != 0 {
+	if revertedBlocks|revertedTxs|revertedTransfers|forgotten != 0 {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chain_counters (name, count, updated_at) VALUES
 				('blocks_total',       $1, NOW()),
 				('transactions_total', $2, NOW()),
-				('transfers_total',    $3, NOW())
+				('transfers_total',    $3, NOW()),
+				('addresses_total',    $4, NOW())
 			ON CONFLICT (name) DO UPDATE
 				SET count = GREATEST(chain_counters.count + EXCLUDED.count, 0), updated_at = NOW()`,
-			-revertedBlocks, -revertedTxs, -revertedTransfers); err != nil {
+			-revertedBlocks, -revertedTxs, -revertedTransfers, -forgotten); err != nil {
 			return err
 		}
 	}
@@ -277,6 +354,20 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		return err
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM logs WHERE block_number = $1", number); err != nil {
+		return err
+	}
+	// The history tables are partitioned (migration 014) and carry no foreign keys, so nothing cascades.
+	if _, err := tx.Exec(ctx, `DELETE FROM op_deposits WHERE l2_tx_hash IN (SELECT hash FROM transactions WHERE block_number = $1)`, number); err != nil {
+		return err
+	}
+	// 014 dropped the creation_tx foreign key whose cascade used to remove the block's contracts.
+	if _, err := tx.Exec(ctx, "DELETE FROM contracts WHERE block_number = $1", number); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM internal_transactions WHERE block_number = $1", number); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM transactions WHERE block_number = $1", number); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number); err != nil {
@@ -297,7 +388,7 @@ func (d *DB) InsertTransaction(ctx context.Context, tx *types.Transaction) error
 		INSERT INTO transactions (hash, block_number, block_timestamp, tx_index, from_address, to_address, value, gas_used, gas_price,
 			gas_limit, max_fee_per_gas, max_priority_fee_per_gas, nonce, tx_type, input_data, status, error, revert_reason, categories)
 		VALUES ($1, $2, $3, $4, LOWER($5), LOWER($6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-		ON CONFLICT (hash) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		tx.Hash, tx.BlockNumber, tx.BlockTimestamp, tx.TxIndex, tx.From, tx.To, tx.Value, tx.GasUsed, tx.GasPrice,
 		tx.GasLimit, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, tx.Nonce, tx.TxType, tx.InputData, tx.Status, tx.Error, tx.RevertReason, categories)
 	return err
@@ -311,7 +402,7 @@ func (d *DB) GetTransaction(ctx context.Context, hash string) (*types.Transactio
 			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
 		FROM transactions t
-		LEFT JOIN contracts c ON c.creation_tx = t.hash
+		LEFT JOIN contracts c ON c.creation_tx = t.hash AND t.to_address IS NULL
 		WHERE t.hash = $1`, hash).Scan(
 		&tx.Hash, &tx.BlockNumber, &tx.TxIndex, &tx.From, &tx.To, &tx.ContractAddress, &valueStr,
 		&tx.GasUsed, &tx.GasPrice, &tx.GasLimit, &tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.Nonce,
@@ -573,9 +664,19 @@ func (d *DB) GetTransactionsWithCategories(ctx context.Context, limit int, befor
 	return scanTransactionsWithCategories(rows)
 }
 
+// GetTransactionsPaginatedWithCategories returns a feed page and its total. Without hidden tx types the total is
+// the transactions_total counter, which counts pruned history; with them it is a COUNT(*) of the retained rows.
 func (d *DB) GetTransactionsPaginatedWithCategories(ctx context.Context, page, pageSize int) ([]types.Transaction, int64, error) {
 	var total int64
-	err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE NOT (tx_type = ANY($1::int[]))`, d.HiddenTxTypes).Scan(&total)
+	var err error
+	if len(d.HiddenTxTypes) == 0 {
+		err = d.pool.QueryRow(ctx, `
+			SELECT COALESCE(
+				(SELECT count FROM chain_counters WHERE name = 'transactions_total'),
+				(SELECT COUNT(*) FROM transactions))`).Scan(&total)
+	} else {
+		err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE NOT (tx_type = ANY($1::int[]))`, d.HiddenTxTypes).Scan(&total)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -610,7 +711,7 @@ func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*ty
 			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
 			t.categories
 		FROM transactions t
-		LEFT JOIN contracts c ON c.creation_tx = t.hash
+		LEFT JOIN contracts c ON c.creation_tx = t.hash AND t.to_address IS NULL
 		WHERE t.hash = $1`, hash).Scan(
 		&tx.Hash, &tx.BlockNumber, &tx.BlockTimestamp, &tx.TxIndex, &tx.From, &tx.To, &tx.ContractAddress, &valueStr,
 		&tx.GasUsed, &tx.GasPrice, &tx.GasLimit, &tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.Nonce,
@@ -918,14 +1019,13 @@ func (d *DB) GetTransfersByAddress(ctx context.Context, address string, limit in
 	return scanTokenTransfers(rows)
 }
 
-// CountTransfersByAddress returns the total number of transfers where the
-// address is sender or receiver, ignoring pagination. Mirrors the WHERE clause
-// of GetTransfersByAddress so consumers can show a true "of N" total.
+// CountTransfersByAddress returns address_stats.token_transfer_count: every transfer the address sent or received,
+// pruned history included. A self-transfer counts once, as migration 017 and the writer count it.
 func (d *DB) CountTransfersByAddress(ctx context.Context, address string) (int64, error) {
 	var total int64
-	addr := strings.ToLower(address)
-	err := d.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM token_transfers WHERE from_address = $1 OR to_address = $1`, addr).Scan(&total)
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT token_transfer_count FROM address_stats WHERE address = $1), 0)`,
+		strings.ToLower(address)).Scan(&total)
 	return total, err
 }
 
@@ -942,9 +1042,16 @@ func (d *DB) GetTransfersByTransaction(ctx context.Context, txHash string) ([]ty
 	return scanTokenTransfers(rows)
 }
 
+// GetTransfersByToken's total is tokens.transfer_count, which counts pruned history. A token without a tokens row
+// yet (metadata discovery pending) falls back to counting its retained transfers.
 func (d *DB) GetTransfersByToken(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenTransfer, int64, error) {
 	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM token_transfers WHERE token_address = LOWER($1)", tokenAddress).Scan(&total)
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(
+			(SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = LOWER($1)),
+			(SELECT COUNT(*) FROM token_transfers WHERE token_address = LOWER($1)))`, tokenAddress).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
@@ -1052,27 +1159,22 @@ func scanTokenTransfers(rows pgx.Rows) ([]types.TokenTransfer, error) {
 // Token holder operations
 
 func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenHolder, int64, error) {
+	// Current balances, not the balances history: retention drops history by range (migration 014), and the
+	// history read showed a holder's older positive balance after it went to zero.
 	var total int64
-	d.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT address) FROM balances
-		WHERE token_address = LOWER($1) AND balance > 0`, tokenAddress).Scan(&total)
+	d.pool.QueryRow(ctx, `SELECT COALESCE(holder_count, 0) FROM tokens WHERE address = LOWER($1)`, tokenAddress).Scan(&total)
 
 	rows, err := d.pool.Query(ctx, `
-		WITH latest_balances AS (
-			SELECT address, balance,
-				ROW_NUMBER() OVER (PARTITION BY address ORDER BY block_number DESC) as rn
-			FROM balances
+		WITH total_supply AS (
+			SELECT COALESCE(SUM(balance), 1) as supply FROM token_balances_current
 			WHERE token_address = LOWER($1) AND balance > 0
-		),
-		total_supply AS (
-			SELECT COALESCE(SUM(balance), 1) as supply FROM latest_balances WHERE rn = 1
 		)
-		SELECT lb.address, lb.balance::text,
-			(lb.balance::numeric / NULLIF(ts.supply::numeric, 0) * 100)::numeric(10,4) as percentage,
-			COALESCE((SELECT true FROM contracts WHERE address = LOWER(lb.address)), false) as is_contract
-		FROM latest_balances lb, total_supply ts
-		WHERE lb.rn = 1
-		ORDER BY lb.balance DESC
+		SELECT c.address, c.balance::text,
+			(c.balance::numeric / NULLIF(ts.supply::numeric, 0) * 100)::numeric(10,4) as percentage,
+			COALESCE((SELECT true FROM contracts WHERE address = LOWER(c.address)), false) as is_contract
+		FROM token_balances_current c, total_supply ts
+		WHERE c.token_address = LOWER($1) AND c.balance > 0
+		ORDER BY c.balance DESC
 		LIMIT $2 OFFSET $3`, tokenAddress, limit, offset)
 	if err != nil {
 		return nil, 0, err
@@ -1145,9 +1247,8 @@ func (d *DB) GetLatestBalance(ctx context.Context, address string, tokenAddress 
 	var balanceStr string
 	err := d.pool.QueryRow(ctx, `
 		SELECT address, token_address, block_number, balance::text
-		FROM balances
-		WHERE address = LOWER($1) AND token_address = LOWER($2)
-		ORDER BY block_number DESC LIMIT 1`, address, tokenAddress).Scan(
+		FROM token_balances_current
+		WHERE address = LOWER($1) AND token_address = LOWER($2)`, address, tokenAddress).Scan(
 		&b.Address, &b.TokenAddress, &b.BlockNumber, &balanceStr)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -1185,14 +1286,9 @@ func (d *DB) GetBalanceHistory(ctx context.Context, address string, tokenAddress
 
 func (d *DB) GetTokenBalances(ctx context.Context, address string) ([]types.Balance, error) {
 	rows, err := d.pool.Query(ctx, `
-		WITH latest_balances AS (
-			SELECT address, token_address, balance, block_number,
-				ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY block_number DESC) as rn
-			FROM balances
-			WHERE address = LOWER($1)
-		)
 		SELECT address, token_address, block_number, balance::text
-		FROM latest_balances WHERE rn = 1 AND balance > 0
+		FROM token_balances_current
+		WHERE address = LOWER($1) AND balance > 0
 		ORDER BY balance DESC`, address)
 	if err != nil {
 		return nil, err
@@ -1576,7 +1672,7 @@ func (d *DB) InsertInternalTransaction(ctx context.Context, it *types.InternalTr
 		INSERT INTO internal_transactions (tx_hash, block_number, trace_address, from_address, to_address, value,
 			gas, gas_used, input, output, call_type, error, timestamp)
 		VALUES ($1, $2, $3, LOWER($4), LOWER($5), $6, $7, $8, $9, $10, $11, $12, $13)
-		ON CONFLICT (tx_hash, trace_address) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		it.TxHash, it.BlockNumber, it.TraceAddress, it.From, it.To, it.Value,
 		it.Gas, it.GasUsed, it.Input, it.Output, it.CallType, it.Error, it.Timestamp)
 	return err
@@ -1608,11 +1704,14 @@ func (d *DB) GetInternalTransactionsByBlock(ctx context.Context, blockNumber uin
 	return scanInternalTransactions(rows)
 }
 
+// GetInternalTransactionsByAddress's total is address_stats.internal_tx_count, which counts pruned history; a
+// self-call counts twice, once per side.
 func (d *DB) GetInternalTransactionsByAddress(ctx context.Context, address string, limit int, offset int) ([]types.InternalTransaction, int64, error) {
 	var total int64
-	d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM internal_transactions
-		WHERE from_address = LOWER($1) OR to_address = LOWER($1)`, address).Scan(&total)
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT internal_tx_count FROM address_stats WHERE address = LOWER($1)), 0)`, address).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, tx_hash, block_number, trace_address, from_address, to_address, value::text,
@@ -1938,6 +2037,25 @@ func (d *DB) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) erro
 	return err
 }
 
+// startDailyStatsWatermark sets the first watermark just below the newest day's first block, but only once that
+// block is known to be the day's first: the block before it is stored (it belongs to an earlier day), or nothing
+// is stored before the day at all (a fresh start). daily_stats_advance's own first run takes the first *stored*
+// block of the day, so a day whose start catch-up had not stored yet was cut, and the blocks catch-up stored later
+// fell below the watermark and were never counted (PRST-5436). Until then the advance waits. It reports
+// whether a watermark exists.
+const startDailyStatsWatermarkSQL = `
+	WITH newest AS (SELECT daily_stats_day(timestamp) AS day FROM blocks ORDER BY number DESC LIMIT 1),
+	first AS (SELECT min(number) AS n FROM blocks, newest WHERE timestamp >= daily_stats_epoch(newest.day)),
+	ins AS (
+		INSERT INTO daily_stats_watermark (id, last_block)
+		SELECT 1, first.n - 1 FROM first
+		WHERE first.n IS NOT NULL AND NOT EXISTS (SELECT 1 FROM daily_stats_watermark)
+		  AND (EXISTS (SELECT 1 FROM blocks WHERE number = first.n - 1) OR NOT EXISTS (SELECT 1 FROM blocks WHERE number < first.n))
+		ON CONFLICT (id) DO NOTHING
+		RETURNING 1
+	)
+	SELECT EXISTS (SELECT 1 FROM daily_stats_watermark) OR EXISTS (SELECT 1 FROM ins)`
+
 func (d *DB) GetDailyStats(ctx context.Context, from, to time.Time) ([]types.DailyStats, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT date, total_blocks, total_transactions, total_gas_used, avg_gas_price,
@@ -1993,6 +2111,13 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 	dateStr := date.Format("2006-01-02")
 	s := &types.DailyStats{Date: dateStr}
 
+	// A day whose first blocks are pruned would come out partial and overwrite a correct row.
+	if _, prunedTS, err := d.PrunedThrough(ctx); err != nil {
+		return nil, err
+	} else if prunedTS > 0 && date.Unix() <= prunedTS {
+		return nil, fmt.Errorf("%w: %s", ErrDayPruned, dateStr)
+	}
+
 	// total_blocks, total_gas_used, avg_block_size
 	err := d.pool.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(gas_used)::bigint, 0), COALESCE(AVG(size)::bigint, 0)
@@ -2036,16 +2161,6 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 		return nil, fmt.Errorf("compute active addresses: %w", err)
 	}
 
-	// new_addresses
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE first_seen >= extract(epoch from $1::date)::bigint
-		  AND first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.NewAddresses)
-	if err != nil {
-		return nil, fmt.Errorf("compute new addresses: %w", err)
-	}
-
 	// avg_block_time
 	err = d.pool.QueryRow(ctx, `
 		SELECT COALESCE(
@@ -2061,17 +2176,6 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 		return nil, fmt.Errorf("compute avg block time: %w", err)
 	}
 
-	// new_contracts
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE is_contract = true
-		  AND first_seen >= extract(epoch from $1::date)::bigint
-		  AND first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.NewContracts)
-	if err != nil {
-		return nil, fmt.Errorf("compute new contracts: %w", err)
-	}
-
 	// token_transfer_count
 	err = d.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM token_transfers tt
@@ -2085,40 +2189,62 @@ func (d *DB) ComputeDailyStats(ctx context.Context, date time.Time) (*types.Dail
 
 	// cumulative_transactions: sum of all total_transactions up to and including this date
 	err = d.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(cnt), 0) FROM (
+		SELECT COALESCE(SUM(cnt), 0) + prune_offset('chain', 'transactions_total') FROM (
 			SELECT COUNT(*) as cnt
 			FROM transactions t
 			JOIN blocks b ON t.block_number = b.number
 			WHERE b.timestamp < extract(epoch from ($1::date + interval '1 day'))::bigint
+			  AND t.block_number >= (SELECT history_from())
 		) sub`, dateStr).Scan(&s.CumulativeTransactions)
 	if err != nil {
 		return nil, fmt.Errorf("compute cumulative transactions: %w", err)
 	}
 
-	// cumulative_addresses
+	// Addresses by the day of their first block: from the day's first block to the next day's.
 	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.CumulativeAddresses)
+		WITH span AS (
+			SELECT min(number) AS lo,
+			       COALESCE(max(number) + 1,
+			                (SELECT min(number) FROM blocks WHERE timestamp >= extract(epoch from ($1::date + interval '1 day'))::bigint)) AS hi
+			FROM blocks
+			WHERE timestamp >= extract(epoch from $1::date)::bigint
+			  AND timestamp < extract(epoch from ($1::date + interval '1 day'))::bigint)
+		SELECT count(*) FILTER (WHERE first_seen >= span.lo AND first_seen < span.hi),
+		       count(*) FILTER (WHERE is_contract AND first_seen >= span.lo AND first_seen < span.hi),
+		       count(*) FILTER (WHERE first_seen < span.hi),
+		       count(*) FILTER (WHERE is_contract AND first_seen < span.hi)
+		FROM address_stats, span`, dateStr).
+		Scan(&s.NewAddresses, &s.NewContracts, &s.CumulativeAddresses, &s.CumulativeContracts)
 	if err != nil {
-		return nil, fmt.Errorf("compute cumulative addresses: %w", err)
-	}
-
-	// cumulative_contracts
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM address_stats
-		WHERE is_contract = true
-		  AND first_seen < extract(epoch from ($1::date + interval '1 day'))::bigint`, dateStr).
-		Scan(&s.CumulativeContracts)
-	if err != nil {
-		return nil, fmt.Errorf("compute cumulative contracts: %w", err)
+		return nil, fmt.Errorf("compute address columns: %w", err)
 	}
 
 	return s, nil
 }
 
-// WipeAllData truncates all indexed tables, used for chain reset recovery.
+// WipeMarkTable exists while a wipe is in progress: created before the first truncate, dropped as the wipe's last
+// step. A wipe stopped part way leaves blocks empty, so the next start sees no reset and would not wipe again; it
+// finds the mark instead and finishes the wipe (ResumeInterruptedWipe).
+const WipeMarkTable = "wipe_in_progress"
+
+// WipeAllData truncates all indexed tables, used for chain reset recovery. It holds the history-DDL gate, so no
+// span closes and no range is detached or dropped while it runs. Every step can run again, so a wipe stopped
+// anywhere is finished by running it again from the start.
 func (d *DB) WipeAllData(ctx context.Context) error {
+	release, err := d.holdHistoryDDLGate(ctx, cutGateWait)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		return fmt.Errorf("failed to mark the wipe as in progress: %w", err)
+	}
+	// A refill or repair staged from the old chain must not be applied to the new one. Dropped before chain_counters
+	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count.
+	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable+", "+
+		addressStatsRepairTotalTable); err != nil {
+		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
+	}
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we
 	// list child tables first for clarity.
@@ -2157,6 +2283,13 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"indexer_progress",
 		"missing_block_ranges",
 		"sync_status",
+		// The ledger's closed spans and the archive records describe the wiped chain. Left behind, every total
+		// would add the old chain's spans through prune_offsets, and a new range would count as archived already.
+		"ledger_address",
+		"ledger_token",
+		"ledger_chain",
+		"ledger_spans",
+		"history_archives",
 	}
 	for _, table := range tables {
 		if _, err := d.pool.Exec(ctx, "TRUNCATE TABLE "+table+" CASCADE"); err != nil {
@@ -2172,5 +2305,31 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"INSERT INTO indexer_progress (min_fetched_block, max_fetched_block, backfill_complete) VALUES (0, 0, false) ON CONFLICT DO NOTHING"); err != nil {
 		return fmt.Errorf("failed to re-seed indexer_progress: %w", err)
 	}
+	// Nothing of the new chain is pruned.
+	if _, err := d.pool.Exec(ctx,
+		"UPDATE prune_state SET pruned_through = 0, pruned_through_ts = 0, updated_at = now() WHERE id = 1"); err != nil {
+		return fmt.Errorf("failed to reset the prune watermark: %w", err)
+	}
+	if err := d.coverHistoryFromZero(ctx); err != nil {
+		return err
+	}
+	if _, err := d.pool.Exec(ctx, `DROP TABLE IF EXISTS `+WipeMarkTable); err != nil {
+		return fmt.Errorf("failed to clear the wipe's mark: %w", err)
+	}
 	return nil
+}
+
+// ResumeInterruptedWipe finishes a wipe that was stopped part way. Reconcile runs it first, so it finishes before
+// ingest, the ledger closer and retention start; the gRPC server already serves while it runs, and answers from the
+// half-wiped tables until it is done.
+func (d *DB) ResumeInterruptedWipe(ctx context.Context) error {
+	var marked bool
+	if err := d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, WipeMarkTable).Scan(&marked); err != nil {
+		return err
+	}
+	if !marked {
+		return nil
+	}
+	log.Warn("a FORCE_REINDEX wipe was stopped part way; finishing it before the start")
+	return d.WipeAllData(ctx)
 }

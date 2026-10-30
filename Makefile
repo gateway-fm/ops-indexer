@@ -1,4 +1,4 @@
-.PHONY: help proto-gen proto-lint build test test-integration bench bench-quick run-local migrate-up migrate-down docker-build clean
+.PHONY: help proto-gen proto-lint build test test-integration test-faults bench bench-quick run-local migrate-up migrate-down docker-build clean
 
 BIN_DIR := bin
 GEN_DIR := gen
@@ -28,6 +28,9 @@ test: ## Run unit tests
 
 test-integration: ## Run integration tests (requires docker)
 	go test -tags=integration ./...
+
+test-faults: ## Run the fault-injection tests: node faults, lost commits, restarts, long readers (requires docker; slow)
+	go test -tags faults -race -count=1 -timeout 60m ./...
 
 # Benchmarks need docker: each sub-benchmark starts its own postgres via
 # testcontainers, seeds it to the target table size and tears it down.

@@ -13,8 +13,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Wider than prometheus.DefBuckets, which stops at 10s: RefreshTokenStats alone
-// was measured at 2.4s on a 10M-row database and grows with history.
+// Wider than prometheus.DefBuckets, which stops at 10s, so a stage that runs long on a
+// large database still lands in a bucket. (Before 0.5.0, RefreshTokenStats alone took 2.4s
+// on a 10M-row database.)
 var latencyBuckets = []float64{
 	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
 }
@@ -30,9 +31,36 @@ var (
 		Help: "Highest block number written to the database.",
 	})
 
+	pruneWatermark = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_prune_watermark",
+		Help: "Every block at or below this was pruned on purpose (0: nothing pruned).",
+	})
+
+	ledgerClosedThrough = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_ledger_closed_through",
+		Help: "Every block at or below this is in a closed ledger span.",
+	})
+
+	ledgerCloseSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "indexer_ledger_close_seconds",
+		Help:    "Duration of closing one ledger span from its rows.",
+		Buckets: latencyBuckets,
+	})
+
+	retentionStepSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "indexer_retention_step_seconds",
+		Help:    "Duration of one retention step: cut_constrain, cut_validate, cut_finish, ensure, advance, detach, archive, drop.",
+		Buckets: latencyBuckets,
+	}, []string{"step"})
+
 	missingBlocks = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "indexer_missing_blocks",
 		Help: "Blocks below the chain head absent from the database.",
+	})
+
+	startWaitingBlocks = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_start_waiting_blocks",
+		Help: "Stored blocks the start is waiting for the node to serve before it compares them with the chain; 0 once started.",
 	})
 
 	dailyStatsLag = promauto.NewGauge(prometheus.GaugeOpts{
@@ -136,7 +164,19 @@ func SetLastIndexed(block uint64) { lastIndexedBlock.Set(float64(block)) }
 
 func SetMissingBlocks(n int64) { missingBlocks.Set(float64(n)) }
 
+func SetStartWaitingBlocks(n uint64) { startWaitingBlocks.Set(float64(n)) }
+
 func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
+
+func SetPruneWatermark(block uint64) { pruneWatermark.Set(float64(block)) }
+
+func SetLedgerClosedThrough(block uint64) { ledgerClosedThrough.Set(float64(block)) }
+
+func ObserveLedgerClose(d time.Duration) { ledgerCloseSeconds.Observe(d.Seconds()) }
+
+func ObserveRetentionStep(step string, d time.Duration) {
+	retentionStepSeconds.WithLabelValues(step).Observe(d.Seconds())
+}
 
 func BlockIndexed(txCount int, gasUsed uint64) {
 	blocksIndexed.Inc()
@@ -226,3 +266,54 @@ func BalanceQueueDropped(n int) {
 func ReorgDetected() { reorgs.Inc() }
 
 func ChainResetDetected() { chainResets.Inc() }
+
+var (
+	nodeLookupCache = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_node_lookup_cache_total",
+		Help: "Pruned-block lookups served from the node-lookup cache (hit) or fetched from the node (miss).",
+	}, []string{"result"})
+
+	nodeLookupRPC = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "indexer_node_lookup_rpc_seconds",
+		Help:    "Latency of the node calls that serve pruned blocks and transactions.",
+		Buckets: latencyBuckets,
+	}, []string{"method", "outcome"})
+
+	nodeLookupBusy = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_node_lookup_busy_total",
+		Help: "Pruned lookups refused because every node slot stayed taken for the request timeout.",
+	})
+
+	nodeLookupCachedBlocks = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_node_lookup_cached_blocks",
+		Help: "Blocks held in the node-lookup cache.",
+	})
+
+	nodeLookupCachedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_node_lookup_cached_bytes",
+		Help: "Estimated size of the node-lookup cache.",
+	})
+)
+
+func NodeLookupCache(hit bool) {
+	if hit {
+		nodeLookupCache.WithLabelValues("hit").Inc()
+		return
+	}
+	nodeLookupCache.WithLabelValues("miss").Inc()
+}
+
+func ObserveNodeLookupRPC(method string, d time.Duration, err error) {
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	nodeLookupRPC.WithLabelValues(method, outcome).Observe(d.Seconds())
+}
+
+func NodeLookupBusy() { nodeLookupBusy.Inc() }
+
+func SetNodeLookupCache(blocks, bytes int) {
+	nodeLookupCachedBlocks.Set(float64(blocks))
+	nodeLookupCachedBytes.Set(float64(bytes))
+}

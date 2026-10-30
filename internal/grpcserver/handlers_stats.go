@@ -24,6 +24,14 @@ func (s *Server) GetChainStats(ctx context.Context, _ *indexerv1.Empty) (*indexe
 	if n, e := s.db.GetLatestBlockNumber(ctx); e == nil {
 		resp.LatestBlockNumber = n
 	}
+	through, ts, err := s.prunedThrough(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if through > 0 {
+		resp.PrunedThroughBlock = through
+		resp.PrunedThroughTimestamp = unixToProto(uint64(ts))
+	}
 	return resp, nil
 }
 

@@ -27,7 +27,8 @@ type Database interface {
 	DeleteMissingRangeByBlock(ctx context.Context, blockNum uint64) error
 	RequeueMissingBlock(ctx context.Context, blockNum uint64) error
 	GetMissingRangesBatch(ctx context.Context, batchSize int) ([]db.BlockRange, error)
-	RebuildAddressStats(ctx context.Context) error
+	GetLowestMissingRanges(ctx context.Context, limit int, skip []uint64) ([]db.BlockRange, error)
+	PrunedThrough(ctx context.Context) (uint64, int64, error)
 
 	InsertTransaction(ctx context.Context, tx *types.Transaction) error
 	InsertContract(ctx context.Context, c *types.Contract) error
@@ -46,6 +47,7 @@ type Database interface {
 	UpdateIndexerProgress(ctx context.Context, minBlock, maxBlock uint64, backfillComplete bool) error
 	FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]db.BlockRange, error)
 	SaveMissingRanges(ctx context.Context, ranges []db.BlockRange) error
+	AdvanceMissingRange(ctx context.Context, r db.BlockRange, next uint64) error
 
 	GetAllTokenAddresses(ctx context.Context) ([]string, error)
 	InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error

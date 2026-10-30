@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"sort"
 	"sync"
@@ -252,9 +253,10 @@ func writtenNumbers(ws []storedWrite) []uint64 {
 	return out
 }
 
-// After a reorg the realtime loop reverts the stale blocks and indexes again from the fork point in the same tick:
-// stored 1..100, the chain replaced 98..100, safe head 102, so 98..102 are written from the new chain, in order.
-func TestRealtimeReorgReplaysFromTheForkPointInTheSameTick(t *testing.T) {
+// After a reorg the realtime loop reverts the stale blocks in one tick and indexes from the fork point on the next:
+// stored 1..100, the chain replaced 98..100, safe head 102, so 98..102 are written from the new chain, in order, in
+// tick 2, with no block left behind for the gap collector.
+func TestRealtimeReorgReplaysFromTheForkPointInTheNextTick(t *testing.T) {
 	for _, mode := range []struct {
 		name         string
 		subscription bool
@@ -264,7 +266,7 @@ func TestRealtimeReorgReplaysFromTheForkPointInTheSameTick(t *testing.T) {
 			store := newReorgStore(100, node.tick)
 			rt := newReorgRealtime(store, node, 100)
 
-			runRealtime(t, rt, node, mode.subscription, 1, func() bool { return len(store.written()) >= 5 })
+			runRealtime(t, rt, node, mode.subscription, 2, func() bool { return len(store.written()) >= 5 })
 
 			ws := store.written()
 			got := writtenNumbers(ws)
@@ -273,8 +275,8 @@ func TestRealtimeReorgReplaysFromTheForkPointInTheSameTick(t *testing.T) {
 				t.Fatalf("written %v, want %v", got, want)
 			}
 			for i, w := range ws {
-				if w.number != want[i] || w.hash != node.chain[w.number].Hash.Hex() || w.tick != 1 {
-					t.Fatalf("write %d = block %d hash %s in tick %d, want block %d from the new chain in tick 1 (all writes %v)",
+				if w.number != want[i] || w.hash != node.chain[w.number].Hash.Hex() || w.tick != 2 {
+					t.Fatalf("write %d = block %d hash %s in tick %d, want block %d from the new chain in tick 2 (all writes %v)",
 						i, w.number, w.hash, w.tick, want[i], got)
 				}
 			}
@@ -382,16 +384,18 @@ func TestDetectReorgKeepsTheMismatchFoundBeforeAnError(t *testing.T) {
 	}
 }
 
-// A reorg check that fails ends the tick before any block is indexed; the next tick, with the node healthy, reverts
-// the stale blocks and indexes the new chain.
+// A reorg check that fails ends the tick before any block is indexed. With the node healthy again, realtime reverts
+// the stale blocks on the next tick and indexes the new chain on the one after; the standard loop reverts and indexes
+// in the same tick.
 func TestReorgCheckErrorEndsTheTick(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		forkAt uint64
-		want   []uint64
+		name                       string
+		forkAt                     uint64
+		want                       []uint64
+		realtimeTick, standardTick int
 	}{
-		{"stale head", 98, []uint64{98, 99, 100, 101, 102}},
-		{"no mismatch", 200, []uint64{101, 102}},
+		{"stale head", 98, []uint64{98, 99, 100, 101, 102}, 3, 2},
+		{"no mismatch", 200, []uint64{101, 102}, 2, 2},
 	} {
 		for _, mode := range []struct {
 			name         string
@@ -403,9 +407,9 @@ func TestReorgCheckErrorEndsTheTick(t *testing.T) {
 				store := newReorgStore(100, node.tick)
 				rt := newReorgRealtime(store, node, 100)
 
-				runRealtime(t, rt, node, mode.subscription, 2, func() bool { return len(store.written()) >= len(c.want) })
+				runRealtime(t, rt, node, mode.subscription, c.realtimeTick, func() bool { return len(store.written()) >= len(c.want) })
 
-				assertWrittenInTick(t, store, node, c.want, 2)
+				assertWrittenInTick(t, store, node, c.want, c.realtimeTick)
 			})
 		}
 		t.Run(c.name+"/standard", func(t *testing.T) {
@@ -414,9 +418,9 @@ func TestReorgCheckErrorEndsTheTick(t *testing.T) {
 			store := newReorgStore(100, node.tick)
 			want := append(append([]uint64(nil), c.want...), 103)
 
-			runStandard(t, newReorgStandard(store, node), node, 100, 2, func() bool { return len(store.written()) >= len(want) })
+			runStandard(t, newReorgStandard(store, node), node, 100, c.standardTick, func() bool { return len(store.written()) >= len(want) })
 
-			assertWrittenInTick(t, store, node, want, 2)
+			assertWrittenInTick(t, store, node, want, c.standardTick)
 		})
 	}
 }
@@ -482,6 +486,104 @@ func TestFailedRevertReplaysTheForkWhateverTheDeletesDid(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// skipNode is a reorgNode whose receipts never come, and skipStore records the blocks recorded as missing.
+type skipNode struct{ *reorgNode }
+
+func (skipNode) FetchReceiptsBatch(context.Context, []common.Hash, int, int, ...uint64) (map[common.Hash]*rpclient.Receipt, error) {
+	return nil, errors.New("receipts not found")
+}
+
+type skipStore struct {
+	*reorgStore
+	requeued []uint64
+}
+
+func (s *skipStore) RequeueMissingBlock(_ context.Context, n uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requeued = append(s.requeued, n)
+	return nil
+}
+
+// Realtime indexes through the prefetch loop, so a block whose receipts never come is checked against its parent
+// before it can be recorded as missing: one from another fork is never moved past, however many ticks it fails.
+func TestRealtimeDoesNotSkipABlockFromAnotherForkWhoseReceiptsNeverCome(t *testing.T) {
+	node := newReorgNode(1000, 7)
+	node.chain[3].ParentHash = common.BytesToHash([]byte{0xf0, 0x2c})
+	node.chain[3].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{3})}}
+	store := &skipStore{reorgStore: newReorgStore(2, node.tick)}
+	rt := NewRealtimeIndexer(store, skipNode{node}, &RealtimeConfig{ConfirmationBlocks: 1, PollInterval: 10 * time.Millisecond},
+		&Config{RPCWorkers: 1, RPCRateLimit: 100}, NewTokenCache(), NewContractCache(), nil, false)
+	rt.SetLastProcessedBlock(2)
+
+	runRealtime(t, rt, node, false, maxReceiptAttempts+2, func() bool { return true })
+
+	if got := writtenNumbers(store.written()); len(got) != 0 {
+		t.Fatalf("written %v, want nothing: block 3's parent is not the stored block 2", got)
+	}
+	store.mu.Lock()
+	requeued := store.requeued
+	store.mu.Unlock()
+	if len(requeued) != 0 {
+		t.Fatalf("recorded %v as missing, want nothing", requeued)
+	}
+	if last := rt.GetLastProcessedBlock(); last != 2 {
+		t.Fatalf("last processed %d, want 2", last)
+	}
+}
+
+// Realtime starts at the node head, and a jump moves it there, with nothing stored at its cursor or for a long way
+// below: catch-up fills that. Its first batch goes on from the cursor; it does not start again after the highest
+// stored block, far below.
+func TestRealtimeAtAnUnstoredCursorDoesNotStartFromTheHighestStoredBlock(t *testing.T) {
+	node := newReorgNode(1000, 503)
+	store := newReorgStore(10, node.tick)
+	rt := newReorgRealtime(store, node, 500)
+
+	rt.indexUpTo(context.Background(), 500, 502)
+
+	if got := writtenNumbers(store.written()); fmt.Sprint(got) != "[501 502]" {
+		t.Fatalf("written %d blocks from %v, want [501 502]", len(got), got[:min(len(got), 3)])
+	}
+}
+
+// Realtime runs through the prefetch loop too, with the same remembered hash for a block skipped for its receipts.
+// When the chain replaces that block, realtime drops the stale hash and goes on with the new chain; the skipped
+// block stays recorded as missing for catch-up.
+func TestRealtimeGoesOnAfterTheChainReplacesASkippedBlock(t *testing.T) {
+	node := newReorgNode(1000, 100)
+	node.chain[100].Transactions = []rpc.RawTransaction{{Hash: common.BytesToHash([]byte{100})}}
+	store := &skipStore{reorgStore: newReorgStore(99, node.tick)}
+	rt := NewRealtimeIndexer(store, skipNode{node}, &RealtimeConfig{ConfirmationBlocks: 1, PollInterval: 10 * time.Millisecond},
+		&Config{RPCWorkers: 1, RPCRateLimit: 100}, NewTokenCache(), NewContractCache(), nil, false)
+	rt.SetLastProcessedBlock(99)
+	for attempt := 0; attempt < maxReceiptAttempts; attempt++ {
+		rt.indexUpTo(context.Background(), rt.GetLastProcessedBlock(), 100)
+	}
+	if last := rt.GetLastProcessedBlock(); last != 100 || fmt.Sprint(store.requeued) != "[100]" {
+		t.Fatalf("setup: cursor %d, recorded missing %v; want block 100 skipped", last, store.requeued)
+	}
+
+	node.mu.Lock()
+	for n := uint64(100); n <= 102; n++ {
+		node.chain[n] = &rpc.RawBlock{Number: (*hexutil.Big)(new(big.Int).SetUint64(n)), Hash: newHash(n), ParentHash: newHash(n - 1)}
+	}
+	node.chain[100].ParentHash = oldHash(99)
+	node.mu.Unlock()
+	for i := 0; i < 3 && rt.GetLastProcessedBlock() < 102; i++ {
+		rt.indexUpTo(context.Background(), rt.GetLastProcessedBlock(), 102)
+	}
+
+	if last := rt.GetLastProcessedBlock(); last != 102 {
+		t.Fatalf("cursor %d after 3 ticks, want 102", last)
+	}
+	for n, h := range store.hashes(101, 102) {
+		if h != node.chain[n].Hash.Hex() {
+			t.Fatalf("block %d stored as %q, want the new chain's", n, h)
 		}
 	}
 }

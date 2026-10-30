@@ -14,12 +14,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/gateway-fm/chain-indexer/internal/config"
@@ -28,6 +30,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/indexer"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
+	"github.com/gateway-fm/chain-indexer/internal/nodelookup"
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
@@ -53,6 +56,21 @@ func main() {
 	}
 	defer database.Close()
 	database.RebuildWorkMem = cfg.RebuildWorkMem
+	if len(os.Args) > 1 && os.Args[1] == "refill-daily-stats" {
+		code := runRefillDailyStats(os.Args[2:], database, cfg.RPCURL, cfg.RPCTimeout)
+		database.Close()
+		os.Exit(code)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "repair-address-stats" {
+		code := runRepairAddressStats(os.Args[2:], database)
+		database.Close()
+		os.Exit(code)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "backfill-contracts" {
+		code := runBackfillContracts(os.Args[2:], database, cfg.RPCURL, cfg.RPCTimeout)
+		database.Close()
+		os.Exit(code)
+	}
 	metrics.RegisterPoolStats(database.PoolStat)
 	rpclient.Observer = metrics.ObserveRPC
 
@@ -77,7 +95,7 @@ func main() {
 		}
 	}
 
-	if err := database.Migrate(); err != nil {
+	if err := database.MigrateSchema(); err != nil {
 		log.Fatal("failed to run migrations", "error", err)
 	}
 	if cfg.TxHashIndexes {
@@ -85,8 +103,18 @@ func main() {
 			log.Fatal("failed to build the tx_hash lookup indexes", "error", err)
 		}
 	}
+	if err := database.EnsureContractsBlockIndex(context.Background()); err != nil {
+		log.Fatal("failed to build the contracts block index", "error", err)
+	}
 
-	rpcClient, err := rpc.New(cfg.RPCURL)
+	// Once the history is cut a block above the newest partition cannot be stored: create them before ingest.
+	if head, err := database.GetLatestBlockNumber(context.Background()); err != nil {
+		log.Fatal("failed to read the stored head", "error", err)
+	} else if _, err := database.EnsurePartitionsAhead(context.Background(), head, cfg.PartitionBlocks); err != nil {
+		log.Fatal("failed to create history partitions", "error", err)
+	}
+
+	rpcClient, err := rpc.NewWithTimeout(cfg.RPCURL, cfg.RPCTimeout)
 	if err != nil {
 		log.Fatal("failed to create rpc client", "error", err)
 	}
@@ -106,6 +134,7 @@ func main() {
 		CatchupWorkers:        cfg.CatchupWorkers,
 		CatchupBatchSize:      cfg.CatchupBatchSize,
 		CatchupQueueSize:      cfg.CatchupQueueSize,
+		RealtimeMaxBehind:     cfg.RealtimeMaxBehind,
 		SkipReceiptTxTypes:    skipReceipts,
 		DailyStatsMinInterval: cfg.DailyStatsMinInterval,
 		CommitPipelineDepth:   cfg.CommitPipelineDepth,
@@ -115,9 +144,19 @@ func main() {
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
+	var nodeLookup *nodelookup.Lookup
+	if cfg.PrunedLookup {
+		nodeLookup = nodelookup.New(nodelookup.NewNodeSource(rpcClient), nodelookup.Config{
+			MaxBlocks:   cfg.PrunedLookupCacheBlocks,
+			MaxBytes:    cfg.PrunedLookupCacheMB << 20,
+			Timeout:     cfg.PrunedLookupTimeout,
+			Concurrency: cfg.PrunedLookupConcurrency,
+		})
+	}
 	grpcSrv, err := grpcserver.New(grpcserver.Config{
 		ListenAddr:     cfg.GRPCListenAddr,
 		OPStackEnabled: cfg.EnableOPDeposits,
+		NodeLookup:     nodeLookup,
 	}, database)
 	if err != nil {
 		log.Fatal("failed to create grpc server", "error", err)
@@ -134,23 +173,75 @@ func main() {
 		cancel()
 	}()
 
+	stop := &workerStop{cancel: cancel}
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(4)
+
+	reconciled := make(chan struct{})
+	afterReconcile := func() bool {
+		select {
+		case <-reconciled:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 
 	go func() {
 		defer wg.Done()
+		if !afterReconcile() {
+			return
+		}
+		database.RunLedger(ctx, db.LedgerConfig{
+			SpanBlocks: cfg.LedgerSpanBlocks,
+			FirstBlock: cfg.StartBlock,
+			Interval:   cfg.LedgerCloseInterval,
+			WorkMem:    cfg.LedgerWorkMem,
+			HeadLag: func(ctx context.Context) (uint64, error) {
+				node, err := rpcClient.BlockNumber(ctx)
+				if err != nil {
+					return 0, err
+				}
+				ingested, err := idx.IngestHead(ctx)
+				if err != nil || ingested >= node {
+					return 0, err
+				}
+				return node - ingested, nil
+			},
+			MaxHeadLag: cfg.LedgerMaxHeadLag,
+		})
+	}()
+
+	go func() {
+		defer wg.Done()
+		if !afterReconcile() {
+			return
+		}
+		database.RunRetention(ctx, db.RetentionConfig{
+			RetainBlocks:    cfg.PruneRetainBlocks,
+			PartitionBlocks: cfg.PartitionBlocks,
+			Interval:        cfg.PruneInterval,
+			ArchiveDir:      cfg.PruneArchiveDir,
+			NodeHead:        rpcClient.BlockNumber,
+		})
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := database.Reconcile(ctx); err != nil {
+			log.Fatal("failed to reconcile counters", "error", err)
+		}
+		close(reconciled)
 		log.Info("starting indexer worker")
 		if err := idx.Start(ctx); err != nil {
-			log.Error("indexer worker error", "error", err)
-			cancel()
+			stop.fail("indexer worker error", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		if err := grpcSrv.Serve(ctx); err != nil {
-			log.Error("grpc server error", "error", err)
-			cancel()
+			stop.fail("grpc server error", err)
 		}
 	}()
 
@@ -159,8 +250,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			if err := metrics.ServeMetrics(ctx, cfg.MetricsListenAddr); err != nil {
-				log.Error("metrics server error", "error", err)
-				cancel()
+				stop.fail("metrics server error", err)
 			}
 		}()
 	} else {
@@ -172,12 +262,39 @@ func main() {
 		go func() {
 			defer wg.Done()
 			if err := metrics.ServePprof(ctx, cfg.PprofListenAddr); err != nil {
-				log.Error("pprof server error", "error", err)
-				cancel()
+				stop.fail("pprof server error", err)
 			}
 		}()
 	}
 
 	wg.Wait()
 	log.Info("chain-indexer stopped")
+	if code := stop.exitCode(); code != 0 {
+		database.Close()
+		os.Exit(code)
+	}
+}
+
+// workerStop shuts the process down when a worker fails, and makes it exit non-zero then, so a refused start (a
+// stale fork it cannot revert, a chain reset) reaches restart policies and exit-code alerts like any failure.
+type workerStop struct {
+	cancel context.CancelFunc
+	failed atomic.Bool
+}
+
+func (s *workerStop) fail(what string, err error) {
+	if errors.Is(err, context.Canceled) {
+		// The shutdown cancelled it (Start returns ctx.Err()): a SIGTERM, every rollout, is not a failure.
+		return
+	}
+	log.Error(what, "error", err)
+	s.failed.Store(true)
+	s.cancel()
+}
+
+func (s *workerStop) exitCode() int {
+	if s.failed.Load() {
+		return 1
+	}
+	return 0
 }

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -89,6 +90,10 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 	var upto *int64
 	var pending []int64
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var started bool
+		if err := tx.QueryRow(ctx, startDailyStatsWatermarkSQL).Scan(&started); err != nil || !started {
+			return err
+		}
 		var before *int64
 		if err := tx.QueryRow(ctx, `
 			SELECT (SELECT last_block FROM daily_stats_watermark WHERE id = 1)
@@ -119,7 +124,7 @@ func (d *DB) AdvanceDailyStats(ctx context.Context) (uint64, error) {
 		if from == nil {
 			return nil
 		}
-		return rewriteFrom(ctx, tx, *from)
+		return rewriteFrom(ctx, tx, *from, *upto)
 	})
 	if err != nil || upto == nil {
 		d.lateDays.giveBack(days, search)
@@ -168,8 +173,19 @@ func (d *DB) searchLateDays(ctx context.Context) (days []int64, ok bool, err err
 // (or none below it is), and the block after its last is stored or is the watermark. The day of that next block is
 // recounted with it, for the block-time pair across the boundary. A day older than every aggregated day takes the
 // days up to the first aggregated one with it, so that each day's count of earlier transactions follows from the
-// aggregated day before it. It returns the earliest day recounted, and the days left until their blocks are complete.
+// aggregated day before it. A day whose first blocks are pruned cannot be recounted and keeps its row. It returns the
+// earliest day recounted, and the days left until their blocks are complete.
 func (d *DB) recountDays(ctx context.Context, tx pgx.Tx, watermark int64, days []int64) (from *int64, pending []int64, err error) {
+	var partlyPruned *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT CASE WHEN pruned_through() > 0
+		            THEN (SELECT timestamp / 86400 FROM blocks WHERE number >= history_from() ORDER BY number LIMIT 1) END`).
+		Scan(&partlyPruned); err != nil {
+		return nil, nil, err
+	}
+	if partlyPruned != nil {
+		days = slices.DeleteFunc(days, func(day int64) bool { return day <= *partlyPruned })
+	}
 	if len(days) == 0 {
 		return nil, nil, nil
 	}
@@ -251,15 +267,16 @@ func firstOfSeveralDays(ctx context.Context, tx pgx.Tx, first, last int64) (*int
 }
 
 // rewriteFrom recounts each aggregated day's transactions before it from the first given day on, and rewrites those
-// days' daily_stats rows.
-func rewriteFrom(ctx context.Context, tx pgx.Tx, day int64) error {
+// days' daily_stats rows and the aggregated day's before them, whose addresses end at the first day's first block.
+func rewriteFrom(ctx context.Context, tx pgx.Tx, day, watermark int64) error {
 	from := dayDate(day)
 	if _, err := tx.Exec(ctx, `
 		WITH counted AS (
 			SELECT COALESCE(
 				(SELECT p.txs_before + p.txs FROM daily_stats_acc p WHERE p.date < $1::DATE ORDER BY p.date DESC LIMIT 1),
 				(SELECT count(*) FROM transactions t JOIN blocks b ON t.block_number = b.number
-				 WHERE b.timestamp < daily_stats_epoch($1::DATE))) AS before
+				 WHERE b.timestamp < daily_stats_epoch($1::DATE) AND t.block_number >= history_from())
+				+ prune_offset('chain', 'transactions_total')) AS before
 		), running AS (
 			SELECT date, (SELECT before FROM counted)
 			             + COALESCE(sum(txs) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS before
@@ -281,14 +298,17 @@ func rewriteFrom(ctx context.Context, tx pgx.Tx, day int64) error {
 		       s.cumulative_addresses, s.cumulative_contracts
 		FROM daily_stats_acc a
 		CROSS JOIN LATERAL (
-			SELECT count(*) FILTER (WHERE first_seen >= daily_stats_epoch(a.date) AND first_seen < daily_stats_epoch(a.date + 1)) AS new_addresses,
-			       count(*) FILTER (WHERE is_contract = true AND first_seen >= daily_stats_epoch(a.date)
-			                          AND first_seen < daily_stats_epoch(a.date + 1)) AS new_contracts,
-			       count(*) FILTER (WHERE first_seen < daily_stats_epoch(a.date + 1)) AS cumulative_addresses,
-			       count(*) FILTER (WHERE is_contract = true AND first_seen < daily_stats_epoch(a.date + 1)) AS cumulative_contracts
+			SELECT a.first_block AS lo,
+			       COALESCE((SELECT n.first_block FROM daily_stats_acc n WHERE n.date > a.date ORDER BY n.date LIMIT 1), $2 + 1) AS hi
+		) span
+		CROSS JOIN LATERAL (
+			SELECT count(*) FILTER (WHERE first_seen >= span.lo AND first_seen < span.hi) AS new_addresses,
+			       count(*) FILTER (WHERE is_contract = true AND first_seen >= span.lo AND first_seen < span.hi) AS new_contracts,
+			       count(*) FILTER (WHERE first_seen < span.hi) AS cumulative_addresses,
+			       count(*) FILTER (WHERE is_contract = true AND first_seen < span.hi) AS cumulative_contracts
 			FROM address_stats
 		) s
-		WHERE a.date >= $1::DATE
+		WHERE a.date >= COALESCE((SELECT max(date) FROM daily_stats_acc WHERE date < $1::DATE), $1::DATE)
 		ON CONFLICT (date) DO UPDATE SET
 			total_blocks = EXCLUDED.total_blocks,
 			total_transactions = EXCLUDED.total_transactions,
@@ -304,7 +324,7 @@ func rewriteFrom(ctx context.Context, tx pgx.Tx, day int64) error {
 			token_transfer_count = EXCLUDED.token_transfer_count,
 			cumulative_transactions = EXCLUDED.cumulative_transactions,
 			cumulative_addresses = EXCLUDED.cumulative_addresses,
-			cumulative_contracts = EXCLUDED.cumulative_contracts`, from)
+			cumulative_contracts = EXCLUDED.cumulative_contracts`, from, watermark)
 	return err
 }
 
@@ -332,9 +352,9 @@ func recountDay(ctx context.Context, tx pgx.Tx, watermark, day int64) error {
 			       count(*) FILTER (WHERE t.status = 1) AS successful_txs, count(*) FILTER (WHERE t.status = 0) AS failed_txs
 			FROM transactions t JOIN day_blocks b ON b.number = t.block_number
 		)
-		INSERT INTO daily_stats_acc AS a (date, blocks, gas_used, size_sum, size_n, block_time_sum, block_time_n, txs,
-			gas_price_sum, successful_txs, failed_txs, active_addresses, token_transfers, txs_before)
-		SELECT $1::DATE, count(*), COALESCE(sum(b.gas_used), 0), COALESCE(sum(b.size), 0), count(b.size),
+		INSERT INTO daily_stats_acc AS a (date, first_block, blocks, gas_used, size_sum, size_n, block_time_sum, block_time_n,
+			txs, gas_price_sum, successful_txs, failed_txs, active_addresses, token_transfers, txs_before)
+		SELECT $1::DATE, min(b.number), count(*), COALESCE(sum(b.gas_used), 0), COALESCE(sum(b.size), 0), count(b.size),
 		       COALESCE(sum(b.block_time), 0), count(b.previous), x.txs, x.gas_price_sum, x.successful_txs, x.failed_txs,
 		       (SELECT count(*) FROM daily_active_addresses WHERE date = $1::DATE),
 		       (SELECT count(*) FROM token_transfers tt JOIN day_blocks d ON d.number = tt.block_number), NULL
@@ -342,7 +362,7 @@ func recountDay(ctx context.Context, tx pgx.Tx, watermark, day int64) error {
 		GROUP BY x.txs, x.gas_price_sum, x.successful_txs, x.failed_txs
 		HAVING count(*) > 0
 		ON CONFLICT (date) DO UPDATE SET
-			blocks = EXCLUDED.blocks, gas_used = EXCLUDED.gas_used, size_sum = EXCLUDED.size_sum, size_n = EXCLUDED.size_n,
+			first_block = EXCLUDED.first_block, blocks = EXCLUDED.blocks, gas_used = EXCLUDED.gas_used, size_sum = EXCLUDED.size_sum, size_n = EXCLUDED.size_n,
 			block_time_sum = EXCLUDED.block_time_sum, block_time_n = EXCLUDED.block_time_n, txs = EXCLUDED.txs,
 			gas_price_sum = EXCLUDED.gas_price_sum, successful_txs = EXCLUDED.successful_txs,
 			failed_txs = EXCLUDED.failed_txs, active_addresses = EXCLUDED.active_addresses,

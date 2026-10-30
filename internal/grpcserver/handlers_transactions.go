@@ -21,7 +21,19 @@ func (s *Server) GetTransaction(ctx context.Context, req *indexerv1.GetTransacti
 		return nil, internalErr(err, "GetTransaction")
 	}
 	if tx == nil {
-		return nil, notFound("transaction", req.GetHash())
+		if through, ok, err := s.prunedThroughForNode(ctx); err != nil {
+			return nil, err
+		} else if ok {
+			ntx, err := s.cfg.NodeLookup.Transaction(ctx, req.GetHash(), through)
+			if err != nil {
+				return nil, nodeLookupErr(err, "transaction")
+			}
+			if ntx != nil {
+				servedFromNode(ctx)
+				return mapTransaction(ntx), nil
+			}
+		}
+		return nil, s.notFoundByHash(ctx, "transaction", req.GetHash())
 	}
 	return mapTransaction(tx), nil
 }
@@ -43,29 +55,52 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 		// exclusive, 0 = unbounded) — lets block-paging callers position
 		// without knowing the cursor encoding.
 		var before *db.AddressFeedBound
+		var toBlock uint64
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur txFeedCursor
 			if err := decodeCursor(c, &cur); err != nil {
 				return nil, err
 			}
 			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.TransactionIndex}
-		} else if tb := req.GetBlockRange().GetToBlock(); tb > 0 {
-			before = &db.AddressFeedBound{Block: tb}
+		} else if toBlock = req.GetBlockRange().GetToBlock(); toBlock > 0 {
+			before = &db.AddressFeedBound{Block: toBlock}
+			if err := s.checkRetained(ctx, lastBlockBelow(toBlock)); err != nil {
+				return nil, err
+			}
 		}
 		rows, err := s.db.GetTransactionsByAddress(ctx, addr, int(limit)+1, before)
 		if err != nil {
 			slog.Error("ListTransactions by address", "error", err)
 			return nil, internalErr(err, "ListTransactions")
 		}
+		if toBlock > 0 && len(rows) == 0 {
+			if err := s.recheckRetained(ctx, lastBlockBelow(toBlock)); err != nil {
+				return nil, err
+			}
+		}
 		return buildTxListResponse(rows, limit), nil
 
 	case *indexerv1.ListTransactionsRequest_ByBlock:
 		switch b := f.ByBlock.GetSelector().(type) {
 		case *indexerv1.ListTransactionsRequest_BlockFilter_Number:
+			if nb, err := s.prunedBlockByNumber(ctx, b.Number); err != nil || nb != nil {
+				if err != nil {
+					return nil, err
+				}
+				return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(nb.Txs), Page: &indexerv1.PageResponse{}}, nil
+			}
+			if err := s.checkRetained(ctx, b.Number); err != nil {
+				return nil, err
+			}
 			rows, err := s.db.GetTransactionsByBlock(ctx, b.Number)
 			if err != nil {
 				slog.Error("ListTransactions by block", "error", err)
 				return nil, internalErr(err, "ListTransactions")
+			}
+			if len(rows) == 0 {
+				if err := s.recheckRetained(ctx, b.Number); err != nil {
+					return nil, err
+				}
 			}
 			return &indexerv1.ListTransactionsResponse{
 				Transactions: mapTransactions(rows),
@@ -79,7 +114,13 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 				return nil, internalErr(err, "ListTransactions")
 			}
 			if blk == nil {
-				return nil, notFound("block", b.Hash)
+				if nb, err := s.prunedBlockByHash(ctx, b.Hash); err != nil || nb != nil {
+					if err != nil {
+						return nil, err
+					}
+					return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(nb.Txs), Page: &indexerv1.PageResponse{}}, nil
+				}
+				return nil, s.notFoundByHash(ctx, "block", b.Hash)
 			}
 			rows, err := s.db.GetTransactionsByBlock(ctx, blk.Number)
 			if err != nil {

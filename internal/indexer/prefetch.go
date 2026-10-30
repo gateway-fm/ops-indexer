@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -66,26 +67,34 @@ func (i *Indexer) prefetchBlocks(ctx context.Context, from, to uint64, depth int
 // anchor is the block a tick starts after, and the hash its first block must extend. That is lastIndexed when it is
 // stored, or a block receipts skipped (not stored) at lastIndexed. When lastIndexed is neither, as after a revert whose
 // delete committed but reported an error, the tick starts after the highest stored block below it, so the deleted
-// blocks are fetched again and the check is never skipped. Block 0, or nothing stored at or below lastIndexed, has
-// no hash to check against. A remembered hash the cursor has moved below is dropped. remembered reports that hash
-// is the remembered one (see recheckSkipped). ok is false when the store cannot be read; the tick then ends.
+// blocks are fetched again and the check is never skipped. When nothing is stored at or below lastIndexed, the
+// cursor is not trusted: the tick starts from the start block (indexingFloor), with no hash to check against. Block 0
+// has none either, and neither has realtime's cursor when it is not stored (cursorMayBeUnstored): realtime
+// starts, and jumps, at the node head with nothing stored below it, and its own check after a failed revert moves
+// the cursor down instead. A remembered hash the cursor has moved below is dropped. remembered reports that hash is
+// the remembered one (see recheckSkipped). ok is false when the store cannot be read; the tick then ends.
 func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *receiptSkip) (from uint64, hash common.Hash, remembered, ok bool) {
 	if receipts.skipped > lastIndexed {
 		receipts.skipped, receipts.skippedHash = 0, common.Hash{}
 	}
-	if lastIndexed == 0 {
+	if lastIndexed == 0 && i.startBlock == 0 {
 		return 0, common.Hash{}, false, true
 	}
-	b, err := i.db.GetBlock(ctx, lastIndexed)
-	if err != nil {
-		log.Error("failed to read the block before this tick, retrying on the next tick", "block", lastIndexed, "error", err)
-		return lastIndexed, common.Hash{}, false, false
+	if lastIndexed > 0 {
+		b, err := i.db.GetBlock(ctx, lastIndexed)
+		if err != nil {
+			log.Error("failed to read the block before this tick, retrying on the next tick", "block", lastIndexed, "error", err)
+			return lastIndexed, common.Hash{}, false, false
+		}
+		if b != nil {
+			return lastIndexed, common.HexToHash(b.Hash), false, true
+		}
+		if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
+			return lastIndexed, receipts.skippedHash, true, true
+		}
 	}
-	if b != nil {
-		return lastIndexed, common.HexToHash(b.Hash), false, true
-	}
-	if receipts.skipped == lastIndexed && receipts.skippedHash != (common.Hash{}) {
-		return lastIndexed, receipts.skippedHash, true, true
+	if i.cursorMayBeUnstored {
+		return lastIndexed, common.Hash{}, false, true
 	}
 	below, err := i.db.HighestBlockAtOrBelow(ctx, lastIndexed)
 	if err != nil {
@@ -93,11 +102,34 @@ func (i *Indexer) anchor(ctx context.Context, lastIndexed uint64, receipts *rece
 		return lastIndexed, common.Hash{}, false, false
 	}
 	if below == nil {
-		return lastIndexed, common.Hash{}, false, true
+		return i.indexingFloor(ctx, lastIndexed)
 	}
 	log.Warn("the block before this tick is not stored; indexing again from the highest stored block below it",
 		"block", lastIndexed, "from", below.Number)
 	return below.Number, common.HexToHash(below.Hash), false, true
+}
+
+// indexingFloor is where a tick starts when nothing is stored at or below the cursor: a fresh database, or a revert
+// that deleted every stored block and reported an error. The cursor says nothing then, so the tick starts after the
+// block before the start block, or before the lowest block retention keeps if that is higher, with no hash to check.
+func (i *Indexer) indexingFloor(ctx context.Context, lastIndexed uint64) (from uint64, hash common.Hash, remembered, ok bool) {
+	floor := i.startBlock
+	wm, _, err := i.db.PrunedThrough(ctx)
+	if err != nil {
+		log.Error("failed to read the prune watermark, retrying on the next tick", "error", err)
+		return lastIndexed, common.Hash{}, false, false
+	}
+	if wm > 0 && wm+1 > floor {
+		floor = wm + 1
+	}
+	if floor == 0 {
+		return 0, common.Hash{}, false, true
+	}
+	if floor-1 != lastIndexed {
+		log.Warn("nothing is stored at or below the block before this tick; indexing from the start block",
+			"block", lastIndexed, "from", floor)
+	}
+	return floor - 1, common.Hash{}, false, true
 }
 
 // recheckSkipped is called when the tick's first block does not extend the remembered hash of the block skipped for
@@ -152,6 +184,9 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
 			receipts.skipped, receipts.skippedHash = b.number, b.raw.Hash
+			if i.onIndexed != nil {
+				i.onIndexed(lastIndexed)
+			}
 			continue
 		}
 
@@ -163,16 +198,36 @@ func (i *Indexer) indexPrefetched(ctx context.Context, lastIndexed, latest uint6
 		}
 		if err != nil {
 			log.Error("failed to process block", "block", b.number, "error", err)
+			i.revertStaleBlock(ctx, err)
 			return lastIndexed
 		}
 		lastIndexed = b.number
 		prevHash = b.raw.Hash
+		if i.onIndexed != nil {
+			i.onIndexed(lastIndexed)
+		}
 
 		if lastIndexed%10 == 0 {
 			i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 		}
 	}
 	return lastIndexed
+}
+
+// revertStaleBlock reverts from a block the write found stored with another hash: a block of a fork the chain has
+// left, which the reorg check did not read because it was stored above where the check looked (the node had come
+// back below the stored head, as after a failover to a node that is behind). The tick ends there; the next one
+// writes the chain's block. Other write errors are left as they are.
+func (i *Indexer) revertStaleBlock(ctx context.Context, err error) {
+	var differs *db.StoredBlockDiffersError
+	if !errors.As(err, &differs) {
+		return
+	}
+	log.Warn("a block from another fork is stored where the chain's block goes; reverting from it",
+		"block", differs.Number, "stored_hash", differs.Stored, "chain_hash", differs.Written)
+	if err := i.handleReorg(ctx, differs.Number); err != nil {
+		log.Error("failed to revert the stored fork, retrying on the next tick", "block", differs.Number, "error", err)
+	}
 }
 
 // inFlight is a block whose own rows are being written in its own transaction while earlier
@@ -197,6 +252,14 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 	defer cancel()
 
 	var queue []*inFlight
+	// stale is a block write that found another block stored at its number; the revert runs once every open block
+	// transaction has been rolled back.
+	var stale error
+	defer func() {
+		if stale != nil {
+			i.revertStaleBlock(ctx, stale)
+		}
+	}()
 	abort := func() {
 		for _, f := range queue {
 			if r := <-f.begun; r.err == nil {
@@ -211,6 +274,7 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		r := <-f.begun
 		if r.err != nil {
 			log.Error("failed to process block", "block", f.built.blockNumber, "error", r.err)
+			stale = r.err
 			return false
 		}
 		finishStart := time.Now()
@@ -222,6 +286,9 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 		metrics.ObserveStage(metrics.StageBlockTotal, time.Since(f.built.start))
 		i.afterCommit(ctx, f.built)
 		lastIndexed = f.built.blockNumber
+		if i.onIndexed != nil {
+			i.onIndexed(lastIndexed)
+		}
 		if lastIndexed%10 == 0 {
 			i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 		}
@@ -274,6 +341,9 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 			}
 			lastIndexed, prevHash = b.number, b.raw.Hash
 			receipts.skipped, receipts.skippedHash = b.number, b.raw.Hash
+			if i.onIndexed != nil {
+				i.onIndexed(lastIndexed)
+			}
 			continue
 		}
 		prevHash = b.raw.Hash
@@ -284,9 +354,13 @@ func (i *Indexer) indexPipelined(ctx context.Context, lastIndexed, latest uint64
 			}
 			if err := i.insertEmptyBlock(ctx, b.raw); err != nil {
 				log.Error("failed to process block", "block", b.number, "error", err)
+				stale = err
 				return lastIndexed
 			}
 			lastIndexed = b.number
+			if i.onIndexed != nil {
+				i.onIndexed(lastIndexed)
+			}
 			continue
 		}
 

@@ -109,9 +109,13 @@ func (m *MockDatabase) GetMissingRangesBatch(ctx context.Context, batchSize int)
 	return args.Get(0).([]db.BlockRange), args.Error(1)
 }
 
-func (m *MockDatabase) RebuildAddressStats(ctx context.Context) error {
-	args := m.Called(ctx)
-	return args.Error(0)
+func (m *MockDatabase) GetLowestMissingRanges(ctx context.Context, limit int, skip []uint64) ([]db.BlockRange, error) {
+	args := m.Called(ctx, limit, skip)
+	return args.Get(0).([]db.BlockRange), args.Error(1)
+}
+
+func (m *MockDatabase) PrunedThrough(ctx context.Context) (uint64, int64, error) {
+	return 0, 0, nil
 }
 
 func (m *MockDatabase) InsertTransaction(ctx context.Context, tx *types.Transaction) error {
@@ -193,6 +197,11 @@ func (m *MockDatabase) UpdateIndexerProgress(ctx context.Context, minBlock, maxB
 func (m *MockDatabase) FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]db.BlockRange, error) {
 	args := m.Called(ctx, fromBlock, toBlock)
 	return args.Get(0).([]db.BlockRange), args.Error(1)
+}
+
+func (m *MockDatabase) AdvanceMissingRange(ctx context.Context, r db.BlockRange, next uint64) error {
+	args := m.Called(ctx, r, next)
+	return args.Error(0)
 }
 
 func (m *MockDatabase) SaveMissingRanges(ctx context.Context, ranges []db.BlockRange) error {
@@ -643,6 +652,8 @@ func TestChainResetDetection(t *testing.T) {
 
 		// Chain head at 900, last indexed at 1000 — delta of 100, within maxReorgDepth (128)
 		mockDB.On("GetLatestBlockNumber", mock.Anything).Return(uint64(1000), nil)
+		// The stale-head check compares from the node's head down; nothing is stored there in this fixture.
+		mockDB.On("GetBlock", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 		mockDB.On("GetBlockCount", mock.Anything).Return(int64(1000), nil)
 		mockDB.On("GetBlockCountInRange", mock.Anything, mock.Anything, mock.Anything).Return(int64(1000), nil).Maybe()
 		mockRPC.On("BlockNumber", mock.Anything).Return(uint64(900), nil)

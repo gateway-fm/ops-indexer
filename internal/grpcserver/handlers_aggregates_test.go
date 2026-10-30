@@ -169,6 +169,14 @@ func TestListEndpoints_TotalCount(t *testing.T) {
 		}
 	}
 
+	// The batch writer keeps acct's address_stats counters; these single-row inserts do not.
+	if err := h.db.UpsertAddressStats(ctx, acct, 3, false); err != nil {
+		t.Fatalf("UpsertAddressStats: %v", err)
+	}
+	if err := h.db.UpdateAddressStatsCounters(ctx, acct, 5, 4); err != nil {
+		t.Fatalf("UpdateAddressStatsCounters: %v", err)
+	}
+
 	t.Run("logs by_address", func(t *testing.T) {
 		resp, err := h.client.ListLogs(ctx, &indexerv1.ListLogsRequest{
 			ByAddress: acct,

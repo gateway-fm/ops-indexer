@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -75,8 +76,9 @@ func (d *DB) SaveMissingRanges(ctx context.Context, ranges []BlockRange) error {
 // Returns ranges ordered by from_number descending (process newest first)
 func (d *DB) GetMissingRangesBatch(ctx context.Context, batchSize int) ([]BlockRange, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT id, from_number, to_number, created_at
+		SELECT id, GREATEST(from_number, (SELECT history_from())), to_number, created_at
 		FROM missing_block_ranges
+		WHERE to_number >= (SELECT history_from())
 		ORDER BY from_number DESC
 		LIMIT $1`, batchSize)
 	if err != nil {
@@ -95,6 +97,31 @@ func (d *DB) GetMissingRangesBatch(ctx context.Context, batchSize int) ([]BlockR
 	return ranges, rows.Err()
 }
 
+// GetLowestMissingRanges returns up to limit recorded ranges from history_from() up, lowest first, leaving out the
+// ranges that start at a block in skip.
+func (d *DB) GetLowestMissingRanges(ctx context.Context, limit int, skip []uint64) ([]BlockRange, error) {
+	starts := make([]int64, len(skip))
+	for k, b := range skip {
+		starts[k] = int64(b)
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, from_number, to_number, created_at
+		FROM (SELECT id, GREATEST(from_number, h.lo) AS from_number, to_number, created_at
+		      FROM missing_block_ranges, (SELECT history_from() AS lo) h
+		      WHERE to_number >= h.lo) r
+		WHERE from_number <> ALL($2::bigint[])
+		ORDER BY from_number
+		LIMIT $1`, limit, starts)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (BlockRange, error) {
+		var r BlockRange
+		err := row.Scan(&r.ID, &r.FromNumber, &r.ToNumber, &r.CreatedAt)
+		return r, err
+	})
+}
+
 func (d *DB) DeleteMissingRange(ctx context.Context, id int) error {
 	_, err := d.pool.Exec(ctx, `DELETE FROM missing_block_ranges WHERE id = $1`, id)
 	return err
@@ -105,6 +132,25 @@ func (d *DB) DeleteMissingRangeByBlock(ctx context.Context, blockNumber uint64) 
 		DELETE FROM missing_block_ranges
 		WHERE from_number <= $1 AND to_number >= $1`, blockNumber)
 	return err
+}
+
+// AdvanceMissingRange records that the blocks of r below next are stored, in one transaction: the row starts at next,
+// or goes when next is past its end or the rest is already recorded on its own. A failure leaves r recorded whole,
+// never part of it lost.
+func (d *DB) AdvanceMissingRange(ctx context.Context, r BlockRange, next uint64) error {
+	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if next <= r.ToNumber {
+			tag, err := tx.Exec(ctx, `
+				UPDATE missing_block_ranges SET from_number = $2
+				WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM missing_block_ranges WHERE from_number = $2 AND to_number = $3)`,
+				r.ID, next, r.ToNumber)
+			if err != nil || tag.RowsAffected() > 0 {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM missing_block_ranges WHERE id = $1`, r.ID)
+		return err
+	})
 }
 
 // ShrinkMissingRange shrinks a range after processing a block.
@@ -160,17 +206,14 @@ func (d *DB) GetTotalMissingBlocks(ctx context.Context) (int64, error) {
 	return *total, err
 }
 
-func (d *DB) FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]BlockRange, error) {
-	rows, err := d.pool.Query(ctx, `
-		WITH block_series AS (
-			SELECT generate_series($1::bigint, $2::bigint) AS block_num
-		),
-		existing_blocks AS (
-			SELECT number FROM blocks WHERE number >= $1 AND number <= $2
-		),
-		missing AS (
-			SELECT block_num FROM block_series
-			WHERE block_num NOT IN (SELECT number FROM existing_blocks)
+// findMissingBlocksSQL lists the gaps in fromBlock..toBlock (from history_from() up) as ranges, highest first. Stored
+// blocks are excluded by an anti join on the primary key: NOT IN over a large range does not fit work_mem as a hash
+// and is re-run for every number.
+const findMissingBlocksSQL = `
+		WITH missing AS (
+			SELECT s.block_num
+			FROM generate_series(GREATEST($1::bigint, (SELECT history_from())), $2::bigint) AS s(block_num)
+			WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.number = s.block_num)
 		),
 		gaps AS (
 			SELECT
@@ -181,22 +224,28 @@ func (d *DB) FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock ui
 		SELECT MIN(block_num) as from_num, MAX(block_num) as to_num
 		FROM gaps
 		GROUP BY grp
-		ORDER BY from_num DESC`,
-		fromBlock, toBlock)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+		ORDER BY from_num DESC`
 
+// FindMissingBlocksInRange never reports a block below history_from(): those were pruned on purpose, and a gap
+// there would make catch-up fetch them back.
+func (d *DB) FindMissingBlocksInRange(ctx context.Context, fromBlock, toBlock uint64) ([]BlockRange, error) {
 	var ranges []BlockRange
-	for rows.Next() {
-		var r BlockRange
-		if err := rows.Scan(&r.FromNumber, &r.ToNumber); err != nil {
-			return nil, err
+	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", d.missingScanTimeout().Milliseconds())); err != nil {
+			return err
 		}
-		ranges = append(ranges, r)
-	}
-	return ranges, rows.Err()
+		rows, err := tx.Query(ctx, findMissingBlocksSQL, fromBlock, toBlock)
+		if err != nil {
+			return err
+		}
+		ranges, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (BlockRange, error) {
+			var r BlockRange
+			err := row.Scan(&r.FromNumber, &r.ToNumber)
+			return r, err
+		})
+		return err
+	})
+	return ranges, err
 }
 
 func (d *DB) GetMinMaxIndexedBlocks(ctx context.Context) (min uint64, max uint64, err error) {
@@ -252,4 +301,21 @@ func (d *DB) HasBlock(ctx context.Context, number uint64) (bool, error) {
 	err := d.pool.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM blocks WHERE number = $1)`, number).Scan(&exists)
 	return exists, err
+}
+
+// missingScanTimeoutDefault bounds one gap scan on the server, so that no scan holds back vacuum for longer. A
+// 100,000-block scan, the collector's batch, takes ~0.1 s with the blocks cached; uncached, it reads ~2,100 pages,
+// ~23 s at 11 ms a read on a volume saturated by ingest.
+const missingScanTimeoutDefault = 60 * time.Second
+
+// SetMissingScanTimeout sets the statement timeout of a gap scan; 0 restores the default.
+func (d *DB) SetMissingScanTimeout(timeout time.Duration) {
+	d.missingScan.Store(int64(timeout))
+}
+
+func (d *DB) missingScanTimeout() time.Duration {
+	if t := time.Duration(d.missingScan.Load()); t > 0 {
+		return t
+	}
+	return missingScanTimeoutDefault
 }

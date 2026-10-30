@@ -2,12 +2,14 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -43,6 +45,8 @@ type Config struct {
 	CatchupWorkers   int
 	CatchupBatchSize int
 	CatchupQueueSize int
+	// RealtimeMaxBehind: see config.Config.RealtimeMaxBehind.
+	RealtimeMaxBehind uint64
 
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
@@ -76,8 +80,17 @@ type Indexer struct {
 	pollInterval time.Duration
 	startBlock   uint64
 
+	// missingRetryInterval is how often the standard loop retries the blocks it recorded as missing (retryMissing).
+	missingRetryInterval time.Duration
+	missingRetryAt       time.Time
+	missingBackoff       map[uint64]missingAttempt
+
 	indexRequests chan indexRequest
-	config        *Config
+	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
+	onIndexed func(uint64)
+	// cursorMayBeUnstored is set for realtime's batches (see anchor).
+	cursorMayBeUnstored bool
+	config              *Config
 
 	tokenCache    *TokenCache
 	contractCache *ContractCache
@@ -91,6 +104,8 @@ type Indexer struct {
 
 	catchupIndexer  *CatchupIndexer
 	realtimeIndexer *RealtimeIndexer
+	// liveRealtime is realtimeIndexer for readers outside the indexer's goroutine (IngestHead).
+	liveRealtime atomic.Pointer[RealtimeIndexer]
 
 	catchupRunning bool
 
@@ -238,15 +253,16 @@ func New(database Database, rpcClient RPCClient, pollInterval time.Duration, sta
 
 func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Duration, startBlock uint64, cfg *Config) *Indexer {
 	idx := &Indexer{
-		db:            database,
-		rpc:           rpcClient,
-		pollInterval:  pollInterval,
-		startBlock:    startBlock,
-		indexRequests: make(chan indexRequest, 100),
-		config:        cfg,
-		tokenCache:    NewTokenCache(),
-		contractCache: NewContractCache(),
-		dailyStats:    &dailyStatsThrottle{},
+		db:                   database,
+		rpc:                  rpcClient,
+		pollInterval:         pollInterval,
+		startBlock:           startBlock,
+		missingRetryInterval: defaultMissingRetryInterval,
+		indexRequests:        make(chan indexRequest, 100),
+		config:               cfg,
+		tokenCache:           NewTokenCache(),
+		contractCache:        NewContractCache(),
+		dailyStats:           &dailyStatsThrottle{},
 	}
 
 	if cfg.EnableAsyncBalance && cfg.BalanceWorkers > 0 {
@@ -365,7 +381,16 @@ func (i *Indexer) publishProgressMetrics(ctx context.Context) {
 }
 
 func (i *Indexer) Start(ctx context.Context) error {
-	go i.publishProgressMetrics(ctx)
+	// Blocks at or below the prune watermark are gone on purpose: gap counting, the missing-range collector
+	// and catch-up all start above it, or they would fetch the pruned history back. A wipe resets the watermark,
+	// and the start block goes back to the configured one.
+	configuredStart := i.startBlock
+	if wm, _, err := i.db.PrunedThrough(ctx); err != nil {
+		return fmt.Errorf("read prune watermark: %w", err)
+	} else if wm > 0 && wm >= i.startBlock {
+		log.Info("starting above the prune watermark", "start_block", i.startBlock, "pruned_through", wm)
+		i.startBlock = wm + 1
+	}
 
 	lastIndexed, err := i.db.GetLatestBlockNumber(ctx)
 	if err != nil {
@@ -424,6 +449,21 @@ func (i *Indexer) Start(ctx context.Context) error {
 		"has_gaps", hasGaps,
 		"blocks_behind", blocksToSync)
 
+	wipe := func() error {
+		log.Warn("FORCE_REINDEX=true: wiping indexed data and re-indexing from scratch")
+		if err := i.db.WipeAllData(ctx); err != nil {
+			return fmt.Errorf("failed to wipe data for reindex: %w", err)
+		}
+		i.startBlock = configuredStart
+		lastIndexed = 0
+		blockCount = 0
+		expectedBlocks = 0
+		hasGaps = false
+		blocksToSync = latestOnChain
+		log.Info("data wiped, re-indexing from block 0")
+		return nil
+	}
+
 	// Detect chain reset: if the chain head is significantly behind our last
 	// indexed block, this is a chain reset (e.g. Anvil restart), not a reorg.
 	if lastIndexed > 0 && latestOnChain+maxReorgDepth < lastIndexed {
@@ -435,16 +475,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 			"max_reorg_depth", maxReorgDepth)
 
 		if os.Getenv("FORCE_REINDEX") == "true" {
-			log.Warn("FORCE_REINDEX=true: wiping indexed data and re-indexing from scratch")
-			if err := i.db.WipeAllData(ctx); err != nil {
-				return fmt.Errorf("failed to wipe data for reindex: %w", err)
+			if err := wipe(); err != nil {
+				return err
 			}
-			lastIndexed = 0
-			blockCount = 0
-			expectedBlocks = 0
-			hasGaps = false
-			blocksToSync = latestOnChain
-			log.Info("data wiped, re-indexing from block 0")
 		} else {
 			return fmt.Errorf(
 				"chain reset detected (chain_head=%d, last_indexed=%d). "+
@@ -453,6 +486,36 @@ func (i *Indexer) Start(ctx context.Context) error {
 				latestOnChain, lastIndexed)
 		}
 	}
+
+	// The stored head may be on a stale fork: a reorg while the indexer was down, or a revert that kept failing
+	// until a restart. It is reverted before the start mode is chosen (checkStoredHead): collector mode starts
+	// realtime at the node head, whose reorg check never reaches below its own cursor, and catch-up fills the gap with
+	// no parent check. A stale fork deeper than any reorg is a reset whose new chain already reached the old height:
+	// FORCE_REINDEX wipes it, as it does a reset the height gives away.
+	if lastIndexed > 0 {
+		head, chainHead, err := i.checkStoredHead(ctx, lastIndexed, latestOnChain)
+		reset := errors.Is(err, errChainResetWhileWaiting)
+		if (errors.Is(err, errStaleForkTooDeep) || reset) && os.Getenv("FORCE_REINDEX") == "true" {
+			metrics.ChainResetDetected()
+			latestOnChain = chainHead
+			if err := wipe(); err != nil {
+				return err
+			}
+		} else if err != nil {
+			if reset {
+				metrics.ChainResetDetected()
+			}
+			return err
+		} else {
+			lastIndexed, latestOnChain = head, chainHead
+			blocksToSync = 0
+			if latestOnChain > lastIndexed {
+				blocksToSync = latestOnChain - lastIndexed
+			}
+		}
+	}
+
+	go i.publishProgressMetrics(ctx)
 
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
 	catchupThreshold := uint64(100)
@@ -476,6 +539,16 @@ func (i *Indexer) newCatchupIndexer(cfg *CatchupConfig) *CatchupIndexer {
 	c.SetEventBus(i.eventBus)
 	c.SetDailyStatsThrottle(i.dailyStats)
 	return c
+}
+
+// IngestHead is the block the head path has written up to: realtime's cursor once realtime runs. The highest stored
+// block is not it: catch-up can store blocks near the node head while realtime is far behind. Before realtime
+// starts (standard mode, or startup) it is the highest stored block.
+func (i *Indexer) IngestHead(ctx context.Context) (uint64, error) {
+	if r := i.liveRealtime.Load(); r != nil {
+		return r.GetLastProcessedBlock(), nil
+	}
+	return i.db.GetLatestBlockNumber(ctx)
 }
 
 func (i *Indexer) newRealtimeIndexer(cfg *RealtimeConfig) *RealtimeIndexer {
@@ -509,6 +582,8 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.catchupIndexer.SetRealtimeBehind(i.realtimeIndexer.Behind)
+	i.liveRealtime.Store(i.realtimeIndexer)
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {
@@ -540,6 +615,13 @@ func (i *Indexer) startWithCatchup(ctx context.Context, lastIndexed, latestOnCha
 	}
 
 	return ctx.Err()
+}
+
+// linkCatchupToRealtime makes catch-up yield while realtime is far behind and stops the collector's forward scan at
+// realtime's cursor, so the two never write the same blocks at the tip.
+func (i *Indexer) linkCatchupToRealtime() {
+	i.catchupIndexer.SetRealtimeBehind(i.realtimeIndexer.Behind)
+	i.missingRangeCollector.SetCeiling(i.realtimeIndexer.GetLastProcessedBlock)
 }
 
 func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnChain uint64) error {
@@ -576,6 +658,8 @@ func (i *Indexer) startWithMissingRangeCollector(ctx context.Context, latestOnCh
 	}
 
 	i.realtimeIndexer = i.newRealtimeIndexer(realtimeCfg)
+	i.liveRealtime.Store(i.realtimeIndexer)
+	i.linkCatchupToRealtime()
 
 	i.catchupRunning = true
 	i.catchupIndexer.SetOnComplete(func() {
@@ -619,7 +703,8 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 
 	ticker := time.NewTicker(i.pollInterval)
 	defer ticker.Stop()
-	var receipts receiptSkip
+	receipts := receiptSkip{recorded: true}
+	i.missingRetryAt = time.Now().Add(i.missingRetryInterval)
 
 	for {
 		select {
@@ -641,29 +726,36 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 				continue
 			}
 
-			if lastIndexed > 0 {
-				reorgDepth, err := i.detectReorg(ctx, lastIndexed)
-				if err != nil {
-					log.Error("failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
-					continue
-				}
-				if reorgDepth > 0 {
-					log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
-					if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
-						log.Error("failed to handle reorg", "error", err)
-						continue
-					}
-					lastIndexed = lastIndexed - reorgDepth
-				}
-			}
-
-			if i.config.CommitPipelineDepth > 1 {
-				lastIndexed = i.indexPipelined(ctx, lastIndexed, latestOnChain, i.config.CommitPipelineDepth, &receipts)
-			} else {
-				lastIndexed = i.indexPrefetched(ctx, lastIndexed, latestOnChain, &receipts)
-			}
+			lastIndexed = i.standardTick(ctx, lastIndexed, latestOnChain, &receipts)
+			i.retryMissing(ctx, lastIndexed, &receipts)
 		}
 	}
+}
+
+// standardTick reverts a reorg at the stored head, then indexes up to latestOnChain, and returns the new last
+// indexed block. A reorg check or a revert that fails ends the tick on the stale block, to retry on the next one, as
+// realtime does: indexing on would write the new fork on top of the stale blocks.
+func (i *Indexer) standardTick(ctx context.Context, lastIndexed, latestOnChain uint64, receipts *receiptSkip) uint64 {
+	if lastIndexed > 0 {
+		reorgDepth, err := i.detectReorg(ctx, lastIndexed)
+		if err != nil {
+			log.Error("failed to check for reorg, retrying on the next tick", "error", err, "stale_blocks_found", reorgDepth)
+			return lastIndexed
+		}
+		if reorgDepth > 0 {
+			log.Warn("detected reorg, reverting blocks", "depth", reorgDepth)
+			if err := i.handleReorg(ctx, lastIndexed-reorgDepth+1); err != nil {
+				log.Error("failed to handle reorg; staying on the stale block to retry", "error", err)
+				return lastIndexed
+			}
+			lastIndexed = lastIndexed - reorgDepth
+		}
+	}
+
+	if i.config.CommitPipelineDepth > 1 {
+		return i.indexPipelined(ctx, lastIndexed, latestOnChain, i.config.CommitPipelineDepth, receipts)
+	}
+	return i.indexPrefetched(ctx, lastIndexed, latestOnChain, receipts)
 }
 
 // detectReorg walks down from blockNumber comparing stored and chain hashes and
@@ -721,6 +813,150 @@ func (i *Indexer) detectReorg(ctx context.Context, blockNumber uint64) (uint64, 
 		return deepest, nil
 	}
 	return 0, nil
+}
+
+var errStaleForkTooDeep = errors.New("is on a stale fork deeper than any reorg")
+
+var errChainResetWhileWaiting = errors.New("chain reset detected while waiting to start")
+
+// staleAboveHeadWait is how long the start waits for a node whose head stays below the stored head before it treats
+// the stored blocks above the node's head as stale: the chain reorged onto a shorter one, or the node lost them. A
+// node that was only slow costs those blocks being indexed again.
+var staleAboveHeadWait = 10 * time.Minute
+
+// startWaitInterval is how often a start waiting for the node to serve stored blocks checks again, and warns.
+var startWaitInterval = 10 * time.Second
+
+// checkStoredHead compares the stored chain with the node before any loop starts, reverts a stale fork it finds
+// (revertStaleHead), and returns the stored head and the node head to start from. A stored block the node does not
+// serve, at or below its head, or above it, cannot be compared: the start waits, startWaitInterval at a time, until the
+// node serves every one, with a warning each interval and the count in indexer_start_waiting_blocks. Starting without
+// comparing them let catch-up build the next block on a stale one for good. Stored blocks above a node head that
+// stays below them for staleAboveHeadWait are reverted as stale; a block at or below the node's head the node never
+// serves (it lost it) keeps the start waiting. The revert above the node's head needs the latest head read to have
+// answered, with a head above 0: a head read that fails (a null or empty answer included) is retried, never taken as
+// a head below the stored one. A chain reset found while waiting refuses the start, or with FORCE_REINDEX wipes, as
+// at startup.
+func (i *Indexer) checkStoredHead(ctx context.Context, lastIndexed, latestOnChain uint64) (uint64, uint64, error) {
+	defer metrics.SetStartWaitingBlocks(0)
+	var belowSince time.Time
+	headRead := true
+	for lastIndexed > 0 {
+		var unserved []uint64
+		if top := min(lastIndexed, latestOnChain); top > 0 {
+			head, skipped, err := i.revertStaleHead(ctx, top)
+			if err != nil {
+				return lastIndexed, latestOnChain, err
+			}
+			if head < top {
+				lastIndexed = head
+			}
+			unserved = skipped
+		}
+		var above uint64
+		if lastIndexed > latestOnChain {
+			above = lastIndexed - latestOnChain
+		}
+		if len(unserved) == 0 && above == 0 {
+			break
+		}
+		if above == 0 {
+			belowSince = time.Time{}
+		} else if belowSince.IsZero() {
+			belowSince = time.Now()
+		} else if headRead && latestOnChain > 0 && time.Since(belowSince) >= staleAboveHeadWait {
+			log.Warn("the node's head stayed below the stored head; reverting the stored blocks above it as stale",
+				"from", latestOnChain+1, "to", lastIndexed, "waited", staleAboveHeadWait)
+			if err := i.handleReorg(ctx, latestOnChain+1); err != nil {
+				return lastIndexed, latestOnChain, fmt.Errorf("revert the stored blocks above the node's head %d: %w", latestOnChain, err)
+			}
+			lastIndexed, belowSince = latestOnChain, time.Time{}
+			continue
+		}
+		metrics.SetStartWaitingBlocks(uint64(len(unserved)) + above)
+		args := []any{"stored_head", lastIndexed, "node_head", latestOnChain, "above_node_head", above, "unserved", len(unserved)}
+		if len(unserved) > 0 {
+			args = append(args, "unserved_from", unserved[len(unserved)-1], "unserved_to", unserved[0])
+		}
+		log.Warn("waiting for the node to serve stored blocks: they are compared with the chain before indexing starts", args...)
+		select {
+		case <-ctx.Done():
+			return lastIndexed, latestOnChain, ctx.Err()
+		case <-time.After(startWaitInterval):
+		}
+		head, err := i.rpc.BlockNumber(ctx)
+		if headRead = err == nil; !headRead {
+			log.Warn("failed to read the node head while waiting to start; retrying", "error", err)
+			continue
+		}
+		if head+maxReorgDepth < lastIndexed {
+			return lastIndexed, head, fmt.Errorf("%w (chain_head=%d, last_indexed=%d): the chain was likely restarted with "+
+				"fresh state; set FORCE_REINDEX=true to wipe and re-index", errChainResetWhileWaiting, head, lastIndexed)
+		}
+		latestOnChain = head
+	}
+	return lastIndexed, latestOnChain, nil
+}
+
+// staleHeadWindow is how many blocks below the stored head the start check reads at least, as detectReorg does per
+// tick: a stale block under a matching head (a partial revert) is reverted too.
+const staleHeadWindow = 10
+
+// revertStaleHead measures how far below top the stored chain no longer matches the node, down to the deepest
+// mismatch in the first staleHeadWindow blocks or, below them, to the first stored block that matches, then reverts that many blocks, with every stored block above them, at once, and returns the
+// block the stored chain then ends at (top when nothing was stale), with the stored blocks at or below it the node
+// does not serve yet, which it could not compare (from top down; it stops after staleHeadWindow of them, since
+// checkStoredHead walks again once they are served). A stale fork deeper than maxReorgDepth (a reset
+// chain, or RPC_URL pointing at another chain) refuses the start before anything is deleted, as does a revert that
+// fails: starting on top of the fork would keep it stored for good.
+func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, []uint64, error) {
+	var depth uint64
+	var skipped []uint64
+	for d := uint64(0); d < top && d <= maxReorgDepth; d++ {
+		n := top - d
+		stored, err := i.db.GetBlock(ctx, n)
+		if err != nil {
+			return top, nil, fmt.Errorf("read the stored block %d: %w", n, err)
+		}
+		if stored == nil {
+			continue
+		}
+		chainHash, err := i.rpc.RawBlockHash(ctx, n)
+		if errors.Is(err, rpc.ErrBlockNotAvailable) {
+			if skipped = append(skipped, n); len(skipped) >= staleHeadWindow {
+				break
+			}
+			continue
+		}
+		if err != nil {
+			return top, nil, fmt.Errorf("check the stored block %d against the chain: %w", n, err)
+		}
+		if stored.Hash == chainHash {
+			if d+1 >= staleHeadWindow {
+				break
+			}
+			continue
+		}
+		if depth = d + 1; depth > maxReorgDepth {
+			return top, nil, fmt.Errorf("the stored chain below block %d %w (%d blocks): the chain was likely reset, or "+
+				"RPC_URL points at another chain; nothing was deleted. Set FORCE_REINDEX=true to wipe and re-index",
+				top, errStaleForkTooDeep, maxReorgDepth)
+		}
+	}
+	if depth == 0 {
+		return top, skipped, nil
+	}
+	log.Warn("the stored head is on a stale fork; reverting it before starting", "block", top, "depth", depth)
+	if err := i.handleReorg(ctx, top-depth+1); err != nil {
+		return top, nil, fmt.Errorf("the stored block %d is on a stale fork and reverting it failed: %w", top, err)
+	}
+	var kept []uint64
+	for _, n := range skipped {
+		if n <= top-depth {
+			kept = append(kept, n)
+		}
+	}
+	return top - depth, kept, nil
 }
 
 func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
@@ -874,6 +1110,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 
 	newTokenAddresses := make([]common.Address, 0)
 	newTokenTxHashes := make(map[common.Address]string)
+	addressTxs := make(map[string]map[int]struct{})
 	balanceWork := make([]BalanceWork, 0)
 
 	// NFT instances touched this block, and (for mints) the tokenURI fetches to
@@ -959,11 +1196,11 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			Error:                txError,
 		})
 
-		i.updateAddressStatsDelta(blockData.AddressStats, from, blockNumber, false)
+		touchAddressTx(blockData.AddressStats, addressTxs, from, idx, blockNumber)
 
 		if to != nil {
-			isContract := i.contractCache.Has(*to)
-			i.updateAddressStatsDelta(blockData.AddressStats, *to, blockNumber, isContract)
+			toDelta := touchAddressTx(blockData.AddressStats, addressTxs, *to, idx, blockNumber)
+			toDelta.IsContract = toDelta.IsContract || i.contractCache.Has(*to)
 		}
 
 		if receipt != nil && rawTx.To == nil && receipt.ContractAddress != (common.Address{}) {
@@ -983,7 +1220,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 					IsVerified:   false,
 				})
 				i.contractCache.Add(contractAddr)
-				i.updateAddressStatsDelta(blockData.AddressStats, contractAddr, blockNumber, true)
+				addressDelta(blockData.AddressStats, contractAddr, blockNumber).IsContract = true
 			}
 		}
 
@@ -1112,10 +1349,16 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 				// Pre-bug, we incremented the txn's from/to here, which both
 				// over-counted the contract address and missed every transfer
 				// recipient who never sent a tx themselves.
-				i.bumpTokenTransferDelta(blockData.AddressStats, fromAddr, blockNumber)
-				i.bumpTokenTransferDelta(blockData.AddressStats, toAddr, blockNumber)
+				countTransferParticipant(blockData.AddressStats, addressTxs, fromAddr, idx, blockNumber)
+				if toAddr != fromAddr {
+					countTransferParticipant(blockData.AddressStats, addressTxs, toAddr, idx, blockNumber)
+				}
 			}
 		}
+	}
+
+	for addr, txs := range addressTxs {
+		blockData.AddressStats[addr].TxCountDelta += len(txs)
 	}
 
 	if i.tracingSupported && len(txHashes) > 0 {
@@ -1127,10 +1370,19 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			blockData.InternalTransactions = internalTxs
 
 			for _, it := range internalTxs {
-				i.updateAddressStatsDeltaInternal(blockData.AddressStats, it.From, blockNumber)
-				if it.To != nil {
-					i.updateAddressStatsDeltaInternal(blockData.AddressStats, *it.To, blockNumber)
+				addressDelta(blockData.AddressStats, it.From, blockNumber).InternalTxCountDelta++
+				if it.To != nil && !strings.EqualFold(*it.To, it.From) {
+					addressDelta(blockData.AddressStats, *it.To, blockNumber).InternalTxCountDelta++
 				}
+			}
+			for _, it := range internalCreations(internalTxs) {
+				c := contractFromCreation(ctx, i.rpc.GetCode, it, blockNumber)
+				if c == nil {
+					continue
+				}
+				blockData.Contracts = append(blockData.Contracts, c)
+				i.contractCache.Add(c.Address)
+				addressDelta(blockData.AddressStats, c.Address, blockNumber).IsContract = true
 			}
 		}
 	}
@@ -1301,22 +1553,32 @@ func (i *Indexer) scheduleDeferredDailyStats(ctx context.Context) {
 	}
 }
 
-func (i *Indexer) updateAddressStatsDelta(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64, isContract bool) {
+func addressDelta(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64) *db.AddressStatsDelta {
 	key := strings.ToLower(address)
-	if delta, ok := stats[key]; ok {
-		delta.TxCountDelta++
-		if isContract {
-			delta.IsContract = true
-		}
-	} else {
-		// Store lowercased so the row PK matches `WHERE address = LOWER($1)` reads.
-		stats[key] = &db.AddressStatsDelta{
-			Address:      key,
-			TxCountDelta: 1,
-			IsContract:   isContract,
-			BlockNumber:  blockNumber,
-		}
+	delta, ok := stats[key]
+	if !ok {
+		delta = &db.AddressStatsDelta{Address: key, BlockNumber: blockNumber}
+		stats[key] = delta
 	}
+	return delta
+}
+
+func touchAddressTx(stats map[string]*db.AddressStatsDelta, addressTxs map[string]map[int]struct{}, address string, txIndex int, blockNumber uint64) *db.AddressStatsDelta {
+	delta := addressDelta(stats, address, blockNumber)
+	txs := addressTxs[delta.Address]
+	if txs == nil {
+		txs = make(map[int]struct{})
+		addressTxs[delta.Address] = txs
+	}
+	txs[txIndex] = struct{}{}
+	return delta
+}
+
+func countTransferParticipant(stats map[string]*db.AddressStatsDelta, addressTxs map[string]map[int]struct{}, addr common.Address, txIndex int, blockNumber uint64) {
+	if addr == zeroAddress {
+		return
+	}
+	touchAddressTx(stats, addressTxs, addr.Hex(), txIndex, blockNumber).TokenTransferDelta++
 }
 
 func (i *Indexer) advanceDailyStats(ctx context.Context) bool {
@@ -1327,19 +1589,6 @@ func (i *Indexer) advanceDailyStats(ctx context.Context) bool {
 	return true
 }
 
-// bumpTokenTransferDelta records this address as a participant in a Transfer
-// event. Creates the address_stats entry if absent so transfer-only
-// recipients (who never sent a tx of their own) are still indexed. Skips
-// the zero address (mint source / burn sink isn't a holder).
-//
-// When creating a new entry, we also seed TxCountDelta=1: this transfer's
-// underlying tx genuinely touches the address (it shows up in their
-// Transactions list via the same log-join we do in GetTransactionsByAddress).
-// If the entry already exists, the address was already credited as tx-from
-// or tx-to and we mustn't double-count. This is approximate when the same
-// address appears in transfers across multiple txs in one block (the rebuild
-// SQL is authoritative for those edge cases), but it eliminates the common
-// pure-recipient drift of badge=0 vs list=N.
 // classifyNewToken decides the stored token_type and decimals for a freshly
 // discovered contract. ERC721 is inferred from the transfer topology already
 // parsed for this block (a 4-topic Transfer carries the tokenId as an indexed
@@ -1350,36 +1599,6 @@ func classifyNewToken(isERC721 bool, metaDecimals int) (tokenType string, decima
 		return types.TokenTypeERC721, 0
 	}
 	return types.TokenTypeERC20, metaDecimals
-}
-
-func (i *Indexer) bumpTokenTransferDelta(stats map[string]*db.AddressStatsDelta, addr common.Address, blockNumber uint64) {
-	if addr == zeroAddress {
-		return
-	}
-	key := strings.ToLower(addr.Hex())
-	delta, ok := stats[key]
-	if !ok {
-		delta = &db.AddressStatsDelta{
-			Address:      key,
-			TxCountDelta: 1,
-			BlockNumber:  blockNumber,
-		}
-		stats[key] = delta
-	}
-	delta.TokenTransferDelta++
-}
-
-func (i *Indexer) updateAddressStatsDeltaInternal(stats map[string]*db.AddressStatsDelta, address string, blockNumber uint64) {
-	key := strings.ToLower(address)
-	if delta, ok := stats[key]; ok {
-		delta.InternalTxCountDelta++
-	} else {
-		stats[key] = &db.AddressStatsDelta{
-			Address:              key,
-			InternalTxCountDelta: 1,
-			BlockNumber:          blockNumber,
-		}
-	}
 }
 
 func (i *Indexer) trackBalance(ctx context.Context, addr common.Address, tokenAddress common.Address, blockNumber uint64) {
