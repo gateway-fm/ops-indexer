@@ -444,6 +444,9 @@ func (i *Indexer) Start(ctx context.Context) error {
 	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
 		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
 	}
+	if store, ok := i.db.(balanceRereadStore); ok {
+		go i.RunBalanceRereads(ctx, store)
+	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)
 	if err != nil {

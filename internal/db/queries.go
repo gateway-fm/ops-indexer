@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -270,7 +271,33 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		return err
 	}
 
-	// One statement per token in sorted order (the ORDER BY above), not a
+	// The block's balances, in a balance flush's lock order, before any tokens row.
+	balances, err := revertBalances(ctx, tx, number)
+	if err != nil {
+		return err
+	}
+	touched := map[string]bool{}
+	for _, r := range doomed {
+		touched[r.token] = true
+	}
+	var holderTokens []string
+	for t := range balances.holderDelta {
+		touched[t] = true
+		holderTokens = append(holderTokens, t)
+	}
+	if len(holderTokens) > 0 {
+		sort.Strings(holderTokens)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k`,
+			tokenLockKeys(holderTokens)); err != nil {
+			return err
+		}
+	}
+	transfers := make(map[string]reverted, len(doomed))
+	for _, r := range doomed {
+		transfers[r.token] = r
+	}
+
+	// One statement per token in sorted order, not a
 	// single UPDATE ... FROM: this takes tokens row locks held to commit and a
 	// reorg can run while catchup workers are committing batches, so it has to
 	// join the same total lock order those use. UPDATE ... FROM would take them
@@ -280,17 +307,24 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	// negative value would be served to consumers as authoritative; a floor
 	// turns an accounting error into a visibly wrong-but-sane number rather
 	// than a nonsensical one.
-	for _, r := range doomed {
-		if _, err := tx.Exec(ctx, `
-			UPDATE tokens SET
-				transfer_count = GREATEST(COALESCE(transfer_count, 0) - $2, 0),
-				total_supply = CASE
-					WHEN token_type = 'ERC20'
-					THEN `+clampSupply(`COALESCE(total_supply, 0) - $3::NUMERIC`)+`
-					ELSE total_supply
-				END
-			WHERE address = $1`, r.token, r.count, r.supply); err != nil {
-			return err
+	for _, token := range sortedTokens(touched) {
+		if r, ok := transfers[token]; ok {
+			if _, err := tx.Exec(ctx, `
+				UPDATE tokens SET
+					transfer_count = GREATEST(COALESCE(transfer_count, 0) - $2, 0),
+					total_supply = CASE
+						WHEN token_type = 'ERC20'
+						THEN `+clampSupply(`COALESCE(total_supply, 0) - $3::NUMERIC`)+`
+						ELSE total_supply
+					END
+				WHERE address = $1`, r.token, r.count, r.supply); err != nil {
+				return err
+			}
+		}
+		if delta := balances.holderDelta[token]; delta != 0 {
+			if _, err := tx.Exec(ctx, holderCountApplySQL, token, delta); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -371,6 +405,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		return err
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number); err != nil {
+		return err
+	}
+	if err := recordBalanceRereads(ctx, tx, balances.keys); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -2297,6 +2334,8 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"ledger_chain",
 		"ledger_spans",
 		"history_archives",
+		// A request to re-read a balance of the wiped chain.
+		"balance_rereads",
 	}
 	for _, table := range tables {
 		if _, err := d.pool.Exec(ctx, "TRUNCATE TABLE "+table+" CASCADE"); err != nil {

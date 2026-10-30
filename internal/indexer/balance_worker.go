@@ -19,6 +19,8 @@ type BalanceWork struct {
 	Address      common.Address
 	TokenAddress common.Address
 	BlockNumber  uint64
+	// Reread is the balance_rereads request this read answers, 0 for none. Folded keys keep the highest.
+	Reread int64
 }
 
 type BalanceWorkerPool struct {
@@ -259,6 +261,9 @@ func (p *BalanceWorkerPool) coalesce() {
 				if work.BlockNumber > h.BlockNumber {
 					h.BlockNumber = work.BlockNumber
 				}
+				if work.Reread > h.Reread {
+					h.Reread = work.Reread
+				}
 				metrics.BalanceDeduped(1)
 				continue
 			}
@@ -356,6 +361,7 @@ func (p *BalanceWorkerPool) fetchBalance(work BalanceWork) (*types.Balance, erro
 		TokenAddress: work.TokenAddress.Hex(),
 		BlockNumber:  work.BlockNumber,
 		Balance:      types.JSONString(balance.String()),
+		Reread:       work.Reread,
 	}, nil
 }
 
@@ -408,9 +414,9 @@ drain:
 			}
 			k := balanceKey{w.Address, w.TokenAddress}
 			if prev, seen := works[k]; seen {
-				if w.BlockNumber > prev.BlockNumber {
-					works[k] = w
-				}
+				prev.BlockNumber = max(prev.BlockNumber, w.BlockNumber)
+				prev.Reread = max(prev.Reread, w.Reread)
+				works[k] = prev
 				metrics.BalanceDeduped(1)
 				continue
 			}
@@ -445,6 +451,7 @@ drain:
 				TokenAddress: w.TokenAddress.Hex(),
 				BlockNumber:  w.BlockNumber,
 				Balance:      types.JSONString(values[i].String()),
+				Reread:       w.Reread,
 			})
 		}
 	}

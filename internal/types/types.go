@@ -147,6 +147,8 @@ type Balance struct {
 	TokenAddress string     `json:"tokenAddress"`
 	BlockNumber  uint64     `json:"blockNumber"`
 	Balance      JSONString `json:"balance"`
+	// Reread is the balance_rereads request this read answers, 0 for none.
+	Reread int64 `json:"-"`
 }
 
 type Counter struct {
