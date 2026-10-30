@@ -337,6 +337,26 @@ type backfillInitStore interface {
 	InitStatsBackfill(ctx context.Context, target, targetTimestamp uint64) error
 }
 
+type reconcileStore interface {
+	backfillInitStore
+	Reconcile(ctx context.Context) error
+}
+
+// ReconcileForStart re-derives the counters, finishing a FORCE_REINDEX wipe a stop interrupted (Reconcile), then
+// prepares the stats backfill when one is wanted. The prepare comes second: the resumed wipe removes a backfill.
+func ReconcileForStart(ctx context.Context, store reconcileStore, node RPCClient, startBlock uint64, backfill bool) error {
+	if err := store.Reconcile(ctx); err != nil {
+		return err
+	}
+	if !backfill {
+		return nil
+	}
+	if err := PrepareStatsBackfill(ctx, store, node, startBlock); err != nil {
+		return fmt.Errorf("prepare the stats backfill: %w", err)
+	}
+	return nil
+}
+
 // PrepareStatsBackfill starts the stats backfill of [0, startBlock) unless one exists. The whole range, and the whole
 // day holding startBlock, must be below the node's reorg floor: a reorg there could not be reverted (the day's first
 // blocks are pruned from day one).

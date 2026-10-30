@@ -529,3 +529,24 @@ func TestAWipeForReindexPreparesTheStatsBackfillAgain(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, db.BackfillState{Exists: true, Target: 4_999, Through: -1}, s, "a new backfill, from the start")
 }
+
+// A FORCE_REINDEX wipe stopped part way, after it removed the stats backfill and before it prepared the new one: the
+// next start finishes the wipe in its reconcile, and the backfill is prepared after that, not before it.
+func TestAStartAfterAWipeStoppedPartWayHasItsStatsBackfill(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000))
+	_, err := sql.Exec(ctx, `CREATE TABLE `+db.WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`)
+	require.NoError(t, err, "the wipe had started")
+	_, err = sql.Exec(ctx, `TRUNCATE stats_backfill`)
+	require.NoError(t, err, "and removed the backfill when it stopped")
+
+	require.NoError(t, ReconcileForStart(ctx, store, chain, 5_000, true))
+	s, err := store.StatsBackfillState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, db.BackfillState{Exists: true, Target: 4_999, Through: -1}, s, "the backfill is prepared after the wipe")
+	var mark *string
+	require.NoError(t, sql.QueryRow(ctx, `SELECT to_regclass($1)::text`, db.WipeMarkTable).Scan(&mark))
+	require.Nil(t, mark, "the wipe finished")
+}

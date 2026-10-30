@@ -159,11 +159,6 @@ func main() {
 			SpanBlocks: cfg.LedgerSpanBlocks, Retry: 10 * time.Second,
 		},
 	}
-	if cfg.StartBlock > 0 && cfg.PruneRetainBlocks > 0 {
-		if err := indexer.PrepareStatsBackfill(context.Background(), database, rpcClient, cfg.StartBlock); err != nil {
-			log.Fatal("failed to prepare the stats backfill", "error", err)
-		}
-	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
 	var nodeLookup *nodelookup.Lookup
@@ -262,8 +257,9 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		if err := database.Reconcile(ctx); err != nil {
-			log.Fatal("failed to reconcile counters", "error", err)
+		backfill := cfg.StartBlock > 0 && cfg.PruneRetainBlocks > 0
+		if err := indexer.ReconcileForStart(ctx, database, rpcClient, cfg.StartBlock, backfill); err != nil {
+			log.Fatal("failed to reconcile counters or prepare the stats backfill", "error", err)
 		}
 		close(reconciled)
 		log.Info("starting indexer worker")
