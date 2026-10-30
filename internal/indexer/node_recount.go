@@ -11,6 +11,7 @@ import (
 
 type prunedSpanStore interface {
 	NextPrunedSpan(ctx context.Context) (lo, hi int64, ok bool, err error)
+	PrunedSpanFrom(ctx context.Context, lo, hi int64) (int64, error)
 	SettleNodeSpan(ctx context.Context, lo, hi int64, s *db.SpanTotals, repair bool) (db.SpanCheck, error)
 }
 
@@ -29,7 +30,11 @@ func (i *Indexer) RecountPrunedSpan(ctx context.Context, store prunedSpanStore, 
 	if err != nil || !ok {
 		return db.SpanCheck{}, false, err
 	}
-	totals, err := counter.count(ctx, uint64(lo), uint64(hi))
+	from, err := store.PrunedSpanFrom(ctx, lo, hi)
+	if err != nil {
+		return db.SpanCheck{}, false, err
+	}
+	totals, err := counter.count(ctx, uint64(from), uint64(hi))
 	if err != nil {
 		return db.SpanCheck{}, false, err
 	}

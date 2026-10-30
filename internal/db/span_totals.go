@@ -142,3 +142,20 @@ func (d *DB) NextPrunedSpan(ctx context.Context) (lo, hi int64, ok bool, err err
 	}
 	return lo, hi, err == nil, err
 }
+
+// PrunedSpanFrom is the first block a recount of the closed span [lo, hi) counts: lo, except that block 0 counts only
+// when the span's ledger counted it. Ingest never stores block 0 on an empty database, and a closed span is complete
+// but for that block, so span 0 counted it exactly when its blocks_total is its width (the stats backfill counts it).
+func (d *DB) PrunedSpanFrom(ctx context.Context, lo, hi int64) (int64, error) {
+	if lo != 0 {
+		return lo, nil
+	}
+	var whole bool
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT value FROM ledger_chain WHERE lo = $1 AND name = 'blocks_total') = $2 - $1, false)`,
+		lo, hi).Scan(&whole)
+	if err != nil || whole {
+		return lo, err
+	}
+	return 1, nil
+}

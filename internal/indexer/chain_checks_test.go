@@ -62,3 +62,21 @@ func TestChainChecksPassOnKnownGoodAndFailOnEachSabotage(t *testing.T) {
 	require.Equal(t, "drift", state)
 	require.True(t, strings.HasPrefix(checker.lastToken, "0x"), "the supply check walks the tokens")
 }
+
+// Block 0 stored and counted, then span 0 pruned with it: the blocks check still counts from genesis, as span 0's
+// ledger did, instead of finding blocks_total one above the head.
+func TestTheBlocksCheckCountsGenesisAfterItsSpanIsPruned(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 14_000, busy: 1_000}
+	idx := newTestIndexer(store, chain)
+	ingestChain(t, idx, store, sql, chain)
+	require.NoError(t, store.Migrate(), "the startup re-seed counts the filler blocks")
+	_, err := sql.Exec(ctx, `UPDATE prune_state SET pruned_through = 999; DELETE FROM blocks WHERE number < 1000`)
+	require.NoError(t, err, "span 0 pruned, block 0 with it")
+	checker := idx.newChainChecker(store, ChainCheckConfig{RPS: 1_000_000, Sample: 50})
+	r, err := checker.pass(ctx)
+	require.NoError(t, err)
+	require.True(t, r.BlocksApplicable)
+	require.Zero(t, r.BlocksDrift)
+}

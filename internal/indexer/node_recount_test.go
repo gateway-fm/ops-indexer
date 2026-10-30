@@ -130,3 +130,34 @@ func TestNodeRecountRetriesABlockInsteadOfTheSpan(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, db.SpanCheck{Lo: 0, Hi: 1000, State: "ok"}, c)
 }
+
+// Ingest on an empty database never stores block 0, so span 0 closed from its rows counts one block fewer than its
+// width. The recount counts what the span's ledger counted: without genesis, no blocks_total drift and no repair.
+func TestNodeRecountOfSpanZeroCountsGenesisOnlyWhereTheLedgerDid(t *testing.T) {
+	store, sql := setupPostgres(t)
+	ctx := context.Background()
+	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 14_000, busy: 1_000}
+	idx := newTestIndexer(store, chain)
+	for n := uint64(1); n < chain.busy; n++ {
+		require.NoError(t, idx.processBlock(ctx, n))
+	}
+	_, err := sql.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT b, 'filler' || b, 'filler' || (b - 1), 1700000000 + 60 * b + b % 7, 0, 30000000, 0 FROM generate_series($1::bigint, $2::bigint) b`,
+		chain.busy, chain.head)
+	require.NoError(t, err)
+	_, err = store.CloseLedgerSpans(ctx, db.LedgerConfig{SpanBlocks: 1000}, 1_000)
+	require.NoError(t, err)
+	var blocks int64
+	require.NoError(t, sql.QueryRow(ctx, `SELECT value FROM ledger_chain WHERE lo = 0 AND name = 'blocks_total'`).Scan(&blocks))
+	require.EqualValues(t, 999, blocks, "span 0 without block 0")
+	_, err = sql.Exec(ctx, `UPDATE prune_state SET pruned_through = 999`)
+	require.NoError(t, err)
+
+	c, ok, err := idx.RecountPrunedSpan(ctx, store, idx.newSpanCounter(1_000_000), true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, db.SpanCheck{Lo: 0, Hi: 1000, State: "ok"}, c, "the recount counts blocks 1..999, as the span did")
+	require.NoError(t, sql.QueryRow(ctx, `SELECT value FROM ledger_chain WHERE lo = 0 AND name = 'blocks_total'`).Scan(&blocks))
+	require.EqualValues(t, 999, blocks)
+}
