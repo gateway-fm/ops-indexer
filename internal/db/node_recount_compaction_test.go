@@ -44,7 +44,7 @@ func spanTotalsFromLedger(t *testing.T, d *DB, lo int64) *SpanTotals {
 // The node recount picks a pruned span, counts it from the node for as long as its rate allows, then settles it by
 // lo. Compaction can merge that span into a wider one meanwhile; the settle then compares the merged span's rows with
 // the first span's count and, with repair on, replaces them: the pruned totals of the other spans leave the ledger.
-func TestNodeRecountSettlesASpanCompactionMergedDuringTheCount(t *testing.T) {
+func TestANodeRecountLeavesThePrunedTotalsOfASpanCompactionMergedDuringTheCount(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
