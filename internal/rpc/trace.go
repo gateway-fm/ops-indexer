@@ -99,15 +99,24 @@ func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string
 	return traces, nil
 }
 
+// TraceTransaction fails on a null or empty result: a node that answers so has no trace of the transaction.
 func (c *Client) TraceTransaction(ctx context.Context, txHash common.Hash) (*CallFrame, error) {
-	var result CallFrame
+	var result *CallFrame
 
 	err := c.raw.CallContext(ctx, &result, "debug_traceTransaction", txHash.Hex(), &TraceConfig{Tracer: "callTracer"})
 	if err != nil {
 		return nil, fmt.Errorf("debug_traceTransaction failed: %w", err)
 	}
+	if !traced(result) {
+		return nil, fmt.Errorf("debug_traceTransaction of %s: no trace in the result", txHash.Hex())
+	}
 
-	return &result, nil
+	return result, nil
+}
+
+// traced is whether a call tracer's frame is a trace: every root frame has a call type.
+func traced(frame *CallFrame) bool {
+	return frame != nil && frame.Type != ""
 }
 
 func FlattenCallFrame(frame *CallFrame, txHash string, blockNumber uint64, timestamp *uint64) []*explorerTypes.InternalTransaction {
@@ -217,7 +226,7 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 
 		for _, txHash := range txHashes {
 			entry, ok := blockTraces[txHash.Hex()]
-			if !ok || entry.Error != "" || entry.Result == nil {
+			if !ok || entry.Error != "" || !traced(entry.Result) {
 				if strict {
 					return nil, fmt.Errorf("block %d: no trace for transaction %s: %q", blockNumber, txHash.Hex(), entry.Error)
 				}
