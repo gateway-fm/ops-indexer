@@ -552,18 +552,27 @@ func (i *Indexer) Start(ctx context.Context) error {
 	// After the start's wipe, if any: the backfill job ends once its backfill is complete or absent, and a wipe
 	// prepares the new chain's; the node recount and the chain checks would otherwise check rows the wipe removes, and
 	// the balance rereads would write the old chain's balances after it.
+	// Start returns only once they have stopped, so the caller can close the pool behind it.
 	close(i.pastWipe)
+	jobsCtx, stopJobs := context.WithCancel(ctx)
+	var jobs sync.WaitGroup
+	defer func() {
+		stopJobs()
+		jobs.Wait()
+	}()
 	if store, ok := i.db.(balanceRereadStore); ok {
-		go i.RunBalanceRereads(ctx, store)
+		jobs.Go(func() { i.RunBalanceRereads(jobsCtx, store) })
 	}
 	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
-		go i.RunStatsBackfill(ctx, store, i.config.StatsBackfill)
+		jobs.Go(func() { i.RunStatsBackfill(jobsCtx, store, i.config.StatsBackfill) })
 	}
 	if store, ok := i.db.(prunedSpanStore); ok && i.config.NodeRecountRPS > 0 {
-		go i.RunNodeRecount(ctx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
+		jobs.Go(func() {
+			i.RunNodeRecount(jobsCtx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
+		})
 	}
 	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
-		go i.RunChainChecks(ctx, store, i.config.ChainCheck)
+		jobs.Go(func() { i.RunChainChecks(jobsCtx, store, i.config.ChainCheck) })
 	}
 	go i.publishProgressMetrics(ctx)
 
