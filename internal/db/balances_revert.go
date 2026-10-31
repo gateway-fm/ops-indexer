@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"math"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -29,48 +30,55 @@ type revertedBalances struct {
 // without one keeps its current row. None of this is certain: every row was read at the node's latest state, so the
 // remaining row may itself be fork-era, and a read queued before the revert can still land after it. The certain value
 // is the node's at the new head, which the caller requests for every key (recordBalanceRereads).
+//
+// A flush can write a row at the block between the read of its keys and their locks: a read at the head, which is
+// this block, of a key the block did not touch. The keys are read again under the locks until no new one appears. A
+// new key is waited for only when its lock comes after every lock held, as a flush takes them; one that comes before
+// is taken if free, and otherwise left to the reread alone, so the revert never waits out of order.
 func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBalances, error) {
 	out := revertedBalances{holderDelta: map[string]int{}}
-	rows, err := tx.Query(ctx, `
-		SELECT token_address, address, bool_or(had_row) FROM (
-			SELECT LOWER(token_address) AS token_address, LOWER(address) AS address, true AS had_row
-			FROM balances WHERE block_number = $1
-			UNION ALL
-			SELECT LOWER(t.token_address), LOWER(x.address), false
-			FROM token_transfers t CROSS JOIN LATERAL (VALUES (t.from_address), (t.to_address)) AS x(address)
-			WHERE t.block_number = $1 AND t.token_type IN ('ERC20', 'ERC721') AND x.address IS NOT NULL
-			  AND LOWER(x.address) <> '`+zeroAddress+`'
-		) k
-		GROUP BY token_address, address
-		ORDER BY token_address, address`, int64(number))
-	if err != nil {
+	keys, err := blockBalanceKeys(ctx, tx, number)
+	if err != nil || len(keys) == 0 {
 		return out, err
 	}
-	var restore []balanceKey
-	for rows.Next() {
-		var k balanceKey
-		var hadRow bool
-		if err := rows.Scan(&k.token, &k.address, &hadRow); err != nil {
-			rows.Close()
+	var held []int32
+	seen := map[balanceKey]bool{}
+	hadRow := map[balanceKey]bool{}
+	locked := map[balanceKey]bool{}
+	for len(keys) > 0 {
+		var fresh []balanceKey
+		for k, had := range keys {
+			hadRow[k] = hadRow[k] || had
+			if !seen[k] {
+				seen[k] = true
+				fresh = append(fresh, k)
+			}
+		}
+		if len(fresh) == 0 {
+			break
+		}
+		got, err := lockBalanceKeys(ctx, tx, fresh, held)
+		if err != nil {
 			return out, err
 		}
+		for _, k := range got {
+			locked[k] = true
+			held = append(held, tbcLockKey(k.token, k.address))
+		}
+		if keys, err = blockBalanceKeys(ctx, tx, number); err != nil {
+			return out, err
+		}
+	}
+	var restore []balanceKey
+	for k := range seen {
 		out.keys = append(out.keys, k)
-		if hadRow {
+		if hadRow[k] && locked[k] {
 			restore = append(restore, k)
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return out, err
-	}
-	if len(out.keys) == 0 {
-		return out, nil
-	}
+	sortBalanceKeys(out.keys)
+	sortBalanceKeys(restore)
 
-	tokens, addresses := balanceKeyColumns(out.keys)
-	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(tokens, addresses)); err != nil {
-		return out, err
-	}
 	before, err := positiveBalances(ctx, tx, restore)
 	if err != nil {
 		return out, err
@@ -110,6 +118,97 @@ func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBala
 		}
 	}
 	return out, nil
+}
+
+// blockBalanceKeys reads the keys of a block's balance history rows and of its ERC-20 and ERC-721 transfers' holders,
+// each with whether it had a history row at the block.
+func blockBalanceKeys(ctx context.Context, tx pgx.Tx, number uint64) (map[balanceKey]bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT token_address, address, bool_or(had_row) FROM (
+			SELECT LOWER(token_address) AS token_address, LOWER(address) AS address, true AS had_row
+			FROM balances WHERE block_number = $1
+			UNION ALL
+			SELECT LOWER(t.token_address), LOWER(x.address), false
+			FROM token_transfers t CROSS JOIN LATERAL (VALUES (t.from_address), (t.to_address)) AS x(address)
+			WHERE t.block_number = $1 AND t.token_type IN ('ERC20', 'ERC721') AND x.address IS NOT NULL
+			  AND LOWER(x.address) <> '`+zeroAddress+`'
+		) k
+		GROUP BY token_address, address`, int64(number))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := map[balanceKey]bool{}
+	for rows.Next() {
+		var k balanceKey
+		var had bool
+		if err := rows.Scan(&k.token, &k.address, &had); err != nil {
+			return nil, err
+		}
+		keys[k] = had
+	}
+	return keys, rows.Err()
+}
+
+// lockBalanceKeys takes the balance-key locks of keys, given the locks the transaction holds, and returns the keys
+// it holds afterwards. Keys whose lock comes after every held one are waited for, in order, as a flush takes them; a
+// key whose lock is held already is held; one whose lock comes before is taken only if it is free.
+func lockBalanceKeys(ctx context.Context, tx pgx.Tx, keys []balanceKey, held []int32) ([]balanceKey, error) {
+	top, holding := int32(math.MinInt32), map[int32]bool{}
+	for _, h := range held {
+		top, holding[h] = max(top, h), true
+	}
+	var got, wait []balanceKey
+	var lower []int32
+	lowerKeys := map[int32][]balanceKey{}
+	for _, k := range keys {
+		switch h := tbcLockKey(k.token, k.address); {
+		case holding[h]:
+			got = append(got, k)
+		case len(held) == 0 || h > top:
+			wait = append(wait, k)
+		default:
+			if lowerKeys[h] == nil {
+				lower = append(lower, h)
+			}
+			lowerKeys[h] = append(lowerKeys[h], k)
+		}
+	}
+	if len(wait) > 0 {
+		tokens, addresses := balanceKeyColumns(wait)
+		if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(tokens, addresses)); err != nil {
+			return nil, err
+		}
+		got = append(got, wait...)
+	}
+	if len(lower) == 0 {
+		return got, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT k, pg_try_advisory_xact_lock(4669, k) FROM unnest($1::int4[]) AS k`, lower)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h int32
+		var ok bool
+		if err := rows.Scan(&h, &ok); err != nil {
+			return nil, err
+		}
+		if ok {
+			got = append(got, lowerKeys[h]...)
+		}
+	}
+	return got, rows.Err()
+}
+
+func sortBalanceKeys(keys []balanceKey) {
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].token != keys[j].token {
+			return keys[i].token < keys[j].token
+		}
+		return keys[i].address < keys[j].address
+	})
 }
 
 // positiveBalances reports which keys hold a positive current balance.
