@@ -38,8 +38,9 @@ func (r *RebaseResult) add(o RebaseResult) {
 // their rows above the closed spans (ledger_address_truth), in batches of rebaseBatch (rebaseAddressBatch). create are
 // the addresses a missing row may be created for; it is created only for one the truth has, and any other address is
 // only corrected. A row whose address has no truth, no block left that saw it, is removed: an address no canonical
-// block has seen has no row. A batch counts without holding any row and never retries for a conflict, so it neither
-// stalls ingest nor stalls behind it.
+// block has seen has no row. A batch counts its truth before taking any row; it then takes its rows, creating the
+// missing ones, in address order, waiting for any writer that holds one, and counts again under the lock only the rows
+// a revert changed since its read or whose first or last block it corrects.
 func (d *DB) RebaseAddresses(ctx context.Context, addresses, create []string) (RebaseResult, error) {
 	return d.rebaseAddresses(ctx, addresses, create, nil)
 }

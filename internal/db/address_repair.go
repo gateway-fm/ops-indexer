@@ -33,7 +33,8 @@ const addressRepairCursor = "address_repair_next"
 // AddressRepairBatch is the default number of addresses one repair transaction rebases; AddressRepairBatchTimeout is
 // the longest one may run. A batch that runs out of time is split in half and run again; one address that does stops
 // the repair. A batch holds the rebase lock (span closes and the running check wait for it) for its whole
-// transaction, and the rows it corrects only from its first write to its commit.
+// transaction. It counts its truth before taking any row, then takes its rows, creating the missing ones, in address
+// order, and holds them to its commit.
 const (
 	AddressRepairBatch        = 100
 	AddressRepairBatchTimeout = 30 * time.Second

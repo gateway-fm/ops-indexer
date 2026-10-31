@@ -21,7 +21,9 @@ on any drift. The ledger and the checks run with retention on or off.
   with a row in it, and every address of a block reverted since the last close, is set to that count. One statement
   counts the truth of all of them at once (one join with the closed ledger rows, one pass over the rows above the
   closed spans) and stages the rows that differ; the corrections are then added in short batches of 1,000, so no row
-  is held while the truth is counted. An error in an address's running counters is gone one span after it happened.
+  is held while that truth is counted. Each batch takes its rows, creating the missing ones, in address order, waiting
+  for any writer that holds one, and counts again under the lock only the rows a revert changed since the count or
+  whose first or last block it corrects. An error in an address's running counters is gone one span after it happened.
   A restart resumes at the first span not rebased (`ledger_spans.rebased_at`); the log line `ledger: span's
   addresses rebased` gives the rows staged, changed and created.
 
