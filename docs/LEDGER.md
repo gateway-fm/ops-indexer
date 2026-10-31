@@ -141,7 +141,7 @@ waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-u
 
 The `node` check and the stats backfill count old blocks, and need an archive node with tracing for them: the traces
 and the code at a creation's block need the block's state. With `ENABLE_TRACING`, the backfill traces block 1 when it
-is prepared, and a node that answers without the state (such as `historical state is not available`) fails the
+is prepared, and again at every start while blocks remain to count, and a node that answers without the state (such as `historical state is not available`) fails the
 start with that error, rather than a backfill that could count no block; a node with no tracing at all is counted
 without internal transactions, as ingest counts it. A single block the backfill cannot count whole (a trace or a
 contract's code the node fails to serve) is retried, and after 30 failures in a row counted without what failed, as

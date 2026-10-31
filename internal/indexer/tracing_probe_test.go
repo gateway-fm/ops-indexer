@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,10 +86,13 @@ func TestAFailedTracingCheckNeverCountsAnOldBlockWithoutTraces(t *testing.T) {
 	}
 }
 
-// initStore is a database with no stats backfill yet; it records whether one was prepared.
-type initStore struct{ prepared bool }
+// initStore is a database with the stats backfill state; it records whether one was prepared.
+type initStore struct {
+	state    db.BackfillState
+	prepared bool
+}
 
-func (s *initStore) StatsBackfillState(context.Context) (db.BackfillState, error) { return db.BackfillState{}, nil }
+func (s *initStore) StatsBackfillState(context.Context) (db.BackfillState, error) { return s.state, nil }
 func (s *initStore) InitStatsBackfill(context.Context, uint64, uint64) error {
 	s.prepared = true
 	return nil
@@ -146,4 +150,71 @@ func TestAnOldBlockTheNodeCannotTraceIsNeverRetriedForever(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, out.Spans, "the block is counted")
 	})
+}
+
+// A backfill prepared on an archive node can be resumed on a node without old state: every start checks the node's
+// history again while blocks remain to count, and fails as the prepare would.
+func TestEveryStartRechecksTheNodesHistoryWhileTheBackfillHasBlocksToCount(t *testing.T) {
+	ctx := context.Background()
+	node := &probedChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000, busy: 20},
+		supported: true, traceBlockErr: errNoHistoricalState}
+	counting := &initStore{state: db.BackfillState{Exists: true, Target: 4_999, Through: 1_000}}
+	err := PrepareStatsBackfill(ctx, counting, node, 5_000, true)
+	require.ErrorIs(t, err, errNoHistoricalState)
+	require.ErrorContains(t, err, "archive node")
+	require.False(t, counting.prepared, "the backfill is resumed, not prepared again")
+
+	for _, done := range []db.BackfillState{
+		{Exists: true, Target: 4_999, Through: 4_999},
+		{Exists: true, Complete: true, Target: 4_999, Through: 4_999},
+	} {
+		require.NoError(t, PrepareStatsBackfill(ctx, &initStore{state: done}, node, 5_000, true),
+			"no block left to trace")
+	}
+	require.NoError(t, PrepareStatsBackfill(ctx, counting, node, 5_000, false), "tracing off")
+}
+
+// countingChain counts the blocks fetched; its traces fail until failUntil tries of block 7 have failed.
+type countingChain struct {
+	*probedChain
+	mu       sync.Mutex
+	fetched  map[uint64]int
+	failures int
+	failFor  int
+}
+
+func (c *countingChain) RawBlockByNumber(ctx context.Context, n uint64) (*rpc.RawBlock, error) {
+	c.mu.Lock()
+	c.fetched[n]++
+	c.mu.Unlock()
+	return c.probedChain.RawBlockByNumber(ctx, n)
+}
+
+func (c *countingChain) FetchTracesBatchStrict(_ context.Context, _ []common.Hash, block uint64, _ uint64, _ int, _ int) ([]*types.InternalTransaction, error) {
+	if block == 7 && c.failures < c.failFor {
+		c.failures++
+		return nil, errNoHistoricalState
+	}
+	return nil, nil
+}
+
+// A batch retried after one of its blocks failed fetches none of its blocks again, and builds only from the block
+// that failed.
+func TestABackfillBatchRetryFetchesNoBlockAgain(t *testing.T) {
+	ctx := context.Background()
+	chain := &countingChain{probedChain: &probedChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 20,
+		busy: 20}, supported: true}, fetched: map[uint64]int{}, failFor: 2}
+	idx := newTestIndexer(new(MockDatabase), chain)
+	idx.tracingSupported = true
+	b := idx.newBackfiller(nil, testBackfill)
+	for range chain.failFor {
+		_, _, err := b.batch(ctx, 5, 10, 1_000_000, nil)
+		require.ErrorIs(t, err, errNoHistoricalState)
+	}
+	out, _, err := b.batch(ctx, 5, 10, 1_000_000, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, out.Spans)
+	for n := uint64(5); n < 10; n++ {
+		require.Equal(t, 1, chain.fetched[n], "block %d fetched once", n)
+	}
 }

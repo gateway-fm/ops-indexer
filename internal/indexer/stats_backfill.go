@@ -66,6 +66,15 @@ type backfiller struct {
 	readAfter *db.BalanceKey
 	// waitUntil is when a completion that waits for catch-up is checked again.
 	waitUntil time.Time
+	// retrying keeps a failed batch's fetched blocks, and those it built before the one that failed, for its retry:
+	// the blocks are final, and a retry fetches and builds only from the block that failed.
+	retrying *batchRetry
+}
+
+type batchRetry struct {
+	from, to uint64
+	blocks   []fetched
+	built    []*builtBlock
 }
 
 func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *backfiller {
@@ -99,10 +108,16 @@ type fetched struct {
 
 // batch fetches and builds blocks [from, to) and merges them into one batch; prevTs is block from - 1's timestamp.
 func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs *int64) (*db.BackfillBatch, []string, error) {
-	blocks := make([]fetched, to-from)
+	if r := b.retrying; r == nil || r.from != from || r.to != to {
+		b.retrying = &batchRetry{from: from, to: to, blocks: make([]fetched, to-from)}
+	}
+	blocks := b.retrying.blocks
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(max(b.cfg.Workers, 1))
 	for n := from; n < to; n++ {
+		if blocks[n-from].raw != nil {
+			continue
+		}
 		g.Go(func() error {
 			raw, err := b.idx.rpc.RawBlockByNumber(gctx, n)
 			if err != nil {
@@ -124,7 +139,13 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 		Shared: &db.BlockData{AddressStats: map[string]*db.AddressStatsDelta{}}, TokenFirstSeen: map[string]db.TokenSeen{},
 		Days: map[string]*db.DayParts{}, Active: map[string]map[string]struct{}{}}
 	var discovered []string
-	for _, f := range blocks {
+	for i, f := range blocks {
+		if i < len(b.retrying.built) {
+			if err := addBlock(out, b.retrying.built[i], b.spanOf, target, &prevTs, &discovered); err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
 		built := b.idx.buildBlock(ctx, f.raw, f.receipts)
 		if err := errors.Join(built.tracesErr, built.codeErr); err != nil {
 			if !b.givesUp(built.blockNumber) {
@@ -136,22 +157,33 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 			metrics.StatsBackfillLenientBlock()
 			built = b.lenient.buildBlock(ctx, f.raw, f.receipts)
 		}
-		lo, hi := b.spanOf(built.blockNumber, target)
-		span := out.Spans[lo]
-		if span == nil {
-			span = db.NewSpanTotals()
-			out.Spans[lo], out.SpanHi[lo] = span, hi
-		}
-		if err := span.AddBlock(built.data); err != nil {
+		b.retrying.built = append(b.retrying.built, built)
+		if err := addBlock(out, built, b.spanOf, target, &prevTs, &discovered); err != nil {
 			return nil, nil, err
 		}
-		mergeShared(out, built)
-		addDay(out, built, prevTs)
-		ts := int64(built.blockTimestamp)
-		prevTs = &ts
-		discovered = append(discovered, built.discovered...)
 	}
+	b.retrying = nil
 	return out, discovered, nil
+}
+
+// addBlock merges a built block into the batch: its span's totals, the shared rows, its day's parts.
+func addBlock(out *db.BackfillBatch, built *builtBlock, spanOf func(n, target uint64) (uint64, uint64), target uint64,
+	prevTs **int64, discovered *[]string) error {
+	lo, hi := spanOf(built.blockNumber, target)
+	span := out.Spans[lo]
+	if span == nil {
+		span = db.NewSpanTotals()
+		out.Spans[lo], out.SpanHi[lo] = span, hi
+	}
+	if err := span.AddBlock(built.data); err != nil {
+		return err
+	}
+	mergeShared(out, built)
+	addDay(out, built, *prevTs)
+	ts := int64(built.blockTimestamp)
+	*prevTs = &ts
+	*discovered = append(*discovered, built.discovered...)
+	return nil
 }
 
 // givesUp records that block failed, and is whether it has now failed strictBlockTries times in a row.
@@ -411,14 +443,21 @@ func ReconcileForStart(ctx context.Context, store reconcileStore, node RPCClient
 
 // PrepareStatsBackfill starts the stats backfill of [0, startBlock) unless one exists. The whole range, and the whole
 // day holding startBlock, must be below the node's reorg floor: a reorg there could not be reverted (the day's first
-// blocks are pruned from day one). With traces, the node must trace the range's old blocks (historicalTraces).
+// blocks are pruned from day one). With traces, the node must trace the range's old blocks (historicalTraces), checked
+// again at every start while blocks remain to count: the node may have been replaced since.
 func PrepareStatsBackfill(ctx context.Context, store backfillInitStore, node RPCClient, startBlock uint64, traces bool) error {
 	if startBlock == 0 {
 		return nil
 	}
 	s, err := store.StatsBackfillState(ctx)
-	if err != nil || s.Exists {
+	if err != nil {
 		return err
+	}
+	if s.Exists {
+		if traces && !s.Complete && s.Through < s.Target {
+			return historicalTraces(ctx, node, startBlock)
+		}
+		return nil
 	}
 	head, err := node.BlockNumber(ctx)
 	if err != nil {
