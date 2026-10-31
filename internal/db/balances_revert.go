@@ -87,9 +87,32 @@ func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBala
 	if err != nil {
 		return out, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM balances WHERE block_number = $1`, int64(number)); err != nil {
+	if beforeBalanceHistoryDelete != nil {
+		beforeBalanceHistoryDelete()
+	}
+	// A flush can still commit a row at the block, for a key the last read did not see, before the delete: the delete
+	// returns its key, which is asked to be read again like the others.
+	deleted, err := tx.Query(ctx, `
+		DELETE FROM balances WHERE block_number = $1 RETURNING LOWER(token_address), LOWER(address)`, int64(number))
+	if err != nil {
 		return out, err
 	}
+	for deleted.Next() {
+		var k balanceKey
+		if err := deleted.Scan(&k.token, &k.address); err != nil {
+			deleted.Close()
+			return out, err
+		}
+		if !seen[k] {
+			seen[k] = true
+			out.keys = append(out.keys, k)
+		}
+	}
+	deleted.Close()
+	if err := deleted.Err(); err != nil {
+		return out, err
+	}
+	sortBalanceKeys(out.keys)
 	if len(restore) == 0 {
 		return out, nil
 	}
@@ -123,6 +146,10 @@ func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBala
 	}
 	return out, nil
 }
+
+// beforeBalanceHistoryDelete, when set, runs just before a revert deletes its block's balance history rows: a test
+// commits a flush there, which no read of the revert can see.
+var beforeBalanceHistoryDelete func()
 
 // blockBalanceKeys reads the keys of a block's balance history rows and of its ERC-20 and ERC-721 transfers' holders,
 // each with whether it had a history row at the block.

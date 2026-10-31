@@ -58,3 +58,33 @@ func TestARevertRestoresOrRereadsABalanceWrittenAtItsBlockAfterItReadItsKeys(t *
 	require.True(t, block < 10 || reread,
 		"the key's current balance is %s at the reverted block %d, with no request to read it again", balance, block)
 }
+
+// A flush can commit a row at the reverted block for a key no read of the revert saw, after its last read and before
+// it deletes the block's history rows. The revert sees that row only in its delete, so it asks for the key returned
+// there to be read again. A real flush cannot be timed into that gap without a hook, so the test commits it from
+// beforeBalanceHistoryDelete.
+func TestARevertRereadsAKeyItsHistoryDeleteFoundUnread(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	other := "0x00000000000000000000000000000000000000c4"
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(9)))
+	require.NoError(t, d.InsertBlockDataBatch(ctx,
+		reorgBalBlock(10, reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, reorgBalA, reorgBalB, "1", nil))))
+
+	beforeBalanceHistoryDelete = func() {
+		epoch, err := d.CurrentBalanceEpoch(ctx)
+		require.NoError(t, err)
+		b := reorgBalances(10, [3]string{other, reorgBalToken, "7"})
+		b[0].Epoch = epoch
+		require.NoError(t, d.InsertBalancesBatch(ctx, b), "a read at the head, block 10, of a key block 10 did not touch")
+	}
+	t.Cleanup(func() { beforeBalanceHistoryDelete = nil })
+	require.NoError(t, d.DeleteBlock(ctx, 10))
+
+	var reread bool
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM balance_rereads
+		WHERE token_address = $1 AND address = $2 AND open)`, reorgBalToken, other).Scan(&reread))
+	require.True(t, reread, "the key whose history row the revert deleted is read again")
+}
