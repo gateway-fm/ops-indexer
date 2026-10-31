@@ -34,7 +34,11 @@ type revertedBalances struct {
 // A flush can write a row at the block between the read of its keys and their locks: a read at the head, which is
 // this block, of a key the block did not touch. The keys are read again under the locks until no new one appears. A
 // new key is waited for only when its lock comes after every lock held, as a flush takes them; one that comes before
-// is taken if free, and otherwise left to the reread alone, so the revert never waits out of order.
+// is taken if free, and otherwise left to the reread alone, so the revert never waits out of order. The re-read finds
+// such a key by its history row: every writer of token_balances_current at a head block also writes one, in the same
+// transaction (InsertBalancesBatch, from the balance workers' flush and the reread loop). The others do not write at a
+// head block: the start's reconcile copies history rows, and the stats backfill (InsertCurrentBalances, current rows
+// without history) writes below START_BLOCK. A new writer of current rows without history at the head breaks this.
 func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBalances, error) {
 	out := revertedBalances{holderDelta: map[string]int{}}
 	keys, err := blockBalanceKeys(ctx, tx, number)
