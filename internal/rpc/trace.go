@@ -69,16 +69,36 @@ func (c *Client) CheckTracingSupport(ctx context.Context) (bool, error) {
 	var result json.RawMessage
 	err = c.raw.CallContext(ctx, &result, "debug_traceBlockByNumber", fmt.Sprintf("0x%x", blockNumber), &TraceConfig{Tracer: "callTracer"})
 	if err != nil {
-		msg := strings.ToLower(err.Error())
-		for _, signal := range methodAbsentSignals {
-			if strings.Contains(msg, signal) {
-				return false, nil
-			}
+		if TracingAbsent(err) {
+			return false, nil
 		}
 		// Anything else is transient: report it instead of assuming support.
 		return false, fmt.Errorf("tracing support check: debug_traceBlockByNumber on block %d: %w", blockNumber, err)
 	}
 	return true, nil
+}
+
+// missingStateSignals are the error substrings of a node that traces but lacks the block's state, such as
+// "historical state is not available", which methodAbsentSignals' "not available" would otherwise take for no tracing.
+var missingStateSignals = []string{
+	"state",
+	"missing trie node",
+}
+
+// TracingAbsent is whether a trace call's error says the node has no debug_traceBlockByNumber at all.
+func TracingAbsent(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, signal := range missingStateSignals {
+		if strings.Contains(msg, signal) {
+			return false
+		}
+	}
+	for _, signal := range methodAbsentSignals {
+		if strings.Contains(msg, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string]TraceBlockResult, error) {

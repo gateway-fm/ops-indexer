@@ -842,7 +842,7 @@ func (i *Indexer) wipeForReindex(ctx context.Context, configuredStart uint64) er
 		return fmt.Errorf("failed to wipe data for reindex: %w", err)
 	}
 	if backfills {
-		if err := PrepareStatsBackfill(ctx, init, i.rpc, configuredStart); err != nil {
+		if err := PrepareStatsBackfill(ctx, init, i.rpc, configuredStart, i.config.EnableTracing); err != nil {
 			return fmt.Errorf("prepare the stats backfill again after the wipe: %w", err)
 		}
 	}

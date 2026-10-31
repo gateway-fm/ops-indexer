@@ -362,6 +362,14 @@ var balanceRereadsAbandoned = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Balances a reorg revert asked to read again that every attempt failed to read; each stays as the revert restored it until the holder's next transfer.",
 })
 
+var statsBackfillLenientBlocks = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_stats_backfill_lenient_blocks_total",
+	Help: "Blocks the stats backfill counted without a trace or a contract's code the node failed to serve on every try.",
+})
+
+// StatsBackfillLenientBlock counts a block the stats backfill counted without what failed on every try.
+func StatsBackfillLenientBlock() { statsBackfillLenientBlocks.Inc() }
+
 // BalanceRereadsAbandoned counts reread requests given up after their last attempt.
 func BalanceRereadsAbandoned(n int) {
 	if n > 0 {

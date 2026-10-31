@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 )
@@ -22,6 +24,12 @@ type probedChain struct {
 	supported bool
 	probeErr  error
 	probes    int
+	// traceBlockErr is the node's answer to a trace of a whole old block.
+	traceBlockErr error
+}
+
+func (p *probedChain) TraceBlock(context.Context, uint64) (map[string]rpc.TraceBlockResult, error) {
+	return nil, p.traceBlockErr
 }
 
 func (p *probedChain) CheckTracingSupport(context.Context) (bool, error) {
@@ -75,4 +83,67 @@ func TestAFailedTracingCheckNeverCountsAnOldBlockWithoutTraces(t *testing.T) {
 			require.NoError(t, berr)
 		})
 	}
+}
+
+// initStore is a database with no stats backfill yet; it records whether one was prepared.
+type initStore struct{ prepared bool }
+
+func (s *initStore) StatsBackfillState(context.Context) (db.BackfillState, error) { return db.BackfillState{}, nil }
+func (s *initStore) InitStatsBackfill(context.Context, uint64, uint64) error {
+	s.prepared = true
+	return nil
+}
+
+// An old block a node without historical state cannot trace fails on every try. The node recount puts its span at the
+// back of the queue; the stats backfill refuses to start on such a node, and counts a single block that keeps failing
+// without what failed after strictBlockTries tries. Neither retries a block forever, so neither holds retention.
+func TestAnOldBlockTheNodeCannotTraceIsNeverRetriedForever(t *testing.T) {
+	ctx := context.Background()
+	newChain := func() *probedChain {
+		return &probedChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000, busy: 20},
+			supported: true, traceBlockErr: errNoHistoricalState}
+	}
+
+	t.Run("the node recount defers the span", func(t *testing.T) {
+		idx := newTestIndexer(new(MockDatabase), newChain())
+		idx.tracingSupported = true
+		store := &deferStore{}
+		counter := idx.newSpanCounter(1_000_000)
+		counter.retry = 0
+		for range nodeRecountFailuresBeforeDefer {
+			_, _, _ = idx.RecountPrunedSpan(ctx, store, counter, true)
+		}
+		require.Equal(t, []int64{0}, store.deferred)
+		require.Zero(t, store.settled)
+	})
+
+	t.Run("the stats backfill fails its prepare", func(t *testing.T) {
+		store := &initStore{}
+		err := PrepareStatsBackfill(ctx, store, newChain(), 5_000, true)
+		require.ErrorIs(t, err, errNoHistoricalState)
+		require.ErrorContains(t, err, "archive node")
+		require.False(t, store.prepared)
+
+		absent := newChain()
+		absent.traceBlockErr = errors.New("the method debug_traceBlockByNumber does not exist/is not available")
+		require.NoError(t, PrepareStatsBackfill(ctx, store, absent, 5_000, true), "a node that does not trace")
+		require.True(t, store.prepared)
+		require.NoError(t, PrepareStatsBackfill(ctx, &initStore{}, newChain(), 5_000, false), "tracing off")
+	})
+
+	t.Run("the stats backfill counts a block that keeps failing without what failed", func(t *testing.T) {
+		tries := strictBlockTries
+		strictBlockTries = 3
+		t.Cleanup(func() { strictBlockTries = tries })
+		idx := newTestIndexer(new(MockDatabase), newChain())
+		idx.tracingSupported = true
+		b := idx.newBackfiller(nil, testBackfill)
+		for range strictBlockTries - 1 {
+			_, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+			require.ErrorIs(t, err, errNoHistoricalState)
+		}
+		out, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+		require.NoError(t, err)
+		require.NotEmpty(t, out.Spans, "the block is counted")
+	})
 }

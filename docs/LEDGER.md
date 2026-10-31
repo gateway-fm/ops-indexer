@@ -137,6 +137,16 @@ the backfill has written its days, which it counts from the blocks stored from `
 waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-up has stored every block from
 `START_BLOCK` to daily_stats' first, and logs that once.
 
+The `node` check and the stats backfill count old blocks, and need an archive node with tracing for them: the traces
+and the code at a creation's block need the block's state. With `ENABLE_TRACING`, the backfill traces block 1 when it
+is prepared, and a node that answers without the state (such as `historical state is not available`) fails the
+start with that error, rather than a backfill that could count no block; a node with no tracing at all is counted
+without internal transactions, as ingest counts it. A single block the backfill cannot count whole (a trace or a
+contract's code the node fails to serve) is retried, and after 30 failures in a row counted without what failed, as
+ingest would have counted it, with an error log and `indexer_stats_backfill_lenient_blocks_total`; the `node` check
+recounts its span later. A start whose tracing check fails is not taken for a node without tracing: the `node` check
+and the backfill fetch traces anyway, and fail a block they cannot trace.
+
 | variable | default | bounds |
 |---|---|---|
 | `STATS_BACKFILL_RPS` | 100 | Node calls per second of the backfill: about two per block (block, receipts), plus traces with internal transactions indexed, `eth_getCode` per contract creation, token metadata per new token, `tokenURI` per NFT mint. Every call waits for it; a receipts or trace call that falls back to one request per transaction runs those at the budget divided by `STATS_BACKFILL_WORKERS`, so the backfill stays under twice the budget while fallbacks run. The head path's `RPC_RATE_LIMIT` is separate. |
@@ -153,6 +163,7 @@ waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-u
 | `indexer_ledger_closed_through` | Every block at or below this is in a closed span. |
 | `indexer_ledger_close_seconds` | Time to close one span from its rows. |
 | `indexer_stats_backfill_through` | Every block at or below this is counted by the stats backfill. |
+| `indexer_stats_backfill_lenient_blocks_total` | Blocks the stats backfill counted without a trace or a contract's code the node failed to serve on 30 tries in a row. Alert when it rises: the `node` check recounts their spans, which an archive node with tracing can settle. |
 | `indexer_stats_backfill_waiting_for_catchup` | 1 while the backfill has counted every block below `START_BLOCK` and waits for catch-up to store every block from it. |
 | `indexer_prune_blocked_by_stats_backfill` | 1 while retention prunes nothing because the backfill has not written its days; history grows meanwhile. |
 | `indexer_verify_ranges_checked_total{check}` | Spans, buckets or samples checked. |

@@ -257,7 +257,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		backfill := cfg.StartBlock > 0 && cfg.PruneRetainBlocks > 0
-		if err := indexer.ReconcileForStart(ctx, database, rpcClient, cfg.StartBlock, backfill); err != nil {
+		if err := indexer.ReconcileForStart(ctx, database, rpcClient, cfg.StartBlock, backfill, cfg.EnableTracing); err != nil {
 			log.Fatal("failed to reconcile counters or prepare the stats backfill", "error", err)
 		}
 		log.Info("starting indexer worker")

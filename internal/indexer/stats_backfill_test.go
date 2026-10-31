@@ -245,16 +245,16 @@ func TestPrepareStatsBackfillNeedsTheRangeAndItsDayFinal(t *testing.T) {
 	ctx := context.Background()
 	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
 
-	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 10_000), "within the reorg floor")
-	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 7_000), "whole day is final")
-	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000))
+	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 10_000, false), "within the reorg floor")
+	require.ErrorContains(t, PrepareStatsBackfill(ctx, store, chain, 7_000, false), "whole day is final")
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000, false))
 	s, err := store.StatsBackfillState(ctx)
 	require.NoError(t, err)
 	require.Equal(t, db.BackfillState{Exists: true, Target: 4_999, Through: -1}, s)
 	wm, ts, err := store.PrunedThrough(ctx)
 	require.NoError(t, err)
 	require.Equal(t, [2]int64{4_999, int64(blockTime(4_999))}, [2]int64{int64(wm), ts}, "pruned from day one")
-	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000), "a prepared backfill is resumed, not restarted")
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000, false), "a prepared backfill is resumed, not restarted")
 }
 
 func TestStatsBackfillReadsEachTouchedBalanceOnce(t *testing.T) {
@@ -519,7 +519,7 @@ func TestAWipeForReindexPreparesTheStatsBackfillAgain(t *testing.T) {
 	store, sql := setupPostgres(t)
 	ctx := context.Background()
 	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
-	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000))
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000, false))
 	_, err := sql.Exec(ctx, `UPDATE stats_backfill SET through = target, completed_at = now(), daily_done = true`)
 	require.NoError(t, err, "the old chain's backfill had completed")
 
@@ -536,13 +536,13 @@ func TestAStartAfterAWipeStoppedPartWayHasItsStatsBackfill(t *testing.T) {
 	store, sql := setupPostgres(t)
 	ctx := context.Background()
 	chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20_000}
-	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000))
+	require.NoError(t, PrepareStatsBackfill(ctx, store, chain, 5_000, false))
 	_, err := sql.Exec(ctx, `CREATE TABLE `+db.WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`)
 	require.NoError(t, err, "the wipe had started")
 	_, err = sql.Exec(ctx, `TRUNCATE stats_backfill`)
 	require.NoError(t, err, "and removed the backfill when it stopped")
 
-	require.NoError(t, ReconcileForStart(ctx, store, chain, 5_000, true))
+	require.NoError(t, ReconcileForStart(ctx, store, chain, 5_000, true, false))
 	s, err := store.StatsBackfillState(ctx)
 	require.NoError(t, err)
 	require.Equal(t, db.BackfillState{Exists: true, Target: 4_999, Through: -1}, s, "the backfill is prepared after the wipe")

@@ -121,3 +121,11 @@ func TestANullOrEmptyTraceIsNoTrace(t *testing.T) {
 		}
 	}
 }
+
+// A node that traces but lacks an old block's state is not a node without tracing.
+func TestMissingStateIsNotMissingTracing(t *testing.T) {
+	require.False(t, TracingAbsent(fmt.Errorf("-32000: historical state is not available")))
+	require.False(t, TracingAbsent(fmt.Errorf("missing trie node 1a2b (path ) state 0x1a2b is not available")))
+	require.True(t, TracingAbsent(fmt.Errorf("the method debug_traceBlockByNumber does not exist/is not available")))
+	require.True(t, TracingAbsent(fmt.Errorf("Method not found")))
+}

@@ -44,10 +44,20 @@ type StatsBackfillConfig struct {
 	Retry        time.Duration
 }
 
+// strictBlockTries is how many times in a row the backfill fails a block it cannot count whole (a trace or a contract's
+// code the node does not serve) before it counts the block without what failed, as ingest would have.
+var strictBlockTries = 30
+
 // backfiller counts [0, START_BLOCK) from the node with the head path's block builder and writes only counters,
 // state and the ledger.
 type backfiller struct {
-	idx     *Indexer
+	idx *Indexer
+	// lenient builds a block that failed strictBlockTries times in a row, failing is that block and its failures.
+	lenient *Indexer
+	failing struct {
+		block uint64
+		tries int
+	}
 	store   backfillStore
 	cfg     StatsBackfillConfig
 	limiter *rate.Limiter
@@ -63,10 +73,15 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	c.RPCRateLimit, c.TraceRateLimit = cfg.RPS, cfg.RPS
 	c.RPCWorkers, c.TraceWorkers, c.TokenMetadataWorkers = 1, 1, 1
 	c.StrictTraces, c.CodeAtBlock = true, true
+	lc := c
+	lc.StrictTraces, lc.CodeAtBlock = false, false
 	limiter := rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1))
+	node := newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers)
 	return &backfiller{
-		idx: &Indexer{db: i.db, rpc: newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers), config: &c,
-			tokenCache: i.tokenCache, contractCache: i.contractCache, tracingSupported: i.tracesOldBlocks()},
+		idx: &Indexer{db: i.db, rpc: node, config: &c, tokenCache: i.tokenCache, contractCache: i.contractCache,
+			tracingSupported: i.tracesOldBlocks()},
+		lenient: &Indexer{db: i.db, rpc: node, config: &lc, tokenCache: i.tokenCache, contractCache: i.contractCache,
+			tracingSupported: i.tracesOldBlocks()},
 		store: store, cfg: cfg, limiter: limiter,
 	}
 }
@@ -111,11 +126,15 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 	var discovered []string
 	for _, f := range blocks {
 		built := b.idx.buildBlock(ctx, f.raw, f.receipts)
-		if built.tracesErr != nil {
-			return nil, nil, fmt.Errorf("block %d traces: %w", built.blockNumber, built.tracesErr)
-		}
-		if built.codeErr != nil {
-			return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, built.codeErr)
+		if err := errors.Join(built.tracesErr, built.codeErr); err != nil {
+			if !b.givesUp(built.blockNumber) {
+				return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, err)
+			}
+			log.Error("stats backfill: a block failed on every try; counted without what failed, as ingest would have",
+				"block", built.blockNumber, "tries", strictBlockTries, "error", err,
+				"metric", "indexer_stats_backfill_lenient_blocks_total")
+			metrics.StatsBackfillLenientBlock()
+			built = b.lenient.buildBlock(ctx, f.raw, f.receipts)
 		}
 		lo, hi := b.spanOf(built.blockNumber, target)
 		span := out.Spans[lo]
@@ -133,6 +152,15 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 		discovered = append(discovered, built.discovered...)
 	}
 	return out, discovered, nil
+}
+
+// givesUp records that block failed, and is whether it has now failed strictBlockTries times in a row.
+func (b *backfiller) givesUp(block uint64) bool {
+	if b.failing.block != block {
+		b.failing.block, b.failing.tries = block, 0
+	}
+	b.failing.tries++
+	return b.failing.tries >= strictBlockTries
 }
 
 // addDay adds a block to its day's daily_stats parts, as daily_stats_advance aggregates stored blocks.
@@ -335,6 +363,27 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 	}
 }
 
+// blockTracer traces a whole block, as the start's tracing check does.
+type blockTracer interface {
+	TraceBlock(ctx context.Context, blockNumber uint64) (map[string]rpc.TraceBlockResult, error)
+}
+
+// historicalTraces checks that the node traces block 1, the oldest the backfill traces (many nodes cannot trace
+// genesis). A node without the old state cannot trace any block of the range, and the backfill would fail every one
+// of them: the prepare fails instead, and says so. A node that has no tracing at all is counted without traces, as
+// ingest counts it.
+func historicalTraces(ctx context.Context, node RPCClient, startBlock uint64) error {
+	t, ok := node.(blockTracer)
+	if !ok || startBlock < 2 {
+		return nil
+	}
+	if _, err := t.TraceBlock(ctx, 1); err != nil && !rpc.TracingAbsent(err) {
+		return fmt.Errorf("the stats backfill traces the blocks below START_BLOCK, and the node does not trace block 1 "+
+			"(it needs an archive node with tracing, or ENABLE_TRACING=false to count without internal transactions): %w", err)
+	}
+	return nil
+}
+
 type backfillInitStore interface {
 	StatsBackfillState(ctx context.Context) (db.BackfillState, error)
 	InitStatsBackfill(ctx context.Context, target, targetTimestamp uint64) error
@@ -347,14 +396,14 @@ type reconcileStore interface {
 
 // ReconcileForStart re-derives the counters, finishing a FORCE_REINDEX wipe a stop interrupted (Reconcile), then
 // prepares the stats backfill when one is wanted. The prepare comes second: the resumed wipe removes a backfill.
-func ReconcileForStart(ctx context.Context, store reconcileStore, node RPCClient, startBlock uint64, backfill bool) error {
+func ReconcileForStart(ctx context.Context, store reconcileStore, node RPCClient, startBlock uint64, backfill, traces bool) error {
 	if err := store.Reconcile(ctx); err != nil {
 		return err
 	}
 	if !backfill {
 		return nil
 	}
-	if err := PrepareStatsBackfill(ctx, store, node, startBlock); err != nil {
+	if err := PrepareStatsBackfill(ctx, store, node, startBlock, traces); err != nil {
 		return fmt.Errorf("prepare the stats backfill: %w", err)
 	}
 	return nil
@@ -362,8 +411,8 @@ func ReconcileForStart(ctx context.Context, store reconcileStore, node RPCClient
 
 // PrepareStatsBackfill starts the stats backfill of [0, startBlock) unless one exists. The whole range, and the whole
 // day holding startBlock, must be below the node's reorg floor: a reorg there could not be reverted (the day's first
-// blocks are pruned from day one).
-func PrepareStatsBackfill(ctx context.Context, store backfillInitStore, node RPCClient, startBlock uint64) error {
+// blocks are pruned from day one). With traces, the node must trace the range's old blocks (historicalTraces).
+func PrepareStatsBackfill(ctx context.Context, store backfillInitStore, node RPCClient, startBlock uint64, traces bool) error {
 	if startBlock == 0 {
 		return nil
 	}
@@ -390,6 +439,11 @@ func PrepareStatsBackfill(ctx context.Context, store backfillInitStore, node RPC
 	if day, floorDay := blockDay(uint64(first.Timestamp)), blockDay(uint64(floor.Timestamp)); !day.Before(floorDay) {
 		return fmt.Errorf("START_BLOCK %d is on %s, the day of the reorg floor (block %d): choose a START_BLOCK whose whole day is final",
 			startBlock, day.Format("2006-01-02"), head-db.PruneFloorGap)
+	}
+	if traces {
+		if err := historicalTraces(ctx, node, startBlock); err != nil {
+			return err
+		}
 	}
 	prev, err := node.RawBlockByNumber(ctx, startBlock-1)
 	if err != nil {
