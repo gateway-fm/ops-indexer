@@ -340,16 +340,6 @@ func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
 	return d.recountPendingDays(ctx)
 }
 
-// recordRepair logs a drift in ledger_repairs and says whether to repair it: a key that drifted again after a repair
-// is quarantined instead.
-func recordRepair(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
-	repair, err := repairable(ctx, tx, dr)
-	if err != nil || !repair {
-		return false, err
-	}
-	return true, logRepair(ctx, tx, dr)
-}
-
 // repairable logs a drift and says whether to repair it: a key quarantined, or one that drifted again after a repair
 // (which quarantines it now), is not.
 func repairable(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {

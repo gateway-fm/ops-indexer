@@ -127,14 +127,12 @@ func TestRunningCheckRepairsDriftedCountersOnceThenQuarantines(t *testing.T) {
 	tx, err := d.pool.Begin(ctx)
 	require.NoError(t, err)
 	for _, dr := range found {
-		if dr.Family == "address" {
-			_, err := recordRepair(ctx, tx, dr)
-			require.NoError(t, err)
-			continue
-		}
 		apply, err := repairable(ctx, tx, dr)
 		require.NoError(t, err)
-		if apply {
+		switch {
+		case apply && dr.Family == "address":
+			require.NoError(t, logRepair(ctx, tx, dr))
+		case apply:
 			require.NoError(t, settleRunning(ctx, tx, dr))
 		}
 	}
