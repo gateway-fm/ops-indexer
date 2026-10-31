@@ -1085,10 +1085,8 @@ func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
 	}
 	metrics.ReorgDetected()
 
-	release := holdBalanceEpoch(i.db, i.balanceWorkers)
-	defer release(ctx)
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
-		if err := i.db.DeleteBlock(ctx, blockNum); err != nil {
+		if err := revertBlockHoldingEpoch(ctx, i.db, i.balanceWorkers, blockNum); err != nil {
 			log.Error("failed to delete block", "block", blockNum, "error", err)
 			return err
 		}

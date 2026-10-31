@@ -222,6 +222,12 @@ func keepDailyStatsWatermarkOnStoredBlocks(ctx context.Context, tx pgx.Tx) error
 }
 
 func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
+	return d.DeleteBlockLocked(ctx, number, nil)
+}
+
+// DeleteBlockLocked is DeleteBlock calling locked, when not nil, once the block's transaction holds the daily-stats
+// lock, which it waits for first, and before the revert changes anything.
+func (d *DB) DeleteBlockLocked(ctx context.Context, number uint64, locked func()) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -231,6 +237,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	// The block's day is re-aggregated from its first block on the next advance (migration 012).
 	if _, err := tx.Exec(ctx, `SELECT daily_stats_invalidate($1)`, number); err != nil {
 		return err
+	}
+	if locked != nil {
+		locked()
 	}
 	if err := keepDailyStatsWatermarkOnStoredBlocks(ctx, tx); err != nil {
 		return err

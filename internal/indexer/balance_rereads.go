@@ -37,10 +37,10 @@ func loadBalanceEpoch(ctx context.Context, d Database, pool *BalanceWorkerPool) 
 // epochRetry is the first wait before the reorg epoch is read again after a failed read; it doubles to a minute.
 var epochRetry = time.Second
 
-// holdBalanceEpoch makes the balance pool's new work wait for its stamp for the length of a revert, and returns the
-// release, which reads the revert's epoch, retrying until it is read, and only then lets new work be stamped with
-// it. Work stamped meanwhile with the epoch from before the revert would be dropped for every key the revert touched,
-// for good.
+// holdBalanceEpoch makes the balance pool's new work wait for its stamp for the length of a block's revert, and
+// returns the release, which reads the revert's epoch, retrying until it is read, and only then lets new work be
+// stamped with it. Work stamped meanwhile with the epoch from before the revert would be dropped for every key the
+// revert touched, for good.
 func holdBalanceEpoch(d Database, pool *BalanceWorkerPool) (release func(ctx context.Context)) {
 	store, ok := d.(balanceRereadStore)
 	if !ok || pool == nil {
@@ -68,6 +68,29 @@ func holdBalanceEpoch(d Database, pool *BalanceWorkerPool) (release func(ctx con
 			wait = min(2*wait, time.Minute)
 		}
 	}
+}
+
+// lockedBlockDeleter reverts a block, calling locked once the revert holds the daily-stats lock it waits for first.
+type lockedBlockDeleter interface {
+	DeleteBlockLocked(ctx context.Context, number uint64, locked func()) error
+}
+
+// revertBlockHoldingEpoch reverts one block under holdBalanceEpoch, taken only once the revert holds the daily-stats
+// lock: a day recount or advance can hold that lock for minutes, and new balance work, which every committed block
+// queues, must not wait behind the revert's wait for it.
+func revertBlockHoldingEpoch(ctx context.Context, d Database, pool *BalanceWorkerPool, number uint64) error {
+	deleter, ok := d.(lockedBlockDeleter)
+	if !ok {
+		release := holdBalanceEpoch(d, pool)
+		defer release(ctx)
+		return d.DeleteBlock(ctx, number)
+	}
+	var release func(ctx context.Context)
+	err := deleter.DeleteBlockLocked(ctx, number, func() { release = holdBalanceEpoch(d, pool) })
+	if release != nil {
+		release(ctx)
+	}
+	return err
 }
 
 // balanceRereadInterval is how often the open requests are handed to the balance reads.
