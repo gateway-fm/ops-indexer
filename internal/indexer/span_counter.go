@@ -57,7 +57,7 @@ func (c *spanCounter) publishUnchecked() {
 
 func (i *Indexer) newSpanCounter(rps int) *spanCounter {
 	cfg := *i.config
-	cfg.CountersOnly, cfg.StrictTraces = true, true
+	cfg.CountersOnly, cfg.StrictTraces, cfg.CodeAtBlock = true, true, true
 	cfg.RPCRateLimit, cfg.TraceRateLimit = rps, rps
 	cfg.RPCWorkers, cfg.TraceWorkers = min(cfg.RPCWorkers, 4), min(cfg.TraceWorkers, 4)
 	limiter := rate.NewLimiter(rate.Limit(rps), 1)

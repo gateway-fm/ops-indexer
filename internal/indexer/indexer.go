@@ -52,12 +52,14 @@ type Config struct {
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
 	// CountersOnly builds blocks for their counters alone (the recount of a pruned span): no token metadata or
-	// tokenURI fetches, and a creation is judged by its code at the block (contractCode).
+	// tokenURI fetches.
 	CountersOnly bool
 	// StrictTraces fails a block whose traces are incomplete, a transaction's trace missing or failed, instead of
-	// leaving its internal calls out: for the counts that replace or extend the ledger (the stats backfill and the
-	// recount of a pruned span).
+	// leaving its internal calls out, and CodeAtBlock judges a creation by its code at the block and fails the block
+	// when it cannot (contractCode): for the counts of old blocks that replace or extend the ledger (the stats
+	// backfill and the recount of a pruned span).
 	StrictTraces bool
+	CodeAtBlock  bool
 
 	// NodeRecountRPS bounds the recount of pruned spans from the node; 0 turns it off. VerifyRepair lets it
 	// replace a drifted span's ledger rows.
@@ -1153,7 +1155,8 @@ type builtBlock struct {
 	blockNumber    uint64
 	blockTimestamp uint64
 	tracesErr      error
-	// codeErr is why a recount (CountersOnly) could not decide whether a creation of the block is a contract.
+	// codeErr is why a count of an old block (CodeAtBlock) could not decide whether a creation of the block is a
+	// contract.
 	codeErr error
 }
 
@@ -1168,16 +1171,16 @@ type codeAtReader interface {
 	GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error)
 }
 
-// errContractUndecided: a recount cannot tell whether a creation is a contract.
+// errContractUndecided: a count of an old block cannot tell whether a creation is a contract.
 var errContractUndecided = errors.New("the node does not serve the code at the creation's block, and has none for it at the head")
 
 // contractCode is the code a creation in block is judged by. Ingest reads it at latest, soon after the block, and an
-// error or no code means no contract. A recount (CountersOnly) has to judge an old block as ingest did then: the code
-// after that block where the node keeps its state, else the code at latest when there is some. An error, or no code
-// at latest (never deployed, or destroyed since: the two cannot be told apart), is returned, so the block fails rather
-// than lose the contract.
+// error or no code means no contract. A count of an old block (CodeAtBlock) has to judge it as ingest did then: the
+// code after that block where the node keeps its state, else the code at latest when there is some. An error, or no
+// code at latest (never deployed, or destroyed since: the two cannot be told apart), is returned, so the block fails
+// rather than lose the contract.
 func (i *Indexer) contractCode(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
-	if !i.config.CountersOnly {
+	if !i.config.CodeAtBlock {
 		return i.rpc.GetCode(ctx, address)
 	}
 	if r, ok := i.rpc.(codeAtReader); ok {
@@ -1340,7 +1343,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 		if receipt != nil && rawTx.To == nil && receipt.ContractAddress != (common.Address{}) && receipt.Status != 0 {
 			contractAddr := receipt.ContractAddress.Hex()
 			code, err := i.contractCode(ctx, receipt.ContractAddress, blockNumber)
-			if err != nil && i.config.CountersOnly {
+			if err != nil && i.config.CodeAtBlock {
 				codeErr = errors.Join(codeErr, err)
 			}
 			if err == nil && len(code) > 0 {
@@ -1517,7 +1520,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			for _, it := range internalCreations(internalTxs) {
 				c := contractFromCreation(ctx, func(ctx context.Context, a common.Address) ([]byte, error) {
 					code, err := i.contractCode(ctx, a, blockNumber)
-					if err != nil && i.config.CountersOnly {
+					if err != nil && i.config.CodeAtBlock {
 						codeErr = errors.Join(codeErr, err)
 					}
 					return code, err

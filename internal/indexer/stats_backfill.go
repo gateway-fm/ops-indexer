@@ -62,7 +62,7 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	c := *i.config
 	c.RPCRateLimit, c.TraceRateLimit = cfg.RPS, cfg.RPS
 	c.RPCWorkers, c.TraceWorkers, c.TokenMetadataWorkers = 1, 1, 1
-	c.StrictTraces = true
+	c.StrictTraces, c.CodeAtBlock = true, true
 	limiter := rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1))
 	return &backfiller{
 		idx: &Indexer{db: i.db, rpc: newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers), config: &c,
@@ -113,6 +113,9 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 		built := b.idx.buildBlock(ctx, f.raw, f.receipts)
 		if built.tracesErr != nil {
 			return nil, nil, fmt.Errorf("block %d traces: %w", built.blockNumber, built.tracesErr)
+		}
+		if built.codeErr != nil {
+			return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, built.codeErr)
 		}
 		lo, hi := b.spanOf(built.blockNumber, target)
 		span := out.Spans[lo]

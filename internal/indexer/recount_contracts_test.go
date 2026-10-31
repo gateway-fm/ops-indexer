@@ -96,6 +96,46 @@ func TestARecountJudgesAContractByItsCodeAtTheBlock(t *testing.T) {
 	}
 }
 
+// The stats backfill counts the oldest blocks of the chain and is the only writer of their contracts: it judges a
+// creation as the recount does, and fails the block where the recount would.
+func TestTheBackfillJudgesAContractAsTheRecountDoes(t *testing.T) {
+	code := []byte{0x60, 0x80}
+	for _, c := range []struct {
+		name        string
+		rpc         RPCClient
+		contract    bool
+		undecidable bool
+	}{
+		{"code at the head", &creationChain{latest: code}, true, false},
+		{"destroyed since, code at the block", &archiveChain{creationChain: &creationChain{}, at: code}, true, false},
+		{"never had code, at the block", &archiveChain{creationChain: &creationChain{latest: code}, at: nil}, false, false},
+		{"destroyed since, no old state", &creationChain{}, false, true},
+		{"the code read fails", &creationChain{latestErr: errors.New("429 too many requests")}, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			chain := &fakeChain{MockRPCClient: new(MockRPCClient), head: 20, busy: 20}
+			switch r := c.rpc.(type) {
+			case *creationChain:
+				r.fakeChain = chain
+			case *archiveChain:
+				r.fakeChain = chain
+			}
+			idx := newTestIndexer(new(MockDatabase), c.rpc)
+			out, _, err := idx.newBackfiller(nil, testBackfill).batch(context.Background(), 5, 6, 1_000_000, nil)
+			if c.undecidable {
+				require.Error(t, err, "the block fails rather than count without the contract")
+				return
+			}
+			require.NoError(t, err)
+			counted := false
+			for _, k := range out.Contracts {
+				counted = counted || strings.EqualFold(k.Address, recountCreated.Hex())
+			}
+			require.Equal(t, c.contract, counted)
+		})
+	}
+}
+
 // deferStore is one pruned span [0, 10) to recount; it records what the recount did with it.
 type deferStore struct {
 	deferred []int64
