@@ -107,14 +107,6 @@ func main() {
 	if err := database.EnsureContractsBlockIndex(context.Background()); err != nil {
 		log.Fatal("failed to build the contracts block index", "error", err)
 	}
-	// Built CONCURRENTLY beside ingest and gRPC; the ledger checks and the span rebase wait for them.
-	go func() {
-		for err := database.EnsureLedgerIndexes(context.Background()); err != nil; err = database.EnsureLedgerIndexes(context.Background()) {
-			log.Error("failed to build the ledger indexes; retrying in a minute", "error", err)
-			time.Sleep(time.Minute)
-		}
-	}()
-
 	// Once the history is cut a block above the newest partition cannot be stored: create them before ingest.
 	if head, err := database.GetLatestBlockNumber(context.Background()); err != nil {
 		log.Fatal("failed to read the stored head", "error", err)
@@ -192,7 +184,14 @@ func main() {
 
 	stop := &workerStop{cancel: cancel}
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(6)
+
+	// Built CONCURRENTLY beside ingest and gRPC; the ledger checks and the span rebase wait for them. A shutdown stops
+	// the build, so the pool can close, and the next start replaces the index it left invalid.
+	go func() {
+		defer wg.Done()
+		database.RunLedgerIndexes(ctx, time.Minute)
+	}()
 
 	afterStartWipe := func() bool {
 		select {

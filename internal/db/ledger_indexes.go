@@ -51,6 +51,23 @@ func (d *DB) EnsureLedgerIndexes(ctx context.Context) error {
 	return err
 }
 
+// RunLedgerIndexes builds the ledger indexes, retrying a failed build every retry, until they are built or ctx is
+// done. A build that ctx cancels leaves its index invalid, and the next start replaces it.
+func (d *DB) RunLedgerIndexes(ctx context.Context, retry time.Duration) {
+	for {
+		err := d.EnsureLedgerIndexes(ctx)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		log.Error("failed to build the ledger indexes; retrying", "error", err, "in", retry)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retry):
+		}
+	}
+}
+
 // LedgerIndexesReady reports whether every ledger index exists and is valid.
 func (d *DB) LedgerIndexesReady(ctx context.Context) (bool, error) {
 	names := make([]string, len(ledgerIndexes))

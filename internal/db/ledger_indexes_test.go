@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
@@ -102,4 +104,69 @@ func TestTheLedgerIndexesReadyGaugeFollowsTheIndexes(t *testing.T) {
 	require.Equal(t, float64(0), gauge())
 	require.NoError(t, d.EnsureLedgerIndexes(ctx))
 	require.Equal(t, float64(1), gauge())
+}
+
+// A shutdown during a ledger index build stops it: the build returns, the pool closes at once, and the index the build
+// left invalid is replaced by the next start's.
+func TestAShutdownDuringALedgerIndexBuildClosesThePoolAndTheNextStartRebuildsIt(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	connString := d.pool.Config().ConnString()
+	_, err := d.pool.Exec(ctx, `DROP INDEX ledger_address_address`)
+	require.NoError(t, err)
+
+	writer, err := pgx.Connect(ctx, connString)
+	require.NoError(t, err)
+	defer writer.Close(ctx)
+	held, err := writer.Begin(ctx)
+	require.NoError(t, err)
+	_, err = held.Exec(ctx, `LOCK TABLE ledger_address IN ROW EXCLUSIVE MODE`)
+	require.NoError(t, err, "a writer the concurrent build must wait out")
+
+	runCtx, shutdown := context.WithCancel(ctx)
+	built := make(chan struct{})
+	go func() {
+		defer close(built)
+		d.RunLedgerIndexes(runCtx, time.Minute)
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		require.NoError(t, writer.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_class WHERE relname = 'ledger_address_address')`).
+			Scan(&waiting))
+		return waiting
+	}, 20*time.Second, 50*time.Millisecond, "the build has started and waits for the writer")
+
+	shutdown()
+	select {
+	case <-built:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the build did not return on shutdown")
+	}
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		d.Close()
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pool did not close while the build's writer was still open")
+	}
+
+	var valid bool
+	require.NoError(t, held.QueryRow(ctx, `
+		SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'ledger_address_address'`).
+		Scan(&valid))
+	require.False(t, valid, "the stopped build left its index invalid")
+	require.NoError(t, held.Rollback(ctx))
+
+	pool, err := pgxpool.New(ctx, connString)
+	require.NoError(t, err)
+	defer pool.Close()
+	next := &DB{pool: pool}
+	require.NoError(t, next.EnsureLedgerIndexes(ctx))
+	ready, err := next.LedgerIndexesReady(ctx)
+	require.NoError(t, err)
+	require.True(t, ready, "the next start replaces the invalid index")
 }
