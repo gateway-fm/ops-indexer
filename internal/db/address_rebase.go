@@ -171,40 +171,92 @@ func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []st
 	})
 }
 
-// revertedSinceRead locks the batch's rows in byte order and returns the addresses a revert has recorded since the
-// read (a ledger_reverted_address version the read did not see). A revert subtracts its block from the row and from
-// the truth, but its subtraction stops at zero and it moves first_seen and last_seen, so a correction read before it
-// can overshoot; those rows are counted again under their locks, and a row missing at the read is not created from
-// them. A revert still in progress holds the rows, so the lock waits for it and the versions read after it are its.
-func revertedSinceRead(ctx context.Context, tx pgx.Tx, read []rebaseRow) (map[string]bool, error) {
+// creates is whether the batch creates v's row, as far as the read can tell: a revert since it can still call it off.
+func (v rebaseRow) creates() bool {
+	return !v.present && v.seen && v.creatable && v.differs()
+}
+
+// lockBatchRows takes the batch's rows one by one in byte order, ingest's order: a row present at the read is locked,
+// and a row the batch is to create is inserted empty, or locked where ingest created it since, so the batch never takes
+// a row after a higher one. It returns the addresses whose empty row it inserted. read is in byte order.
+func lockBatchRows(ctx context.Context, tx pgx.Tx, read []rebaseRow) (map[string]bool, error) {
+	locks := &pgx.Batch{}
+	var inserts []string
+	for _, v := range read {
+		switch {
+		case v.present:
+			locks.Queue(`SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, v.address)
+		case v.creates():
+			locks.Queue(`
+				INSERT INTO address_stats AS s (address, tx_count, sent_count, internal_tx_count, token_transfer_count,
+					is_contract, updated_at)
+				VALUES ($1, 0, 0, 0, 0, EXISTS (SELECT 1 FROM contracts c WHERE c.address = $1), NOW())
+				ON CONFLICT (address) DO UPDATE SET address = s.address
+				RETURNING (xmax = 0)`, v.address)
+			inserts = append(inserts, v.address)
+		}
+	}
+	inserted := map[string]bool{}
+	if locks.Len() == 0 {
+		return inserted, nil
+	}
+	results := tx.SendBatch(ctx, locks)
+	next := 0
+	for _, v := range read {
+		switch {
+		case v.present:
+			if _, err := results.Exec(); err != nil {
+				_ = results.Close()
+				return nil, err
+			}
+		case v.creates():
+			var fresh bool
+			if err := results.QueryRow().Scan(&fresh); err != nil {
+				_ = results.Close()
+				return nil, err
+			}
+			inserted[inserts[next]] = fresh
+			next++
+		}
+	}
+	return inserted, results.Close()
+}
+
+// revertedSinceRead takes the batch's rows (lockBatchRows) and returns the addresses a revert has recorded since the
+// read (a ledger_reverted_address version the read did not see), and those whose empty row it inserted. A revert
+// subtracts its block from the row and from the truth, but its subtraction stops at zero and it moves first_seen and
+// last_seen, so a correction read before it can overshoot; those rows are counted again under their locks, and a row
+// missing at the read is not created from them. A revert still in progress holds the rows, so the lock waits for it
+// and the versions read after it are its.
+func revertedSinceRead(ctx context.Context, tx pgx.Tx, read []rebaseRow) (stale, inserted map[string]bool, err error) {
 	addresses := make([]string, len(read))
 	seen := make(map[string]*string, len(read))
 	for i, v := range read {
 		addresses[i] = v.address
 		seen[v.address] = v.reverted
 	}
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM address_stats WHERE address = ANY($1) ORDER BY address FOR UPDATE`, addresses); err != nil {
-		return nil, err
+	if inserted, err = lockBatchRows(ctx, tx, read); err != nil {
+		return nil, nil, err
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT a, (SELECT r.xmin::TEXT FROM ledger_reverted_address r WHERE r.address = a)
 		FROM unnest($1::TEXT[]) a`, addresses)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	stale := map[string]bool{}
+	stale = map[string]bool{}
 	for rows.Next() {
 		var address string
 		var version *string
 		if err := rows.Scan(&address, &version); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if version != nil && (seen[address] == nil || *seen[address] != *version) {
 			stale[address] = true
 		}
 	}
-	return stale, rows.Err()
+	return stale, inserted, rows.Err()
 }
 
 // applyRebaseRows applies the corrections of rows read in one snapshot, in one transaction, taking the rows in byte
@@ -212,7 +264,7 @@ func revertedSinceRead(ctx context.Context, tx pgx.Tx, read []rebaseRow) (map[st
 func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after func(ctx context.Context, tx pgx.Tx) error) (RebaseResult, error) {
 	var r RebaseResult
 	sort.Slice(read, func(i, j int) bool { return read[i].address < read[j].address })
-	stale, err := revertedSinceRead(ctx, tx, read)
+	stale, inserted, err := revertedSinceRead(ctx, tx, read)
 	if err != nil {
 		return r, err
 	}
@@ -272,7 +324,18 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 					updated_at = NOW()
 				WHERE address = $1`, v.address, v.wantTxs-v.txs, v.wantSent-v.sent, v.wantInternal-v.internal,
 				v.wantTransf-v.transfers, v.firstSeen, v.wantFirst, v.lastSeen, v.wantLast)
-		case !v.present && v.seen && v.creatable && v.differs() && !stale[v.address]:
+		case v.creates() && stale[v.address]:
+			if inserted[v.address] {
+				writes.Queue(`DELETE FROM address_stats WHERE address = $1`, v.address)
+				kinds = append(kinds, rebaseCorrect)
+			}
+			continue
+		case v.creates():
+			// Its row is there by now, the empty one lockBatchRows inserted or one ingest created since the read: the
+			// correction is added to it.
+			if inserted[v.address] {
+				r.Created++
+			}
 			kinds = append(kinds, rebaseCreate)
 			writes.Queue(`
 				INSERT INTO address_stats AS s (address, tx_count, sent_count, internal_tx_count, token_transfer_count,
