@@ -181,7 +181,9 @@ func folded(a, b BalanceWork) BalanceWork {
 	return a
 }
 
-// QueueWork returns false if the queue is full (non-blocking).
+// QueueWork does not wait for room: it returns false if the queue is full. It does wait while a block's revert holds
+// the epoch (stamped), so that the work carries the revert's epoch; the other queueing calls wait there too, whatever
+// their context or grace.
 func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
 	p.sendMu.RLock()
 	defer p.sendMu.RUnlock()
