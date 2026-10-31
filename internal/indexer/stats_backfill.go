@@ -66,7 +66,7 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	limiter := rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1))
 	return &backfiller{
 		idx: &Indexer{db: i.db, rpc: newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers), config: &c,
-			tokenCache: i.tokenCache, contractCache: i.contractCache, tracingSupported: i.tracingSupported},
+			tokenCache: i.tokenCache, contractCache: i.contractCache, tracingSupported: i.tracesOldBlocks()},
 		store: store, cfg: cfg, limiter: limiter,
 	}
 }

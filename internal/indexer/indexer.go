@@ -124,7 +124,9 @@ type Indexer struct {
 	balanceWorkers *BalanceWorkerPool
 
 	tracingSupported bool
-	eventBus         *events.Bus
+	// tracingUnknown: tracing is configured, but the start could not check that the node traces.
+	tracingUnknown bool
+	eventBus       *events.Bus
 
 	missingRangeCollector *MissingRangeCollector
 
@@ -435,18 +437,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 		log.Info("loaded tokens into cache", "count", i.tokenCache.Size())
 	}
 
-	if i.config.EnableTracing {
-		supported, err := i.rpc.CheckTracingSupport(ctx)
-		if err != nil {
-			log.Warn("failed to check tracing support", "error", err)
-		} else if supported {
-			i.tracingSupported = true
-			log.Info("tracing enabled: node supports debug_traceBlockByNumber")
-		} else {
-			log.Warn("tracing requested but node does not support it, disabling")
-			i.tracingSupported = false
-		}
-	}
+	i.probeTracing(ctx)
 
 	if i.balanceWorkers != nil {
 		i.balanceWorkers.Start()
@@ -591,6 +582,49 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 // newCatchupIndexer and newRealtimeIndexer build the sub-indexers with the
 // state they share with this one, including the daily-stats throttle.
+// tracingProbes and tracingProbeRetry bound the start's check of the node's tracing support.
+var (
+	tracingProbes     = 3
+	tracingProbeRetry = 5 * time.Second
+)
+
+// probeTracing checks that the node traces, when tracing is configured, retrying a check that fails. A check that
+// keeps failing is not an answer: ingest goes on without traces, as for a node that does not trace, but the counts that
+// replace or extend the ledger fetch traces anyway and fail a block they cannot trace (tracingUnknown).
+func (i *Indexer) probeTracing(ctx context.Context) {
+	if !i.config.EnableTracing {
+		return
+	}
+	for n := 1; ; n++ {
+		supported, err := i.rpc.CheckTracingSupport(ctx)
+		switch {
+		case err == nil && supported:
+			i.tracingSupported = true
+			log.Info("tracing enabled: node supports debug_traceBlockByNumber")
+			return
+		case err == nil:
+			log.Warn("tracing requested but node does not support it, disabling")
+			return
+		case n >= tracingProbes || ctx.Err() != nil:
+			i.tracingUnknown = true
+			log.Error("could not check the node's tracing support; ingest runs without traces, the stats backfill and the "+
+				"node recount fetch them and fail a block they cannot trace", "error", err, "attempts", n)
+			return
+		}
+		log.Warn("failed to check tracing support; retrying", "error", err, "attempt", n)
+		select {
+		case <-ctx.Done():
+		case <-time.After(tracingProbeRetry):
+		}
+	}
+}
+
+// tracesOldBlocks is whether the counts of old blocks that replace or extend the ledger fetch traces: unless the node
+// answered that it does not trace, so that a failed check never counts a block without its internal calls.
+func (i *Indexer) tracesOldBlocks() bool {
+	return i.tracingSupported || i.tracingUnknown
+}
+
 func (i *Indexer) newCatchupIndexer(cfg *CatchupConfig) *CatchupIndexer {
 	c := NewCatchupIndexer(
 		i.db, i.rpc, cfg, i.config,

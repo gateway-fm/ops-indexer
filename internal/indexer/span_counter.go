@@ -63,7 +63,7 @@ func (i *Indexer) newSpanCounter(rps int) *spanCounter {
 	limiter := rate.NewLimiter(rate.Limit(rps), 1)
 	return &spanCounter{
 		idx: &Indexer{db: i.db, rpc: newLimitedRPC(i.rpc, limiter, rps, 1), config: &cfg, tokenCache: i.tokenCache,
-			contractCache: i.contractCache, tracingSupported: i.tracingSupported},
+			contractCache: i.contractCache, tracingSupported: i.tracesOldBlocks()},
 		limiter: limiter,
 		retry:   time.Second,
 	}
