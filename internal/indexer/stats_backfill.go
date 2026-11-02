@@ -45,7 +45,9 @@ type StatsBackfillConfig struct {
 }
 
 // strictBlockTries is how many times in a row the backfill fails a block it cannot count whole (a trace or a contract's
-// code the node does not serve) before it counts the block without what failed, as ingest would have.
+// code the node does not serve) before it counts the block without what failed, as ingest would have: without the
+// traces, and a creation it cannot judge as no contract. Every other creation is still judged by its code at the
+// block.
 var strictBlockTries = 30
 
 // backfiller counts [0, START_BLOCK) from the node with the head path's block builder and writes only counters,
@@ -83,7 +85,7 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	c.RPCWorkers, c.TraceWorkers, c.TokenMetadataWorkers = 1, 1, 1
 	c.StrictTraces, c.CodeAtBlock = true, true
 	lc := c
-	lc.StrictTraces, lc.CodeAtBlock = false, false
+	lc.StrictTraces = false
 	limiter := rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1))
 	node := newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers)
 	return &backfiller{
@@ -151,11 +153,15 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 			if !b.givesUp(built.blockNumber) {
 				return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, err)
 			}
+			lenient := b.lenient.buildBlock(ctx, f.raw, f.receipts)
+			if !undecidedOnly(lenient.codeErr) {
+				return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, lenient.codeErr)
+			}
 			log.Error("stats backfill: a block failed on every try; counted without what failed, as ingest would have",
 				"block", built.blockNumber, "tries", strictBlockTries, "error", err,
 				"metric", "indexer_stats_backfill_lenient_blocks_total")
 			metrics.StatsBackfillLenientBlock()
-			built = b.lenient.buildBlock(ctx, f.raw, f.receipts)
+			built = lenient
 		}
 		b.retrying.built = append(b.retrying.built, built)
 		if err := addBlock(out, built, b.spanOf, target, &prevTs, &discovered); err != nil {
@@ -184,6 +190,20 @@ func addBlock(out *db.BackfillBatch, built *builtBlock, spanOf func(n, target ui
 	*prevTs = &ts
 	*discovered = append(*discovered, built.discovered...)
 	return nil
+}
+
+// undecidedOnly is whether every error in err is a creation the node cannot judge, which ingest counts as no contract.
+func undecidedOnly(err error) bool {
+	j, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return err == nil || errors.Is(err, errContractUndecided)
+	}
+	for _, e := range j.Unwrap() {
+		if !undecidedOnly(e) {
+			return false
+		}
+	}
+	return true
 }
 
 // givesUp records that block failed, and is whether it has now failed strictBlockTries times in a row.
