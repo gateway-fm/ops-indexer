@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -197,7 +198,7 @@ func TestATraceFetchSkippingRefusalsFailsOnAnythingElse(t *testing.T) {
 // heavyTraceServer traces transaction A whole and B, a heavy transaction on cold state, only when the request gives
 // the tracer a timeout: under the node's default it answers B with "execution timeout". It records the timeouts it
 // was sent.
-func heavyTraceServer(t *testing.T, blockTraced bool, timeouts *[]string) *httptest.Server {
+func heavyTraceServer(t *testing.T, blockTraced bool, timeouts *sentTimeouts) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -212,7 +213,7 @@ func heavyTraceServer(t *testing.T, blockTraced bool, timeouts *[]string) *httpt
 			Timeout string `json:"timeout"`
 		}
 		require.NoError(t, json.Unmarshal(req.Params[1], &cfg))
-		*timeouts = append(*timeouts, cfg.Timeout)
+		timeouts.add(cfg.Timeout)
 		b := traceFrameWithACall
 		if cfg.Timeout == "" {
 			b = ""
@@ -235,14 +236,35 @@ func heavyTraceServer(t *testing.T, blockTraced bool, timeouts *[]string) *httpt
 	}))
 }
 
+// sentTimeouts are the tracer timeouts a server was sent, from its concurrent handlers.
+type sentTimeouts struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (s *sentTimeouts) add(timeout string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, timeout)
+}
+
+// take returns the timeouts sent since the last take.
+func (s *sentTimeouts) take() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sent := s.sent
+	s.sent = nil
+	return sent
+}
+
 // The counts of old blocks give the tracer a timeout well above a node's default (5 s on geth), which a heavy
 // transaction on cold state exceeds: such a count retries a failed block rather than leave it out, so under the
 // default it would fail that block on every try. Ingest's fetch keeps the node's default.
 func TestTheCountsOfOldBlocksGiveTheTracerATimeout(t *testing.T) {
 	for _, blockTraced := range []bool{true, false} {
 		t.Run(fmt.Sprintf("block=%v", blockTraced), func(t *testing.T) {
-			var timeouts []string
-			srv := heavyTraceServer(t, blockTraced, &timeouts)
+			timeouts := &sentTimeouts{}
+			srv := heavyTraceServer(t, blockTraced, timeouts)
 			defer srv.Close()
 			c, err := New(srv.URL)
 			require.NoError(t, err)
@@ -252,20 +274,23 @@ func TestTheCountsOfOldBlocksGiveTheTracerATimeout(t *testing.T) {
 			for name, fetch := range map[string]func(context.Context, []common.Hash, uint64, uint64, int, int) ([]*explorerTypes.InternalTransaction, error){
 				"strict": c.FetchTracesBatchStrict, "skipping refusals": c.FetchTracesBatchSkippingRefusals,
 			} {
-				timeouts = nil
+				timeouts.take()
 				got, err := fetch(ctx, txs, 7, 1700000000, 2, 100)
 				require.NoError(t, err, name)
 				require.Len(t, got, 2, "%s: A's and B's internal calls", name)
-				require.NotEmpty(t, timeouts, name)
-				for _, timeout := range timeouts {
+				sent := timeouts.take()
+				require.NotEmpty(t, sent, name)
+				for _, timeout := range sent {
 					require.NotEmpty(t, timeout, "%s: every trace call gives the tracer a timeout", name)
 				}
 			}
 
-			timeouts = nil
+			timeouts.take()
 			_, err = c.FetchTracesBatch(ctx, txs, 7, 1700000000, 2, 100)
 			require.NoError(t, err)
-			for _, timeout := range timeouts {
+			sent := timeouts.take()
+			require.NotEmpty(t, sent, "ingest's fetch traced")
+			for _, timeout := range sent {
 				require.Empty(t, timeout, "ingest keeps the node's default")
 			}
 		})
