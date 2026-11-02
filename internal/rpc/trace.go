@@ -36,7 +36,15 @@ type CallFrame struct {
 
 type TraceConfig struct {
 	Tracer string `json:"tracer"`
+	// Timeout is the tracer's limit per transaction, as a Go duration; empty is the node's default (5 s on geth).
+	Timeout string `json:"timeout,omitempty"`
 }
+
+// countTraceTimeout is the tracer timeout of the trace fetches for counts of old blocks. Under a node's default a
+// heavy transaction on cold state times out, and such a count retries a block that failed rather than leave its
+// traces out, so it would fail that block on every try. It stays under the client's 60 s call timeout, so the node
+// answers before the call is cut.
+const countTraceTimeout = "50s"
 
 // TraceBlockResult is one transaction's entry in a block trace. A node reports a transaction whose own trace failed
 // with an error and no result.
@@ -135,11 +143,15 @@ func TracingAbsent(err error) bool {
 }
 
 func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string]TraceBlockResult, error) {
+	return c.traceBlock(ctx, blockNumber, &TraceConfig{Tracer: "callTracer"})
+}
+
+func (c *Client) traceBlock(ctx context.Context, blockNumber uint64, cfg *TraceConfig) (map[string]TraceBlockResult, error) {
 	blockHex := fmt.Sprintf("0x%x", blockNumber)
 
 	var results []TraceBlockResult
 
-	err := c.raw.CallContext(ctx, &results, "debug_traceBlockByNumber", blockHex, &TraceConfig{Tracer: "callTracer"})
+	err := c.raw.CallContext(ctx, &results, "debug_traceBlockByNumber", blockHex, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("debug_traceBlockByNumber failed: %w", err)
 	}
@@ -154,9 +166,13 @@ func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string
 
 // TraceTransaction fails on a null or empty result: a node that answers so has no trace of the transaction.
 func (c *Client) TraceTransaction(ctx context.Context, txHash common.Hash) (*CallFrame, error) {
+	return c.traceTransaction(ctx, txHash, &TraceConfig{Tracer: "callTracer"})
+}
+
+func (c *Client) traceTransaction(ctx context.Context, txHash common.Hash, cfg *TraceConfig) (*CallFrame, error) {
 	var result *CallFrame
 
-	err := c.raw.CallContext(ctx, &result, "debug_traceTransaction", txHash.Hex(), &TraceConfig{Tracer: "callTracer"})
+	err := c.raw.CallContext(ctx, &result, "debug_traceTransaction", txHash.Hex(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("debug_traceTransaction failed: %w", err)
 	}
@@ -295,7 +311,11 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 		return nil, nil
 	}
 
-	blockTraces, err := c.TraceBlock(ctx, blockNumber)
+	cfg := &TraceConfig{Tracer: "callTracer"}
+	if mode != skipFailures {
+		cfg.Timeout = countTraceTimeout
+	}
+	blockTraces, err := c.traceBlock(ctx, blockNumber, cfg)
 	if err == nil && len(blockTraces) > 0 {
 		var allInternalTxs []*explorerTypes.InternalTransaction
 		ts := timestamp
@@ -340,7 +360,7 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 				return nil // Don't fail the whole batch
 			}
 
-			frame, err := c.TraceTransaction(ctx, hash)
+			frame, err := c.traceTransaction(ctx, hash, cfg)
 			if err != nil {
 				if mode.fails(err) {
 					return fmt.Errorf("trace of transaction %s: %w", hash.Hex(), err)

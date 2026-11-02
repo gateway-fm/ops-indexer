@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	explorerTypes "github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 )
 
@@ -189,6 +190,84 @@ func TestATraceFetchSkippingRefusalsFailsOnAnythingElse(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Len(t, got, 1, "A's internal call, B's left out")
+		})
+	}
+}
+
+// heavyTraceServer traces transaction A whole and B, a heavy transaction on cold state, only when the request gives
+// the tracer a timeout: under the node's default it answers B with "execution timeout". It records the timeouts it
+// was sent.
+func heavyTraceServer(t *testing.T, blockTraced bool, timeouts *[]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		var tx string
+		require.NoError(t, json.Unmarshal(req.Params[0], &tx))
+		var cfg struct {
+			Timeout string `json:"timeout"`
+		}
+		require.NoError(t, json.Unmarshal(req.Params[1], &cfg))
+		*timeouts = append(*timeouts, cfg.Timeout)
+		b := traceFrameWithACall
+		if cfg.Timeout == "" {
+			b = ""
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case req.Method == "debug_traceBlockByNumber" && blockTraced && b == "":
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":[{"txHash":%q,"result":%s},{"txHash":%q,"error":"execution timeout"}]}`,
+				req.ID, traceTxA.Hex(), traceFrameWithACall, traceTxB.Hex())
+		case req.Method == "debug_traceBlockByNumber" && blockTraced:
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":[{"txHash":%q,"result":%s},{"txHash":%q,"result":%s}]}`,
+				req.ID, traceTxA.Hex(), traceFrameWithACall, traceTxB.Hex(), b)
+		case req.Method == "debug_traceBlockByNumber":
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"not available"}}`, req.ID)
+		case tx == traceTxA.Hex() || b != "":
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, req.ID, traceFrameWithACall)
+		default:
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"execution timeout"}}`, req.ID)
+		}
+	}))
+}
+
+// The counts of old blocks give the tracer a timeout well above a node's default (5 s on geth), which a heavy
+// transaction on cold state exceeds: such a count retries a failed block rather than leave it out, so under the
+// default it would fail that block on every try. Ingest's fetch keeps the node's default.
+func TestTheCountsOfOldBlocksGiveTheTracerATimeout(t *testing.T) {
+	for _, blockTraced := range []bool{true, false} {
+		t.Run(fmt.Sprintf("block=%v", blockTraced), func(t *testing.T) {
+			var timeouts []string
+			srv := heavyTraceServer(t, blockTraced, &timeouts)
+			defer srv.Close()
+			c, err := New(srv.URL)
+			require.NoError(t, err)
+			ctx := context.Background()
+			txs := []common.Hash{traceTxA, traceTxB}
+
+			for name, fetch := range map[string]func(context.Context, []common.Hash, uint64, uint64, int, int) ([]*explorerTypes.InternalTransaction, error){
+				"strict": c.FetchTracesBatchStrict, "skipping refusals": c.FetchTracesBatchSkippingRefusals,
+			} {
+				timeouts = nil
+				got, err := fetch(ctx, txs, 7, 1700000000, 2, 100)
+				require.NoError(t, err, name)
+				require.Len(t, got, 2, "%s: A's and B's internal calls", name)
+				require.NotEmpty(t, timeouts, name)
+				for _, timeout := range timeouts {
+					require.NotEmpty(t, timeout, "%s: every trace call gives the tracer a timeout", name)
+				}
+			}
+
+			timeouts = nil
+			_, err = c.FetchTracesBatch(ctx, txs, 7, 1700000000, 2, 100)
+			require.NoError(t, err)
+			for _, timeout := range timeouts {
+				require.Empty(t, timeout, "ingest keeps the node's default")
+			}
 		})
 	}
 }
