@@ -118,7 +118,7 @@ SELECT (SELECT row(tx_count, sent_count, internal_tx_count, token_transfer_count
 |---|---|---|
 | `LEDGER_SPAN_BLOCKS` | 100000 | Span size (grid). |
 | `LEDGER_CLOSE_INTERVAL` | 10s | One span closed per interval. |
-| `LEDGER_WORK_MEM` | 512MB | work_mem of the transaction that closes or recounts a span, so its per-address grouping stays in memory. One backend, no parallel workers: at most about 2.5 GB (two hash nodes at 2 × work_mem, one sort), far less in practice. |
+| `LEDGER_WORK_MEM` | 512MB | work_mem of the transaction that closes or recounts a span, so its per-address grouping stays in memory, on one backend with no parallel workers. work_mem bounds each sort or hash of that backend, not the backend: it is not a memory cap. Budget Postgres for shared_buffers, plus ingest's backends (about 1.3 GiB at 3,000 tx/s), plus up to about 3.5 GiB for each close or recount that runs at once at 512MB. Those were measured on one host at one load and are not a bound: one close at 3,000 tx/s peaked at 5–6.6 GiB of Postgres memory in all, and back-to-back closes after a catch-up had a Postgres with an 8 GiB limit OOM-killed. |
 | `LEDGER_MAX_HEAD_LAG_BLOCKS` | 0 (off) | The closer skips its interval while ingest is more than this many blocks behind the node. A span already being closed finishes. |
 | `LEDGER_COMPACT_SPANS` | 0 (off) | When 2 or more: per interval, that many consecutive pruned spans the `node` check verified are merged into one. Totals do not move; per-address rows shrink where an address is active in several of them; the merged span is recounted from the node over its larger range. |
 | `VERIFY_RECOUNT_INTERVAL` | 1m | One retained span and one address bucket per interval (`recount`, `running`). |
@@ -146,7 +146,8 @@ restore the backup taken before the upgrade.
 
 The `node` check and the stats backfill count old blocks, and need an archive node with tracing for them: the traces
 and the code at a creation's block need the block's state. With `ENABLE_TRACING`, the backfill traces block 1 when it
-is prepared, and again at every start while blocks remain to count, and a node that answers without the state (such as `historical state is not available`) fails the
+is prepared, and again at every start while blocks remain to count, as its counts trace an old block (with their 50 s
+tracer timeout), and a node that answers without the state (such as `historical state is not available`) fails the
 start with that error, rather than a backfill that could count no block; a node with no tracing at all is counted
 without internal transactions, as ingest counts it. A single block the backfill cannot count whole (a trace or a
 contract's code the node fails to serve) is retried, and after 30 failures in a row counted without what failed, as
