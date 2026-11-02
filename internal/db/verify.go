@@ -176,6 +176,11 @@ func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool, workMem strin
 			if retainedRecountStagedHook != nil {
 				retainedRecountStagedHook(c.Lo)
 			}
+			// The rebase lock before the span's row: a span rebase holds it while it marks spans rebased, and a
+			// settlement that corrects the ledger must not land between a rebase batch's read and its write.
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, 1)`, rebaseLock); err != nil {
+				return err
+			}
 			// The span's row, locked: a compaction that merged it since the snapshot makes this a serialization failure
 			// and the recount starts over; one that comes later waits for this settle.
 			var hi int64
@@ -226,10 +231,43 @@ func settleSpan(ctx context.Context, tx pgx.Tx, c *SpanCheck, repair bool) error
 		log.Warn("ledger: span drifted", "lo", c.Lo, "hi", c.Hi, "family", dr.Family, "key", dr.Key, "counter", dr.Counter,
 			"stored", deref(dr.Stored), "recount", deref(dr.Recount))
 	}
+	var prior string
+	if err := tx.QueryRow(ctx, `SELECT check_state FROM ledger_spans WHERE lo = $1`, c.Lo).Scan(&prior); err != nil {
+		return err
+	}
 	if err := tx.QueryRow(ctx, `SELECT ledger_span_settle($1, $2)`, c.Lo, repair).Scan(&c.Drifted); err != nil {
 		return err
 	}
+	if c.Drifted > 0 && repair && prior != "repaired" && prior != "quarantined" {
+		if err := truthMoved(ctx, tx, c.Lo, drifts); err != nil {
+			return err
+		}
+	}
 	return tx.QueryRow(ctx, `SELECT check_state FROM ledger_spans WHERE lo = $1`, c.Lo).Scan(&c.State)
+}
+
+// truthMoved records what a settlement that corrected span lo's ledger rows changed for the running counters: its
+// repairs are dated now, under the rebase lock its caller holds, so the running check tells a key whose truth moved
+// since its last repair from one that drifted again (repairable); and each address whose rows it changed is recorded
+// as a revert records one, so a rebase batch that read it before counts it again under its row lock, and the next span
+// rebase sets it.
+func truthMoved(ctx context.Context, tx pgx.Tx, lo int64, drifts []Drift) error {
+	if _, err := tx.Exec(ctx, `UPDATE ledger_repairs SET at = clock_timestamp() WHERE lo = $1 AND at = now()`, lo); err != nil {
+		return err
+	}
+	var addresses []string
+	for _, dr := range drifts {
+		if dr.Family == "address" && !slices.Contains(addresses, dr.Key) {
+			addresses = append(addresses, dr.Key)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO ledger_reverted_address (address) SELECT a FROM unnest($1::TEXT[]) a ORDER BY a COLLATE "C"
+		ON CONFLICT (address) DO UPDATE SET address = EXCLUDED.address`, addresses)
+	return err
 }
 
 func collectDrifts(ctx context.Context, tx pgx.Tx, sql string, args ...any) ([]Drift, error) {
@@ -302,6 +340,13 @@ func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
 	byAddress := map[string][]Drift{}
 	var addresses []string
 	if err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		// A chain or token counter is repaired to the truth it reads, and dated, under the rebase lock, before any
+		// row: a settlement of the ledger lands wholly before or after it (truthMoved).
+		if slices.ContainsFunc(drifts, func(dr Drift) bool { return dr.Family != "address" }) {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, 1)`, rebaseLock); err != nil {
+				return err
+			}
+		}
 		for _, dr := range drifts {
 			repair, err := repairable(ctx, tx, dr)
 			if err != nil || !repair {
@@ -341,14 +386,17 @@ func (d *DB) repairDrifts(ctx context.Context, drifts []Drift) error {
 }
 
 // repairable logs a drift and says whether to repair it: a key quarantined, or one that drifted again after a repair
-// (which quarantines it now), is not.
+// (which quarantines it now), is not. A key whose closed ledger rows a settlement corrected since its last repair did
+// not drift again: its truth moved, and it is repaired again.
 func repairable(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
 	log.Warn("ledger: running counter drifted", "family", dr.Family, "key", dr.Key, "counter", dr.Counter,
 		"running", deref(dr.Stored), "expected", deref(dr.Recount))
 	var quarantined, repairedBefore bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM ledger_quarantine WHERE family = $1 AND key = $2),
-		       EXISTS (SELECT 1 FROM ledger_repairs WHERE lo IS NULL AND family = $1 AND key = $2 AND counter = $3)`,
+		       EXISTS (SELECT 1 FROM ledger_repairs r WHERE r.lo IS NULL AND r.family = $1 AND r.key = $2 AND r.counter = $3
+		               AND r.at > COALESCE((SELECT max(s.at) FROM ledger_repairs s
+		                                    WHERE s.lo IS NOT NULL AND s.family = $1 AND s.key = $2), '-infinity'))`,
 		dr.Family, dr.Key, dr.Counter).Scan(&quarantined, &repairedBefore); err != nil {
 		return false, err
 	}
@@ -363,9 +411,12 @@ func repairable(ctx context.Context, tx pgx.Tx, dr Drift) (bool, error) {
 	return true, nil
 }
 
+// logRepair puts a running counter's repair on record, dated when it is made under the rebase lock, so that a
+// settlement of the ledger (truthMoved) dates after it exactly when it came after it.
 func logRepair(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO ledger_repairs (family, key, counter, stored, repaired) VALUES ($1, $2, $3, $4::NUMERIC, $5::NUMERIC)`,
+		INSERT INTO ledger_repairs (at, family, key, counter, stored, repaired)
+		VALUES (clock_timestamp(), $1, $2, $3, $4::NUMERIC, $5::NUMERIC)`,
 		dr.Family, dr.Key, dr.Counter, dr.Stored, dr.Recount)
 	return err
 }

@@ -115,6 +115,11 @@ func (d *DB) SettleNodeSpan(ctx context.Context, lo, hi int64, s *SpanTotals, re
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4672, 1)`); err != nil {
 			return err
 		}
+		// The rebase lock before any span row (truthMoved): a settlement that corrects the ledger must not land between
+		// a rebase batch's read and its write.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, 1)`, rebaseLock); err != nil {
+			return err
+		}
 		var same bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ledger_spans WHERE lo = $1 AND hi = $2)`,
 			lo, hi).Scan(&same); err != nil {
