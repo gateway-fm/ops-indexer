@@ -43,6 +43,17 @@ $f$;
 
 ---- create above / drop below ----
 
+-- Each down runs in its own transaction, so a rollback past an unfinished stats backfill is refused here, at the
+-- newest migration's down, before any down drops what the backfill needs (028's down repeats the check). A newer
+-- migration takes this guard into its own down.
+DO $guard$
+BEGIN
+    IF EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NULL) THEN
+        RAISE EXCEPTION 'schema rollback: the stats backfill has not finished (stats_backfill.completed_at is NULL), and the downs would drop its state, its span in progress and its balance keys. Let the backfill finish on this release and roll back then, or restore the pre-upgrade backup.';
+    END IF;
+END
+$guard$;
+
 CREATE OR REPLACE FUNCTION ledger_running_diff_address(bucket INT)
 RETURNS TABLE (family TEXT, key TEXT, counter TEXT, running NUMERIC, expected NUMERIC) LANGUAGE sql STABLE AS $f$
     WITH open_rows AS (

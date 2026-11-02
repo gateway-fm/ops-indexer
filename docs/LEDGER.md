@@ -139,10 +139,10 @@ the backfill has written its days, which it counts from the blocks stored from `
 waits until daily_stats has started (on a day after `START_BLOCK`'s) and catch-up has stored every block from
 `START_BLOCK` to daily_stats' first, and logs that once.
 
-A schema rollback below migration 028 (to a release before the stats backfill) is refused while the backfill has not
-finished (`stats_incomplete` true): 028's down would drop the backfill's state, its span in progress and its balance
-keys, and the earlier schema would count without them. Let the backfill finish on this release and roll back then, or
-restore the backup taken before the upgrade.
+A schema rollback of this release is refused while the stats backfill has not finished (`stats_incomplete` true),
+at the newest migration's down, before any down has run: the downs would drop the backfill's state, its span in
+progress and its balance keys (028) and the tables it writes its days to, and the earlier schema would count without
+them. Let the backfill finish on this release and roll back then, or restore the backup taken before the upgrade.
 
 The `node` check and the stats backfill count old blocks, and need an archive node with tracing for them: the traces
 and the code at a creation's block need the block's state. With `ENABLE_TRACING`, the backfill traces block 1 when it

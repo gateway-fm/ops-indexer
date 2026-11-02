@@ -14,7 +14,7 @@ func TestMigration030DownRelabelsMergedSpans(t *testing.T) {
 	ctx := context.Background()
 	migrateTo(t, pool, -1)
 	_, err := pool.Exec(ctx, `
-		INSERT INTO stats_backfill (id, target, through) VALUES (1, 199, 199);
+		INSERT INTO stats_backfill (id, target, through, completed_at) VALUES (1, 199, 199, now());
 		INSERT INTO ledger_spans (lo, hi, source) VALUES (0, 200, 'merged'), (200, 400, 'merged'), (400, 500, 'rows')`)
 	require.NoError(t, err)
 	migrateTo(t, pool, 29)
