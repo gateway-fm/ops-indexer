@@ -8,6 +8,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// balanceRevertLock is the advisory lock a balance revert holds exclusively from before it reads its block's keys to
+// its commit, and every balance history write (InsertBalancesBatch) holds shared from before its key locks to its
+// commit.
+const balanceRevertLock = 4675
+
 // balanceKey is one (token, holder) pair, both lower-case.
 type balanceKey struct {
 	token, address string
@@ -41,6 +46,11 @@ type revertedBalances struct {
 // without history) writes below START_BLOCK. A new writer of current rows without history at the head breaks this.
 func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBalances, error) {
 	out := revertedBalances{holderDelta: map[string]int{}}
+	// Before any key: a flush holding the lock shared commits first, so the history delete below sees its rows, and
+	// none starts until the revert commits its new epoch, which fences every read decided before it.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, 1)`, balanceRevertLock); err != nil {
+		return out, err
+	}
 	keys, err := blockBalanceKeys(ctx, tx, number)
 	if err != nil || len(keys) == 0 {
 		return out, err
@@ -112,6 +122,9 @@ func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBala
 	if err := deleted.Err(); err != nil {
 		return out, err
 	}
+	if afterBalanceHistoryDelete != nil {
+		afterBalanceHistoryDelete()
+	}
 	sortBalanceKeys(out.keys)
 	if len(restore) == 0 {
 		return out, nil
@@ -150,6 +163,10 @@ func revertBalances(ctx context.Context, tx pgx.Tx, number uint64) (revertedBala
 // beforeBalanceHistoryDelete, when set, runs just before a revert deletes its block's balance history rows: a test
 // commits a flush there, which no read of the revert can see.
 var beforeBalanceHistoryDelete func()
+
+// afterBalanceHistoryDelete, when set, runs once a revert has deleted its block's balance history rows: a test starts
+// a flush there, which the delete could not see.
+var afterBalanceHistoryDelete func()
 
 // blockBalanceKeys reads the keys of a block's balance history rows and of its ERC-20 and ERC-721 transfers' holders,
 // each with whether it had a history row at the block.
@@ -267,10 +284,12 @@ func positiveBalances(ctx context.Context, tx pgx.Tx, keys []balanceKey) (map[ba
 
 // recordBalanceRereads takes a new reorg epoch, records it on every key and opens each key's request to be read again
 // at the new head. It is DeleteBlock's last write, after every row lock a balance flush takes, which takes
-// balance_rereads last too.
+// balance_rereads last too. A revert with no key still takes the epoch: a flush that waited for it then writes no read
+// decided before it.
 func recordBalanceRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey) error {
 	if len(keys) == 0 {
-		return nil
+		_, err := tx.Exec(ctx, `SELECT nextval('balance_reorg_epoch')`)
+		return err
 	}
 	tokens, addresses := balanceKeyColumns(keys)
 	_, err := tx.Exec(ctx, `
@@ -359,6 +378,23 @@ func closeRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey) error {
 	_, err := tx.Exec(ctx, `
 		UPDATE balance_rereads r SET open = false FROM unnest($1::TEXT[], $2::TEXT[]) AS k(token_address, address)
 		WHERE r.token_address = k.token_address AND r.address = k.address`, tokens, addresses)
+	return err
+}
+
+// reopenRereads opens the request to read each key again at epoch or later: a flush's reads of them were decided
+// before a revert.
+func reopenRereads(ctx context.Context, tx pgx.Tx, keys []balanceKey, epoch int64) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	sortBalanceKeys(keys)
+	tokens, addresses := balanceKeyColumns(keys)
+	_, err := tx.Exec(ctx, `
+		INSERT INTO balance_rereads AS r (token_address, address, epoch, open, attempts)
+		SELECT k.token_address, k.address, $3, true, 0
+		FROM unnest($1::TEXT[], $2::TEXT[]) WITH ORDINALITY AS k(token_address, address, n) ORDER BY k.n
+		ON CONFLICT (token_address, address) DO UPDATE SET epoch = GREATEST(r.epoch, EXCLUDED.epoch), open = true, attempts = 0`,
+		tokens, addresses, epoch)
 	return err
 }
 

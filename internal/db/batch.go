@@ -897,9 +897,18 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 	}
 	defer tx.Rollback(ctx)
 
-	// Phase 0: advisory locks on every key, then the reorg epoch of each key a revert touched (balance_rereads, written
-	// under the same locks). A read decided before its key's last revert (a lower epoch) may hold the fork's value and
-	// is not written; a read at the key's epoch or later answers its open request.
+	// Phase 0: the balance revert lock shared (history writes, which are at the head), advisory locks on every key,
+	// then the latest reorg epoch and the reorg epoch of each key a revert touched (balance_rereads, written under the
+	// same locks). A read decided before a revert (a lower epoch than the latest) may hold the fork's value: it is not
+	// written, and its key is asked to be read again, whether or not the revert knew the key. A revert in progress
+	// holds the lock until it commits, so its epoch is the latest by the time a flush reads it, and a flush in progress
+	// commits before the revert deletes its block's history rows, so the revert sees what it wrote. A read at the key's
+	// epoch or later answers its open request.
+	if history {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, balanceRevertLock); err != nil {
+			return fmt.Errorf("lock balance reverts: %w", err)
+		}
+	}
 	lockTok := make([]string, len(ordered))
 	lockAddr := make([]string, len(ordered))
 	for i, b := range ordered {
@@ -908,18 +917,30 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(lockTok, lockAddr)); err != nil {
 		return fmt.Errorf("lock balance keys: %w", err)
 	}
+	var latest int64
+	if history {
+		if err := tx.QueryRow(ctx, `SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM balance_reorg_epoch`).
+			Scan(&latest); err != nil {
+			return fmt.Errorf("read the reorg epoch: %w", err)
+		}
+	}
 	epochs, err := revertEpochs(ctx, tx, lockTok, lockAddr)
 	if err != nil {
 		return fmt.Errorf("read reorg epochs: %w", err)
 	}
-	var answered []balanceKey
-	if len(epochs) > 0 {
+	var answered, late []balanceKey
+	if len(epochs) > 0 || latest > 0 {
 		kept := ordered[:0:0]
-		closing := map[balanceKey]bool{}
+		closing, lateKeys := map[balanceKey]bool{}, map[balanceKey]bool{}
 		for _, b := range ordered {
 			k := balanceKey{token: strings.ToLower(b.TokenAddress), address: strings.ToLower(b.Address)}
 			e, reverted := epochs[k]
 			switch {
+			case b.Epoch < latest:
+				if !lateKeys[k] {
+					lateKeys[k] = true
+					late = append(late, k)
+				}
 			case !reverted:
 				kept = append(kept, b)
 			case b.Epoch >= e.epoch:
@@ -932,6 +953,9 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 		}
 		ordered = kept
 		if len(ordered) == 0 {
+			if err := reopenRereads(ctx, tx, late, latest); err != nil {
+				return fmt.Errorf("reopen balance rereads: %w", err)
+			}
 			return tx.Commit(ctx)
 		}
 	}
@@ -1088,9 +1112,12 @@ func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, hist
 		}
 	}
 
-	// Last phase: the requests these reads answer.
+	// Last phase: the requests these reads answer, and those of the keys whose reads came too late.
 	if err := closeRereads(ctx, tx, answered); err != nil {
 		return fmt.Errorf("clear balance rereads: %w", err)
+	}
+	if err := reopenRereads(ctx, tx, late, latest); err != nil {
+		return fmt.Errorf("reopen balance rereads: %w", err)
 	}
 	return tx.Commit(ctx)
 }
