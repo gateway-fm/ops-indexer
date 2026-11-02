@@ -14,8 +14,12 @@ import (
 // subtraction could not; an address already recorded is recorded again, as a new row version, so a rebase that read the
 // earlier one does not clear it. It returns the number of rows removed.
 // It first adds one to the address_stats_reverts counter, before any address_stats row: after a rollback to the
-// earlier release, its staged repair compares that counter (addressStatsRevertsCounter).
+// earlier release, its staged repair compares that counter (addressStatsRevertsCounter). Before both it takes the
+// revert lock shared, so a row a rebase batch has inserted and not committed is committed before the revert reads it.
 func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, error) {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, $2)`, rebaseLock, revertLock); err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO chain_counters (name, count, updated_at) VALUES ($1, 1, NOW())
 		ON CONFLICT (name) DO UPDATE SET count = chain_counters.count + 1, updated_at = NOW()`, addressStatsRevertsCounter); err != nil {

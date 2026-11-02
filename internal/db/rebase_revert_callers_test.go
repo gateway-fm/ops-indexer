@@ -2,10 +2,13 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -147,4 +150,148 @@ func TestARebaseCreatingRowsAcrossARevertCreatesOnlyThoseStillSeen(t *testing.T)
 	require.Zero(t, freshRows, "no row for an address no canonical block has seen")
 	requireAddressStatsIsExactlyTheTruth(t, d)
 	requireAddressStatsIsTheTruth(t, d)
+}
+
+// A revert of the head that starts once a rebase creating two missing rows has taken them and read the reverts since
+// its read: the revert subtracts its block from the rows the rebase created rather than miss them, so the row of the
+// address older blocks still see ends at its truth, the row of the address only the head saw is removed, and
+// addresses_total counts the rows.
+func TestARevertDuringARebaseCreatingRowsSubtractsFromTheRowsItCreates(t *testing.T) {
+	d, ctx := repairFixture(t)
+	repairUntilDone(t, d)
+	fresh := rebaseNewAddress(13501)
+	deleteRowsKeepingTotal(t, d, rebaseHot, fresh)
+	reverted := make(chan error, 1)
+	var once sync.Once
+	rebaseLockedHook = func() {
+		once.Do(func() {
+			go func() { reverted <- d.DeleteBlock(ctx, 13501) }()
+			select {
+			case err := <-reverted:
+				reverted <- err
+			case <-time.After(2 * time.Second):
+			}
+		})
+	}
+	t.Cleanup(func() { rebaseLockedHook = nil })
+	r, err := d.RebaseAddresses(ctx, []string{rebaseHot, fresh}, []string{rebaseHot, fresh})
+	require.NoError(t, err)
+	rebaseLockedHook = nil
+	require.Equal(t, 2, r.Created, "both rows are created at their truth as read")
+	require.NoError(t, <-reverted)
+	var freshRows int
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM address_stats WHERE address = $1`, fresh).Scan(&freshRows))
+	require.Zero(t, freshRows, "the revert removes the row of the address only the head saw")
+	requireAddressStatsIsExactlyTheTruth(t, d)
+	requireAddressStatsIsTheTruth(t, d)
+}
+
+// revertLockWaiters is how many sessions wait for the revert lock.
+func revertLockWaiters(t *testing.T, d *DB) int {
+	t.Helper()
+	var waiting int
+	require.NoError(t, d.pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_locks l JOIN pg_database db ON db.oid = l.database
+		WHERE l.locktype = 'advisory' AND NOT l.granted AND db.datname = current_database()
+		  AND l.classid = $1 AND l.objid = $2 AND l.objsubid = 2`, rebaseLock, revertLock).Scan(&waiting))
+	return waiting
+}
+
+// openRevert begins a revert of the head and runs it up to and including its address_stats rows: it holds the
+// daily-stats lock, the revert lock and the head's rows.
+func openRevert(t *testing.T, d *DB) pgx.Tx {
+	t.Helper()
+	ctx := context.Background()
+	revert, err := d.pool.Begin(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = revert.Rollback(context.Background()) })
+	_, err = revert.Exec(ctx, `SELECT daily_stats_invalidate(13501)`)
+	require.NoError(t, err)
+	_, err = revertAddressStats(ctx, revert, 13501)
+	require.NoError(t, err)
+	return revert
+}
+
+// A rebase batch that creates rows takes the revert lock holding only the rebase lock (and, in a span close, its
+// stage); a revert takes it holding the daily-stats lock and its block's balances, tokens and nft_tokens rows, none of
+// which a batch takes. In either order the second waits for the first on the revert lock and both finish, for the
+// repair and a span close: a revert holding everything up to and including its rows while the batch reaches the lock
+// (in a span close, a revert begun after the close's day recount, between its stage and its batch), and a batch
+// holding the lock and its rows while a revert starts.
+func TestARevertAndARebaseCreatingRowsDoNotDeadlockInEitherOrder(t *testing.T) {
+	missing := rebaseNewAddress(210)
+	finishes := func(t *testing.T, done <-chan error, what string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			require.NoError(t, err, what)
+		case <-time.After(30 * time.Second):
+			t.Fatalf("%s did not finish: deadlock", what)
+		}
+	}
+	created := func(t *testing.T, d *DB) {
+		t.Helper()
+		var rows int
+		require.NoError(t, d.pool.QueryRow(context.Background(), `SELECT count(*) FROM address_stats WHERE address = $1`,
+			missing).Scan(&rows))
+		require.Equal(t, 1, rows, "the batch created the missing row")
+	}
+	repair := func(ctx context.Context, d *DB) error {
+		_, err := d.RepairAddressBucket(ctx, 0, AddressRepairBatch)
+		return err
+	}
+	spanClose := func(ctx context.Context, d *DB) error {
+		closed, err := d.CloseLedgerSpans(ctx, repairLedger, 1)
+		if err == nil && closed != 1 {
+			err = fmt.Errorf("closed %d spans, not 1", closed)
+		}
+		return err
+	}
+	revertFirst := func(t *testing.T, rebase func(context.Context, *DB) error, open func(d *DB, opened chan<- pgx.Tx)) {
+		d, ctx := repairFixture(t)
+		deleteRowsKeepingTotal(t, d, missing)
+		opened := make(chan pgx.Tx, 1)
+		open(d, opened)
+		done := make(chan error, 1)
+		go func() { done <- rebase(ctx, d) }()
+		revert := <-opened
+		require.Eventually(t, func() bool { return revertLockWaiters(t, d) == 1 }, 10*time.Second, 20*time.Millisecond,
+			"the batch creating the row waits for the revert")
+		require.NoError(t, revert.Rollback(ctx))
+		finishes(t, done, "the rebase")
+		created(t, d)
+	}
+	batchFirst := func(t *testing.T, rebase func(context.Context, *DB) error) {
+		d, ctx := repairFixture(t)
+		deleteRowsKeepingTotal(t, d, missing)
+		reverted := make(chan error, 1)
+		var once sync.Once
+		rebaseLockedHook = func() {
+			once.Do(func() {
+				go func() { reverted <- d.DeleteBlock(ctx, 13501) }()
+				require.Eventually(t, func() bool { return revertLockWaiters(t, d) == 1 }, 10*time.Second,
+					20*time.Millisecond, "the revert waits for the batch creating the row")
+			})
+		}
+		t.Cleanup(func() { rebaseLockedHook = nil })
+		done := make(chan error, 1)
+		go func() { done <- rebase(ctx, d) }()
+		finishes(t, done, "the rebase")
+		rebaseLockedHook = nil
+		finishes(t, reverted, "the revert")
+		created(t, d)
+	}
+
+	t.Run("repair, revert first", func(t *testing.T) {
+		revertFirst(t, repair, func(d *DB, opened chan<- pgx.Tx) { opened <- openRevert(t, d) })
+	})
+	t.Run("span close, revert first", func(t *testing.T) {
+		revertFirst(t, spanClose, func(d *DB, opened chan<- pgx.Tx) {
+			var once sync.Once
+			spanRebaseStagedHook = func(int64) { once.Do(func() { opened <- openRevert(t, d) }) }
+			t.Cleanup(func() { spanRebaseStagedHook = nil })
+		})
+	})
+	t.Run("repair, batch first", func(t *testing.T) { batchFirst(t, repair) })
+	t.Run("span close, batch first", func(t *testing.T) { batchFirst(t, spanClose) })
 }

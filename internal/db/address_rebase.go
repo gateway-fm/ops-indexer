@@ -16,6 +16,10 @@ const rebaseBatch = 1000
 // rebaseLock serializes rebases among themselves (advisory lock key).
 const rebaseLock = 4674
 
+// revertLock is the second key, under rebaseLock, of the lock a revert holds shared from before its first address_stats
+// row to its commit, and a rebase batch that creates rows holds exclusively from before it inserts them to its commit.
+const revertLock = 2
+
 // RebaseResult is what a rebase changed: Changed counts the rows it wrote, those it created included and those it
 // removed not (a removal that found the row in use again and set it instead counts as changed); Created and Removed
 // count the rows it created and removed. FirstSeenFrom is the earliest first_seen block, old or new, of a row whose
@@ -149,6 +153,10 @@ var spanRebaseStagedHook func(lo int64)
 // rebaseReadHook, when a test sets it, runs between a batch's read and its first write.
 var rebaseReadHook func(batch []string)
 
+// rebaseLockedHook, when a test sets it, runs once a batch has taken its rows and read the reverts since its read,
+// before its writes.
+var rebaseLockedHook func()
+
 func rebaseAddressBatchLocked(ctx context.Context, tx pgx.Tx, batch, create []string,
 	inBatch func(ctx context.Context, tx pgx.Tx, batch []string) error) (RebaseResult, error) {
 	creatable := make(map[string]bool, len(create))
@@ -245,13 +253,21 @@ func lockBatchRows(ctx context.Context, tx pgx.Tx, read []rebaseRow) (map[string
 // subtracts its block from the row and from the truth, but its subtraction stops at zero and it moves first_seen and
 // last_seen, so a correction read before it can overshoot; those rows are counted again under their locks, a row
 // missing at the read included. A revert still in progress holds the rows, so the lock waits for it and the versions
-// read after it are its.
+// read after it are its. A row the batch inserts is one a revert cannot see until the batch commits, so a batch that
+// creates rows first takes the revert lock: a revert in progress ends first, and none starts until the batch commits.
 func revertedSinceRead(ctx context.Context, tx pgx.Tx, read []rebaseRow) (stale, inserted map[string]bool, err error) {
 	addresses := make([]string, len(read))
 	seen := make(map[string]*string, len(read))
+	creates := false
 	for i, v := range read {
 		addresses[i] = v.address
 		seen[v.address] = v.reverted
+		creates = creates || v.creates()
+	}
+	if creates {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, rebaseLock, revertLock); err != nil {
+			return nil, nil, err
+		}
 	}
 	if inserted, err = lockBatchRows(ctx, tx, read); err != nil {
 		return nil, nil, err
@@ -285,6 +301,9 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 	stale, inserted, err := revertedSinceRead(ctx, tx, read)
 	if err != nil {
 		return r, err
+	}
+	if rebaseLockedHook != nil {
+		rebaseLockedHook()
 	}
 	writes := &pgx.Batch{}
 	var kinds []rebaseWrite
