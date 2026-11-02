@@ -60,6 +60,9 @@ type Config struct {
 	// backfill and the recount of a pruned span).
 	StrictTraces bool
 	CodeAtBlock  bool
+	// SkipTraceRefusals, with StrictTraces off, leaves out only the traces the node answers it cannot serve, and fails
+	// the block on any other trace failure (a count of an old block that goes on without them).
+	SkipTraceRefusals bool
 
 	// NodeRecountRPS bounds the recount of pruned spans from the node; 0 turns it off. VerifyRepair lets it
 	// replace a drifted span's ledger rows.
@@ -1198,6 +1201,12 @@ type strictTracer interface {
 		rateLimit int) ([]*types.InternalTransaction, error)
 }
 
+// refusalTracer fetches a block's traces leaving out only the transactions the node answers it cannot trace.
+type refusalTracer interface {
+	FetchTracesBatchSkippingRefusals(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64,
+		workers int, rateLimit int) ([]*types.InternalTransaction, error)
+}
+
 // codeAtReader reads an account's code after a given block, where the node keeps that block's state.
 type codeAtReader interface {
 	GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error)
@@ -1210,14 +1219,19 @@ var errContractUndecided = errors.New("the node does not serve the code at the c
 // error or no code means no contract. A count of an old block (CodeAtBlock) has to judge it as ingest did then: the
 // code after that block where the node keeps its state, else the code at latest when there is some. An error, or no
 // code at latest (never deployed, or destroyed since: the two cannot be told apart), is returned, so the block fails
-// rather than lose the contract.
+// rather than lose the contract. A read at the block that fails other than by the node lacking its state is returned
+// as it is: it says nothing of the code.
 func (i *Indexer) contractCode(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
 	if !i.config.CodeAtBlock {
 		return i.rpc.GetCode(ctx, address)
 	}
 	if r, ok := i.rpc.(codeAtReader); ok {
-		if code, err := r.GetCodeAt(ctx, address, block); err == nil {
+		code, err := r.GetCodeAt(ctx, address, block)
+		if err == nil {
 			return code, nil
+		}
+		if !rpc.NodeRefused(err) && !errors.Is(err, errNotSupported) {
+			return nil, fmt.Errorf("code of %s at block %d: %w", address.Hex(), block, err)
 		}
 	}
 	code, err := i.rpc.GetCode(ctx, address)
@@ -1535,6 +1549,8 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 		fetch := i.rpc.FetchTracesBatch
 		if s, ok := i.rpc.(strictTracer); ok && i.config.StrictTraces {
 			fetch = s.FetchTracesBatchStrict
+		} else if s, ok := i.rpc.(refusalTracer); ok && i.config.SkipTraceRefusals {
+			fetch = s.FetchTracesBatchSkippingRefusals
 		}
 		internalTxs, err := fetch(ctx, txHashes, blockNumber, blockTimestamp, i.config.TraceWorkers, i.config.TraceRateLimit)
 		if err != nil {

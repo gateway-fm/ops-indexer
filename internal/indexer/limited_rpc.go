@@ -120,6 +120,17 @@ func (l *limitedRPC) FetchTracesBatchStrict(ctx context.Context, txHashes []comm
 	return s.FetchTracesBatchStrict(ctx, txHashes, blockNumber, timestamp, workers, l.rate(rateLimit))
 }
 
+func (l *limitedRPC) FetchTracesBatchSkippingRefusals(ctx context.Context, txHashes []common.Hash, blockNumber, timestamp uint64, workers, rateLimit int) ([]*types.InternalTransaction, error) {
+	s, ok := l.inner.(refusalTracer)
+	if !ok {
+		return nil, errNotSupported
+	}
+	if err := l.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	return s.FetchTracesBatchSkippingRefusals(ctx, txHashes, blockNumber, timestamp, workers, l.rate(rateLimit))
+}
+
 func (l *limitedRPC) FetchTokenMetadataBatch(ctx context.Context, addresses []common.Address, workers int, rateLimit int) (map[common.Address]*rpc.TokenMetadataResult, error) {
 	if err := l.limiter.Wait(ctx); err != nil {
 		return nil, err

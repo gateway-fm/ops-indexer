@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/hexutil"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
@@ -85,6 +87,37 @@ var missingStateSignals = []string{
 	"missing trie node",
 }
 
+// ErrNotTraced is the node answering a trace without one for a transaction: no entry for it, a null trace, or an
+// error entry other than a timeout.
+var ErrNotTraced = errors.New("the node returned no trace")
+
+// NodeRefused is whether err is the node answering that it cannot serve what was asked: no trace for a transaction,
+// or an error saying it lacks the block's state. A timeout, a rate limit or a node that does not answer is not.
+func NodeRefused(err error) bool {
+	if errors.Is(err, ErrNotTraced) {
+		return true
+	}
+	var answer *rpclient.RPCError
+	if !errors.As(err, &answer) {
+		return false
+	}
+	msg := strings.ToLower(answer.Message)
+	for _, signal := range missingStateSignals {
+		if strings.Contains(msg, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+// noTrace is the error for a transaction a block's traces answered without a trace; msg is its error entry.
+func noTrace(blockNumber uint64, txHash common.Hash, msg string) error {
+	if strings.Contains(strings.ToLower(msg), "timeout") {
+		return fmt.Errorf("block %d: trace of transaction %s timed out: %q", blockNumber, txHash.Hex(), msg)
+	}
+	return fmt.Errorf("block %d: transaction %s: %w: %q", blockNumber, txHash.Hex(), ErrNotTraced, msg)
+}
+
 // TracingAbsent is whether a trace call's error says the node has no debug_traceBlockByNumber at all.
 func TracingAbsent(err error) bool {
 	msg := strings.ToLower(err.Error())
@@ -128,7 +161,7 @@ func (c *Client) TraceTransaction(ctx context.Context, txHash common.Hash) (*Cal
 		return nil, fmt.Errorf("debug_traceTransaction failed: %w", err)
 	}
 	if !traced(result) {
-		return nil, fmt.Errorf("debug_traceTransaction of %s: no trace in the result", txHash.Hex())
+		return nil, fmt.Errorf("debug_traceTransaction of %s: %w", txHash.Hex(), ErrNotTraced)
 	}
 
 	return result, nil
@@ -224,17 +257,40 @@ type TraceResult struct {
 	Err          error
 }
 
+// traceMode is what a block's trace fetch does with a transaction it gets no trace for.
+type traceMode int
+
+const (
+	// skipFailures leaves the transaction out, as ingest does.
+	skipFailures traceMode = iota
+	// failOnAny fails the fetch.
+	failOnAny
+	// skipRefusals leaves it out when the node answered that it cannot trace it, and fails the fetch otherwise.
+	skipRefusals
+)
+
 func (c *Client) FetchTracesBatch(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int) ([]*explorerTypes.InternalTransaction, error) {
-	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, false)
+	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, skipFailures)
 }
 
 // FetchTracesBatchStrict is FetchTracesBatch for counts that replace or extend the ledger: a transaction whose trace
 // is missing from the block's traces, or whose own trace fails, fails the batch instead of being left out.
 func (c *Client) FetchTracesBatchStrict(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int) ([]*explorerTypes.InternalTransaction, error) {
-	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, true)
+	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, failOnAny)
 }
 
-func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int, strict bool) ([]*explorerTypes.InternalTransaction, error) {
+// FetchTracesBatchSkippingRefusals is FetchTracesBatch for a count that goes on without the traces the node cannot
+// serve: a transaction the node answers it cannot trace is left out, and any other failure fails the batch.
+func (c *Client) FetchTracesBatchSkippingRefusals(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int) ([]*explorerTypes.InternalTransaction, error) {
+	return c.fetchTraces(ctx, txHashes, blockNumber, timestamp, workers, rateLimit, skipRefusals)
+}
+
+// fails is whether a transaction's missing trace, err, fails the fetch.
+func (m traceMode) fails(err error) bool {
+	return m == failOnAny || m == skipRefusals && !NodeRefused(err)
+}
+
+func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int, rateLimit int, mode traceMode) ([]*explorerTypes.InternalTransaction, error) {
 	if len(txHashes) == 0 {
 		return nil, nil
 	}
@@ -247,8 +303,8 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 		for _, txHash := range txHashes {
 			entry, ok := blockTraces[txHash.Hex()]
 			if !ok || entry.Error != "" || !traced(entry.Result) {
-				if strict {
-					return nil, fmt.Errorf("block %d: no trace for transaction %s: %q", blockNumber, txHash.Hex(), entry.Error)
+				if err := noTrace(blockNumber, txHash, entry.Error); mode.fails(err) {
+					return nil, err
 				}
 				continue
 			}
@@ -278,7 +334,7 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 		hash := hash
 		g.Go(func() error {
 			if err := limiter.Wait(ctx); err != nil {
-				if strict {
+				if mode.fails(err) {
 					return err
 				}
 				return nil // Don't fail the whole batch
@@ -286,7 +342,7 @@ func (c *Client) fetchTraces(ctx context.Context, txHashes []common.Hash, blockN
 
 			frame, err := c.TraceTransaction(ctx, hash)
 			if err != nil {
-				if strict {
+				if mode.fails(err) {
 					return fmt.Errorf("trace of transaction %s: %w", hash.Hex(), err)
 				}
 				log.Warn("failed to trace tx", "tx", hash.Hex(), "error", err)

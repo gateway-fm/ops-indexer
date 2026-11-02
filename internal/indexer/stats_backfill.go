@@ -44,10 +44,11 @@ type StatsBackfillConfig struct {
 	Retry        time.Duration
 }
 
-// strictBlockTries is how many times in a row the backfill fails a block it cannot count whole (a trace or a contract's
-// code the node does not serve) before it counts the block without what failed, as ingest would have: without the
-// traces, and a creation it cannot judge as no contract. Every other creation is still judged by its code at the
-// block.
+// strictBlockTries is how many times in a row the node answers that it cannot serve what a block needs (a trace, or the
+// state to judge a creation) before the backfill counts the block without what failed, as ingest would have: without
+// the traces it refuses, and a creation it cannot judge as no contract. Every other creation is still judged by its
+// code at the block. A failure that is not such an answer (a timeout, a rate limit, a node down) fails the block
+// without counting toward the tries.
 var strictBlockTries = 30
 
 // backfiller counts [0, START_BLOCK) from the node with the head path's block builder and writes only counters,
@@ -85,7 +86,7 @@ func (i *Indexer) newBackfiller(store backfillStore, cfg StatsBackfillConfig) *b
 	c.RPCWorkers, c.TraceWorkers, c.TokenMetadataWorkers = 1, 1, 1
 	c.StrictTraces, c.CodeAtBlock = true, true
 	lc := c
-	lc.StrictTraces = false
+	lc.StrictTraces, lc.SkipTraceRefusals = false, true
 	limiter := rate.NewLimiter(rate.Limit(cfg.RPS), max(cfg.Workers, 1))
 	node := newLimitedRPC(i.rpc, limiter, cfg.RPS, cfg.Workers)
 	return &backfiller{
@@ -150,12 +151,12 @@ func (b *backfiller) batch(ctx context.Context, from, to, target uint64, prevTs 
 		}
 		built := b.idx.buildBlock(ctx, f.raw, f.receipts)
 		if err := errors.Join(built.tracesErr, built.codeErr); err != nil {
-			if !b.givesUp(built.blockNumber) {
+			if !refusedOnly(err) || !b.givesUp(built.blockNumber) {
 				return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, err)
 			}
 			lenient := b.lenient.buildBlock(ctx, f.raw, f.receipts)
-			if !undecidedOnly(lenient.codeErr) {
-				return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, lenient.codeErr)
+			if lenient.tracesErr != nil || !undecidedOnly(lenient.codeErr) {
+				return nil, nil, fmt.Errorf("block %d: %w", built.blockNumber, errors.Join(lenient.tracesErr, lenient.codeErr))
 			}
 			log.Error("stats backfill: a block failed on every try; counted without what failed, as ingest would have",
 				"block", built.blockNumber, "tries", strictBlockTries, "error", err,
@@ -194,12 +195,22 @@ func addBlock(out *db.BackfillBatch, built *builtBlock, spanOf func(n, target ui
 
 // undecidedOnly is whether every error in err is a creation the node cannot judge, which ingest counts as no contract.
 func undecidedOnly(err error) bool {
+	return every(err, func(e error) bool { return errors.Is(e, errContractUndecided) })
+}
+
+// refusedOnly is whether every error in err is the node answering that it cannot serve what the block needs.
+func refusedOnly(err error) bool {
+	return every(err, func(e error) bool { return errors.Is(e, errContractUndecided) || rpc.NodeRefused(e) })
+}
+
+// every is whether each error errors.Join put together in err satisfies is; nil has none.
+func every(err error, is func(error) bool) bool {
 	j, ok := err.(interface{ Unwrap() []error })
 	if !ok {
-		return err == nil || errors.Is(err, errContractUndecided)
+		return err == nil || is(err)
 	}
 	for _, e := range j.Unwrap() {
-		if !undecidedOnly(e) {
+		if !every(e, is) {
 			return false
 		}
 	}

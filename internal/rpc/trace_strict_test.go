@@ -129,3 +129,66 @@ func TestMissingStateIsNotMissingTracing(t *testing.T) {
 	require.True(t, TracingAbsent(fmt.Errorf("the method debug_traceBlockByNumber does not exist/is not available")))
 	require.True(t, TracingAbsent(fmt.Errorf("Method not found")))
 }
+
+// answerServer traces transaction A whole, and answers B's trace as b says: "refused" (the node lacks the state),
+// "timeout" (the tracer timed out) or "down" (an HTTP 503), per block or per transaction.
+func answerServer(t *testing.T, blockTraced bool, b string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params []any           `json:"params"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		msg := map[string]string{"refused": "missing trie node 1a2b (path )", "timeout": "execution timeout"}[b]
+		if b == "down" && (req.Method == "debug_traceBlockByNumber" || req.Params[0] == traceTxB.Hex()) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case req.Method == "debug_traceBlockByNumber" && blockTraced:
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":[{"txHash":%q,"result":%s},{"txHash":%q,"error":%q}]}`,
+				req.ID, traceTxA.Hex(), traceFrameWithACall, traceTxB.Hex(), msg)
+		case req.Method == "debug_traceBlockByNumber":
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":%q}}`, req.ID, msg)
+		case req.Params[0] == traceTxA.Hex():
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, req.ID, traceFrameWithACall)
+		default:
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":%q}}`, req.ID, msg)
+		}
+	}))
+}
+
+// A fetch that skips refusals leaves out a transaction the node answers it cannot trace, and fails on a timeout or a
+// node that does not answer, which say nothing of the trace.
+func TestATraceFetchSkippingRefusalsFailsOnAnythingElse(t *testing.T) {
+	for _, c := range []struct {
+		b           string
+		blockTraced bool
+		fails       bool
+	}{
+		{"refused", true, false},
+		{"refused", false, false},
+		{"timeout", true, true},
+		{"timeout", false, true},
+		{"down", false, true},
+	} {
+		t.Run(fmt.Sprintf("%s/block=%v", c.b, c.blockTraced), func(t *testing.T) {
+			srv := answerServer(t, c.blockTraced, c.b)
+			defer srv.Close()
+			cl, err := New(srv.URL)
+			require.NoError(t, err)
+			got, err := cl.FetchTracesBatchSkippingRefusals(context.Background(), []common.Hash{traceTxA, traceTxB}, 7,
+				1700000000, 2, 100)
+			if c.fails {
+				require.Error(t, err)
+				require.False(t, NodeRefused(err))
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, got, 1, "A's internal call, B's left out")
+		})
+	}
+}

@@ -13,10 +13,11 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 // errNoHistoricalState is a node without old state answering a trace of an old block.
-var errNoHistoricalState = errors.New("historical state is not available")
+var errNoHistoricalState error = &rpclient.RPCError{Code: -32000, Message: "historical state is not available"}
 
 // probedChain answers the start's tracing check with probe (an error, or whether the node traces), and traces no old
 // block: it keeps no historical state.
@@ -44,6 +45,10 @@ func (p *probedChain) FetchTracesBatch(context.Context, []common.Hash, uint64, u
 
 func (p *probedChain) FetchTracesBatchStrict(context.Context, []common.Hash, uint64, uint64, int, int) ([]*types.InternalTransaction, error) {
 	return nil, errNoHistoricalState
+}
+
+func (p *probedChain) FetchTracesBatchSkippingRefusals(context.Context, []common.Hash, uint64, uint64, int, int) ([]*types.InternalTransaction, error) {
+	return nil, nil
 }
 
 // A tracing check that fails is retried, and one that keeps failing is no answer: the node recount and the stats
