@@ -95,7 +95,24 @@ const (
 	rebaseCorrect rebaseWrite = iota
 	rebaseCreate
 	rebaseRemove
+	// rebaseCreateRecounted is rebaseRemove on a row the batch inserted: kept, it is created; gone, it never was.
+	rebaseCreateRecounted
 )
+
+// rebaseRecount sets a taken row to its address's truth, counted now, or removes it when the address has none; it
+// returns whether it removed the row.
+const rebaseRecount = `
+	WITH t AS (SELECT * FROM ledger_address_truth(ARRAY[$1::TEXT])),
+	gone AS (
+		DELETE FROM address_stats WHERE address = $1 AND NOT EXISTS (SELECT 1 FROM t)
+		RETURNING first_seen
+	), kept AS (
+		UPDATE address_stats a SET
+			tx_count = t.txs, sent_count = t.sent, internal_tx_count = t.internal, token_transfer_count = t.transfers,
+			first_seen = t.first_seen, last_seen = t.last_seen, updated_at = NOW()
+		FROM t WHERE a.address = $1
+	)
+	SELECT EXISTS (SELECT 1 FROM gone)`
 
 func sameBlock(a, b *int64) bool {
 	return (a == nil) == (b == nil) && (a == nil || *a == *b)
@@ -226,9 +243,9 @@ func lockBatchRows(ctx context.Context, tx pgx.Tx, read []rebaseRow) (map[string
 // revertedSinceRead takes the batch's rows (lockBatchRows) and returns the addresses a revert has recorded since the
 // read (a ledger_reverted_address version the read did not see), and those whose empty row it inserted. A revert
 // subtracts its block from the row and from the truth, but its subtraction stops at zero and it moves first_seen and
-// last_seen, so a correction read before it can overshoot; those rows are counted again under their locks, and a row
-// missing at the read is not created from them. A revert still in progress holds the rows, so the lock waits for it
-// and the versions read after it are its.
+// last_seen, so a correction read before it can overshoot; those rows are counted again under their locks, a row
+// missing at the read included. A revert still in progress holds the rows, so the lock waits for it and the versions
+// read after it are its.
 func revertedSinceRead(ctx context.Context, tx pgx.Tx, read []rebaseRow) (stale, inserted map[string]bool, err error) {
 	addresses := make([]string, len(read))
 	seen := make(map[string]*string, len(read))
@@ -284,18 +301,7 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 			// snapshot, and rows a revert changed since it, pay for this count.
 			writes.Queue(`SELECT 1 FROM address_stats WHERE address = $1 FOR UPDATE`, v.address)
 			kinds = append(kinds, rebaseCorrect)
-			writes.Queue(`
-				WITH t AS (SELECT * FROM ledger_address_truth(ARRAY[$1::TEXT])),
-				gone AS (
-					DELETE FROM address_stats WHERE address = $1 AND NOT EXISTS (SELECT 1 FROM t)
-					RETURNING first_seen
-				), kept AS (
-					UPDATE address_stats a SET
-						tx_count = t.txs, sent_count = t.sent, internal_tx_count = t.internal, token_transfer_count = t.transfers,
-						first_seen = t.first_seen, last_seen = t.last_seen, updated_at = NOW()
-					FROM t WHERE a.address = $1
-				)
-				SELECT EXISTS (SELECT 1 FROM gone)`, v.address)
+			writes.Queue(rebaseRecount, v.address)
 			kinds = append(kinds, rebaseRemove)
 			if v.firstSeen != nil && (r.FirstSeenFrom == nil || *v.firstSeen < *r.FirstSeenFrom) {
 				r.FirstSeenFrom = v.firstSeen
@@ -326,9 +332,17 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 				WHERE address = $1`, v.address, v.wantTxs-v.txs, v.wantSent-v.sent, v.wantInternal-v.internal,
 				v.wantTransf-v.transfers, v.firstSeen, v.wantFirst, v.lastSeen, v.wantLast)
 		case v.creates() && stale[v.address]:
+			// Its row is there and taken, the empty one lockBatchRows inserted or one ingest created since the read,
+			// from blocks a revert since the read may have replaced: the truth is counted again under its lock, as for
+			// a present row a revert changed. The row goes if the address has none, and is set to it otherwise.
+			kind := rebaseRemove
 			if inserted[v.address] {
-				writes.Queue(`DELETE FROM address_stats WHERE address = $1`, v.address)
-				kinds = append(kinds, rebaseCorrect)
+				kind = rebaseCreateRecounted
+			}
+			kinds = append(kinds, kind)
+			writes.Queue(rebaseRecount, v.address)
+			if r.FirstSeenFrom == nil || *v.wantFirst < *r.FirstSeenFrom {
+				r.FirstSeenFrom = v.wantFirst
 			}
 			continue
 		case v.creates():
@@ -388,6 +402,9 @@ func applyRebaseRows(ctx context.Context, tx pgx.Tx, read []rebaseRow, after fun
 				case kind == rebaseRemove && done:
 					r.Removed++
 				case kind == rebaseRemove:
+					r.Changed++
+				case kind == rebaseCreateRecounted && !done:
+					r.Created++
 					r.Changed++
 				}
 			}
