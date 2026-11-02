@@ -176,6 +176,16 @@ $f$;
 
 ---- create above / drop below ----
 
+-- The down drops the backfill's state, its span in progress and its balance keys; with the backfill unfinished, the
+-- earlier schema would count without them. It refuses instead.
+DO $guard$
+BEGIN
+    IF EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NULL) THEN
+        RAISE EXCEPTION 'migration 028 down: the stats backfill has not finished (stats_backfill.completed_at is NULL), and the down would drop its state, its span in progress and its balance keys. Let the backfill finish on this release and roll back then, or restore the pre-upgrade backup.';
+    END IF;
+END
+$guard$;
+
 CREATE OR REPLACE FUNCTION ledger_running_diff_chain_token()
 RETURNS TABLE (family TEXT, key TEXT, counter TEXT, running NUMERIC, expected NUMERIC) LANGUAGE sql STABLE AS $f$
     WITH open AS (SELECT ledger_closed_through() AS lo),
