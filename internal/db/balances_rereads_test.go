@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -310,4 +311,106 @@ func TestABalanceFlushAndARevertDoNotDeadlockInEitherOrder(t *testing.T) {
 			require.NoError(t, <-written)
 		})
 	}
+}
+
+// Two reverts, of blocks 3 and 2, each ask for the keys of its block to be read again, at its own epoch. Every
+// request handed out after both is answered by its read: a read decided after the latest revert carries its epoch,
+// so the balance write neither drops it nor asks for its key again.
+func TestRereadsHandedOutAfterTwoRevertsAreAnswered(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	id := "1"
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(1,
+		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, zeroAddress, reorgBalA, "10", nil),
+		reorgBalTransfer(reorgBalNFT, types.TokenTypeERC721, zeroAddress, reorgBalO, "1", &id))))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(2,
+		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, reorgBalA, reorgBalB, "4", nil))))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(3,
+		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, reorgBalB, reorgBalX, "1", nil),
+		reorgBalTransfer(reorgBalNFT, types.TokenTypeERC721, reorgBalO, reorgBalX, "1", &id))))
+	for _, n := range []uint64{3, 2} {
+		require.NoError(t, d.DeleteBlock(ctx, n))
+	}
+	claimed, _, err := d.ClaimBalanceRereads(ctx, 100)
+	require.NoError(t, err)
+	require.NotEmpty(t, claimed)
+	var answers []*types.Balance
+	for _, c := range claimed {
+		b := reorgBalances(1, [3]string{c.Address, c.Token, "0"})[0]
+		b.Epoch = c.Epoch
+		answers = append(answers, b)
+	}
+	require.NoError(t, d.InsertBalancesBatch(ctx, answers))
+	require.Empty(t, rereads(t, d), "every request answered")
+}
+
+// The reorg epoch is a sequence: a revert's new epoch is seen at once, before the revert commits its delete of the
+// block. A reread handed out in that window, as the reread loop does it (claim, then the stored head, then the
+// balance write), must not carry the new epoch with the head still at the reverted block: its write would then pass
+// for one decided after the revert and land at a block that is gone. The claim waits for the revert instead. The test
+// runs the loop's steps from afterBalanceRereadsRecorded and waits a bounded time for them.
+func TestARereadHandedOutWhileARevertCommitsIsNotWrittenAtTheRevertedBlock(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	id := "1"
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(1,
+		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, zeroAddress, reorgBalA, "10", nil),
+		reorgBalTransfer(reorgBalNFT, types.TokenTypeERC721, zeroAddress, reorgBalO, "1", &id))))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(2,
+		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, reorgBalA, reorgBalB, "4", nil))))
+	require.NoError(t, d.InsertBlockDataBatch(ctx, reorgBalBlock(3,
+		reorgBalTransfer(reorgBalToken, types.TokenTypeERC20, reorgBalB, reorgBalX, "1", nil))))
+	require.NoError(t, d.DeleteBlock(ctx, 3), "block 3's keys, X among them, are asked to be read again")
+
+	reread := make(chan error, 1)
+	var once sync.Once
+	afterBalanceRereadsRecorded = func() {
+		once.Do(func() {
+			go func() {
+				claimed, _, err := d.ClaimBalanceRereads(ctx, 100)
+				if err != nil {
+					reread <- err
+					return
+				}
+				head, err := d.GetLatestBlockNumber(ctx)
+				if err != nil {
+					reread <- err
+					return
+				}
+				var balances []*types.Balance
+				for _, c := range claimed {
+					if c.Address == reorgBalX {
+						b := reorgBalances(head, [3]string{c.Address, c.Token, "0"})[0]
+						b.Epoch = c.Epoch
+						balances = append(balances, b)
+					}
+				}
+				reread <- d.InsertBalancesBatch(ctx, balances)
+			}()
+			select {
+			case err := <-reread:
+				reread <- err
+			case <-time.After(2 * time.Second):
+			}
+		})
+	}
+	t.Cleanup(func() { afterBalanceRereadsRecorded = nil })
+	require.NoError(t, d.DeleteBlock(ctx, 2))
+	afterBalanceRereadsRecorded = nil
+	require.NoError(t, <-reread)
+
+	var atReverted int
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM balances WHERE block_number >= 2)
+		     + (SELECT count(*) FROM token_balances_current WHERE block_number >= 2)`).Scan(&atReverted))
+	require.Zero(t, atReverted, "no balance at a reverted block")
+	var open bool
+	var block int64
+	require.NoError(t, d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM balance_rereads WHERE token_address = $1 AND address = $2 AND open),
+		       COALESCE((SELECT block_number FROM token_balances_current WHERE token_address = $1 AND address = $2), -1)`,
+		reorgBalToken, reorgBalX).Scan(&open, &block))
+	require.True(t, open || block == 1, "X is read again, or was answered at the new head")
 }

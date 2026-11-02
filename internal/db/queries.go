@@ -419,6 +419,9 @@ func (d *DB) DeleteBlockLocked(ctx context.Context, number uint64, locked func()
 	if err := recordBalanceRereads(ctx, tx, balances.keys); err != nil {
 		return err
 	}
+	if afterBalanceRereadsRecorded != nil {
+		afterBalanceRereadsRecorded()
+	}
 	return tx.Commit(ctx)
 }
 

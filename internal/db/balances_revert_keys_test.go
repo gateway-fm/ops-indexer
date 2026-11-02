@@ -168,8 +168,9 @@ func TestABalanceFlushLandingAfterARevertsHistoryDeleteIsReadAgainNotWritten(t *
 	require.True(t, reread, "the key is read again at the new head")
 }
 
-// The balance revert lock in either order, against a head flush (InsertBalancesBatch, which takes it shared first)
-// and against the stats backfill's current balances (InsertCurrentBalances, which does not take it): a writer holding
+// The balance revert lock in either order, against a head flush (InsertBalancesBatch, which takes it shared first),
+// the reread loop's claim (ClaimBalanceRereads, likewise) and the stats backfill's current balances
+// (InsertCurrentBalances, which does not take it): a writer holding
 // a key of the reverted block while the revert starts, and a revert holding the lock, the block's keys and its
 // history delete while the writer starts. The second waits for the first and both finish.
 func TestARevertAndABalanceWriteDoNotDeadlockInEitherOrder(t *testing.T) {
@@ -208,6 +209,10 @@ func TestARevertAndABalanceWriteDoNotDeadlockInEitherOrder(t *testing.T) {
 		}},
 		{"backfill current balances", false, func(ctx context.Context, d *DB) error {
 			return d.InsertCurrentBalances(ctx, reorgBalances(3, [3]string{reorgBalB, reorgBalToken, "2"}))
+		}},
+		{"reread claim", true, func(ctx context.Context, d *DB) error {
+			_, _, err := d.ClaimBalanceRereads(ctx, 100)
+			return err
 		}},
 	}
 	for _, w := range writers {

@@ -168,6 +168,10 @@ var beforeBalanceHistoryDelete func()
 // a flush there, which the delete could not see.
 var afterBalanceHistoryDelete func()
 
+// afterBalanceRereadsRecorded, when set, runs once a revert has taken its reorg epoch and before it commits: the epoch
+// is a sequence, which others see at once, while the revert's rows are not yet theirs.
+var afterBalanceRereadsRecorded func()
+
 // blockBalanceKeys reads the keys of a block's balance history rows and of its ERC-20 and ERC-721 transfers' holders,
 // each with whether it had a history row at the block.
 func blockBalanceKeys(ctx context.Context, tx pgx.Tx, number uint64) (map[balanceKey]bool, error) {
@@ -409,9 +413,16 @@ type BalanceReread struct {
 const MaxBalanceRereadAttempts = 20
 
 // ClaimBalanceRereads hands out up to limit open requests, counting an attempt on each, and closes the ones that ran
-// out of attempts, which it returns separately (their epoch still drops reads decided before the revert).
+// out of attempts, which it returns separately (their epoch still drops reads decided before the revert). A request
+// handed out carries the latest reorg epoch, or its own if later: its read is decided now, after every revert so far,
+// and a balance write drops a read decided before the latest one. The claim holds the balance revert lock shared, as
+// its first statement: the epoch is a sequence, which a revert moves before it commits, and a claim between the two
+// would stamp a read at the head still being reverted with the revert's epoch.
 func (d *DB) ClaimBalanceRereads(ctx context.Context, limit int) (claimed, dropped []BalanceReread, err error) {
 	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, balanceRevertLock); err != nil {
+			return err
+		}
 		collect := func(rows pgx.Rows, err error) ([]BalanceReread, error) {
 			if err != nil {
 				return nil, err
@@ -431,7 +442,8 @@ func (d *DB) ClaimBalanceRereads(ctx context.Context, limit int) (claimed, dropp
 			FROM (SELECT token_address, address FROM balance_rereads WHERE open
 			      ORDER BY epoch LIMIT $1 FOR UPDATE SKIP LOCKED) o
 			WHERE r.token_address = o.token_address AND r.address = o.address
-			RETURNING r.token_address, r.address, r.epoch`, limit))
+			RETURNING r.token_address, r.address,
+			          GREATEST(r.epoch, (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM balance_reorg_epoch))`, limit))
 		return err
 	})
 	return claimed, dropped, err

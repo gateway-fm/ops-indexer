@@ -46,10 +46,12 @@ func fkAnswer(t *testing.T, d *DB) error {
 		reorgBalToken + " " + reorgBalA: "10", reorgBalToken + " " + reorgBalB: "0", reorgBalToken + " " + reorgBalX: "0",
 		reorgBalNFT + " " + reorgBalO: "1", reorgBalNFT + " " + reorgBalX: "0",
 	}
+	claimed, _, err := d.ClaimBalanceRereads(context.Background(), 100)
+	require.NoError(t, err)
 	var answers []*types.Balance
-	for k, epoch := range rereads(t, d) {
-		b := reorgBalances(1, [3]string{k[len(reorgBalToken)+1:], k[:len(reorgBalToken)], node[k]})[0]
-		b.Epoch = epoch
+	for _, c := range claimed {
+		b := reorgBalances(1, [3]string{c.Address, c.Token, node[c.Token+" "+c.Address]})[0]
+		b.Epoch = c.Epoch
 		answers = append(answers, b)
 	}
 	return d.InsertBalancesBatch(context.Background(), answers)
