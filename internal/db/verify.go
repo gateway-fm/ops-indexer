@@ -370,29 +370,34 @@ func logRepair(ctx context.Context, tx pgx.Tx, dr Drift) error {
 	return err
 }
 
-// runningTruth is a chain or token counter's truth: its closed ledger rows, the open stats backfill span's, and the
-// open tail's history rows, read in one statement, as ledger_running_diff_chain_token reads them for every key.
+// runningTruth is the statement that reads a chain or token counter's truth as text: its closed ledger rows, the open
+// stats backfill span's, and the open tail's history rows, read in one statement, as ledger_running_diff_chain_token
+// reads them for every key.
 var runningTruth = map[string]string{
 	"chain": `
-		SELECT COALESCE(sum(v), 0) FROM (
-			SELECT value AS v FROM ledger_chain WHERE name = $1
-			UNION ALL SELECT value FROM ledger_stage_chain WHERE lo = stats_backfill_open_span() AND name = $1
-			UNION ALL SELECT count(*) FROM blocks WHERE $1 = 'blocks_total' AND number >= ledger_closed_through()
-			UNION ALL SELECT count(*) FROM transactions
-				WHERE $1 = 'transactions_total' AND block_number >= ledger_closed_through()
-			UNION ALL SELECT count(*) FROM token_transfers
-				WHERE $1 = 'transfers_total' AND block_number >= ledger_closed_through()
-		) u`,
+		SELECT t::TEXT FROM (
+			SELECT COALESCE(sum(v), 0) FROM (
+				SELECT value AS v FROM ledger_chain WHERE name = $1
+				UNION ALL SELECT value FROM ledger_stage_chain WHERE lo = stats_backfill_open_span() AND name = $1
+				UNION ALL SELECT count(*) FROM blocks WHERE $1 = 'blocks_total' AND number >= ledger_closed_through()
+				UNION ALL SELECT count(*) FROM transactions
+					WHERE $1 = 'transactions_total' AND block_number >= ledger_closed_through()
+				UNION ALL SELECT count(*) FROM token_transfers
+					WHERE $1 = 'transfers_total' AND block_number >= ledger_closed_through()
+			) u
+		) AS truth(t)`,
 	"token": `
-		SELECT CASE $2 WHEN 'transfers' THEN COALESCE(sum(transfers), 0) ELSE COALESCE(sum(supply), 0) END FROM (
-			SELECT transfers, supply FROM ledger_token WHERE token = $1
-			UNION ALL SELECT transfers, supply FROM ledger_stage_token WHERE lo = stats_backfill_open_span() AND token = $1
-			UNION ALL
-			SELECT count(*),
-			       COALESCE(SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
-			              - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END), 0)
-			FROM token_transfers WHERE token_address = $1 AND block_number >= ledger_closed_through()
-		) u`,
+		SELECT t::TEXT FROM (
+			SELECT CASE $2 WHEN 'transfers' THEN COALESCE(sum(transfers), 0) ELSE COALESCE(sum(supply), 0) END FROM (
+				SELECT transfers, supply FROM ledger_token WHERE token = $1
+				UNION ALL SELECT transfers, supply FROM ledger_stage_token WHERE lo = stats_backfill_open_span() AND token = $1
+				UNION ALL
+				SELECT count(*),
+				       COALESCE(SUM(CASE WHEN token_type = 'ERC20' AND from_address = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END)
+				              - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '0x0000000000000000000000000000000000000000' THEN value ELSE 0 END), 0)
+				FROM token_transfers WHERE token_address = $1 AND block_number >= ledger_closed_through()
+			) u
+		) AS truth(t)`,
 }
 
 // settleRunning puts a chain or token counter's repair on record, then sets the counter to its truth, read under the
@@ -428,7 +433,7 @@ func settleRunning(ctx context.Context, tx pgx.Tx, dr Drift) error {
 		args = append(args, dr.Counter)
 	}
 	var truth string
-	if err := tx.QueryRow(ctx, `SELECT t::TEXT FROM (`+runningTruth[dr.Family]+`) AS truth(t)`, args...).Scan(&truth); err != nil {
+	if err := tx.QueryRow(ctx, runningTruth[dr.Family], args...).Scan(&truth); err != nil {
 		return err
 	}
 	var same bool
