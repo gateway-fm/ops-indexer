@@ -426,9 +426,9 @@ func (i *Indexer) RunStatsBackfill(ctx context.Context, store backfillStore, cfg
 	}
 }
 
-// blockTracer traces a whole block, as the start's tracing check does.
-type blockTracer interface {
-	TraceBlock(ctx context.Context, blockNumber uint64) (map[string]rpc.TraceBlockResult, error)
+// oldBlockTracer traces a whole old block as the counts of old blocks do, with their tracer timeout.
+type oldBlockTracer interface {
+	TraceOldBlock(ctx context.Context, blockNumber uint64) (map[string]rpc.TraceBlockResult, error)
 }
 
 // historicalTraces checks that the node traces block 1, the oldest the backfill traces (many nodes cannot trace
@@ -436,11 +436,11 @@ type blockTracer interface {
 // of them: the prepare fails instead, and says so. A node that has no tracing at all is counted without traces, as
 // ingest counts it.
 func historicalTraces(ctx context.Context, node RPCClient, startBlock uint64) error {
-	t, ok := node.(blockTracer)
+	t, ok := node.(oldBlockTracer)
 	if !ok || startBlock < 2 {
 		return nil
 	}
-	if _, err := t.TraceBlock(ctx, 1); err != nil && !rpc.TracingAbsent(err) {
+	if _, err := t.TraceOldBlock(ctx, 1); err != nil && !rpc.TracingAbsent(err) {
 		return fmt.Errorf("the stats backfill traces the blocks below START_BLOCK, and the node does not trace block 1 "+
 			"(it needs an archive node with tracing, or ENABLE_TRACING=false to count without internal transactions): %w", err)
 	}

@@ -30,7 +30,7 @@ type probedChain struct {
 	traceBlockErr error
 }
 
-func (p *probedChain) TraceBlock(context.Context, uint64) (map[string]rpc.TraceBlockResult, error) {
+func (p *probedChain) TraceOldBlock(context.Context, uint64) (map[string]rpc.TraceBlockResult, error) {
 	return nil, p.traceBlockErr
 }
 

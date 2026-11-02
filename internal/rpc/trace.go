@@ -159,6 +159,11 @@ func (c *Client) TraceBlock(ctx context.Context, blockNumber uint64) (map[string
 	return c.traceBlock(ctx, blockNumber, &TraceConfig{Tracer: "callTracer"})
 }
 
+// TraceOldBlock is TraceBlock as the counts of old blocks trace one, with their tracer timeout.
+func (c *Client) TraceOldBlock(ctx context.Context, blockNumber uint64) (map[string]TraceBlockResult, error) {
+	return c.traceBlock(ctx, blockNumber, &TraceConfig{Tracer: "callTracer", Timeout: countTraceTimeout})
+}
+
 func (c *Client) traceBlock(ctx context.Context, blockNumber uint64, cfg *TraceConfig) (map[string]TraceBlockResult, error) {
 	blockHex := fmt.Sprintf("0x%x", blockNumber)
 
