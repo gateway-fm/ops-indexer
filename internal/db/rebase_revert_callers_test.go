@@ -129,6 +129,28 @@ func TestTheSpanRebaseOfAMissingRowAcrossARevertWhoseReplacementCreatesTheRow(t 
 	requireAddressStatsIsTheTruth(t, d)
 }
 
+// The running check's repair of a missing row, across a revert that commits between its read and its lock and the
+// block stored in its place, which creates the row again from that block alone: the row ends equal to its truth.
+func TestTheRunningRepairOfAMissingRowAcrossARevertWhoseReplacementCreatesTheRow(t *testing.T) {
+	d, ctx := repairFixture(t)
+	repairUntilDone(t, d)
+	deleteRowsKeepingTotal(t, d, rebaseHot)
+	var once sync.Once
+	rebaseReadHook = func(batch []string) {
+		for _, a := range batch {
+			if a == rebaseHot {
+				once.Do(func() { reorgTail(t, d) })
+			}
+		}
+	}
+	t.Cleanup(func() { rebaseReadHook = nil })
+	_, err := d.CheckRunning(ctx, rebaseHotBucket(t), true)
+	require.NoError(t, err)
+	rebaseReadHook = nil
+	requireAddressStatsIsExactlyTheTruth(t, d)
+	requireAddressStatsIsTheTruth(t, d)
+}
+
 // A rebase creating two missing rows, across a revert of the head with nothing stored in its place that commits
 // between its read and its lock: the row of the address older blocks still see is created at its truth, the row of
 // the address only the head saw is not created, and addresses_total counts the one created.
@@ -186,6 +208,36 @@ func TestARevertDuringARebaseCreatingRowsSubtractsFromTheRowsItCreates(t *testin
 	requireAddressStatsIsTheTruth(t, d)
 }
 
+// The same for the running check's repair, which finds both rows missing.
+func TestARevertDuringARunningRepairCreatingRowsSubtractsFromTheRowsItCreates(t *testing.T) {
+	d, ctx := repairFixture(t)
+	repairUntilDone(t, d)
+	fresh := rebaseNewAddress(13501)
+	deleteRowsKeepingTotal(t, d, rebaseHot, fresh)
+	reverted := make(chan error, 1)
+	var once sync.Once
+	rebaseLockedHook = func() {
+		once.Do(func() {
+			go func() { reverted <- d.DeleteBlock(ctx, 13501) }()
+			select {
+			case err := <-reverted:
+				reverted <- err
+			case <-time.After(2 * time.Second):
+			}
+		})
+	}
+	t.Cleanup(func() { rebaseLockedHook = nil })
+	_, err := d.CheckRunning(ctx, rebaseHotBucket(t), true)
+	require.NoError(t, err)
+	rebaseLockedHook = nil
+	require.NoError(t, <-reverted)
+	var freshRows int
+	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM address_stats WHERE address = $1`, fresh).Scan(&freshRows))
+	require.Zero(t, freshRows, "the revert removes the row of the address only the head saw")
+	requireAddressStatsIsExactlyTheTruth(t, d)
+	requireAddressStatsIsTheTruth(t, d)
+}
+
 // revertLockWaiters is how many sessions wait for the revert lock.
 func revertLockWaiters(t *testing.T, d *DB) int {
 	t.Helper()
@@ -215,7 +267,7 @@ func openRevert(t *testing.T, d *DB) pgx.Tx {
 // A rebase batch that creates rows takes the revert lock holding only the rebase lock (and, in a span close, its
 // stage); a revert takes it holding the daily-stats lock and its block's balances, tokens and nft_tokens rows, none of
 // which a batch takes. In either order the second waits for the first on the revert lock and both finish, for the
-// repair and a span close: a revert holding everything up to and including its rows while the batch reaches the lock
+// repair, the running check's repair and a span close: a revert holding everything up to and including its rows while the batch reaches the lock
 // (in a span close, a revert begun after the close's day recount, between its stage and its batch), and a batch
 // holding the lock and its rows while a revert starts.
 func TestARevertAndARebaseCreatingRowsDoNotDeadlockInEitherOrder(t *testing.T) {
@@ -238,6 +290,10 @@ func TestARevertAndARebaseCreatingRowsDoNotDeadlockInEitherOrder(t *testing.T) {
 	}
 	repair := func(ctx context.Context, d *DB) error {
 		_, err := d.RepairAddressBucket(ctx, 0, AddressRepairBatch)
+		return err
+	}
+	running := func(ctx context.Context, d *DB) error {
+		_, err := d.CheckRunning(ctx, 0, true)
 		return err
 	}
 	spanClose := func(ctx context.Context, d *DB) error {
@@ -292,6 +348,10 @@ func TestARevertAndARebaseCreatingRowsDoNotDeadlockInEitherOrder(t *testing.T) {
 			t.Cleanup(func() { spanRebaseStagedHook = nil })
 		})
 	})
+	t.Run("running check, revert first", func(t *testing.T) {
+		revertFirst(t, running, func(d *DB, opened chan<- pgx.Tx) { opened <- openRevert(t, d) })
+	})
 	t.Run("repair, batch first", func(t *testing.T) { batchFirst(t, repair) })
 	t.Run("span close, batch first", func(t *testing.T) { batchFirst(t, spanClose) })
+	t.Run("running check, batch first", func(t *testing.T) { batchFirst(t, running) })
 }
