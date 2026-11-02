@@ -431,6 +431,9 @@ type oldBlockTracer interface {
 	TraceOldBlock(ctx context.Context, blockNumber uint64) (map[string]rpc.TraceBlockResult, error)
 }
 
+// The node client traces old blocks: without it historicalTraces would pass every node unchecked.
+var _ oldBlockTracer = (*rpc.Client)(nil)
+
 // historicalTraces checks that the node traces block 1, the oldest the backfill traces (many nodes cannot trace
 // genesis). A node without the old state cannot trace any block of the range, and the backfill would fail every one
 // of them: the prepare fails instead, and says so. A node that has no tracing at all is counted without traces, as
