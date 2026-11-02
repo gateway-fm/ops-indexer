@@ -99,23 +99,36 @@ var missingStateSignals = []string{
 // error entry other than a timeout.
 var ErrNotTraced = errors.New("the node returned no trace")
 
+// rateLimited is the JSON-RPC error code of a request over the node's rate limit.
+const rateLimited = -32005
+
+// notRefusalSignals are the error substrings of a node that answered without saying whether it can serve what was
+// asked: a timeout or a rate limit.
+var notRefusalSignals = []string{
+	"timeout",
+	"deadline",
+	"rate limit",
+	"too many requests",
+}
+
 // NodeRefused is whether err is the node answering that it cannot serve what was asked: no trace for a transaction,
-// or an error saying it lacks the block's state. A timeout, a rate limit or a node that does not answer is not.
+// or any error it answers with other than a timeout or a rate limit, whatever its words. A node that does not answer
+// is not.
 func NodeRefused(err error) bool {
 	if errors.Is(err, ErrNotTraced) {
 		return true
 	}
 	var answer *rpclient.RPCError
-	if !errors.As(err, &answer) {
+	if !errors.As(err, &answer) || answer.Code == rateLimited {
 		return false
 	}
 	msg := strings.ToLower(answer.Message)
-	for _, signal := range missingStateSignals {
+	for _, signal := range notRefusalSignals {
 		if strings.Contains(msg, signal) {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // noTrace is the error for a transaction a block's traces answered without a trace; msg is its error entry.

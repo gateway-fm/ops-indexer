@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	explorerTypes "github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 var (
@@ -133,7 +135,8 @@ func TestMissingStateIsNotMissingTracing(t *testing.T) {
 }
 
 // answerServer traces transaction A whole, and answers B's trace as b says: "refused" (the node lacks the state),
-// "timeout" (the tracer timed out) or "down" (an HTTP 503), per block or per transaction.
+// "out of range" (the node refuses in its own words), "timeout" (the tracer timed out), "rate limited" or "down" (an
+// HTTP 503), per block or per transaction.
 func answerServer(t *testing.T, blockTraced bool, b string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +146,13 @@ func answerServer(t *testing.T, blockTraced bool, b string) *httptest.Server {
 			Params []any           `json:"params"`
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-		msg := map[string]string{"refused": "missing trie node 1a2b (path )", "timeout": "execution timeout"}[b]
+		msg := map[string]string{"refused": "missing trie node 1a2b (path )",
+			"out of range": "BlockOutOfRangeError: block height is 60000 but requested was 7", "timeout": "execution timeout",
+			"rate limited": "rate limit exceeded"}[b]
+		code := map[string]int{"out of range": -32602, "rate limited": -32005}[b]
+		if code == 0 {
+			code = -32000
+		}
 		if b == "down" && (req.Method == "debug_traceBlockByNumber" || req.Params[0] == traceTxB.Hex()) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -154,17 +163,17 @@ func answerServer(t *testing.T, blockTraced bool, b string) *httptest.Server {
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":[{"txHash":%q,"result":%s},{"txHash":%q,"error":%q}]}`,
 				req.ID, traceTxA.Hex(), traceFrameWithACall, traceTxB.Hex(), msg)
 		case req.Method == "debug_traceBlockByNumber":
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":%q}}`, req.ID, msg)
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":%q}}`, req.ID, code, msg)
 		case req.Params[0] == traceTxA.Hex():
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, req.ID, traceFrameWithACall)
 		default:
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":%q}}`, req.ID, msg)
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":%q}}`, req.ID, code, msg)
 		}
 	}))
 }
 
-// A fetch that skips refusals leaves out a transaction the node answers it cannot trace, and fails on a timeout or a
-// node that does not answer, which say nothing of the trace.
+// A fetch that skips refusals leaves out a transaction the node answers it cannot trace, in whatever words, and fails
+// on a timeout, a rate limit or a node that does not answer, which say nothing of the trace.
 func TestATraceFetchSkippingRefusalsFailsOnAnythingElse(t *testing.T) {
 	for _, c := range []struct {
 		b           string
@@ -173,8 +182,10 @@ func TestATraceFetchSkippingRefusalsFailsOnAnythingElse(t *testing.T) {
 	}{
 		{"refused", true, false},
 		{"refused", false, false},
+		{"out of range", false, false},
 		{"timeout", true, true},
 		{"timeout", false, true},
+		{"rate limited", false, true},
 		{"down", false, true},
 	} {
 		t.Run(fmt.Sprintf("%s/block=%v", c.b, c.blockTraced), func(t *testing.T) {
@@ -294,5 +305,29 @@ func TestTheCountsOfOldBlocksGiveTheTracerATimeout(t *testing.T) {
 				require.Empty(t, timeout, "ingest keeps the node's default")
 			}
 		})
+	}
+}
+
+// Any error the node answers with is it refusing what was asked, except a timeout or a rate limit: those say nothing
+// of whether it can serve it. An error the node did not answer with is never a refusal.
+func TestAnyAnswerOtherThanATimeoutOrARateLimitIsTheNodeRefusing(t *testing.T) {
+	for _, c := range []struct {
+		err     error
+		refused bool
+	}{
+		{ErrNotTraced, true},
+		{&rpclient.RPCError{Code: -32000, Message: "historical state is not available"}, true},
+		{&rpclient.RPCError{Code: -32602, Message: "BlockOutOfRangeError: block height is 60000 but requested was 1"}, true},
+		{fmt.Errorf("code at block 1: %w", &rpclient.RPCError{Code: -32000, Message: "pruned history unavailable"}), true},
+		{&rpclient.RPCError{Code: -32005, Message: "limit exceeded"}, false},
+		{&rpclient.RPCError{Code: -32000, Message: "Rate limit reached"}, false},
+		{&rpclient.RPCError{Code: -32000, Message: "too many requests"}, false},
+		{&rpclient.RPCError{Code: -32000, Message: "execution timeout"}, false},
+		{&rpclient.RPCError{Code: -32000, Message: "context deadline exceeded"}, false},
+		{&rpclient.HTTPStatusError{Code: http.StatusTooManyRequests}, false},
+		{errors.New("dial tcp 192.0.2.1:8545: connect: connection refused"), false},
+		{context.Canceled, false},
+	} {
+		require.Equal(t, c.refused, NodeRefused(c.err), "%v", c.err)
 	}
 }

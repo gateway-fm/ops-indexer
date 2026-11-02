@@ -1219,8 +1219,8 @@ var errContractUndecided = errors.New("the node does not serve the code at the c
 // error or no code means no contract. A count of an old block (CodeAtBlock) has to judge it as ingest did then: the
 // code after that block where the node keeps its state, else the code at latest when there is some. An error, or no
 // code at latest (never deployed, or destroyed since: the two cannot be told apart), is returned, so the block fails
-// rather than lose the contract. A read at the block that fails other than by the node lacking its state is returned
-// as it is: it says nothing of the code.
+// rather than lose the contract. A read at the block that fails other than by the node refusing it (a timeout, a rate
+// limit, a node down) is returned as it is: it says nothing of the code.
 func (i *Indexer) contractCode(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
 	if !i.config.CodeAtBlock {
 		return i.rpc.GetCode(ctx, address)

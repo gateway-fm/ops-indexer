@@ -10,8 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/rpc"
 	"github.com/gateway-fm/chain-indexer/internal/types"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 )
 
 // untracedArchive keeps old state, so it serves a creation's code at its block, but traces no old block.
@@ -92,8 +94,8 @@ var errNodeDown = errors.New("dial tcp 192.0.2.1:8545: connect: connection refus
 
 var tracedCallee = "0x00000000000000000000000000000000000000c3"
 
-// scriptedTraces answers its trace calls in turn from answers: errNoHistoricalState is the node refusing, errNodeDown
-// the node down, nil (and every call past the list) the block's one internal call, from its recipient to tracedCallee.
+// scriptedTraces answers its trace calls in turn from answers: an error the node answers with, errNodeDown the node
+// down, nil (and every call past the list) the block's one internal call, from its recipient to tracedCallee.
 type scriptedTraces struct {
 	*fakeChain
 	mu      sync.Mutex
@@ -131,10 +133,10 @@ func (s *scriptedTraces) FetchTracesBatchStrict(_ context.Context, _ []common.Ha
 }
 
 func (s *scriptedTraces) FetchTracesBatchSkippingRefusals(_ context.Context, _ []common.Hash, block uint64, _ uint64, _ int, _ int) ([]*types.InternalTransaction, error) {
-	switch err := s.next(); err {
-	case nil:
+	switch err := s.next(); {
+	case err == nil:
 		return s.call(block), nil
-	case errNoHistoricalState:
+	case rpc.NodeRefused(err):
 		return nil, nil
 	default:
 		return nil, err
@@ -227,4 +229,88 @@ func TestOnlyTheNodeRefusingABlockCountsTowardCountingItWithoutWhatFailed(t *tes
 		require.NoError(t, err)
 		require.Zero(t, internalCalls(out), "counted without its traces once the node answers again")
 	})
+}
+
+// errOutOfRange is a node refusing an old block in its own words.
+var errOutOfRange error = &rpclient.RPCError{Code: -32602, Message: "BlockOutOfRangeError: block height is 60000 but requested was 5"}
+
+// outOfRangeChain keeps no old state and refuses the code at an old block in its own words.
+type outOfRangeChain struct {
+	*creationChain
+}
+
+func (o *outOfRangeChain) GetCodeAt(context.Context, common.Address, uint64) ([]byte, error) {
+	return nil, errOutOfRange
+}
+
+// The node refusing a block's code or traces counts toward strictBlockTries whatever words it refuses in, so the block
+// is counted without what failed. A timeout or a rate limit does not count: the block fails on every try until the
+// node serves it.
+func TestANodeRefusingInItsOwnWordsCountsTowardCountingABlockWithoutWhatFailed(t *testing.T) {
+	ctx := context.Background()
+	tries := strictBlockTries
+	strictBlockTries = 3
+	t.Cleanup(func() { strictBlockTries = tries })
+	internalCalls := func(out *db.BackfillBatch) int {
+		if d := out.Shared.AddressStats[tracedCallee]; d != nil {
+			return d.InternalTxCountDelta
+		}
+		return 0
+	}
+	newBackfiller := func(r RPCClient, traces bool) *backfiller {
+		idx := newTestIndexer(new(MockDatabase), r)
+		idx.tracingSupported = traces
+		return idx.newBackfiller(nil, testBackfill)
+	}
+	answering := func(err error, n int) []error {
+		answers := make([]error, n)
+		for i := range answers {
+			answers[i] = err
+		}
+		return answers
+	}
+
+	t.Run("code at the block", func(t *testing.T) {
+		b := newBackfiller(&outOfRangeChain{creationChain: &creationChain{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient),
+			head: 20, busy: 20}}}, false)
+		for range strictBlockTries - 1 {
+			_, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+			require.Error(t, err)
+		}
+		out, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+		require.NoError(t, err)
+		for _, k := range out.Contracts {
+			require.False(t, strings.EqualFold(k.Address, recountCreated.Hex()), "a creation the node cannot judge is no contract")
+		}
+	})
+
+	t.Run("traces", func(t *testing.T) {
+		b := newBackfiller(&scriptedTraces{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 20, busy: 20},
+			answers: answering(errOutOfRange, strictBlockTries+1)}, true)
+		for range strictBlockTries - 1 {
+			_, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+			require.ErrorIs(t, err, errOutOfRange)
+		}
+		out, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+		require.NoError(t, err)
+		require.Zero(t, internalCalls(out), "counted without its traces")
+	})
+
+	for _, notRefused := range []error{
+		&rpclient.RPCError{Code: -32000, Message: "execution timeout"},
+		&rpclient.RPCError{Code: -32005, Message: "limit exceeded"},
+	} {
+		t.Run(notRefused.Error(), func(t *testing.T) {
+			answers := answering(notRefused, strictBlockTries+2)
+			b := newBackfiller(&scriptedTraces{fakeChain: &fakeChain{MockRPCClient: new(MockRPCClient), head: 20, busy: 20},
+				answers: answers}, true)
+			for range len(answers) {
+				_, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+				require.ErrorIs(t, err, notRefused)
+			}
+			out, _, err := b.batch(ctx, 5, 6, 1_000_000, nil)
+			require.NoError(t, err)
+			require.Equal(t, 1, internalCalls(out), "the block is counted with its internal call")
+		})
+	}
 }
