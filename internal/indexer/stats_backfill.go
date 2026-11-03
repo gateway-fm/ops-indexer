@@ -435,46 +435,40 @@ type oldBlockTracer interface {
 var _ oldBlockTracer = (*rpc.Client)(nil)
 
 // historicalTraces checks that the node traces block 1, the oldest the backfill traces (many nodes cannot trace
-// genesis), as the counts of old blocks trace it: the whole block, and each of its transactions on its own when the
-// whole block fails other than by the node refusing it (a timeout). A node without the old state cannot trace any
-// block of the range, and the backfill would fail every one of them: the prepare fails instead, and says so. A node
-// that has no tracing at all is counted without traces, as ingest counts it.
+// genesis), as the counts of old blocks trace it: its transactions through the strict fetch, which falls back to
+// each transaction on its own when the whole block fails, or the whole block, with the counts' timeout, when it has
+// none. A node without the old state cannot trace any block of the range, and the backfill would fail every one of
+// them: the prepare fails instead, and says so. A node that has no tracing at all is counted without traces, as
+// ingest counts it.
 func historicalTraces(ctx context.Context, node RPCClient, startBlock uint64) error {
 	t, ok := node.(oldBlockTracer)
 	if !ok || startBlock < 2 {
 		return nil
 	}
-	_, err := t.TraceOldBlock(ctx, 1)
+	err := tracesOldBlock(ctx, node, t, 1)
 	if err == nil || rpc.TracingAbsent(err) {
 		return nil
-	}
-	if !rpc.NodeRefused(err) {
-		// The counts fall back to tracing each transaction of a block whose whole trace fails other than by the node
-		// refusing it (a timeout): so does the check.
-		if err = tracesEachTransaction(ctx, node, 1); err == nil {
-			return nil
-		}
 	}
 	return fmt.Errorf("the stats backfill traces the blocks below START_BLOCK, and the node does not trace block 1 "+
 		"(it needs an archive node with tracing, or ENABLE_TRACING=false to count without internal transactions): %w", err)
 }
 
-// preflightTraceWorkers and preflightTraceRate are the start's check's budget for tracing block 1 one transaction
-// at a time.
+// preflightTraceWorkers and preflightTraceRate are the start's check's budget for tracing block 1's transactions.
 const (
 	preflightTraceWorkers = 4
 	preflightTraceRate    = 50
 )
 
-// tracesEachTransaction traces block's transactions as the counts of old blocks do (FetchTracesBatchStrict), whose
-// fallback traces each one on its own, and fails if any trace fails.
-func tracesEachTransaction(ctx context.Context, node RPCClient, block uint64) error {
-	s, ok := node.(strictTracer)
-	if !ok {
-		return fmt.Errorf("the node client has no strict trace fetch")
-	}
+// tracesOldBlock traces block as the counts of old blocks do (FetchTracesBatchStrict), failing if any of its
+// transactions' traces fails; a block without transactions is traced whole, which still needs the block's state.
+func tracesOldBlock(ctx context.Context, node RPCClient, t oldBlockTracer, block uint64) error {
 	raw, err := node.RawBlockByNumber(ctx, block)
 	if err != nil {
+		return err
+	}
+	s, ok := node.(strictTracer)
+	if !ok || len(raw.Transactions) == 0 {
+		_, err := t.TraceOldBlock(ctx, block)
 		return err
 	}
 	hashes := make([]common.Hash, len(raw.Transactions))

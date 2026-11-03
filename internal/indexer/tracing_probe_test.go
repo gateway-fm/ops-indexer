@@ -26,7 +26,8 @@ type probedChain struct {
 	supported bool
 	probeErr  error
 	probes    int
-	// traceBlockErr is the node's answer to a trace of a whole old block.
+	// traceBlockErr is the node's answer to a trace of an old block, whole or a transaction at a time; when nil, the
+	// strict fetch answers errNoHistoricalState.
 	traceBlockErr error
 }
 
@@ -44,6 +45,9 @@ func (p *probedChain) FetchTracesBatch(context.Context, []common.Hash, uint64, u
 }
 
 func (p *probedChain) FetchTracesBatchStrict(context.Context, []common.Hash, uint64, uint64, int, int) ([]*types.InternalTransaction, error) {
+	if p.traceBlockErr != nil {
+		return nil, p.traceBlockErr
+	}
 	return nil, errNoHistoricalState
 }
 
