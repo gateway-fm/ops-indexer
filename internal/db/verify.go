@@ -170,6 +170,11 @@ func (d *DB) RecountRetainedSpan(ctx context.Context, repair bool, workMem strin
 				return err
 			}
 			ok = true
+			// The span's stage lock before its stage rows, as the node recount takes it: retention can hand the span
+			// to the node recount while this one stages it.
+			if _, err := tx.Exec(ctx, spanStageLockSQL, c.Lo); err != nil {
+				return err
+			}
 			if _, err := tx.Exec(ctx, `SELECT ledger_stage_from_rows($1, $2)`, c.Lo, c.Hi); err != nil {
 				return err
 			}

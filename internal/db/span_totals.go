@@ -105,6 +105,10 @@ func stageSpanTotals(ctx context.Context, tx pgx.Tx, lo int64, s *SpanTotals) er
 	return err
 }
 
+// spanStageLockSQL takes span $1's stage lock: the retained and the node recounts of one span take it before they
+// stage the span's rows, so neither stages while the other holds its stage rows, whichever lock it takes next.
+const spanStageLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended('ledger_span_stage:' || $1::BIGINT::TEXT, 0))`
+
 // SettleNodeSpan compares a closed span's stored rows with its totals counted from the node and settles it, as the
 // retained recount does with totals counted from rows. It takes compaction's lock and settles only a stored span that
 // is exactly the range it counted, whatever its source: one compaction widened while the count ran keeps its rows, and
@@ -112,6 +116,11 @@ func stageSpanTotals(ctx context.Context, tx pgx.Tx, lo int64, s *SpanTotals) er
 func (d *DB) SettleNodeSpan(ctx context.Context, lo, hi int64, s *SpanTotals, repair bool) (SpanCheck, error) {
 	c := SpanCheck{Lo: lo, Hi: hi}
 	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		// The span's stage lock first, before compaction's lock and the rebase lock: a retained recount of the span
+		// takes it before its stage rows and then the rebase lock.
+		if _, err := tx.Exec(ctx, spanStageLockSQL, lo); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4672, 1)`); err != nil {
 			return err
 		}
