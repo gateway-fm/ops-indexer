@@ -139,6 +139,9 @@ func (d *DB) WriteRefilledDailyStats(ctx context.Context, days []RefillDay, dry 
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, bumpDailyGenerationSQL); err != nil {
+			return err
+		}
 		var watermark int64
 		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT last_block FROM daily_stats_watermark WHERE id = 1), -1)`).Scan(&watermark); err != nil {
 			return err

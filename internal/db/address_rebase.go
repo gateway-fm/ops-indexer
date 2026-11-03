@@ -696,6 +696,9 @@ func (d *DB) recountPendingDays(ctx context.Context) error {
 		if pending == 0 {
 			return nil
 		}
+		if _, err := tx.Exec(ctx, bumpDailyGenerationSQL); err != nil {
+			return err
+		}
 		if err := recountDailyAddressColumns(ctx, tx); err != nil {
 			return err
 		}

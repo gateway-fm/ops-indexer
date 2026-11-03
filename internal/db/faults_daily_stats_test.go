@@ -39,11 +39,11 @@ func TestFaultDailyAdvanceFaults(t *testing.T) {
 		match  string
 		late   bool
 	}{
-		{"lost-ack", faultkit.LostAck, "daily_stats_advance", false},
-		{"fail-commit", faultkit.FailCommit, "daily_stats_advance", false},
-		{"kill-before", faultkit.KillBefore, "daily_stats_advance", false},
-		{"lost-ack-late", faultkit.LostAck, "daily_stats_advance", true},
-		{"fail-commit-late", faultkit.FailCommit, "daily_stats_advance", true},
+		{"lost-ack", faultkit.LostAck, "daily_stats_fold_apply", false},
+		{"fail-commit", faultkit.FailCommit, "daily_stats_fold_apply", false},
+		{"kill-before", faultkit.KillBefore, "daily_stats_fold_apply", false},
+		{"lost-ack-late", faultkit.LostAck, "daily_stats_fold_apply", true},
+		{"fail-commit-late", faultkit.FailCommit, "daily_stats_fold_apply", true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ref, _, _ := fkDB(t)

@@ -56,7 +56,7 @@ var fkLedgerQueries = []string{
 var fkDailyQueries = []string{
 	`SELECT * FROM daily_stats`,
 	`SELECT * FROM daily_stats_acc`,
-	`SELECT * FROM daily_stats_watermark`,
+	`SELECT id, last_block FROM daily_stats_watermark`,
 	`SELECT name, count FROM chain_counters`,
 }
 
