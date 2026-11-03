@@ -416,7 +416,7 @@ func (r *RealtimeIndexer) handleReorg(ctx context.Context, fromBlock uint64) err
 	metrics.ReorgDetected()
 
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
-		if err := r.db.DeleteBlock(ctx, blockNum); err != nil {
+		if err := revertBlockHoldingEpoch(ctx, r.db, r.balanceWorkers, blockNum); err != nil {
 			log.Error("realtime: failed to delete block", "block", blockNum, "error", err)
 			return err
 		}

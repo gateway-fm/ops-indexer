@@ -41,12 +41,22 @@ type Config struct {
 	LedgerCloseInterval time.Duration `mapstructure:"ledger_close_interval"`
 	LedgerWorkMem       string        `mapstructure:"ledger_work_mem"`
 	// PrunedLookup serves blocks and transactions below the prune watermark from the node (PRST-5375).
-	PrunedLookup            bool          `mapstructure:"pruned_lookup"`
-	PrunedLookupCacheBlocks int           `mapstructure:"pruned_lookup_cache_blocks"`
-	PrunedLookupCacheMB     int           `mapstructure:"pruned_lookup_cache_mb"`
-	PrunedLookupTimeout     time.Duration `mapstructure:"pruned_lookup_timeout"`
-	PrunedLookupConcurrency int           `mapstructure:"pruned_lookup_concurrency"`
-	LedgerMaxHeadLag        uint64        `mapstructure:"ledger_max_head_lag_blocks"`
+	PrunedLookup             bool          `mapstructure:"pruned_lookup"`
+	PrunedLookupCacheBlocks  int           `mapstructure:"pruned_lookup_cache_blocks"`
+	PrunedLookupCacheMB      int           `mapstructure:"pruned_lookup_cache_mb"`
+	PrunedLookupTimeout      time.Duration `mapstructure:"pruned_lookup_timeout"`
+	PrunedLookupConcurrency  int           `mapstructure:"pruned_lookup_concurrency"`
+	LedgerMaxHeadLag         uint64        `mapstructure:"ledger_max_head_lag_blocks"`
+	VerifyRecountInterval    time.Duration `mapstructure:"verify_recount_interval"`
+	VerifyRepair             bool          `mapstructure:"verify_repair"`
+	VerifyNodeRecountRPS     int           `mapstructure:"verify_node_recount_rps"`
+	VerifyChainRPS           int           `mapstructure:"verify_chain_rps"`
+	VerifyChainSample        int           `mapstructure:"verify_chain_sample"`
+	VerifyChainInterval      time.Duration `mapstructure:"verify_chain_interval"`
+	StatsBackfillRPS         int           `mapstructure:"stats_backfill_rps"`
+	StatsBackfillWorkers     int           `mapstructure:"stats_backfill_workers"`
+	StatsBackfillBatchBlocks uint64        `mapstructure:"stats_backfill_batch_blocks"`
+	LedgerCompactSpans       int           `mapstructure:"ledger_compact_spans"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -134,6 +144,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pruned_lookup_timeout", "5s")
 	v.SetDefault("pruned_lookup_concurrency", 4)
 	v.SetDefault("ledger_max_head_lag_blocks", 0)
+	v.SetDefault("ledger_compact_spans", 0)
+	v.SetDefault("verify_recount_interval", "1m")
+	v.SetDefault("verify_repair", true)
+	v.SetDefault("verify_node_recount_rps", 50)
+	v.SetDefault("verify_chain_rps", 20)
+	v.SetDefault("verify_chain_sample", 20)
+	v.SetDefault("verify_chain_interval", "1m")
+	v.SetDefault("stats_backfill_rps", 100)
+	v.SetDefault("stats_backfill_workers", 4)
+	v.SetDefault("stats_backfill_batch_blocks", 1000)
 
 	v.SetDefault("rpc_workers", 50)
 	v.SetDefault("rpc_rate_limit", 500)
@@ -161,7 +181,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("catchup_workers", 10)
 	v.SetDefault("catchup_batch_size", 100)
 	v.SetDefault("catchup_queue_size", 1000)
-	v.SetDefault("realtime_max_behind_blocks", 0)
+	v.SetDefault("realtime_max_behind_blocks", 1000)
 
 	v.SetDefault("privacy_proxy_url", "")
 	v.SetDefault("privacy_proxy_public_url", "")
@@ -225,6 +245,16 @@ func Load() (*Config, error) {
 	cfg.PrunedLookupTimeout = v.GetDuration("pruned_lookup_timeout")
 	cfg.PrunedLookupConcurrency = v.GetInt("pruned_lookup_concurrency")
 	cfg.LedgerMaxHeadLag = v.GetUint64("ledger_max_head_lag_blocks")
+	cfg.LedgerCompactSpans = v.GetInt("ledger_compact_spans")
+	cfg.VerifyRecountInterval = v.GetDuration("verify_recount_interval")
+	cfg.VerifyRepair = v.GetBool("verify_repair")
+	cfg.VerifyNodeRecountRPS = v.GetInt("verify_node_recount_rps")
+	cfg.VerifyChainRPS = v.GetInt("verify_chain_rps")
+	cfg.VerifyChainSample = v.GetInt("verify_chain_sample")
+	cfg.VerifyChainInterval = v.GetDuration("verify_chain_interval")
+	cfg.StatsBackfillRPS = v.GetInt("stats_backfill_rps")
+	cfg.StatsBackfillWorkers = v.GetInt("stats_backfill_workers")
+	cfg.StatsBackfillBatchBlocks = v.GetUint64("stats_backfill_batch_blocks")
 
 	cfg.RPCWorkers = v.GetInt("rpc_workers")
 	cfg.RPCRateLimit = v.GetInt("rpc_rate_limit")
@@ -359,9 +389,12 @@ func (c *Config) Validate() error {
 			"this small let a chain of up to %d blocks/s outrun them; set PARTITION_BLOCKS to at least %d",
 			c.PartitionBlocks, partitionKeeperInterval, MaxChainBlocksPerSecond, MinPartitionBlocks)
 	}
-	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 {
-		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d needs the stats backfill of blocks [0, START_BLOCK), which this build does not have: "+
-			"every total would leave those blocks out. Set START_BLOCK=0, or PRUNE_RETAIN_BLOCKS=0 to keep totals from START_BLOCK", c.StartBlock, c.PruneRetainBlocks)
+	if c.VerifyRecountInterval <= 0 || (c.VerifyChainRPS > 0 && c.VerifyChainInterval <= 0) {
+		return fmt.Errorf("VERIFY_RECOUNT_INTERVAL and (with VERIFY_CHAIN_RPS) VERIFY_CHAIN_INTERVAL must be greater than 0")
+	}
+	if c.StartBlock > 0 && c.PruneRetainBlocks > 0 && (c.StatsBackfillRPS <= 0 || c.StatsBackfillBatchBlocks == 0) {
+		return fmt.Errorf("START_BLOCK %d with PRUNE_RETAIN_BLOCKS %d counts [0, START_BLOCK) with the stats backfill: "+
+			"STATS_BACKFILL_RPS and STATS_BACKFILL_BATCH_BLOCKS must be greater than 0", c.StartBlock, c.PruneRetainBlocks)
 	}
 	if c.EnableOPDeposits {
 		if c.L1RPCURL == "" {

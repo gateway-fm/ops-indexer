@@ -47,6 +47,56 @@ var (
 		Buckets: latencyBuckets,
 	})
 
+	statsBackfillThrough = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_stats_backfill_through",
+		Help: "Every block at or below this is counted by the stats backfill.",
+	})
+
+	statsBackfillWaiting = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_stats_backfill_waiting_for_catchup",
+		Help: "1 while the stats backfill has counted every block below START_BLOCK and waits for catch-up to store every block from it.",
+	})
+
+	pruneBlockedByBackfill = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_prune_blocked_by_stats_backfill",
+		Help: "1 while retention prunes nothing because the stats backfill has not written its days.",
+	})
+
+	verifyChecked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_verify_ranges_checked_total",
+		Help: "Ledger checks run, by check (recount: one retained span; running: chain, tokens and one address bucket; node: one pruned span).",
+	}, []string{"check"})
+
+	verifyDrifted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_verify_ranges_drifted_total",
+		Help: "Ledger checks that found at least one differing counter, by check.",
+	}, []string{"check"})
+
+	verifyDrift = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "indexer_verify_drift",
+		Help: "Differing counters found by the last check, by check.",
+	}, []string{"check"})
+
+	verifyRepairs = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "indexer_verify_repairs_total",
+		Help: "Ledger checks whose drift was repaired, by check.",
+	}, []string{"check"})
+
+	verifyQuarantined = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_verify_quarantined",
+		Help: "Spans and running keys that drifted again after a repair: no longer repaired.",
+	})
+
+	verifyCycleSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "indexer_verify_cycle_seconds",
+		Help: "Duration of the last full cycle over every range (or address bucket), by check.",
+	}, []string{"check"})
+
+	verifyLastFullCycle = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "indexer_verify_last_full_cycle_timestamp",
+		Help: "Unix time the last full cycle finished, by check.",
+	}, []string{"check"})
+
 	retentionStepSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "indexer_retention_step_seconds",
 		Help:    "Duration of one retention step: cut_constrain, cut_validate, cut_finish, ensure, advance, detach, archive, drop.",
@@ -170,6 +220,42 @@ func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
 
 func SetPruneWatermark(block uint64) { pruneWatermark.Set(float64(block)) }
 
+// VerifyChecked records one check's outcome: its differing counters and the state it left (ok, drift, repaired,
+// quarantined).
+func VerifyChecked(check string, drifted int, state string) {
+	verifyChecked.WithLabelValues(check).Inc()
+	verifyDrift.WithLabelValues(check).Set(float64(drifted))
+	if drifted > 0 {
+		verifyDrifted.WithLabelValues(check).Inc()
+	}
+	if state == "repaired" && drifted > 0 {
+		verifyRepairs.WithLabelValues(check).Inc()
+	}
+}
+
+// VerifyCheckedN records a sampled check: checked items, of which drifted differ.
+func VerifyCheckedN(check string, checked, drifted int) {
+	if checked == 0 {
+		return
+	}
+	verifyChecked.WithLabelValues(check).Add(float64(checked))
+	verifyDrift.WithLabelValues(check).Set(float64(drifted))
+	verifyDrifted.WithLabelValues(check).Add(float64(drifted))
+}
+
+func SetStatsBackfillThrough(block uint64) { statsBackfillThrough.Set(float64(block)) }
+
+func SetStatsBackfillWaiting(waiting bool) { statsBackfillWaiting.Set(boolGauge(waiting)) }
+
+func SetPruneBlockedByBackfill(blocked bool) { pruneBlockedByBackfill.Set(boolGauge(blocked)) }
+
+func SetVerifyQuarantined(n int64) { verifyQuarantined.Set(float64(n)) }
+
+func VerifyCycle(check string, d time.Duration) {
+	verifyCycleSeconds.WithLabelValues(check).Set(d.Seconds())
+	verifyLastFullCycle.WithLabelValues(check).SetToCurrentTime()
+}
+
 func SetLedgerClosedThrough(block uint64) { ledgerClosedThrough.Set(float64(block)) }
 
 func ObserveLedgerClose(d time.Duration) { ledgerCloseSeconds.Observe(d.Seconds()) }
@@ -238,6 +324,58 @@ var (
 		Help: "Balances requested through batched reads (one eth_call reads many).",
 	})
 )
+
+var ledgerIndexesReady = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "indexer_ledger_indexes_ready",
+	Help: "1 once the ledger's lookup indexes are built; 0 while they are not, and the span rebase, the ledger checks and repair-address-stats wait.",
+})
+
+// SetLedgerIndexesReady sets indexer_ledger_indexes_ready.
+func SetLedgerIndexesReady(ready bool) {
+	if ready {
+		ledgerIndexesReady.Set(1)
+	} else {
+		ledgerIndexesReady.Set(0)
+	}
+}
+
+var nodeRecountFailures = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_ledger_node_recount_failures_total",
+	Help: "Pruned-span recounts from the node that failed; a span that fails twice in a row goes to the back of the queue unchecked.",
+})
+
+// NodeRecountFailed counts a failed pruned-span recount.
+func NodeRecountFailed() { nodeRecountFailures.Inc() }
+
+var nodeSpansUnchecked = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "indexer_ledger_node_spans_unchecked",
+	Help: "Pruned spans the node recount left unchecked since it started, by reason: undecided (the node cannot judge a contract creation) or failing (its recount failed twice in a row).",
+}, []string{"reason"})
+
+// SetNodeSpansUnchecked sets indexer_ledger_node_spans_unchecked for one reason.
+func SetNodeSpansUnchecked(reason string, n int) {
+	nodeSpansUnchecked.WithLabelValues(reason).Set(float64(n))
+}
+
+var balanceRereadsAbandoned = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_balance_rereads_abandoned_total",
+	Help: "Balances a reorg revert asked to read again that every attempt failed to read; each stays as the revert restored it until the holder's next transfer.",
+})
+
+var statsBackfillLenientBlocks = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "indexer_stats_backfill_lenient_blocks_total",
+	Help: "Blocks the stats backfill counted without a trace or a contract's code the node failed to serve on every try.",
+})
+
+// StatsBackfillLenientBlock counts a block the stats backfill counted without what failed on every try.
+func StatsBackfillLenientBlock() { statsBackfillLenientBlocks.Inc() }
+
+// BalanceRereadsAbandoned counts reread requests given up after their last attempt.
+func BalanceRereadsAbandoned(n int) {
+	if n > 0 {
+		balanceRereadsAbandoned.Add(float64(n))
+	}
+}
 
 func BalanceFetchFailed(n int) {
 	if n > 0 {
@@ -316,4 +454,11 @@ func NodeLookupBusy() { nodeLookupBusy.Inc() }
 func SetNodeLookupCache(blocks, bytes int) {
 	nodeLookupCachedBlocks.Set(float64(blocks))
 	nodeLookupCachedBytes.Set(float64(bytes))
+}
+
+func boolGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }

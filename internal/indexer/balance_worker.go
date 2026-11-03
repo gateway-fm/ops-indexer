@@ -19,6 +19,9 @@ type BalanceWork struct {
 	Address      common.Address
 	TokenAddress common.Address
 	BlockNumber  uint64
+	// Epoch is the reorg epoch current when the read was decided; the pool stamps it when the caller leaves it 0.
+	// Folded keys keep the highest: the read happens after the last of them was decided.
+	Epoch int64
 }
 
 type BalanceWorkerPool struct {
@@ -30,6 +33,12 @@ type BalanceWorkerPool struct {
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	// epoch is the reorg epoch stamped on new work (SetEpoch). epochGate is held for writing from the start of a
+	// revert until its epoch is read, and for reading while work is stamped, so no work is stamped with the epoch from
+	// before a revert once the revert has begun.
+	epoch     atomic.Int64
+	epochGate sync.RWMutex
 
 	// sendMu guards workChan's close against concurrent sends; closed is set under its write lock by Stop.
 	sendMu   sync.RWMutex
@@ -128,7 +137,53 @@ func (p *BalanceWorkerPool) Stop() {
 	})
 }
 
-// QueueWork returns false if the queue is full (non-blocking).
+// SetEpoch moves the reorg epoch the pool stamps on new work forward to e (CurrentBalanceEpoch after a revert).
+func (p *BalanceWorkerPool) SetEpoch(e int64) {
+	for {
+		cur := p.epoch.Load()
+		if e <= cur || p.epoch.CompareAndSwap(cur, e) {
+			return
+		}
+	}
+}
+
+// stamped is work with the pool's current reorg epoch when it carries none; it waits while a revert's epoch is being
+// read.
+func (p *BalanceWorkerPool) stamped(work BalanceWork) BalanceWork {
+	if work.Epoch == 0 {
+		p.epochGate.RLock()
+		work.Epoch = p.epoch.Load()
+		p.epochGate.RUnlock()
+	}
+	return work
+}
+
+// holdEpoch makes new work wait for its stamp until releaseEpoch: a revert is under way and its epoch is not read yet.
+func (p *BalanceWorkerPool) holdEpoch() { p.epochGate.Lock() }
+
+// releaseEpoch moves the epoch to e and lets new work be stamped again.
+func (p *BalanceWorkerPool) releaseEpoch(e int64) {
+	p.SetEpoch(e)
+	p.epochGate.Unlock()
+}
+
+// folded is one key's two work items as one read: the block of the item at the higher epoch, the higher block at the
+// same epoch. An item from before a revert (a lower epoch) may carry a reverted block above the new chain's, which
+// the highest-block guard would then let win over the new chain's next read.
+func folded(a, b BalanceWork) BalanceWork {
+	switch {
+	case b.Epoch > a.Epoch:
+		return b
+	case b.Epoch < a.Epoch:
+		return a
+	}
+	a.BlockNumber = max(a.BlockNumber, b.BlockNumber)
+	return a
+}
+
+// QueueWork does not wait for room: it returns false if the queue is full. It does wait while a block's revert holds
+// the epoch (stamped), so that the work carries the revert's epoch; the other queueing calls wait there too, whatever
+// their context or grace.
 func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
 	p.sendMu.RLock()
 	defer p.sendMu.RUnlock()
@@ -136,7 +191,7 @@ func (p *BalanceWorkerPool) QueueWork(work BalanceWork) bool {
 		return false
 	}
 	select {
-	case p.workChan <- work:
+	case p.workChan <- p.stamped(work):
 		return true
 	default:
 		return false
@@ -164,7 +219,7 @@ func (p *BalanceWorkerPool) QueueWorkBatchWait(ctx context.Context, works []Bala
 	queued := 0
 	for _, work := range works {
 		select {
-		case p.workChan <- work:
+		case p.workChan <- p.stamped(work):
 			queued++
 		case <-ctx.Done():
 			return queued
@@ -256,9 +311,7 @@ func (p *BalanceWorkerPool) coalesce() {
 			}
 			k := balanceKey{address: work.Address, token: work.TokenAddress}
 			if h, ok := held[k]; ok {
-				if work.BlockNumber > h.BlockNumber {
-					h.BlockNumber = work.BlockNumber
-				}
+				*h = folded(*h, work)
 				metrics.BalanceDeduped(1)
 				continue
 			}
@@ -356,6 +409,7 @@ func (p *BalanceWorkerPool) fetchBalance(work BalanceWork) (*types.Balance, erro
 		TokenAddress: work.TokenAddress.Hex(),
 		BlockNumber:  work.BlockNumber,
 		Balance:      types.JSONString(balance.String()),
+		Epoch:        work.Epoch,
 	}, nil
 }
 
@@ -408,9 +462,7 @@ drain:
 			}
 			k := balanceKey{w.Address, w.TokenAddress}
 			if prev, seen := works[k]; seen {
-				if w.BlockNumber > prev.BlockNumber {
-					works[k] = w
-				}
+				works[k] = folded(prev, w)
 				metrics.BalanceDeduped(1)
 				continue
 			}
@@ -445,6 +497,7 @@ drain:
 				TokenAddress: w.TokenAddress.Hex(),
 				BlockNumber:  w.BlockNumber,
 				Balance:      types.JSONString(values[i].String()),
+				Epoch:        w.Epoch,
 			})
 		}
 	}

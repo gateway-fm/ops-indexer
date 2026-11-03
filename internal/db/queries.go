@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -221,6 +222,12 @@ func keepDailyStatsWatermarkOnStoredBlocks(ctx context.Context, tx pgx.Tx) error
 }
 
 func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
+	return d.DeleteBlockLocked(ctx, number, nil)
+}
+
+// DeleteBlockLocked is DeleteBlock calling locked, when not nil, once the block's transaction holds the daily-stats
+// lock, which it waits for first, and before the revert changes anything.
+func (d *DB) DeleteBlockLocked(ctx context.Context, number uint64, locked func()) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -230,6 +237,9 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	// The block's day is re-aggregated from its first block on the next advance (migration 012).
 	if _, err := tx.Exec(ctx, `SELECT daily_stats_invalidate($1)`, number); err != nil {
 		return err
+	}
+	if locked != nil {
+		locked()
 	}
 	if err := keepDailyStatsWatermarkOnStoredBlocks(ctx, tx); err != nil {
 		return err
@@ -270,7 +280,33 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 		return err
 	}
 
-	// One statement per token in sorted order (the ORDER BY above), not a
+	// The block's balances, in a balance flush's lock order, before any tokens row.
+	balances, err := revertBalances(ctx, tx, number)
+	if err != nil {
+		return err
+	}
+	touched := map[string]bool{}
+	for _, r := range doomed {
+		touched[r.token] = true
+	}
+	var holderTokens []string
+	for t := range balances.holderDelta {
+		touched[t] = true
+		holderTokens = append(holderTokens, t)
+	}
+	if len(holderTokens) > 0 {
+		sort.Strings(holderTokens)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k`,
+			tokenLockKeys(holderTokens)); err != nil {
+			return err
+		}
+	}
+	transfers := make(map[string]reverted, len(doomed))
+	for _, r := range doomed {
+		transfers[r.token] = r
+	}
+
+	// One statement per token in sorted order, not a
 	// single UPDATE ... FROM: this takes tokens row locks held to commit and a
 	// reorg can run while catchup workers are committing batches, so it has to
 	// join the same total lock order those use. UPDATE ... FROM would take them
@@ -280,17 +316,24 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	// negative value would be served to consumers as authoritative; a floor
 	// turns an accounting error into a visibly wrong-but-sane number rather
 	// than a nonsensical one.
-	for _, r := range doomed {
-		if _, err := tx.Exec(ctx, `
-			UPDATE tokens SET
-				transfer_count = GREATEST(COALESCE(transfer_count, 0) - $2, 0),
-				total_supply = CASE
-					WHEN token_type = 'ERC20'
-					THEN `+clampSupply(`COALESCE(total_supply, 0) - $3::NUMERIC`)+`
-					ELSE total_supply
-				END
-			WHERE address = $1`, r.token, r.count, r.supply); err != nil {
-			return err
+	for _, token := range sortedTokens(touched) {
+		if r, ok := transfers[token]; ok {
+			if _, err := tx.Exec(ctx, `
+				UPDATE tokens SET
+					transfer_count = GREATEST(COALESCE(transfer_count, 0) - $2, 0),
+					total_supply = CASE
+						WHEN token_type = 'ERC20'
+						THEN `+clampSupply(`COALESCE(total_supply, 0) - $3::NUMERIC`)+`
+						ELSE total_supply
+					END
+				WHERE address = $1`, r.token, r.count, r.supply); err != nil {
+				return err
+			}
+		}
+		if delta := balances.holderDelta[token]; delta != 0 {
+			if _, err := tx.Exec(ctx, holderCountApplySQL, token, delta); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -372,6 +415,12 @@ func (d *DB) DeleteBlock(ctx context.Context, number uint64) error {
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM blocks WHERE number = $1", number); err != nil {
 		return err
+	}
+	if err := recordBalanceRereads(ctx, tx, balances.keys); err != nil {
+		return err
+	}
+	if afterBalanceRereadsRecorded != nil {
+		afterBalanceRereadsRecorded()
 	}
 	return tx.Commit(ctx)
 }
@@ -1381,9 +1430,9 @@ func (d *DB) UpdateAddressStatsCounters(ctx context.Context, address string, int
 func (d *DB) GetAddressStats(ctx context.Context, address string) (*types.AddressStats, error) {
 	var s types.AddressStats
 	err := d.pool.QueryRow(ctx, `
-		SELECT address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at
+		SELECT address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at
 		FROM address_stats WHERE address = LOWER($1)`, address).Scan(
-		&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt)
+		&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.SentCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return &types.AddressStats{Address: address}, nil
 	}
@@ -1399,7 +1448,7 @@ func (d *DB) GetAccountsPaginated(ctx context.Context, page, pageSize int) ([]ty
 
 	offset := (page - 1) * pageSize
 	rows, err := d.pool.Query(ctx, `
-		SELECT address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at
+		SELECT address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at
 		FROM address_stats
 		ORDER BY tx_count DESC, address ASC
 		LIMIT $1 OFFSET $2`, pageSize, offset)
@@ -1411,7 +1460,7 @@ func (d *DB) GetAccountsPaginated(ctx context.Context, page, pageSize int) ([]ty
 	var accounts []types.AddressStats
 	for rows.Next() {
 		var s types.AddressStats
-		if err := rows.Scan(&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.SentCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		accounts = append(accounts, s)
@@ -2039,7 +2088,9 @@ func (d *DB) UpsertDailyStats(ctx context.Context, stats *types.DailyStats) erro
 
 // startDailyStatsWatermark sets the first watermark just below the newest day's first block, but only once that
 // block is known to be the day's first: the block before it is stored (it belongs to an earlier day), or nothing
-// is stored before the day at all (a fresh start). daily_stats_advance's own first run takes the first *stored*
+// is stored before the day at all (a fresh start). With a stats backfill nothing below START_BLOCK is ever stored, so
+// that is no fresh start: the watermark waits for a day whose previous block is stored, always a day after
+// START_BLOCK's, which daily_stats_backfill_complete needs. daily_stats_advance's own first run takes the first *stored*
 // block of the day, so a day whose start catch-up had not stored yet was cut, and the blocks catch-up stored later
 // fell below the watermark and were never counted (PRST-5436). Until then the advance waits. It reports
 // whether a watermark exists.
@@ -2050,7 +2101,8 @@ const startDailyStatsWatermarkSQL = `
 		INSERT INTO daily_stats_watermark (id, last_block)
 		SELECT 1, first.n - 1 FROM first
 		WHERE first.n IS NOT NULL AND NOT EXISTS (SELECT 1 FROM daily_stats_watermark)
-		  AND (EXISTS (SELECT 1 FROM blocks WHERE number = first.n - 1) OR NOT EXISTS (SELECT 1 FROM blocks WHERE number < first.n))
+		  AND (EXISTS (SELECT 1 FROM blocks WHERE number = first.n - 1)
+		       OR (NOT EXISTS (SELECT 1 FROM blocks WHERE number < first.n) AND NOT EXISTS (SELECT 1 FROM stats_backfill)))
 		ON CONFLICT (id) DO NOTHING
 		RETURNING 1
 	)
@@ -2240,10 +2292,23 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		return fmt.Errorf("failed to mark the wipe as in progress: %w", err)
 	}
 	// A refill or repair staged from the old chain must not be applied to the new one. Dropped before chain_counters
-	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count.
+	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count; and an
+	// unfinished repair of the old chain's addresses is not resumed part way into the new one.
 	if _, err := d.pool.Exec(ctx, "DROP TABLE IF EXISTS "+DailyStatsRefillTable+", "+AddressStatsRepairTable+", "+
 		addressStatsRepairTotalTable); err != nil {
 		return fmt.Errorf("failed to drop the staged refill and repair: %w", err)
+	}
+	if _, err := d.pool.Exec(ctx, `DELETE FROM ledger_verify_state WHERE name = $1`, addressRepairCursor); err != nil {
+		return fmt.Errorf("failed to forget an unfinished address_stats repair: %w", err)
+	}
+	// The ledger checks' progress starts over with the new chain: the reconciliation runs again, no recount is pending,
+	// and no running cycle is complete. A span rebase's stage is the old chain's.
+	if _, err := d.pool.Exec(ctx, `
+		UPDATE ledger_verify_state SET value = 0 WHERE name IN ('address_reconcile_next', 'address_days_recount', 'running_cycles')`); err != nil {
+		return fmt.Errorf("failed to reset the ledger checks' progress: %w", err)
+	}
+	if _, err := d.pool.Exec(ctx, `DROP TABLE IF EXISTS address_rebase_stage`); err != nil {
+		return fmt.Errorf("failed to drop a span rebase's stage: %w", err)
 	}
 	// Order matters: truncate tables with foreign key dependencies using CASCADE.
 	// TRUNCATE ... CASCADE handles referential integrity automatically, but we
@@ -2290,6 +2355,21 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		"ledger_chain",
 		"ledger_spans",
 		"history_archives",
+		// A request to re-read a balance of the wiped chain.
+		"balance_rereads",
+		// The ledger's checks, stats backfill and staging of the wiped chain. The stage tables are logged and carry no
+		// foreign key to ledger_spans, so its cascade does not reach them. A backfill row left behind would be taken
+		// for the new chain's, and the new chain's totals would miss [0, START_BLOCK).
+		"ledger_stage_address",
+		"ledger_stage_token",
+		"ledger_stage_chain",
+		"ledger_repairs",
+		"ledger_quarantine",
+		"ledger_reverted_address",
+		"stats_backfill_balance_keys",
+		"stats_backfill",
+		"daily_stats_base",
+		"daily_active_base",
 	}
 	for _, table := range tables {
 		if _, err := d.pool.Exec(ctx, "TRUNCATE TABLE "+table+" CASCADE"); err != nil {

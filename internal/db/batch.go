@@ -92,22 +92,6 @@ func clampSupply(expr string) string {
 	return `LEAST(GREATEST(` + expr + `, -` + numeric78Max + `), ` + numeric78Max + `)`
 }
 
-// tokenStatsFromTransfers derives a token's two history-scale counters from
-// token_transfers in one pass: the transfer row count, and the ERC20
-// mint-minus-burn supply. $1 is the lowercased token address.
-//
-// The token_type filter sits inside the CASE rather than in the WHERE so that
-// COUNT(*) still spans every transfer of the token while the sums stay
-// ERC20-only -- the same split the two separate queries in RefreshTokenStats
-// used to make, at one scan instead of two.
-const tokenStatsFromTransfers = `
-	SELECT COUNT(*),
-	       COALESCE(
-	           SUM(CASE WHEN token_type = 'ERC20' AND from_address = '` + zeroAddress + `' THEN value ELSE 0 END)
-	         - SUM(CASE WHEN token_type = 'ERC20' AND to_address   = '` + zeroAddress + `' THEN value ELSE 0 END),
-	           0)
-	FROM token_transfers WHERE token_address = $1`
-
 // tokenStatsDelta is one token's counter movement contributed by a single
 // batch: the transfer rows that genuinely landed, and the ERC20 supply change
 // those rows imply. Both are applied in the batch's own transaction, so a read
@@ -122,8 +106,11 @@ type AddressStatsDelta struct {
 	TxCountDelta         int
 	InternalTxCountDelta int
 	TokenTransferDelta   int
+	SentDelta            int
 	IsContract           bool
-	BlockNumber          uint64
+	// LastBlock, when above BlockNumber, is the newest block of a delta merged over several (the stats backfill).
+	LastBlock   uint64
+	BlockNumber uint64
 }
 
 // BlockWrite is one block's ingest transaction, split so that the rows a block owns can be written
@@ -409,9 +396,34 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	if w.stored {
 		return nil
 	}
-	tx, data, tokenDeltas := w.tx, w.data, w.tokenDeltas
-	defer tx.Rollback(ctx)
-	deltaBlocks, deltaTxs, deltaTransfers := w.deltaBlocks, w.deltaTxs, w.deltaTransfers
+	defer w.tx.Rollback(ctx)
+	if err := writeSharedRows(ctx, w.tx, sharedRows{data: w.data, blocks: w.deltaBlocks, txs: w.deltaTxs,
+		transfers: w.deltaTransfers, tokenDeltas: w.tokenDeltas, seedCountsOwnRows: true}); err != nil {
+		return err
+	}
+	if err := w.tx.Commit(ctx); err != nil {
+		return err
+	}
+	if w.data.Block != nil && (w.deltaBlocks > 0 || w.deltaTxs > 0 || w.deltaTransfers > 0) {
+		w.lateDays.noteBlock(w.data.Block.Number, w.data.Block.Timestamp)
+	}
+	return nil
+}
+
+// sharedRows is what a write adds to the rows blocks share. tokenDeltas are the transfer and supply counts per
+// token; seedCountsOwnRows says a token created here is seeded from rows that include this write's own transfers
+// (ingest stores them first), so their delta must not be added on top.
+type sharedRows struct {
+	data                   *BlockData
+	blocks, txs, transfers int64
+	tokenDeltas            map[string]*tokenStatsDelta
+	seedCountsOwnRows      bool
+}
+
+// writeSharedRows writes tokens, nft_tokens, address_stats and chain_counters for ingest and the stats backfill.
+func writeSharedRows(ctx context.Context, tx pgx.Tx, w sharedRows) error {
+	data, tokenDeltas := w.data, w.tokenDeltas
+	deltaBlocks, deltaTxs, deltaTransfers := w.blocks, w.txs, w.transfers
 	var deltaTokens, deltaAddresses int64
 	var seedTokens []string
 
@@ -491,7 +503,10 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	// sorted them. ORDER BY on the row pass makes its acquisition order
 	// explicit rather than leaving it to the plan, and on the primary-key btree
 	// it is the same order anyway.
-	lockTokens := make(map[string]struct{}, len(data.Tokens)+len(data.Transfers))
+	lockTokens := make(map[string]struct{}, len(data.Tokens)+len(data.Transfers)+len(tokenDeltas))
+	for token := range tokenDeltas {
+		lockTokens[token] = struct{}{}
+	}
 	for _, t := range data.Tokens {
 		lockTokens[strings.ToLower(t.Address)] = struct{}{}
 	}
@@ -542,7 +557,9 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 					-- seen before this fix, stored as the ERC20 default) when a
 					-- more specific type is observed, but never downgrade.
 					token_type = CASE WHEN EXCLUDED.token_type <> 'ERC20' THEN EXCLUDED.token_type ELSE tokens.token_type END,
-					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)
+					total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply),
+					creation_tx = CASE WHEN EXCLUDED.block_number < tokens.block_number THEN EXCLUDED.creation_tx ELSE tokens.creation_tx END,
+					block_number = LEAST(tokens.block_number, EXCLUDED.block_number)
 				RETURNING (xmax = 0)`,
 				t.Address, t.Symbol, t.Name, t.Decimals, t.TokenType, t.TotalSupply, t.BlockNumber, t.CreationTx, t.L1Address)
 		}
@@ -594,7 +611,7 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 						ELSE tokens.total_supply END,
 					holder_count = (SELECT COUNT(*) FROM token_balances_current
 						WHERE token_address = $1 AND balance > 0)
-				FROM (`+tokenStatsFromTransfers+`) AS s(cnt, supply)
+				FROM token_counted($1) AS s(cnt, supply)
 				WHERE tokens.address = $1`, addr)
 		}
 		br := tx.SendBatch(ctx, batch)
@@ -639,8 +656,10 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 	// The seed above aggregated token_transfers after this block's own rows were inserted, so for a
 	// token it seeded those rows are already counted; adding the block's delta on top would count
 	// them twice.
-	for _, addr := range seedTokens {
-		delete(tokenDeltas, addr)
+	if w.seedCountsOwnRows {
+		for _, addr := range seedTokens {
+			delete(tokenDeltas, addr)
+		}
 	}
 
 	// Apply the per-token counters. Same transaction as the transfer rows they
@@ -710,18 +729,19 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 		for _, addr := range addresses {
 			s := data.AddressStats[addr]
 			batch.Queue(`
-				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
-				VALUES (LOWER($1), $2, $3, $4, $5, $5, $6, NOW())
+				INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
+				VALUES (LOWER($1), $2, $3, $4, $7, $5::BIGINT, GREATEST($5::BIGINT, $8::BIGINT), $6, NOW())
 				ON CONFLICT (address) DO UPDATE SET
 					tx_count = address_stats.tx_count + $2,
 					internal_tx_count = address_stats.internal_tx_count + $3,
 					token_transfer_count = address_stats.token_transfer_count + $4,
+					sent_count = address_stats.sent_count + $7,
 					first_seen = LEAST(address_stats.first_seen, EXCLUDED.first_seen),
 					last_seen = GREATEST(address_stats.last_seen, EXCLUDED.last_seen),
 					is_contract = COALESCE(address_stats.is_contract, false) OR EXCLUDED.is_contract,
 					updated_at = NOW()
 				RETURNING (xmax = 0)`,
-				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract)
+				s.Address, s.TxCountDelta, s.InternalTxCountDelta, s.TokenTransferDelta, s.BlockNumber, s.IsContract, s.SentDelta, s.LastBlock)
 		}
 		br := tx.SendBatch(ctx, batch)
 		for range data.AddressStats {
@@ -755,38 +775,24 @@ func (w *BlockWrite) Finish(ctx context.Context) error {
 			return err
 		}
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	if data.Block != nil && (deltaBlocks > 0 || deltaTxs > 0 || deltaTransfers > 0) {
-		w.lateDays.noteBlock(data.Block.Number, data.Block.Timestamp)
-	}
 	return nil
 }
 
 // ErrHistoryPruned refuses a recount of history that pruning has made partial.
 var ErrHistoryPruned = errors.New("history is pruned: a recount from the retained rows would drop the pruned counts")
 
-// RebuildAddressStats rebuilds address_stats from the stored history, then recounts the days' address columns from it.
-// It refuses once anything was pruned. The indexer no longer calls it (catch-up writes address_stats itself); it stays
-// as the tests' oracle for what the writer counts.
+// ErrAddressStatsFilled refuses a rebuild into a live address_stats: the ledger reconciliation repairs it in place.
+var ErrAddressStatsFilled = errors.New("address_stats is not empty: a rebuild would block every ingest write; the ledger reconciliation repairs it in place")
+
+// RebuildAddressStats builds an empty address_stats from history (a test oracle and an empty database's tool), then
+// recounts the days' address columns from it. It refuses once anything was pruned, and on a table that holds rows.
 func (d *DB) RebuildAddressStats(ctx context.Context) error {
 	if wm, _, err := d.PrunedThrough(ctx); err != nil {
 		return err
 	} else if wm > 0 {
 		return ErrHistoryPruned
 	}
-	// All address keys are lowercased so duplicate-case rows from past
-	// writes (some checksum-cased, some lowercase) collapse to one row per
-	// address. Ongoing delta writes already lowercase the key, so this
-	// stays consistent going forward.
-	//
-	// tx_count is the count of distinct tx hashes involving the address
-	// either as the EVM from/to OR as a Transfer-event participant in that
-	// tx's logs. This matches the inclusive list returned by
-	// GetTransactionsByAddress — a recipient who never sent a tx of their
-	// own still gets credit for the mint/transfer txs that gave them tokens.
+	// Each address's counters are what the writer counts for it, from the same per-row definition as the ledger.
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -797,77 +803,19 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 		return err
 	}
 
+	var filled bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM address_stats)`).Scan(&filled); err != nil {
+		return err
+	}
+	if filled {
+		return ErrAddressStatsFilled
+	}
 	if _, err := tx.Exec(ctx, `
-		TRUNCATE address_stats;
-
-		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, first_seen, last_seen, is_contract, updated_at)
-		SELECT
-			addr,
-			COALESCE(tx_count, 0),
-			COALESCE(internal_tx_count, 0),
-			COALESCE(token_transfer_count, 0),
-			first_seen,
-			last_seen,
-			COALESCE(is_contract, false),
-			NOW()
-		FROM (
-			SELECT
-				a.address as addr,
-				tx.tx_count,
-				it.internal_tx_count,
-				tt.token_transfer_count,
-				LEAST(tx.first_seen, it.first_seen, tt.first_seen) as first_seen,
-				GREATEST(tx.last_seen, it.last_seen, tt.last_seen) as last_seen,
-				c.is_contract
-			FROM (
-				SELECT LOWER(from_address) as address FROM transactions
-				UNION
-				SELECT LOWER(to_address) as address FROM transactions WHERE to_address IS NOT NULL
-				UNION
-				SELECT LOWER(from_address) as address FROM internal_transactions
-				UNION
-				SELECT LOWER(to_address) as address FROM internal_transactions WHERE to_address IS NOT NULL
-				UNION
-				SELECT LOWER(from_address) as address FROM token_transfers
-				UNION
-				SELECT LOWER(to_address) as address FROM token_transfers
-			) a
-			LEFT JOIN (
-				SELECT address, COUNT(DISTINCT tx_hash) as tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
-				FROM (
-					SELECT LOWER(from_address) as address, hash as tx_hash, block_number FROM transactions
-					UNION ALL
-					SELECT LOWER(to_address) as address, hash as tx_hash, block_number FROM transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
-					UNION ALL
-					SELECT LOWER(tt.from_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt
-					UNION ALL
-					SELECT LOWER(tt.to_address) as address, tt.tx_hash, tt.block_number FROM token_transfers tt WHERE tt.to_address IS DISTINCT FROM tt.from_address
-				) t
-				GROUP BY address
-			) tx ON a.address = tx.address
-			LEFT JOIN (
-				SELECT address, COUNT(*) as internal_tx_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
-				FROM (
-					SELECT LOWER(from_address) as address, block_number FROM internal_transactions
-					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM internal_transactions WHERE to_address IS DISTINCT FROM from_address AND to_address IS NOT NULL
-				) t
-				GROUP BY address
-			) it ON a.address = it.address
-			LEFT JOIN (
-				SELECT address, COUNT(*) as token_transfer_count, MIN(block_number) as first_seen, MAX(block_number) as last_seen
-				FROM (
-					SELECT LOWER(from_address) as address, block_number FROM token_transfers
-					UNION ALL
-					SELECT LOWER(to_address) as address, block_number FROM token_transfers WHERE to_address IS DISTINCT FROM from_address
-				) t
-				GROUP BY address
-			) tt ON a.address = tt.address
-			LEFT JOIN (
-				SELECT LOWER(address) as address, true as is_contract FROM contracts
-			) c ON a.address = c.address
-		) stats
-		WHERE addr IS NOT NULL
+		INSERT INTO address_stats (address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at)
+		SELECT x.address, count(DISTINCT x.tx), sum(x.internal), sum(x.transfers), sum(x.sent), min(x.block), max(x.block),
+		       EXISTS (SELECT 1 FROM contracts c WHERE c.address = x.address), NOW()
+		FROM ledger_address_contributions(0, 9223372036854775807) x
+		GROUP BY x.address
 	`); err != nil {
 		return err
 	}
@@ -892,6 +840,16 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 }
 
 func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance) error {
+	return d.insertBalances(ctx, balances, true)
+}
+
+// InsertCurrentBalances writes current balances (and holder_count) without balance-history rows: the stats
+// backfill reads balances it has no history for.
+func (d *DB) InsertCurrentBalances(ctx context.Context, balances []*types.Balance) error {
+	return d.insertBalances(ctx, balances, false)
+}
+
+func (d *DB) insertBalances(ctx context.Context, balances []*types.Balance, history bool) error {
 	if len(balances) == 0 {
 		return nil
 	}
@@ -938,6 +896,69 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	// Phase 0: the balance revert lock shared (history writes, which are at the head), advisory locks on every key,
+	// then the latest reorg epoch and the reorg epoch of each key a revert touched (balance_rereads, written under the
+	// same locks). A read decided before a revert (a lower epoch than the latest) may hold the fork's value: it is not
+	// written, and its key is asked to be read again, whether or not the revert knew the key. A revert in progress
+	// holds the lock until it commits, so its epoch is the latest by the time a flush reads it, and a flush in progress
+	// commits before the revert deletes its block's history rows, so the revert sees what it wrote. A read at the key's
+	// epoch or later answers its open request.
+	if history {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1, 1)`, balanceRevertLock); err != nil {
+			return fmt.Errorf("lock balance reverts: %w", err)
+		}
+	}
+	lockTok := make([]string, len(ordered))
+	lockAddr := make([]string, len(ordered))
+	for i, b := range ordered {
+		lockTok[i], lockAddr[i] = strings.ToLower(b.TokenAddress), strings.ToLower(b.Address)
+	}
+	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(lockTok, lockAddr)); err != nil {
+		return fmt.Errorf("lock balance keys: %w", err)
+	}
+	var latest int64
+	if history {
+		if err := tx.QueryRow(ctx, `SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM balance_reorg_epoch`).
+			Scan(&latest); err != nil {
+			return fmt.Errorf("read the reorg epoch: %w", err)
+		}
+	}
+	epochs, err := revertEpochs(ctx, tx, lockTok, lockAddr)
+	if err != nil {
+		return fmt.Errorf("read reorg epochs: %w", err)
+	}
+	var answered, late []balanceKey
+	if len(epochs) > 0 || latest > 0 {
+		kept := ordered[:0:0]
+		closing, lateKeys := map[balanceKey]bool{}, map[balanceKey]bool{}
+		for _, b := range ordered {
+			k := balanceKey{token: strings.ToLower(b.TokenAddress), address: strings.ToLower(b.Address)}
+			e, reverted := epochs[k]
+			switch {
+			case b.Epoch < latest:
+				if !lateKeys[k] {
+					lateKeys[k] = true
+					late = append(late, k)
+				}
+			case !reverted:
+				kept = append(kept, b)
+			case b.Epoch >= e.epoch:
+				kept = append(kept, b)
+				if e.open && !closing[k] {
+					closing[k] = true
+					answered = append(answered, k)
+				}
+			}
+		}
+		ordered = kept
+		if len(ordered) == 0 {
+			if err := reopenRereads(ctx, tx, late, latest); err != nil {
+				return fmt.Errorf("reopen balance rereads: %w", err)
+			}
+			return tx.Commit(ctx)
+		}
+	}
 
 	// One statement per phase instead of one per row (PRST-4669): the
 	// history rows go in one multi-row INSERT, the current rows in one multi-row
@@ -1004,10 +1025,7 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 		curBlk = append(curBlk, int64(b.BlockNumber))
 	}
 
-	// Phase 0: advisory locks, then the pre-write state of every key.
-	if _, err := tx.Exec(ctx, tbcLockKeysSQL, tbcLockKeys(curTok, curAddr)); err != nil {
-		return fmt.Errorf("lock balance keys: %w", err)
-	}
+	// The pre-write state of every key, under the phase 0 locks.
 	oldPos := make(map[currentKey]bool, len(curTok))
 	rows, err := tx.Query(ctx, tbcOldPosSQL, curTok, curAddr)
 	if err != nil {
@@ -1034,8 +1052,10 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 	}
 
 	// Phase 1: the history rows.
-	if _, err := tx.Exec(ctx, balancesInsertSQL, histAddr, histTok, histBlk, histBal); err != nil {
-		return fmt.Errorf("insert balances: %w", err)
+	if history {
+		if _, err := tx.Exec(ctx, balancesInsertSQL, histAddr, histTok, histBlk, histBal); err != nil {
+			return fmt.Errorf("insert balances: %w", err)
+		}
 	}
 
 	// Phase 2: the current rows, returning (token, delta) for every key written.
@@ -1092,6 +1112,13 @@ func (d *DB) InsertBalancesBatch(ctx context.Context, balances []*types.Balance)
 		}
 	}
 
+	// Last phase: the requests these reads answer, and those of the keys whose reads came too late.
+	if err := closeRereads(ctx, tx, answered); err != nil {
+		return fmt.Errorf("clear balance rereads: %w", err)
+	}
+	if err := reopenRereads(ctx, tx, late, latest); err != nil {
+		return fmt.Errorf("reopen balance rereads: %w", err)
+	}
 	return tx.Commit(ctx)
 }
 

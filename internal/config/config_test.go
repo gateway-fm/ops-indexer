@@ -9,13 +9,16 @@ import (
 
 func validConfig() *Config {
 	return &Config{RPCURL: "http://node", RPCTimeout: time.Minute, DatabaseURL: "postgres://db", APIPort: 8080, RPCWorkers: 1, RPCRateLimit: 1,
-		LedgerSpanBlocks: 100_000, LedgerCloseInterval: 10 * time.Second, PruneInterval: time.Minute, PartitionBlocks: 10_000}
+		LedgerSpanBlocks: 100_000, LedgerCloseInterval: 10 * time.Second, PruneInterval: time.Minute, PartitionBlocks: 10_000,
+		VerifyRecountInterval: time.Minute}
 }
 
-func TestValidateRefusesStartBlockWithRetentionUntilTheStatsBackfill(t *testing.T) {
+func TestValidateNeedsABackfillBudgetForStartBlockWithRetention(t *testing.T) {
 	c := validConfig()
 	c.StartBlock, c.PruneRetainBlocks = 1_000_000, 100_000
 	require.ErrorContains(t, c.Validate(), "stats backfill")
+	c.StatsBackfillRPS, c.StatsBackfillBatchBlocks = 100, 1000
+	require.NoError(t, c.Validate())
 }
 
 func TestValidateKeepsStartBlockWithoutRetention(t *testing.T) {

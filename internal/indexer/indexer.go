@@ -51,6 +51,30 @@ type Config struct {
 	SkipAddressStats   bool
 	SkipReceiptTxTypes map[int]bool // tx types to skip receipt fetching for (e.g. 126 for OP deposit)
 
+	// CountersOnly builds blocks for their counters alone (the recount of a pruned span): no token metadata or
+	// tokenURI fetches.
+	CountersOnly bool
+	// StrictTraces fails a block whose traces are incomplete, a transaction's trace missing or failed, instead of
+	// leaving its internal calls out, and CodeAtBlock judges a creation by its code at the block and fails the block
+	// when it cannot (contractCode): for the counts of old blocks that replace or extend the ledger (the stats
+	// backfill and the recount of a pruned span).
+	StrictTraces bool
+	CodeAtBlock  bool
+	// SkipTraceRefusals, with StrictTraces off, leaves out only the traces the node answers it cannot serve, and fails
+	// the block on any other trace failure (a count of an old block that goes on without them).
+	SkipTraceRefusals bool
+
+	// NodeRecountRPS bounds the recount of pruned spans from the node; 0 turns it off. VerifyRepair lets it
+	// replace a drifted span's ledger rows.
+	NodeRecountRPS int
+	VerifyRepair   bool
+
+	// ChainCheck bounds the chain checks against the node; RPS 0 turns them off.
+	ChainCheck ChainCheckConfig
+
+	// StatsBackfill bounds the stats backfill of [0, START_BLOCK), when one was prepared.
+	StatsBackfill StatsBackfillConfig
+
 	// DailyStatsMinInterval is the minimum time between two daily_stats
 	// advances. Zero advances on every 100th block. See dailyStatsThrottle.
 	DailyStatsMinInterval time.Duration
@@ -79,6 +103,9 @@ type Indexer struct {
 	rpc          RPCClient
 	pollInterval time.Duration
 	startBlock   uint64
+	// countFrom is the configured start block, where the chain's totals start. startBlock is raised above the prune
+	// watermark at start, for ingest; the totals still count from here.
+	countFrom uint64
 
 	// missingRetryInterval is how often the standard loop retries the blocks it recorded as missing (retryMissing).
 	missingRetryInterval time.Duration
@@ -86,6 +113,8 @@ type Indexer struct {
 	missingBackoff       map[uint64]missingAttempt
 
 	indexRequests chan indexRequest
+	// pastWipe closes once Start has passed its FORCE_REINDEX wipe, or found none to do (PastWipe).
+	pastWipe chan struct{}
 	// onIndexed, when set, is told each block indexPrefetched commits (realtime moves its cursor with it).
 	onIndexed func(uint64)
 	// cursorMayBeUnstored is set for realtime's batches (see anchor).
@@ -98,7 +127,9 @@ type Indexer struct {
 	balanceWorkers *BalanceWorkerPool
 
 	tracingSupported bool
-	eventBus         *events.Bus
+	// tracingUnknown: tracing is configured, but the start could not check that the node traces.
+	tracingUnknown bool
+	eventBus       *events.Bus
 
 	missingRangeCollector *MissingRangeCollector
 
@@ -257,8 +288,10 @@ func NewWithConfig(database Database, rpcClient RPCClient, pollInterval time.Dur
 		rpc:                  rpcClient,
 		pollInterval:         pollInterval,
 		startBlock:           startBlock,
+		countFrom:            startBlock,
 		missingRetryInterval: defaultMissingRetryInterval,
 		indexRequests:        make(chan indexRequest, 100),
+		pastWipe:             make(chan struct{}),
 		config:               cfg,
 		tokenCache:           NewTokenCache(),
 		contractCache:        NewContractCache(),
@@ -380,6 +413,10 @@ func (i *Indexer) publishProgressMetrics(ctx context.Context) {
 	}
 }
 
+// PastWipe is closed once Start has passed its FORCE_REINDEX wipe, or found none to do. A worker that reads or writes
+// what a wipe removes (the ledger, the checks, retention) starts after it.
+func (i *Indexer) PastWipe() <-chan struct{} { return i.pastWipe }
+
 func (i *Indexer) Start(ctx context.Context) error {
 	// Blocks at or below the prune watermark are gone on purpose: gap counting, the missing-range collector
 	// and catch-up all start above it, or they would fetch the pruned history back. A wipe resets the watermark,
@@ -403,21 +440,14 @@ func (i *Indexer) Start(ctx context.Context) error {
 		log.Info("loaded tokens into cache", "count", i.tokenCache.Size())
 	}
 
-	if i.config.EnableTracing {
-		supported, err := i.rpc.CheckTracingSupport(ctx)
-		if err != nil {
-			log.Warn("failed to check tracing support", "error", err)
-		} else if supported {
-			i.tracingSupported = true
-			log.Info("tracing enabled: node supports debug_traceBlockByNumber")
-		} else {
-			log.Warn("tracing requested but node does not support it, disabling")
-			i.tracingSupported = false
-		}
-	}
+	i.probeTracing(ctx)
 
 	if i.balanceWorkers != nil {
 		i.balanceWorkers.Start()
+	}
+
+	if err := loadBalanceEpoch(ctx, i.db, i.balanceWorkers); err != nil {
+		return err
 	}
 
 	latestOnChain, err := i.rpc.BlockNumber(ctx)
@@ -451,8 +481,8 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 	wipe := func() error {
 		log.Warn("FORCE_REINDEX=true: wiping indexed data and re-indexing from scratch")
-		if err := i.db.WipeAllData(ctx); err != nil {
-			return fmt.Errorf("failed to wipe data for reindex: %w", err)
+		if err := i.wipeForReindex(ctx, configuredStart); err != nil {
+			return err
 		}
 		i.startBlock = configuredStart
 		lastIndexed = 0
@@ -515,6 +545,31 @@ func (i *Indexer) Start(ctx context.Context) error {
 		}
 	}
 
+	// After the start's wipe, if any: the backfill job ends once its backfill is complete or absent, and a wipe
+	// prepares the new chain's; the node recount and the chain checks would otherwise check rows the wipe removes, and
+	// the balance rereads would write the old chain's balances after it.
+	// Start returns only once they have stopped, so the caller can close the pool behind it.
+	close(i.pastWipe)
+	jobsCtx, stopJobs := context.WithCancel(ctx)
+	var jobs sync.WaitGroup
+	defer func() {
+		stopJobs()
+		jobs.Wait()
+	}()
+	if store, ok := i.db.(balanceRereadStore); ok {
+		jobs.Go(func() { i.RunBalanceRereads(jobsCtx, store) })
+	}
+	if store, ok := i.db.(backfillStore); ok && i.config.StatsBackfill.RPS > 0 {
+		jobs.Go(func() { i.RunStatsBackfill(jobsCtx, store, i.config.StatsBackfill) })
+	}
+	if store, ok := i.db.(prunedSpanStore); ok && i.config.NodeRecountRPS > 0 {
+		jobs.Go(func() {
+			i.RunNodeRecount(jobsCtx, store, NodeRecountConfig{RPS: i.config.NodeRecountRPS, Repair: i.config.VerifyRepair, Idle: time.Minute})
+		})
+	}
+	if store, ok := i.db.(chainCheckStore); ok && i.config.ChainCheck.RPS > 0 {
+		jobs.Go(func() { i.RunChainChecks(jobsCtx, store, i.config.ChainCheck) })
+	}
 	go i.publishProgressMetrics(ctx)
 
 	i.db.UpdateSyncStatus(ctx, lastIndexed, true)
@@ -530,6 +585,49 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 // newCatchupIndexer and newRealtimeIndexer build the sub-indexers with the
 // state they share with this one, including the daily-stats throttle.
+// tracingProbes and tracingProbeRetry bound the start's check of the node's tracing support.
+var (
+	tracingProbes     = 3
+	tracingProbeRetry = 5 * time.Second
+)
+
+// probeTracing checks that the node traces, when tracing is configured, retrying a check that fails. A check that
+// keeps failing is not an answer: ingest goes on without traces, as for a node that does not trace, but the counts that
+// replace or extend the ledger fetch traces anyway and fail a block they cannot trace (tracingUnknown).
+func (i *Indexer) probeTracing(ctx context.Context) {
+	if !i.config.EnableTracing {
+		return
+	}
+	for n := 1; ; n++ {
+		supported, err := i.rpc.CheckTracingSupport(ctx)
+		switch {
+		case err == nil && supported:
+			i.tracingSupported = true
+			log.Info("tracing enabled: node supports debug_traceBlockByNumber")
+			return
+		case err == nil:
+			log.Warn("tracing requested but node does not support it, disabling")
+			return
+		case n >= tracingProbes || ctx.Err() != nil:
+			i.tracingUnknown = true
+			log.Error("could not check the node's tracing support; ingest runs without traces, the stats backfill and the "+
+				"node recount fetch them and fail a block they cannot trace", "error", err, "attempts", n)
+			return
+		}
+		log.Warn("failed to check tracing support; retrying", "error", err, "attempt", n)
+		select {
+		case <-ctx.Done():
+		case <-time.After(tracingProbeRetry):
+		}
+	}
+}
+
+// tracesOldBlocks is whether the counts of old blocks that replace or extend the ledger fetch traces: unless the node
+// answered that it does not trace, so that a failed check never counts a block without its internal calls.
+func (i *Indexer) tracesOldBlocks() bool {
+	return i.tracingSupported || i.tracingUnknown
+}
+
 func (i *Indexer) newCatchupIndexer(cfg *CatchupConfig) *CatchupIndexer {
 	c := NewCatchupIndexer(
 		i.db, i.rpc, cfg, i.config,
@@ -730,6 +828,28 @@ func (i *Indexer) startStandardMode(ctx context.Context, lastIndexed uint64) err
 			i.retryMissing(ctx, lastIndexed, &receipts)
 		}
 	}
+}
+
+// wipeForReindex wipes every indexed row for FORCE_REINDEX. A stats backfill the old chain had is prepared again for
+// the new one once the wipe has removed it; the backfill job starts after the start's wipe.
+func (i *Indexer) wipeForReindex(ctx context.Context, configuredStart uint64) error {
+	init, backfills := i.db.(backfillInitStore)
+	if backfills {
+		state, err := init.StatsBackfillState(ctx)
+		if err != nil {
+			return fmt.Errorf("read the stats backfill before the wipe: %w", err)
+		}
+		backfills = state.Exists
+	}
+	if err := i.db.WipeAllData(ctx); err != nil {
+		return fmt.Errorf("failed to wipe data for reindex: %w", err)
+	}
+	if backfills {
+		if err := PrepareStatsBackfill(ctx, init, i.rpc, configuredStart, i.config.EnableTracing); err != nil {
+			return fmt.Errorf("prepare the stats backfill again after the wipe: %w", err)
+		}
+	}
+	return nil
 }
 
 // standardTick reverts a reorg at the stored head, then indexes up to latestOnChain, and returns the new last
@@ -969,7 +1089,7 @@ func (i *Indexer) handleReorg(ctx context.Context, fromBlock uint64) error {
 	metrics.ReorgDetected()
 
 	for blockNum := lastIndexed; blockNum >= fromBlock; blockNum-- {
-		if err := i.db.DeleteBlock(ctx, blockNum); err != nil {
+		if err := revertBlockHoldingEpoch(ctx, i.db, i.balanceWorkers, blockNum); err != nil {
 			log.Error("failed to delete block", "block", blockNum, "error", err)
 			return err
 		}
@@ -1069,6 +1189,59 @@ type builtBlock struct {
 	start          time.Time
 	blockNumber    uint64
 	blockTimestamp uint64
+	tracesErr      error
+	// codeErr is why a count of an old block (CodeAtBlock) could not decide whether a creation of the block is a
+	// contract.
+	codeErr error
+}
+
+// strictTracer fetches a block's traces failing on any transaction whose trace is missing or failed.
+type strictTracer interface {
+	FetchTracesBatchStrict(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64, workers int,
+		rateLimit int) ([]*types.InternalTransaction, error)
+}
+
+// refusalTracer fetches a block's traces leaving out only the transactions the node answers it cannot trace.
+type refusalTracer interface {
+	FetchTracesBatchSkippingRefusals(ctx context.Context, txHashes []common.Hash, blockNumber uint64, timestamp uint64,
+		workers int, rateLimit int) ([]*types.InternalTransaction, error)
+}
+
+// codeAtReader reads an account's code after a given block, where the node keeps that block's state.
+type codeAtReader interface {
+	GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error)
+}
+
+// errContractUndecided: a count of an old block cannot tell whether a creation is a contract.
+var errContractUndecided = errors.New("the node does not serve the code at the creation's block, and has none for it at the head")
+
+// contractCode is the code a creation in block is judged by. Ingest reads it at latest, soon after the block, and an
+// error or no code means no contract. A count of an old block (CodeAtBlock) has to judge it as ingest did then: the
+// code after that block where the node keeps its state, else the code at latest when there is some. An error, or no
+// code at latest (never deployed, or destroyed since: the two cannot be told apart), is returned, so the block fails
+// rather than lose the contract. A read at the block that fails other than by the node refusing it (a timeout, a rate
+// limit, a node down) is returned as it is: it says nothing of the code.
+func (i *Indexer) contractCode(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
+	if !i.config.CodeAtBlock {
+		return i.rpc.GetCode(ctx, address)
+	}
+	if r, ok := i.rpc.(codeAtReader); ok {
+		code, err := r.GetCodeAt(ctx, address, block)
+		if err == nil {
+			return code, nil
+		}
+		if !rpc.NodeRefused(err) && !errors.Is(err, errNotSupported) {
+			return nil, fmt.Errorf("code of %s at block %d: %w", address.Hex(), block, err)
+		}
+	}
+	code, err := i.rpc.GetCode(ctx, address)
+	if err != nil {
+		return nil, fmt.Errorf("code of %s: %w", address.Hex(), err)
+	}
+	if len(code) == 0 {
+		return nil, fmt.Errorf("contract %s created in block %d: %w", address.Hex(), block, errContractUndecided)
+	}
+	return code, nil
 }
 
 func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receipts map[common.Hash]*rpclient.Receipt) *builtBlock {
@@ -1111,6 +1284,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	newTokenAddresses := make([]common.Address, 0)
 	newTokenTxHashes := make(map[common.Address]string)
 	addressTxs := make(map[string]map[int]struct{})
+	var tracesErr, codeErr error
 	balanceWork := make([]BalanceWork, 0)
 
 	// NFT instances touched this block, and (for mints) the tokenURI fetches to
@@ -1196,7 +1370,10 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			Error:                txError,
 		})
 
-		touchAddressTx(blockData.AddressStats, addressTxs, from, idx, blockNumber)
+		sender := touchAddressTx(blockData.AddressStats, addressTxs, from, idx, blockNumber)
+		if bumpsNonce(txType) {
+			sender.SentDelta++
+		}
 
 		if to != nil {
 			toDelta := touchAddressTx(blockData.AddressStats, addressTxs, *to, idx, blockNumber)
@@ -1207,7 +1384,14 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 			contractAddr := receipt.ContractAddress.Hex()
 			// Set the contract address on the transaction so it shows in the UI
 			blockData.Transactions[len(blockData.Transactions)-1].ContractAddress = &contractAddr
-			code, err := i.rpc.GetCode(ctx, receipt.ContractAddress)
+		}
+		// A reverted creation deployed nothing, whatever code the node keeps or has lost.
+		if receipt != nil && rawTx.To == nil && receipt.ContractAddress != (common.Address{}) && receipt.Status != 0 {
+			contractAddr := receipt.ContractAddress.Hex()
+			code, err := i.contractCode(ctx, receipt.ContractAddress, blockNumber)
+			if err != nil && i.config.CodeAtBlock {
+				codeErr = errors.Join(codeErr, err)
+			}
 			if err == nil && len(code) > 0 {
 				bytecodeHash := common.BytesToHash(common.FromHex(common.Bytes2Hex(code))).Hex()
 				blockData.Contracts = append(blockData.Contracts, &types.Contract{
@@ -1362,9 +1546,15 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	if i.tracingSupported && len(txHashes) > 0 {
-		internalTxs, err := i.rpc.FetchTracesBatch(ctx, txHashes, blockNumber, blockTimestamp,
-			i.config.TraceWorkers, i.config.TraceRateLimit)
+		fetch := i.rpc.FetchTracesBatch
+		if s, ok := i.rpc.(strictTracer); ok && i.config.StrictTraces {
+			fetch = s.FetchTracesBatchStrict
+		} else if s, ok := i.rpc.(refusalTracer); ok && i.config.SkipTraceRefusals {
+			fetch = s.FetchTracesBatchSkippingRefusals
+		}
+		internalTxs, err := fetch(ctx, txHashes, blockNumber, blockTimestamp, i.config.TraceWorkers, i.config.TraceRateLimit)
 		if err != nil {
+			tracesErr = err
 			log.Warn("failed to fetch traces for block", "block", blockNumber, "error", err)
 		} else if len(internalTxs) > 0 {
 			blockData.InternalTransactions = internalTxs
@@ -1376,7 +1566,13 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 				}
 			}
 			for _, it := range internalCreations(internalTxs) {
-				c := contractFromCreation(ctx, i.rpc.GetCode, it, blockNumber)
+				c := contractFromCreation(ctx, func(ctx context.Context, a common.Address) ([]byte, error) {
+					code, err := i.contractCode(ctx, a, blockNumber)
+					if err != nil && i.config.CodeAtBlock {
+						codeErr = errors.Join(codeErr, err)
+					}
+					return code, err
+				}, it, blockNumber)
 				if c == nil {
 					continue
 				}
@@ -1391,7 +1587,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	// see the Add below the batch.
 	var discovered []string
 
-	if len(newTokenAddresses) > 0 {
+	if len(newTokenAddresses) > 0 && !i.config.CountersOnly {
 		// A token is only ever discovered from a Transfer event we just parsed,
 		// and that path already classifies ERC721 by its 4-topic signature (the
 		// tokenId is carried as an indexed topic). Carry that signal over to the
@@ -1430,7 +1626,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	// Resolve tokenURI for freshly minted NFTs and attach to their rows.
-	if len(nftURIReqs) > 0 {
+	if len(nftURIReqs) > 0 && !i.config.CountersOnly {
 		uris := i.rpc.FetchTokenURIsBatch(ctx, nftURIReqs, i.config.TokenMetadataWorkers, i.config.RPCRateLimit)
 		for k, rowIdx := range nftURIRowIdx {
 			if uri, ok := uris[k]; ok {
@@ -1441,7 +1637,7 @@ func (i *Indexer) buildBlock(ctx context.Context, rawBlock *rpc.RawBlock, receip
 	}
 
 	return &builtBlock{raw: rawBlock, data: blockData, balanceWork: balanceWork, discovered: discovered,
-		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp}
+		start: start, blockNumber: blockNumber, blockTimestamp: blockTimestamp, tracesErr: tracesErr, codeErr: codeErr}
 }
 
 func (i *Indexer) afterCommit(ctx context.Context, b *builtBlock) {
@@ -1561,6 +1757,10 @@ func addressDelta(stats map[string]*db.AddressStatsDelta, address string, blockN
 		stats[key] = delta
 	}
 	return delta
+}
+
+func bumpsNonce(txType int) bool {
+	return txType >= 0 && txType <= 4
 }
 
 func touchAddressTx(stats map[string]*db.AddressStatsDelta, addressTxs map[string]map[int]struct{}, address string, txIndex int, blockNumber uint64) *db.AddressStatsDelta {

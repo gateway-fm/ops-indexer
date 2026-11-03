@@ -186,6 +186,14 @@ described.
   transaction the address sent, received or took part in through a Transfer event, as `ListTransactions` `by_address`
   returns them. **Correction:** a self-send used to count twice, and an address in Transfer events of several
   transactions of one block once; rows written before this build keep the old count until they are recounted.
+- `GetAddress` `tx_count_out` (`address_stats.sent_count`, migration 025): transactions of types 0-4 sent by the
+  address. On chains with system or deposit transaction types, such as OP Stack (126) and Arbitrum (100-106), it can be
+  below `eth_getTransactionCount`, since some of those raise the sender's nonce too. It was always 0;
+  rows written before 025 read 0 until the ledger reconciliation recounts them. `tx_count_in` is now the rest of the
+  address's transactions (received, in a Transfer event, or sent of another type), so `tx_count_in + tx_count_out` is
+  its transaction count, each transaction once; a self-send counts in `tx_count_out` only. **Change:** `tx_count_in`
+  carried the full transaction count before, so a consumer that summed the two counted every sent transaction
+  twice.
 - The zero address keeps no transfer count (mints and burns): `ListTokenTransfers` `by_address` `total_count` and
   `GetAddress` `token_count` are 0 for it, and its `GetAddress` transaction count leaves out mint and burn transactions
   it is not the sender or recipient of.
@@ -208,6 +216,30 @@ described.
   count, 0 for a pruned transaction.
 - `GetGasPrices` samples the latest 10,000 transactions; a window holding fewer samples fewer.
 - The rows of every list: they end at the watermark.
+
+## Stats backfill
+
+A deployment that starts at `START_BLOCK` > 0 with `PRUNE_RETAIN_BLOCKS` > 0 has no history below `START_BLOCK`:
+everything below it is pruned from day one (`GetChainStats` `pruned_through_block` = `START_BLOCK` − 1). Its totals
+still cover the whole chain. A stats backfill walks `[0, START_BLOCK)` on the node and adds what those blocks
+contributed to every counter, current balance and current state, without storing their history rows. Startup
+refuses a `START_BLOCK` whose day is not entirely below the reorg floor (12,800 blocks below the node head).
+
+While it runs, `GetChainStats` reports `stats_incomplete` = true and `stats_backfilled_through_block`. It runs until
+every block is counted and every balance those blocks touched is read at the node's latest block; the reads can
+outlast the counting. These are partial until it completes:
+
+- `GetChainStats` totals; `GetAddress` and `BatchGetAddressTransactionCounts` counts and first/last seen blocks.
+- `GetToken` (transfer count, supply, holder count, creation block and transaction).
+- `ListTokenTransfers` `by_token` / `by_address` and `ListInternalTransactions` `by_address` `total_count`;
+  `ListTransactionsPaginated` and `ListAllTokenTransfers` `total_items`.
+- `ListTokenHolders`, `ListTokens`, `ListAddresses` (ordered by transaction count), `ListTokenInventory` (owners).
+- `GetDailyStats`: daily_stats starts on a day after `START_BLOCK`'s, once catch-up has stored that day's blocks, so
+  the days before its first are absent until the backfill completes. On every day served, the `cumulative_*` columns
+  and the address columns (`new_addresses`, `new_contracts`, `cumulative_addresses`, `cumulative_contracts`) leave
+  out what the backfill has not yet counted.
+- `GetTransactionHistory` `DAY` and `WEEK` buckets: built from daily_stats, so absent or partial as above.
+- `Search` address suggestions (ordered by transaction count).
 
 ## Error model
 

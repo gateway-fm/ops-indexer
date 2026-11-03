@@ -24,6 +24,18 @@ type LedgerConfig struct {
 	MaxHeadLag uint64
 	// GateWait bounds a span close's wait for the history-DDL gate (0: defaultLedgerGateWait).
 	GateWait time.Duration
+	// CompactSpans, when 2 or more, merges that many consecutive verified pruned spans into one per interval.
+	CompactSpans int
+}
+
+// CompactLedger merges the oldest run of n consecutive verified pruned spans into one; ok is false when none
+// qualifies.
+func (d *DB) CompactLedger(ctx context.Context, n int) (lo int64, ok bool, err error) {
+	var merged *int64
+	if err := d.pool.QueryRow(ctx, `SELECT ledger_compact($1)`, n).Scan(&merged); err != nil || merged == nil {
+		return 0, false, err
+	}
+	return *merged, true, nil
 }
 
 // defaultLedgerGateWait: retention holds the history-DDL gate for its DDL, a cut's validation the longest. Past a
@@ -34,9 +46,13 @@ const defaultLedgerGateWait = time.Minute
 var errLedgerGateBusy = errors.New("the history-DDL gate is held by retention")
 
 // CloseLedgerSpans closes up to max spans after the closed prefix, stopping at the first that is not final and
-// complete; it returns how many it closed.
+// complete; it returns how many it closed. After each close, and first for any span a restart left, it sets the
+// span's addresses in address_stats to the ledger's count.
 func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (int, error) {
 	closed := 0
+	if err := d.rebasePendingSpans(ctx, cfg.WorkMem); err != nil {
+		return closed, err
+	}
 	for closed < max {
 		var lo, hi int64
 		if err := d.pool.QueryRow(ctx, `SELECT lo, hi FROM ledger_next_span($1, $2)`, int64(cfg.SpanBlocks), int64(cfg.FirstBlock)).Scan(&lo, &hi); err != nil {
@@ -63,6 +79,9 @@ func (d *DB) CloseLedgerSpans(ctx context.Context, cfg LedgerConfig, max int) (i
 		closed++
 		metrics.ObserveLedgerClose(time.Since(start))
 		metrics.SetLedgerClosedThrough(uint64(hi - 1))
+		if err := d.rebasePendingSpans(ctx, cfg.WorkMem); err != nil {
+			return closed, err
+		}
 	}
 	return closed, nil
 }
@@ -100,6 +119,13 @@ func (d *DB) RunLedger(ctx context.Context, cfg LedgerConfig) {
 			log.Warn("ledger: closing a span failed; retrying next interval", "error", err)
 		} else if n > 0 {
 			log.Debug("ledger: span closed")
+		}
+		if cfg.CompactSpans >= 2 {
+			if lo, ok, err := d.CompactLedger(ctx, cfg.CompactSpans); err != nil && ctx.Err() == nil {
+				log.Warn("ledger: compaction failed", "error", err)
+			} else if ok {
+				log.Info("ledger: pruned spans merged", "lo", lo, "spans", cfg.CompactSpans)
+			}
 		}
 		select {
 		case <-ctx.Done():

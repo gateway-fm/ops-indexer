@@ -147,6 +147,9 @@ type Balance struct {
 	TokenAddress string     `json:"tokenAddress"`
 	BlockNumber  uint64     `json:"blockNumber"`
 	Balance      JSONString `json:"balance"`
+	// Epoch is the reorg epoch current when the read was decided (balance_reorg_epoch); 0 when the writer did not
+	// set one, which counts as before every revert.
+	Epoch int64 `json:"-"`
 }
 
 type Counter struct {
@@ -161,6 +164,7 @@ type AddressStats struct {
 	TxCount            int       `json:"txCount"`
 	InternalTxCount    int       `json:"internalTxCount"`
 	TokenTransferCount int       `json:"tokenTransferCount"`
+	SentCount          int64     `json:"sentCount"`
 	FirstSeen          *uint64   `json:"firstSeen"`
 	LastSeen           *uint64   `json:"lastSeen"`
 	IsContract         bool      `json:"isContract"`

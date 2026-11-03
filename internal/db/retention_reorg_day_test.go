@@ -301,3 +301,90 @@ func TestPruneWholeDaysMigrationRevertsAndReapplies(t *testing.T) {
 	require.True(t, floor)
 	require.True(t, check)
 }
+
+// An earlier build pruned exactly through the reorg floor (head 80,800, pruned through 68,000), so no stored block is
+// at or below the floor and the reorg window's day could not be read from one. The start still warns about the
+// partly pruned day, with the head one block lower and one higher too, and retention prunes nothing more.
+func TestTheStartWarnsWhenAnEarlierBuildPrunedExactlyThroughTheFloor(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := RetentionConfig{RetainBlocks: PruneFloorGap, PartitionBlocks: 2_000}
+	seedPrunableHistory(t, d, 80_800, 1700000000, 1)
+
+	var guard string
+	require.NoError(t, d.pool.QueryRow(ctx,
+		`SELECT pg_get_functiondef('history_range_before_reorg_day(text)'::regprocedure)`).Scan(&guard))
+	_, err := d.pool.Exec(ctx, `CREATE OR REPLACE FUNCTION history_range_before_reorg_day(p_suffix TEXT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`)
+	require.NoError(t, err)
+	for i := 0; i < 10 && prunedThrough(t, d) < 68_000; i++ {
+		require.NoError(t, d.retentionPass(ctx, cfg))
+	}
+	require.Equal(t, uint64(68_000), prunedThrough(t, d), "the earlier build pruned through head - 12,800")
+	_, err = d.pool.Exec(ctx, guard)
+	require.NoError(t, err)
+
+	warned := func() string {
+		var buf bytes.Buffer
+		prev := log.Default()
+		log.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+		d.warnPartlyPrunedReorgDay(ctx)
+		log.SetDefault(prev)
+		return buf.String()
+	}
+	for _, head := range []int64{80_800, 80_801, 80_799} {
+		switch head {
+		case 80_801:
+			seedAggregated(t, d, 80_801, 80_801, 1700000000, 1)
+		case 80_799:
+			// A revert into the partly pruned day is refused, so the head is lowered under the check directly.
+			_, err := d.pool.Exec(ctx, `DELETE FROM blocks WHERE number > 80799`)
+			require.NoError(t, err)
+		}
+		out := warned()
+		require.Contains(t, out, "pruned part of a UTC day the reorg window reaches", "head %d", head)
+		require.Contains(t, out, "day=2023-11-15", "head %d", head)
+		require.NoError(t, d.retentionPass(ctx, cfg))
+		require.Equal(t, uint64(68_000), prunedThrough(t, d), "head %d: nothing more is pruned into the reorg day", head)
+	}
+}
+
+// prune_day_floor() in each state: nothing stored; nothing stored at or below the floor and nothing pruned; nothing
+// stored there and history pruned through the floor (the watermark's day); a block stored there (its day). 034 goes
+// down to NULL in the third case and up again.
+func TestPruneDayFloorInEachState(t *testing.T) {
+	pool, _ := emptyTestDB(t)
+	ctx := context.Background()
+	migrateTo(t, pool, -1)
+	floor := func() *int64 {
+		var f *int64
+		require.NoError(t, pool.QueryRow(ctx, `SELECT prune_day_floor()`).Scan(&f))
+		return f
+	}
+	day := func(ts int64) int64 {
+		var e int64
+		require.NoError(t, pool.QueryRow(ctx, `SELECT daily_stats_epoch(daily_stats_day($1))`, ts).Scan(&e))
+		return e
+	}
+	require.Nil(t, floor(), "nothing stored")
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, 'f' || g, 'f' || (g - 1), 1700000000 + g, 0, 1, 0 FROM generate_series(68001, 80800) g`)
+	require.NoError(t, err)
+	require.Nil(t, floor(), "nothing at or below the floor, nothing pruned: a young chain")
+
+	_, err = pool.Exec(ctx, `UPDATE prune_state SET pruned_through = 68000, pruned_through_ts = 1700068000 WHERE id = 1`)
+	require.NoError(t, err)
+	require.Equal(t, day(1700068000), *floor(), "pruned through the floor: the watermark's day")
+
+	migrateTo(t, pool, 33)
+	require.Nil(t, floor(), "before 034")
+	migrateTo(t, pool, -1)
+	require.Equal(t, day(1700068000), *floor())
+
+	_, err = pool.Exec(ctx, `INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		VALUES (80801, 'f80801', 'f80800', 1700180801, 0, 1, 0)`)
+	require.NoError(t, err)
+	require.Equal(t, day(1700068001), *floor(), "block 68,001 is stored at the floor: its day")
+}

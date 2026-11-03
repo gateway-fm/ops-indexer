@@ -1,7 +1,9 @@
 package rpclient
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"testing"
 
@@ -296,7 +298,7 @@ func TestClient_Dial(t *testing.T) {
 }
 
 func TestJsonrpcError_Error(t *testing.T) {
-	e := &jsonrpcError{Code: -32600, Message: "invalid request"}
+	e := &RPCError{Code: -32600, Message: "invalid request"}
 	got := e.Error()
 	if got != "rpc error: code -32600, message: invalid request" {
 		t.Errorf("Error() = %q", got)
@@ -346,5 +348,29 @@ func TestBig_NullHandling(t *testing.T) {
 	}
 	if w.Value != nil {
 		t.Error("null hexutil.Big should unmarshal as nil pointer")
+	}
+}
+
+func TestIsExecutionError(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{&RPCError{Code: 3, Message: "execution reverted: not a holder"}, true},
+		{fmt.Errorf("balanceOf: %w", &RPCError{Code: -32000, Message: "execution reverted"}), true},
+		{&RPCError{Code: -32000, Message: "invalid opcode: INVALID"}, true},
+		{&RPCError{Code: -32000, Message: "out of gas"}, true},
+		{&RPCError{Code: -32000, Message: "invalid jump destination"}, true},
+		{&RPCError{Code: -32000, Message: "stack underflow (0 <=> 1)"}, true},
+		{&RPCError{Code: -32000, Message: "execution aborted (timeout = 5s)"}, false},
+		{&RPCError{Code: 429, Message: "Too Many Requests"}, false},
+		{&RPCError{Code: -32005, Message: "limit exceeded"}, false},
+		{&HTTPStatusError{Code: 503}, false},
+		{context.DeadlineExceeded, false},
+		{nil, false},
+	} {
+		if got := IsExecutionError(c.err); got != c.want {
+			t.Errorf("IsExecutionError(%v) = %v, want %v", c.err, got, c.want)
+		}
 	}
 }

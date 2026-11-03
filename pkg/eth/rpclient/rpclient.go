@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -77,16 +78,36 @@ type jsonrpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      uint64          `json:"id"`
 	Result  json.RawMessage `json:"result"`
-	Error   *jsonrpcError   `json:"error"`
+	Error   *RPCError       `json:"error"`
 }
 
-type jsonrpcError struct {
+type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-func (e *jsonrpcError) Error() string {
+func (e *RPCError) Error() string {
 	return fmt.Sprintf("rpc error: code %d, message: %s", e.Code, e.Message)
+}
+
+// evmFailures are the messages of geth's EVM errors (core/vm/errors.go): the call ran and failed in a way the same
+// call at the same state repeats. "execution aborted (timeout = …)" is the node giving up, and is not one.
+var evmFailures = []string{"revert", "invalid opcode", "out of gas", "invalid jump destination", "stack underflow",
+	"stack limit reached", "write protection", "return data out of bounds", "max call depth exceeded",
+	"gas uint64 overflow", "invalid code"}
+
+// IsExecutionError reports whether the node ran the call and it failed (a revert, an invalid opcode, out of gas):
+// the same call fails again. Rate limits, timeouts and transport failures are not.
+func IsExecutionError(err error) bool {
+	var e *RPCError
+	if !errors.As(err, &e) {
+		return false
+	}
+	if e.Code == 3 {
+		return true
+	}
+	msg := strings.ToLower(e.Message)
+	return slices.ContainsFunc(evmFailures, func(f string) bool { return strings.Contains(msg, f) })
 }
 
 func (c *Client) CallContext(ctx context.Context, result any, method string, args ...any) error {

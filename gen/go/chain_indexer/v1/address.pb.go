@@ -75,12 +75,16 @@ func (ListAddressesRequest_SortBy) EnumDescriptor() ([]byte, []int) {
 // details" payload consumers merge with their own per-context data
 // (e.g. ENS, verification status, labels).
 type Address struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Address        string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
-	IsContract     bool                   `protobuf:"varint,2,opt,name=is_contract,json=isContract,proto3" json:"is_contract,omitempty"`
-	TxCountIn      uint64                 `protobuf:"varint,3,opt,name=tx_count_in,json=txCountIn,proto3" json:"tx_count_in,omitempty"`    // txs where address is `to`
-	TxCountOut     uint64                 `protobuf:"varint,4,opt,name=tx_count_out,json=txCountOut,proto3" json:"tx_count_out,omitempty"` // txs where address is `from`
-	TokenCount     uint64                 `protobuf:"varint,5,opt,name=token_count,json=tokenCount,proto3" json:"token_count,omitempty"`   // distinct tokens held or interacted with
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Address    string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	IsContract bool                   `protobuf:"varint,2,opt,name=is_contract,json=isContract,proto3" json:"is_contract,omitempty"`
+	// tx_count_in + tx_count_out is every transaction the address took part in: as sender, as recipient, or in a
+	// Transfer event, each transaction once. tx_count_out is the transactions it sent of types 0-4; a self-send counts
+	// there only. tx_count_in is the rest: transactions it received or appears in through a Transfer event, and any it
+	// sent of another type.
+	TxCountIn      uint64                 `protobuf:"varint,3,opt,name=tx_count_in,json=txCountIn,proto3" json:"tx_count_in,omitempty"`
+	TxCountOut     uint64                 `protobuf:"varint,4,opt,name=tx_count_out,json=txCountOut,proto3" json:"tx_count_out,omitempty"`
+	TokenCount     uint64                 `protobuf:"varint,5,opt,name=token_count,json=tokenCount,proto3" json:"token_count,omitempty"` // distinct tokens held or interacted with
 	FirstSeenAt    *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=first_seen_at,json=firstSeenAt,proto3" json:"first_seen_at,omitempty"`
 	LastSeenAt     *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=last_seen_at,json=lastSeenAt,proto3" json:"last_seen_at,omitempty"`
 	FirstSeenBlock uint64                 `protobuf:"varint,8,opt,name=first_seen_block,json=firstSeenBlock,proto3" json:"first_seen_block,omitempty"`

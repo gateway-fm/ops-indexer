@@ -222,3 +222,41 @@ func TestRetention_WatermarkFollowsAWipeDown(t *testing.T) {
 		t.Fatalf("GetBlock 1, stored again after the wipe: %v", err)
 	}
 }
+
+func TestStatsBackfill_ChainStatsSaysTotalsAreIncomplete(t *testing.T) {
+	h := newTestHarness(t)
+	defer h.cleanup()
+	ctx := context.Background()
+	stats := func() *indexerv1.ChainStats {
+		resp, err := h.client.GetChainStats(ctx, &indexerv1.Empty{})
+		if err != nil {
+			t.Fatalf("GetChainStats: %v", err)
+		}
+		return resp
+	}
+	if r := stats(); r.GetStatsIncomplete() || r.GetStatsBackfilledThroughBlock() != 0 {
+		t.Fatalf("no backfill: (%v, %d), want complete", r.GetStatsIncomplete(), r.GetStatsBackfilledThroughBlock())
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO stats_backfill (id, target, through) VALUES (1, 99, 49)`); err != nil {
+		t.Fatal(err)
+	}
+	if r := stats(); !r.GetStatsIncomplete() || r.GetStatsBackfilledThroughBlock() != 49 {
+		t.Fatalf("half way: (%v, %d), want (true, 49)", r.GetStatsIncomplete(), r.GetStatsBackfilledThroughBlock())
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE stats_backfill SET through = 99, completed_at = now()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO stats_backfill_balance_keys VALUES ('0xt', '0xa', 7)`); err != nil {
+		t.Fatal(err)
+	}
+	if r := stats(); !r.GetStatsIncomplete() || r.GetStatsBackfilledThroughBlock() != 99 {
+		t.Fatalf("every block counted, a touched balance not read yet: (%v, %d), want (true, 99)",
+			r.GetStatsIncomplete(), r.GetStatsBackfilledThroughBlock())
+	}
+	if _, err := h.pool.Exec(ctx, `DELETE FROM stats_backfill_balance_keys`); err != nil {
+		t.Fatal(err)
+	}
+	if r := stats(); r.GetStatsIncomplete() || r.GetStatsBackfilledThroughBlock() != 99 {
+		t.Fatalf("complete: (%v, %d), want (false, 99)", r.GetStatsIncomplete(), r.GetStatsBackfilledThroughBlock())
+	}
+}

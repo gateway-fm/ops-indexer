@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/config"
 	"github.com/gateway-fm/chain-indexer/internal/db"
@@ -106,7 +107,6 @@ func main() {
 	if err := database.EnsureContractsBlockIndex(context.Background()); err != nil {
 		log.Fatal("failed to build the contracts block index", "error", err)
 	}
-
 	// Once the history is cut a block above the newest partition cannot be stored: create them before ingest.
 	if head, err := database.GetLatestBlockNumber(context.Background()); err != nil {
 		log.Fatal("failed to read the stored head", "error", err)
@@ -141,6 +141,15 @@ func main() {
 		BalanceDedupWindow:    cfg.BalanceDedupWindow,
 		BalanceReaderBatch:    cfg.BalanceReaderBatch,
 		BalanceSkipL1:         cfg.BalanceSkipL1,
+		NodeRecountRPS:        cfg.VerifyNodeRecountRPS,
+		VerifyRepair:          cfg.VerifyRepair,
+		ChainCheck: indexer.ChainCheckConfig{
+			RPS: cfg.VerifyChainRPS, Sample: cfg.VerifyChainSample, Interval: cfg.VerifyChainInterval,
+		},
+		StatsBackfill: indexer.StatsBackfillConfig{
+			RPS: cfg.StatsBackfillRPS, Workers: cfg.StatsBackfillWorkers, BatchBlocks: cfg.StatsBackfillBatchBlocks,
+			SpanBlocks: cfg.LedgerSpanBlocks, Retry: 10 * time.Second,
+		},
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
@@ -175,21 +184,39 @@ func main() {
 
 	stop := &workerStop{cancel: cancel}
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(6)
 
-	reconciled := make(chan struct{})
-	afterReconcile := func() bool {
+	// Built CONCURRENTLY beside ingest and gRPC; the ledger checks and the span rebase wait for them. A shutdown stops
+	// the build, so the pool can close, and the next start replaces the index it left invalid.
+	go func() {
+		defer wg.Done()
+		database.RunLedgerIndexes(ctx, time.Minute)
+	}()
+
+	afterStartWipe := func() bool {
 		select {
-		case <-reconciled:
+		case <-idx.PastWipe():
 			return true
 		case <-ctx.Done():
 			return false
 		}
 	}
 
+	// The checks wait for the startup reconcile and the start's wipe like the ledger and retention: the address
+	// reconciliation creates and removes address_stats rows and moves addresses_total, which the reconcile's re-seed
+	// writes absolutely, and a wipe truncates what they read.
 	go func() {
 		defer wg.Done()
-		if !afterReconcile() {
+		if !afterStartWipe() {
+			return
+		}
+		database.RunVerify(ctx, db.VerifyConfig{RecountInterval: cfg.VerifyRecountInterval, Repair: cfg.VerifyRepair,
+			WorkMem: cfg.LedgerWorkMem, MaxOpenTail: db.MaxOpenTail(cfg.LedgerSpanBlocks)})
+	}()
+
+	go func() {
+		defer wg.Done()
+		if !afterStartWipe() {
 			return
 		}
 		database.RunLedger(ctx, db.LedgerConfig{
@@ -208,13 +235,14 @@ func main() {
 				}
 				return node - ingested, nil
 			},
-			MaxHeadLag: cfg.LedgerMaxHeadLag,
+			MaxHeadLag:   cfg.LedgerMaxHeadLag,
+			CompactSpans: cfg.LedgerCompactSpans,
 		})
 	}()
 
 	go func() {
 		defer wg.Done()
-		if !afterReconcile() {
+		if !afterStartWipe() {
 			return
 		}
 		database.RunRetention(ctx, db.RetentionConfig{
@@ -228,10 +256,10 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		if err := database.Reconcile(ctx); err != nil {
-			log.Fatal("failed to reconcile counters", "error", err)
+		backfill := cfg.StartBlock > 0 && cfg.PruneRetainBlocks > 0
+		if err := indexer.ReconcileForStart(ctx, database, rpcClient, cfg.StartBlock, backfill, cfg.EnableTracing); err != nil {
+			log.Fatal("failed to reconcile counters or prepare the stats backfill", "error", err)
 		}
-		close(reconciled)
 		log.Info("starting indexer worker")
 		if err := idx.Start(ctx); err != nil {
 			stop.fail("indexer worker error", err)

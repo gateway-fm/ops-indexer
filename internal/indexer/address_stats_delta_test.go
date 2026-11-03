@@ -68,6 +68,11 @@ func TestAddressStatsCountEachTransactionTransferAndCallOncePerAddress(t *testin
 		Transactions: []rpc.RawTransaction{
 			statsTx(selfSend, 0, statsA, statsA, &number),
 			statsTx(other, 1, statsA, statsB, &number),
+			func() rpc.RawTransaction {
+				deposit := statsTx(common.HexToHash("0xde90"), 2, statsC, statsB, &number)
+				deposit.Type = 0x7e
+				return deposit
+			}(),
 		},
 	}
 	receipts := map[common.Hash]*rpclient.Receipt{
@@ -87,14 +92,17 @@ func TestAddressStatsCountEachTransactionTransferAndCallOncePerAddress(t *testin
 	assert.Equal(t, 2, a.TxCountDelta, "A: the self-send and the A->B transaction")
 	assert.Equal(t, 3, a.TokenTransferDelta, "A: the self-transfer once, and two transfers in from C")
 	assert.Equal(t, 2, a.InternalTxCountDelta, "A: the self-call once, and the call to B")
+	assert.Equal(t, 2, a.SentDelta, "A sent two nonce-bumping transactions")
 
 	b := addressStatsOf(t, data, statsB)
-	assert.Equal(t, 2, b.TxCountDelta, "B: a transfer participant in the self-send and the recipient of the other")
+	assert.Equal(t, 3, b.TxCountDelta, "B: a transfer participant in the self-send, the recipient of the other and of the deposit")
+	assert.Zero(t, b.SentDelta)
 	assert.Equal(t, 1, b.TokenTransferDelta)
 	assert.Equal(t, 1, b.InternalTxCountDelta)
 
 	c := addressStatsOf(t, data, statsC)
-	assert.Equal(t, 2, c.TxCountDelta, "C: one per transaction, not per transfer")
+	assert.Equal(t, 3, c.TxCountDelta, "C: one per transaction, not per transfer, and the deposit it sent")
+	assert.Zero(t, c.SentDelta, "a deposit (type 0x7e) does not bump the sender's nonce")
 	assert.Equal(t, 3, c.TokenTransferDelta)
 	assert.Equal(t, 0, c.InternalTxCountDelta)
 

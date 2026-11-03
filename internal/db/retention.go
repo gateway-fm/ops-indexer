@@ -780,6 +780,17 @@ func (d *DB) pruneOldest(ctx context.Context, cfg RetentionConfig) (bool, error)
 		log.Debug("retention: oldest range reaches the UTC day a reorg can revert into; not pruned", "range", suffix, "below", *hi)
 		return false, nil
 	}
+	// Everything at or below a stats backfill's target is pruned from day one, so every attached range is above it,
+	// and its completion counts the days from START_BLOCK from their stored blocks.
+	var backfilling bool
+	if err := d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM stats_backfill WHERE NOT daily_done)`).Scan(&backfilling); err != nil {
+		return false, err
+	}
+	metrics.SetPruneBlockedByBackfill(backfilling)
+	if backfilling {
+		log.Info("retention: the stats backfill has not written its days yet; not pruned", "range", suffix, "below", *hi)
+		return false, nil
+	}
 	var closed bool
 	if err := d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ledger_spans WHERE hi = $1)`, *hi).Scan(&closed); err != nil {
 		return false, err

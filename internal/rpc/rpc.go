@@ -14,6 +14,7 @@ import (
 	explorerTypes "github.com/gateway-fm/chain-indexer/internal/types"
 
 	"github.com/gateway-fm/chain-indexer/pkg/eth/common"
+	"github.com/gateway-fm/chain-indexer/pkg/eth/hexutil"
 	"github.com/gateway-fm/chain-indexer/pkg/eth/rpclient"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
@@ -102,6 +103,11 @@ func (c *Client) GetCode(ctx context.Context, address common.Address) ([]byte, e
 	return c.raw.CodeAt(ctx, address, nil)
 }
 
+// GetCodeAt is an account's code after the given block; a node without that block's state answers with an error.
+func (c *Client) GetCodeAt(ctx context.Context, address common.Address, block uint64) ([]byte, error) {
+	return c.raw.CodeAt(ctx, address, new(big.Int).SetUint64(block))
+}
+
 func (c *Client) ChainID(ctx context.Context) (*big.Int, error) {
 	return c.raw.ChainID(ctx)
 }
@@ -112,6 +118,40 @@ func (c *Client) CallContract(ctx context.Context, to common.Address, data []byt
 		Data: data,
 	}
 	return c.raw.CallContract(ctx, msg, nil)
+}
+
+// CallContractAt runs an eth_call against the state after block.
+func (c *Client) CallContractAt(ctx context.Context, to common.Address, data []byte, block uint64) ([]byte, error) {
+	return c.raw.CallContract(ctx, rpclient.CallMsg{To: &to, Data: data}, new(big.Int).SetUint64(block))
+}
+
+// TransactionCountAt is the address's nonce after block (eth_getTransactionCount).
+func (c *Client) TransactionCountAt(ctx context.Context, address common.Address, block uint64) (uint64, error) {
+	var n hexutil.Uint64
+	err := c.raw.CallContext(ctx, &n, "eth_getTransactionCount", address, toHex(block))
+	return uint64(n), err
+}
+
+// BlockTransactionCounts sums eth_getBlockTransactionCountByNumber over [from, to), batchSize calls per request.
+func (c *Client) BlockTransactionCounts(ctx context.Context, from, to uint64, batchSize int) (uint64, error) {
+	var total uint64
+	for lo := from; lo < to; lo += uint64(batchSize) {
+		hi := min(lo+uint64(batchSize), to)
+		counts := make([]hexutil.Uint64, hi-lo)
+		args := make([][]any, hi-lo)
+		results := make([]any, hi-lo)
+		for n := lo; n < hi; n++ {
+			args[n-lo] = []any{toHex(n)}
+			results[n-lo] = &counts[n-lo]
+		}
+		if err := c.raw.BatchCallContext(ctx, "eth_getBlockTransactionCountByNumber", args, results); err != nil {
+			return 0, fmt.Errorf("blocks [%d, %d): %w", lo, hi, err)
+		}
+		for _, n := range counts {
+			total += uint64(n)
+		}
+	}
+	return total, nil
 }
 
 func (c *Client) GetTransactionByHash(ctx context.Context, hash common.Hash) (*explorerTypes.Transaction, error) {
