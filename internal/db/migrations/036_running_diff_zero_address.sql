@@ -48,8 +48,8 @@ $f$;
 -- migration takes this guard into its own down.
 DO $guard$
 BEGIN
-    IF EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NULL) THEN
-        RAISE EXCEPTION 'schema rollback: the stats backfill has not finished (stats_backfill.completed_at is NULL), and the downs would drop its state, its span in progress and its balance keys. Let the backfill finish on this release and roll back then, or restore the pre-upgrade backup.';
+    IF EXISTS (SELECT 1 FROM stats_backfill WHERE completed_at IS NULL) OR EXISTS (SELECT 1 FROM stats_backfill_balance_keys) THEN
+        RAISE EXCEPTION 'schema rollback: the stats backfill has not finished (stats_backfill.completed_at is NULL, or balances it touched are still to be read: stats_backfill_balance_keys has rows), and the downs would drop its state, its span in progress and its balance keys. Let the backfill finish on this release and roll back then, or restore the pre-upgrade backup.';
     END IF;
 END
 $guard$;
