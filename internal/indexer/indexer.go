@@ -1036,6 +1036,9 @@ func (i *Indexer) revertStaleHead(ctx context.Context, top uint64) (uint64, []ui
 		n := top - d
 		stored, err := i.db.GetBlock(ctx, n)
 		if err != nil {
+			if ctx.Err() != nil {
+				return top, nil, ctx.Err()
+			}
 			return top, nil, fmt.Errorf("read the stored block %d: %w", n, err)
 		}
 		if stored == nil {
