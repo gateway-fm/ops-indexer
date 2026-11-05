@@ -32,10 +32,10 @@ BEGIN
 END
 $f$;
 
--- Writes a fold staged in this session's fold_acc, fold_active, fold_reset and fold_stats, if the watermark, the
+-- Writes a fold staged in this session's fold_acc, fold_active, fold_gone and fold_stats, if the watermark, the
 -- generation, the pending first_seen moves and the pruned height are still those its snapshot read. The address
--- sets of days before kept_from are dropped, as daily_stats_advance drops them; kept_from is NULL when the
--- watermark does not move.
+-- sets change by the staged difference: fold_gone out, fold_active in. The sets of days before kept_from are
+-- dropped, as daily_stats_advance drops them; kept_from is NULL when the watermark does not move.
 CREATE FUNCTION daily_stats_fold_apply(wm BIGINT, gen BIGINT, moves BIGINT, pruned BIGINT, upto BIGINT, kept_from DATE)
 RETURNS BOOLEAN LANGUAGE plpgsql AS $f$
 BEGIN
@@ -67,7 +67,8 @@ BEGIN
         active_addresses = EXCLUDED.active_addresses, token_transfers = EXCLUDED.token_transfers,
         txs_before = EXCLUDED.txs_before;
 
-    DELETE FROM daily_active_addresses WHERE date IN (SELECT date FROM fold_reset) OR date < kept_from;
+    DELETE FROM daily_active_addresses l USING fold_gone g WHERE l.date = g.date AND l.address = g.address;
+    DELETE FROM daily_active_addresses WHERE date < kept_from;
     INSERT INTO daily_active_addresses (date, address)
     SELECT date, address FROM fold_active WHERE kept_from IS NULL OR date >= kept_from
     ON CONFLICT DO NOTHING;

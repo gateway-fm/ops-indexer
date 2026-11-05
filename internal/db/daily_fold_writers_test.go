@@ -370,3 +370,48 @@ func TestMigration037RollsBackAndForward(t *testing.T) {
 	require.EqualValues(t, 90, foldWatermark(t, d))
 	requireStoredDaysEqualRecompute(t, d, "after 037 down and up")
 }
+
+// A fold empties its staging tables before its connection goes back to the pool, whether it applied, was refused
+// or failed: the pool keeps the session, and the tables in it, for as long as it lives.
+func TestTheFoldLeavesItsStagingTablesEmpty(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		between func(t *testing.T, d *DB)
+		failed  bool
+	}{
+		{"applied", func(*testing.T, *DB) {}, false},
+		{"refused", func(t *testing.T, d *DB) { replaceBlocks(t, d, 110, 110, forkedLateBlock) }, false},
+		{"failed", func(t *testing.T, d *DB) {
+			_, err := d.pool.Exec(context.Background(),
+				`ALTER FUNCTION daily_stats_fold_apply(BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, DATE) RENAME TO daily_stats_fold_apply_away`)
+			require.NoError(t, err)
+		}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+			for n := 1; n <= 100; n++ {
+				require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+			}
+			advanceUntilStable(t, d)
+			for n := 101; n <= 110; n++ {
+				require.NoError(t, d.InsertBlockDataBatch(ctx, lateBlock(n)))
+			}
+			var staged int64
+			counts := onFoldCounted(t, func(int) {
+				staged = foldStagingBytes(t, d)
+				c.between(t, d)
+			})
+			_, err := d.AdvanceDailyStats(ctx)
+			if c.failed {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Positive(t, counts.Load())
+			require.Positive(t, staged, "the count staged rows")
+			require.Zero(t, foldStagingBytes(t, d), "staging left behind")
+		})
+	}
+}

@@ -94,8 +94,13 @@ const (
 const foldStageSQL = `
 	CREATE TEMP TABLE IF NOT EXISTS fold_acc (LIKE daily_stats_acc INCLUDING ALL);
 	CREATE TEMP TABLE IF NOT EXISTS fold_active (LIKE daily_active_addresses INCLUDING ALL);
+	CREATE TEMP TABLE IF NOT EXISTS fold_gone (LIKE daily_active_addresses INCLUDING ALL);
 	CREATE TEMP TABLE IF NOT EXISTS fold_reset (date DATE PRIMARY KEY);
 	CREATE TEMP TABLE IF NOT EXISTS fold_stats (LIKE daily_stats INCLUDING ALL)`
+
+// emptyFoldStageSQL empties the staging tables, before each count and before the connection goes back to the pool,
+// where they would otherwise keep the last fold's rows for as long as the session lives.
+const emptyFoldStageSQL = `TRUNCATE fold_acc, fold_active, fold_gone, fold_reset, fold_stats`
 
 // bumpDailyGenerationSQL is run under (4670, 1) by every transaction that writes the daily tables, so that a fold
 // counted before it does not apply over it (migration 037).
@@ -173,7 +178,13 @@ func (d *DB) fold(ctx context.Context, days []int64) (upto *int64, pending []int
 	if err != nil {
 		return nil, nil, false, err
 	}
-	defer conn.Release()
+	staged := false
+	defer func() {
+		if staged {
+			emptyFoldStage(ctx, conn)
+		}
+		conn.Release()
+	}()
 	var started bool
 	if err := conn.QueryRow(ctx, startDailyStatsWatermarkSQL).Scan(&started); err != nil || !started {
 		return nil, nil, false, err
@@ -181,6 +192,7 @@ func (d *DB) fold(ctx context.Context, days []int64) (upto *int64, pending []int
 	if _, err := conn.Exec(ctx, foldStageSQL); err != nil {
 		return nil, nil, false, err
 	}
+	staged = true
 	limit := d.DailyStatsFoldMaxBlocks
 	if limit <= 0 {
 		limit = defaultFoldMaxBlocks
@@ -226,12 +238,22 @@ func (d *DB) fold(ctx context.Context, days []int64) (upto *int64, pending []int
 	}
 }
 
+// emptyFoldStage empties the staging tables even when the fold's context is done, and closes the connection when it
+// cannot, so that the pool does not hand it out again holding them.
+func emptyFoldStage(ctx context.Context, conn *pgxpool.Conn) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Exec(ctx, emptyFoldStageSQL); err != nil {
+		_ = conn.Conn().Close(ctx)
+	}
+}
+
 // countFold stages one fold in a read-only snapshot: a copy of daily_stats_acc, what daily_stats_advance would add
 // for the next contiguous stored blocks above the watermark, up to limit of them, and the recount of the first
 // complete late day with the days it carries into (recountDays), each day's daily_stats row they change, and the
-// address pairs to add to daily_active_addresses (fold_active; the days in fold_reset are replaced whole).
+// address pairs to add to daily_active_addresses (fold_active) and to take out of it (fold_gone).
 func countFold(ctx context.Context, conn *pgxpool.Conn, late *lateDays, limit int64, days []int64) (c foldCount, err error) {
-	if _, err := conn.Exec(ctx, `TRUNCATE fold_acc, fold_active, fold_reset, fold_stats`); err != nil {
+	if _, err := conn.Exec(ctx, emptyFoldStageSQL); err != nil {
 		return c, err
 	}
 	err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
@@ -273,12 +295,39 @@ func countFold(ctx context.Context, conn *pgxpool.Conn, late *lateDays, limit in
 				from = spanned
 			}
 		}
-		if from == nil {
-			return nil
+		if from != nil {
+			if err := rewriteFrom(ctx, tx, stagedDays, *from, c.upto); err != nil {
+				return err
+			}
 		}
-		return rewriteFrom(ctx, tx, stagedDays, *from, c.upto)
+		return stageRecountedSets(ctx, tx, c.upto)
 	})
 	return c, err
+}
+
+// stageRecountedSets turns the address sets of the recounted days (fold_reset) into what the apply changes in
+// daily_active_addresses, so that the work under (4670, 1) is the difference, not the sets. Only blocks above the
+// watermark read a day's set, and they are on the watermark's day or later: a recounted day before it keeps the set
+// it has; on the watermark's day the addresses already in its set are not added again (fold_active), and those no
+// longer in the day's blocks are taken out (fold_gone).
+func stageRecountedSets(ctx context.Context, tx pgx.Tx, watermark int64) error {
+	var day *time.Time
+	if err := tx.QueryRow(ctx, `SELECT (SELECT daily_stats_day(timestamp) FROM blocks WHERE number = $1)`, watermark).Scan(&day); err != nil {
+		return err
+	}
+	for _, q := range []string{`
+		DELETE FROM fold_active f USING fold_reset r WHERE f.date = r.date AND f.date < $1`, `
+		INSERT INTO fold_gone (date, address)
+		SELECT l.date, l.address FROM daily_active_addresses l JOIN fold_reset r USING (date)
+		WHERE l.date >= $1 AND NOT EXISTS (SELECT 1 FROM fold_active f WHERE f.date = l.date AND f.address = l.address)`, `
+		DELETE FROM fold_active f USING fold_reset r, daily_active_addresses l
+		WHERE f.date = r.date AND f.date >= $1 AND l.date = f.date AND l.address = f.address`,
+	} {
+		if _, err := tx.Exec(ctx, q, day); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // stageAdvance stages what daily_stats_advance (021) writes for the blocks above wm through upto: their sums added
@@ -590,8 +639,8 @@ func rewriteFrom(ctx context.Context, tx pgx.Tx, t dailyTables, day, watermark i
 	return err
 }
 
-// recountDay stages a day's aggregate and address set from its blocks up to the watermark; the apply replaces the
-// day's set with it (fold_reset).
+// recountDay stages a day's aggregate and address set from its blocks up to the watermark, and notes the day in
+// fold_reset for stageRecountedSets.
 func recountDay(ctx context.Context, tx pgx.Tx, watermark, day int64) error {
 	date := dayDate(day)
 	if _, err := tx.Exec(ctx, `DELETE FROM fold_active WHERE date = $1::DATE`, date); err != nil {
