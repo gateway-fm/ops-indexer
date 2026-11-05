@@ -830,6 +830,9 @@ func (d *DB) RebuildAddressStats(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(4670, 1)`); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, bumpDailyGenerationSQL); err != nil {
+			return err
+		}
 		return recountDailyAddressColumns(ctx, tx)
 	})
 	if err != nil {

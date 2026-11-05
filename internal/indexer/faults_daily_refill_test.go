@@ -52,7 +52,7 @@ func fkDaily(t *testing.T, url string) string {
 	t.Helper()
 	c := faultkit.Conn(t, url)
 	var out []string
-	for _, q := range []string{`SELECT * FROM daily_stats`, `SELECT * FROM daily_stats_acc`, `SELECT * FROM daily_stats_watermark`} {
+	for _, q := range []string{`SELECT * FROM daily_stats`, `SELECT * FROM daily_stats_acc`, `SELECT id, last_block FROM daily_stats_watermark`} {
 		rows, err := c.Query(context.Background(), `SELECT to_jsonb(q)::text FROM (`+q+`) q ORDER BY 1`)
 		require.NoError(t, err)
 		r, err := pgx.CollectRows(rows, pgx.RowTo[string])

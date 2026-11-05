@@ -57,6 +57,7 @@ func main() {
 	}
 	defer database.Close()
 	database.RebuildWorkMem = cfg.RebuildWorkMem
+	database.DailyStatsFoldMaxBlocks = cfg.DailyStatsFoldMaxBlocks
 	if len(os.Args) > 1 && os.Args[1] == "refill-daily-stats" {
 		code := runRefillDailyStats(os.Args[2:], database, cfg.RPCURL, cfg.RPCTimeout)
 		database.Close()

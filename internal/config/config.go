@@ -23,10 +23,13 @@ type Config struct {
 	// Minimum interval between recomputations of the current day's daily_stats
 	// row (PRST-4669). 0 = every 100 blocks (legacy).
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
-	CommitPipelineDepth   int           `mapstructure:"commit_pipeline"`
-	BalanceDedupWindow    time.Duration `mapstructure:"balance_dedup_window"`
-	BalanceReaderBatch    int           `mapstructure:"balance_reader_batch"`
-	BalanceSkipL1         bool          `mapstructure:"balance_skip_l1"`
+	// DailyStatsFoldMaxBlocks is how many blocks one daily_stats fold counts before it writes them, under the lock
+	// a revert waits for. Env: DAILY_STATS_FOLD_MAX_BLOCKS.
+	DailyStatsFoldMaxBlocks int64         `mapstructure:"daily_stats_fold_max_blocks"`
+	CommitPipelineDepth     int           `mapstructure:"commit_pipeline"`
+	BalanceDedupWindow      time.Duration `mapstructure:"balance_dedup_window"`
+	BalanceReaderBatch      int           `mapstructure:"balance_reader_batch"`
+	BalanceSkipL1           bool          `mapstructure:"balance_skip_l1"`
 	// TxHashIndexes keeps an index on tx_hash in logs and token_transfers for consumers that read them by
 	// transaction hash (0.4.0 had one); false spares ingest its random writes.
 	TxHashIndexes bool   `mapstructure:"tx_hash_indexes"`
@@ -125,6 +128,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("api_port", 8080)
 	v.SetDefault("poll_interval", "2s")
 	v.SetDefault("daily_stats_min_interval", "60s")
+	v.SetDefault("daily_stats_fold_max_blocks", 2000)
 	v.SetDefault("commit_pipeline", 1)
 	v.SetDefault("balance_dedup_window", "0s")
 	v.SetDefault("balance_reader_batch", 0)
@@ -223,6 +227,7 @@ func Load() (*Config, error) {
 	cfg.APIPort = v.GetInt("api_port")
 	cfg.PollInterval = v.GetDuration("poll_interval")
 	cfg.DailyStatsMinInterval = v.GetDuration("daily_stats_min_interval")
+	cfg.DailyStatsFoldMaxBlocks = v.GetInt64("daily_stats_fold_max_blocks")
 	cfg.CommitPipelineDepth = v.GetInt("commit_pipeline")
 	cfg.BalanceDedupWindow = v.GetDuration("balance_dedup_window")
 	cfg.BalanceReaderBatch = v.GetInt("balance_reader_batch")

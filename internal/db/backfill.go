@@ -316,6 +316,9 @@ func (d *DB) CompleteStatsBackfill(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `SELECT daily_stats_backfill_complete()`); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, bumpDailyGenerationSQL); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, `UPDATE stats_backfill SET completed_at = now() WHERE id = 1 AND through = target`)
 		return err
 	})

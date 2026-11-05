@@ -118,6 +118,16 @@ var (
 		Help: "Highest stored block minus the daily statistics watermark. It stays high while a missing block holds daily_stats for every later day.",
 	})
 
+	dailyStatsFoldRefused = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_daily_stats_fold_refused_total",
+		Help: "Daily statistics folds whose writes were refused because a revert, refill or recount of the days committed after their count; each counts again.",
+	})
+
+	dailyStatsFoldLocked = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_daily_stats_fold_locked_total",
+		Help: "Daily statistics folds run under the commit lock after several calls in a row had every write refused.",
+	})
+
 	blocksIndexed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "indexer_blocks_indexed_total",
 		Help: "Blocks written to the database since process start.",
@@ -217,6 +227,10 @@ func SetMissingBlocks(n int64) { missingBlocks.Set(float64(n)) }
 func SetStartWaitingBlocks(n uint64) { startWaitingBlocks.Set(float64(n)) }
 
 func SetDailyStatsLag(n int64) { dailyStatsLag.Set(float64(n)) }
+
+func DailyStatsFoldRefused() { dailyStatsFoldRefused.Inc() }
+
+func DailyStatsFoldLocked() { dailyStatsFoldLocked.Inc() }
 
 func SetPruneWatermark(block uint64) { pruneWatermark.Set(float64(block)) }
 

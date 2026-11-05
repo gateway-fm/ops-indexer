@@ -30,9 +30,13 @@ type DB struct {
 	// RebuildWorkMem is the work_mem for the address_stats rebuild transaction.
 	// Empty falls back to a safe default. Set via REBUILD_WORK_MEM env var.
 	RebuildWorkMem string
-	lateDays       lateDays
-	statsGap       statsGap
-	missingScan    atomic.Int64
+	// DailyStatsFoldMaxBlocks is how many blocks one daily-stats fold counts before it writes them; 0 is
+	// defaultFoldMaxBlocks. Set via DAILY_STATS_FOLD_MAX_BLOCKS.
+	DailyStatsFoldMaxBlocks int64
+	lateDays                lateDays
+	foldStalls              atomic.Int64
+	statsGap                statsGap
+	missingScan             atomic.Int64
 	// cutMargin is added to the next history cut's distance from the head after a cut that the head caught up with
 	// while it validated (only the retention goroutine reads or writes it).
 	cutMargin uint64
