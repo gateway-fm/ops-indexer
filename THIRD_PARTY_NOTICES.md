@@ -42,7 +42,7 @@ stubs, SQL migrations, GitHub Actions workflows, and Docker build materials.
 
 ## Container Base Images
 
-The Dockerfile currently builds with `golang:1.26-alpine` and runs on
+The Dockerfile currently builds with `golang:1.26.11-alpine` and runs on
 `gcr.io/distroless/static-debian13:nonroot`. Container distribution should
 include scanner-backed SBOMs, base-image license notices, and source-to-image
 mapping.
