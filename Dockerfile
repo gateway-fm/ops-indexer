@@ -1,5 +1,5 @@
 # The builder runs natively and cross-compiles: under QEMU an arm64 builder emulated the whole Go compile.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine AS builder
 
 ARG TARGETOS TARGETARCH
 
