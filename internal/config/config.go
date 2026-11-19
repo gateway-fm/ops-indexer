@@ -9,17 +9,23 @@ import (
 )
 
 type Config struct {
-	RPCURL          string        `mapstructure:"rpc_url"`
-	DatabaseURL     string        `mapstructure:"database_url"`
+	IndexedReadDSN             string `mapstructure:"indexed_read_dsn"`
+	IndexedReadSourceReference string `mapstructure:"indexed_read_source_reference"`
+	IndexedReadEpoch           string `mapstructure:"indexed_read_epoch"`
+	IndexedReadChainID         string `mapstructure:"indexed_read_chain_id"`
+	IndexedReadGenesisHash     string `mapstructure:"indexed_read_genesis_hash"`
+
+	RPCURL      string `mapstructure:"rpc_url"`
+	DatabaseURL string `mapstructure:"database_url"`
 	// GRPCListenAddr is the address the chain-indexer gRPC server binds to,
 	// e.g. ":50051". Required.
-	GRPCListenAddr  string        `mapstructure:"grpc_listen_addr"`
-	APIPort         int           `mapstructure:"api_port"`
-	PollInterval    time.Duration `mapstructure:"poll_interval"`
+	GRPCListenAddr string        `mapstructure:"grpc_listen_addr"`
+	APIPort        int           `mapstructure:"api_port"`
+	PollInterval   time.Duration `mapstructure:"poll_interval"`
 	// Minimum interval between recomputations of the current day's daily_stats
 	// row (PRST-4669). 0 = every 100 blocks (legacy).
 	DailyStatsMinInterval time.Duration `mapstructure:"daily_stats_min_interval"`
-	StartBlock      uint64        `mapstructure:"start_block"`
+	StartBlock            uint64        `mapstructure:"start_block"`
 
 	RPCWorkers           int  `mapstructure:"rpc_workers"`
 	RPCRateLimit         int  `mapstructure:"rpc_rate_limit"`
@@ -50,7 +56,7 @@ type Config struct {
 
 	// Set PRIVACY_PROXY_URL to enable proxy mode (auth + privacy enforcement).
 	// Leave empty for standalone mode (direct DB/RPC access).
-	PrivacyProxyURL       string `mapstructure:"privacy_proxy_url"`
+	PrivacyProxyURL string `mapstructure:"privacy_proxy_url"`
 	// PrivacyProxyPublicURL is the browser-facing URL for OAuth redirects.
 	// Defaults to PrivacyProxyURL if not set. Set this when the proxy is on a
 	// Docker-internal hostname (e.g. privacy-proxy-proxy-backend-1) but the
@@ -59,15 +65,15 @@ type Config struct {
 	SSOClientID           string `mapstructure:"sso_client_id"`
 	SSORedirectURI        string `mapstructure:"sso_redirect_uri"`
 
-	LogLevel              string        `mapstructure:"log_level"`
+	LogLevel string `mapstructure:"log_level"`
 
 	// HiddenTxTypes is a comma-separated list of transaction type numbers to
 	// exclude from the default transaction listings (e.g. "126" for OP deposit TXs).
-	HiddenTxTypes         string        `mapstructure:"hidden_tx_types"`
+	HiddenTxTypes string `mapstructure:"hidden_tx_types"`
 
 	// RebuildWorkMem sets work_mem (via SET LOCAL) for the one-shot address_stats
 	// rebuild. Env: REBUILD_WORK_MEM. Lower it on memory-tight Postgres.
-	RebuildWorkMem        string        `mapstructure:"rebuild_work_mem"`
+	RebuildWorkMem string `mapstructure:"rebuild_work_mem"`
 
 	EnableOPDeposits      bool          `mapstructure:"enable_op_deposits"`
 	L1RPCURL              string        `mapstructure:"l1_rpc_url"`
@@ -146,6 +152,11 @@ func Load() (*Config, error) {
 	_ = v.ReadInConfig()
 
 	cfg := &Config{}
+	cfg.IndexedReadDSN = v.GetString("indexed_read_dsn")
+	cfg.IndexedReadSourceReference = v.GetString("indexed_read_source_reference")
+	cfg.IndexedReadEpoch = v.GetString("indexed_read_epoch")
+	cfg.IndexedReadChainID = v.GetString("indexed_read_chain_id")
+	cfg.IndexedReadGenesisHash = v.GetString("indexed_read_genesis_hash")
 	cfg.RPCURL = v.GetString("rpc_url")
 	cfg.DatabaseURL = v.GetString("database_url")
 	cfg.GRPCListenAddr = v.GetString("grpc_listen_addr")

@@ -196,3 +196,69 @@ These are internal targets for the indexer implementation. Consumers should add 
 - ops-explorer api, ops-explorer's own postgres, and ops-explorer's own indexer are **not deployed**.
 - ops-explorer frontend nginx routes `/api/*` to Open Privacy Suite. `/ws` returns 404.
 - Indexer listens on the trust network; Open Privacy Suite's backend is the only consumer.
+
+
+## Bounded indexed-read service
+
+`chain_indexer.v1.IndexedReadService` adds fixed-purpose cohort and retained
+transaction reads on the same internal listener. Existing `IndexerService`
+methods remain compatible. It is enabled only when all of
+`INDEXED_READ_DSN`, `INDEXED_READ_SOURCE_REFERENCE`, `INDEXED_READ_EPOCH`,
+`INDEXED_READ_CHAIN_ID` and `INDEXED_READ_GENESIS_HASH` are configured. Partial
+configuration fails startup. Its dedicated SELECT role and exact supported
+catalog are validated inside the indexer. No consumer needs a chain database
+credential or schema descriptor.
+
+The source reference and epoch are configured deployment selections; they do
+not attest database chain contents. The schema digest identifies the fixed wire
+contract. A random process instance and random 32-byte purpose identifier bind
+each opaque handle. New purposes may open after a process restart; old handles
+cannot be rebound to the new process.
+
+Each handle retains the original five-second deadline and cumulative physical
+read budget through all calls and successful rechecks. No transaction stays
+open between RPCs. Cohort recheck includes its original upper hash, rows,
+context and hidden lookahead. Protected recheck repeats destinations and at
+most one witness and one transaction receipt together in one fresh committed
+read-only snapshot, including empty observations and hidden lookahead.
+
+There are at most 32 handles and four active indexed calls. A 64 MiB aggregate
+charged-retention reservation is enforced through the original pre-allocation
+payload charges and remains reserved until handle cleanup. Each purpose keeps
+its original 16 MiB charged-work maximum. Calls reserve separate bounded
+response work; inbound and outbound gRPC envelopes remain limited to 4 MiB and
+16 MiB. These are payload/work reservations, not a guarantee about total Go
+allocator metadata or process RSS. Expiry, explicit Close and failed operations
+retire retained state; expiry remains the cleanup fallback if Close cannot be
+delivered. No recheck error becomes cached success.
+
+Requests contain only fixed typed chain-fact selectors, never SQL, free-form
+where/order expressions, bearer tokens, viewer identities or policy decisions.
+Ordinary record JSON is the existing bounded, fixed-family lossless fact
+projection; it is not a query input. The consumer still applies authorization,
+privacy, canonical-node qualification and audit-before-exposure checks.
+
+`indexed-read-admin` is an offline provisioning command. It reads operator
+`DATABASE_URL` and restricted `INDEXED_READ_DSN`, verifies they select the same
+database, and grants only the descriptor's allowed columns. Role creation,
+CONNECT isolation and credential distribution remain deployment operations.
+`indexed-read-admin --schema-digest` prints the wire contract digest without
+opening a database. The command is not reachable through gRPC.
+
+
+Indexed RPC transport admission runs before request decoding. Only the new
+service receives a server-side maximum five-second transport context; existing
+`IndexerService` RPC admission, deadlines and protobuf behavior are unchanged.
+The four indexed transport reservations continue through handler return,
+protobuf serialization and queued output. A reservation is released only after
+RPC End and the final encoded-buffer release, or RPC End plus terminal
+connection teardown. Small replies also use refcounted buffers. Marshal errors
+release their reservation without pretending a response was delivered.
+
+A live peer that stops reading can keep one of those four bounded reservations
+past the purpose's five-second expiry while its queued encoded payload still
+exists. Expiry does not falsely claim that gRPC discarded already queued bytes.
+The terminal connection event is an ownership barrier after the pinned gRPC
+transport reader and writer exit; any dead transport objects still awaiting Go
+GC are distinct from live reserved payload ownership. No total-process RSS or
+immediate allocator reclamation guarantee is made.

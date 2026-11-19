@@ -25,6 +25,7 @@ import (
 	"github.com/gateway-fm/chain-indexer/internal/config"
 	"github.com/gateway-fm/chain-indexer/internal/db"
 	"github.com/gateway-fm/chain-indexer/internal/grpcserver"
+	"github.com/gateway-fm/chain-indexer/internal/indexedread"
 	"github.com/gateway-fm/chain-indexer/internal/indexer"
 	"github.com/gateway-fm/chain-indexer/internal/log"
 	"github.com/gateway-fm/chain-indexer/internal/metrics"
@@ -105,7 +106,16 @@ func main() {
 	}
 	idx := indexer.NewWithConfig(database, rpcClient, cfg.PollInterval, cfg.StartBlock, idxCfg)
 
+	var indexedSource *indexedread.Service
+	if cfg.IndexedReadDSN != "" || cfg.IndexedReadSourceReference != "" || cfg.IndexedReadEpoch != "" || cfg.IndexedReadChainID != "" || cfg.IndexedReadGenesisHash != "" {
+		indexedSource, err = indexedread.NewService(context.Background(), indexedread.ServiceConfig{DSN: cfg.IndexedReadDSN, SourceReference: cfg.IndexedReadSourceReference, Epoch: cfg.IndexedReadEpoch, ChainID: cfg.IndexedReadChainID, GenesisHash: cfg.IndexedReadGenesisHash})
+		if err != nil {
+			log.Fatal("failed to start bounded indexed source")
+		}
+		defer indexedSource.CloseService()
+	}
 	grpcSrv, err := grpcserver.New(grpcserver.Config{
+		IndexedReads:   indexedSource,
 		ListenAddr:     cfg.GRPCListenAddr,
 		OPStackEnabled: cfg.EnableOPDeposits,
 	}, database)

@@ -21,12 +21,15 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/indexedread"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 )
 
 // Config controls runtime behavior of the gRPC server.
 type Config struct {
+	IndexedReads *indexedread.Service
+
 	// ListenAddr is the address the gRPC server binds to, e.g. ":50051".
 	// Required.
 	ListenAddr string
@@ -97,7 +100,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("grpcserver: listen on %s: %w", s.cfg.ListenAddr, err)
 	}
 
-	grpcSrv := grpc.NewServer(
+	options := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(s.cfg.MaxRecvMsgBytes),
 		grpc.MaxSendMsgSize(s.cfg.MaxSendMsgBytes),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -108,9 +111,15 @@ func (s *Server) Serve(ctx context.Context) error {
 			MinTime:             5 * time.Second,
 			PermitWithoutStream: true,
 		}),
-	)
-
+	}
+	if s.cfg.IndexedReads != nil {
+		options = append(options, s.cfg.IndexedReads.ServerOptions()...)
+	}
+	grpcSrv := grpc.NewServer(options...)
 	indexerv1.RegisterIndexerServiceServer(grpcSrv, s)
+	if s.cfg.IndexedReads != nil {
+		indexerv1.RegisterIndexedReadServiceServer(grpcSrv, s.cfg.IndexedReads)
+	}
 
 	slog.Info("gRPC server listening", "addr", s.cfg.ListenAddr)
 

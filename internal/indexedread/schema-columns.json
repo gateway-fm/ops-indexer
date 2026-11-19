@@ -1,0 +1,1116 @@
+{
+  "version": 2,
+  "purpose": "existing-indexer-fixed-reads/v1",
+  "schema": "public",
+  "tables": [
+    {
+      "name": "address_stats",
+      "columns": [
+        {
+          "name": "address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "first_seen",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "internal_tx_count",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "is_contract",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "last_seen",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "token_transfer_count",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "tx_count",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "updated_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "address"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "balances",
+      "columns": [
+        {
+          "name": "address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "balance",
+          "type_oid": 1700,
+          "type_mod": 5111812,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "token_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "address",
+            "token_address",
+            "block_number"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blocks",
+      "columns": [
+        {
+          "name": "base_fee_per_gas",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "created_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "difficulty",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "extra_data",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "gas_limit",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "gas_used",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "miner",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "nonce",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "parent_hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "receipts_root",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "size",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "state_root",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "timestamp",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "total_difficulty",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "transaction_count",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "transactions_root",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "number"
+          ]
+        },
+        {
+          "kind": "u",
+          "columns": [
+            "hash"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "contracts",
+      "columns": [
+        {
+          "name": "abi",
+          "type_oid": 3802,
+          "type_mod": -1,
+          "not_null": false,
+          "select": false
+        },
+        {
+          "name": "address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "bytecode",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "bytecode_hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "compiler_version",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "constructor_args",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "contract_name",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "created_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "creation_tx",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "creator",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "evm_version",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "is_verified",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "license_type",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "optimization_runs",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "optimization_used",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "source_code",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "address"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "indexer_progress",
+      "columns": [
+        {
+          "name": "backfill_complete",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "id",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "max_fetched_block",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "min_fetched_block",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "updated_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "id"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "internal_transactions",
+      "columns": [
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "call_type",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "error",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "from_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "gas",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "gas_used",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "id",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "input",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "output",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "timestamp",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "to_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "trace_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "tx_hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "value",
+          "type_oid": 1700,
+          "type_mod": 5111812,
+          "not_null": true,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "kind": "u",
+          "columns": [
+            "tx_hash",
+            "trace_address"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "logs",
+      "columns": [
+        {
+          "name": "address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "data",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "id",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "log_index",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "removed",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "timestamp",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "topic0",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "topic1",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "topic2",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "topic3",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "tx_hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "kind": "u",
+          "columns": [
+            "tx_hash",
+            "log_index"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sync_status",
+      "columns": [
+        {
+          "name": "id",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "is_syncing",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "last_finalized_block",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "last_indexed_block",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "last_verified_block",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "updated_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "id"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "token_transfers",
+      "columns": [
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "from_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "id",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "is_internal",
+          "type_oid": 16,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "log_index",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "timestamp",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "to_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "token_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "token_id",
+          "type_oid": 1700,
+          "type_mod": 5111812,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "token_type",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "transfer_type",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "tx_hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "value",
+          "type_oid": 1700,
+          "type_mod": 5111812,
+          "not_null": true,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "id"
+          ]
+        },
+        {
+          "kind": "u",
+          "columns": [
+            "tx_hash",
+            "log_index"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tokens",
+      "columns": [
+        {
+          "name": "address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "created_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "creation_tx",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "decimals",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "holder_count",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "icon_url",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "l1_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "name",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "off_chain_updated_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "symbol",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "token_type",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "total_supply",
+          "type_oid": 1700,
+          "type_mod": 5111812,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "transfer_count",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "usd_price",
+          "type_oid": 1700,
+          "type_mod": 1310732,
+          "not_null": false,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "address"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transactions",
+      "columns": [
+        {
+          "name": "block_number",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "block_timestamp",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "categories",
+          "type_oid": 21,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "created_at",
+          "type_oid": 1114,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "error",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "from_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "gas_limit",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "gas_price",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "gas_used",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "hash",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "input_data",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "max_fee_per_gas",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "max_priority_fee_per_gas",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "nonce",
+          "type_oid": 20,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "revert_reason",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "status",
+          "type_oid": 21,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "to_address",
+          "type_oid": 25,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "tx_index",
+          "type_oid": 23,
+          "type_mod": -1,
+          "not_null": true,
+          "select": true
+        },
+        {
+          "name": "tx_type",
+          "type_oid": 21,
+          "type_mod": -1,
+          "not_null": false,
+          "select": true
+        },
+        {
+          "name": "value",
+          "type_oid": 1700,
+          "type_mod": 5111812,
+          "not_null": true,
+          "select": true
+        }
+      ],
+      "keys": [
+        {
+          "kind": "p",
+          "columns": [
+            "hash"
+          ]
+        }
+      ]
+    }
+  ],
+  "counter_shapes": {
+    "columns": [
+      "address_stats.internal_tx_count",
+      "address_stats.token_transfer_count",
+      "address_stats.tx_count",
+      "tokens.holder_count",
+      "tokens.transfer_count"
+    ],
+    "type_oids": [
+      20,
+      23
+    ]
+  }
+}
