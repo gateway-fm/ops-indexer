@@ -126,13 +126,15 @@ func (x *PageResponse) GetNextCursor() string {
 	return ""
 }
 
-// OffsetPageRequest is used only for bounded browse endpoints where offset
-// pagination is acceptable (see docs/API.md). Prefer cursor pagination.
+// OffsetPageRequest preserves legacy numbered pages. New clients should
+// continue with the opaque cursor; numbered pages use a bounded keyset walk.
 type OffsetPageRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	PageSize int32                  `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// 1-based page number. page=0 is treated as page=1.
-	Page          int32 `protobuf:"varint,2,opt,name=page,proto3" json:"page,omitempty"`
+	Page int32 `protobuf:"varint,2,opt,name=page,proto3" json:"page,omitempty"`
+	// Opaque continuation from next_cursor. Takes precedence over page.
+	Cursor        string `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -181,11 +183,19 @@ func (x *OffsetPageRequest) GetPage() int32 {
 	return 0
 }
 
+func (x *OffsetPageRequest) GetCursor() string {
+	if x != nil {
+		return x.Cursor
+	}
+	return ""
+}
+
 type OffsetPageResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Page          int32                  `protobuf:"varint,1,opt,name=page,proto3" json:"page,omitempty"`
 	PageSize      int32                  `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	TotalItems    int64                  `protobuf:"varint,3,opt,name=total_items,json=totalItems,proto3" json:"total_items,omitempty"`
+	NextCursor    string                 `protobuf:"bytes,4,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -239,6 +249,13 @@ func (x *OffsetPageResponse) GetTotalItems() int64 {
 		return x.TotalItems
 	}
 	return 0
+}
+
+func (x *OffsetPageResponse) GetNextCursor() string {
+	if x != nil {
+		return x.NextCursor
+	}
+	return ""
 }
 
 // BlockRange is a half-open [start, end) interval over block numbers.
@@ -442,15 +459,18 @@ const file_chain_indexer_v1_common_proto_rawDesc = "" +
 	"\x06cursor\x18\x02 \x01(\tR\x06cursor\"/\n" +
 	"\fPageResponse\x12\x1f\n" +
 	"\vnext_cursor\x18\x01 \x01(\tR\n" +
-	"nextCursor\"D\n" +
+	"nextCursor\"\\\n" +
 	"\x11OffsetPageRequest\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x12\n" +
-	"\x04page\x18\x02 \x01(\x05R\x04page\"f\n" +
+	"\x04page\x18\x02 \x01(\x05R\x04page\x12\x16\n" +
+	"\x06cursor\x18\x03 \x01(\tR\x06cursor\"\x87\x01\n" +
 	"\x12OffsetPageResponse\x12\x12\n" +
 	"\x04page\x18\x01 \x01(\x05R\x04page\x12\x1b\n" +
 	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1f\n" +
 	"\vtotal_items\x18\x03 \x01(\x03R\n" +
-	"totalItems\"F\n" +
+	"totalItems\x12\x1f\n" +
+	"\vnext_cursor\x18\x04 \x01(\tR\n" +
+	"nextCursor\"F\n" +
 	"\n" +
 	"BlockRange\x12\x1d\n" +
 	"\n" +

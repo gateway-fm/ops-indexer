@@ -24,23 +24,18 @@ func (s *Server) GetAddress(ctx context.Context, req *indexerv1.GetAddressReques
 }
 
 func (s *Server) ListAddresses(ctx context.Context, req *indexerv1.ListAddressesRequest) (*indexerv1.ListAddressesResponse, error) {
-	page := int(req.GetPage().GetPage())
-	if page < 1 {
-		page = 1
+	switch req.SortBy {
+	case indexerv1.ListAddressesRequest_SORT_BY_UNSPECIFIED, indexerv1.ListAddressesRequest_SORT_BY_TX_COUNT:
+	default:
+		return nil, invalidArgument("native-balance address sorting is not supported")
 	}
-	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
-
-	rows, total, err := s.db.GetAccountsPaginated(ctx, page, pageSize)
+	in, binding, err := s.v1Input("addresses", "tx-count-desc,address-asc", nil, req.Page)
 	if err != nil {
-		slog.Error("ListAddresses", "error", err)
-		return nil, internalErr(err, "ListAddresses")
+		return nil, err
 	}
-	return &indexerv1.ListAddressesResponse{
-		Addresses: mapAddressStatsList(rows),
-		Page: &indexerv1.OffsetPageResponse{
-			Page:       int32(page),
-			PageSize:   int32(pageSize),
-			TotalItems: total,
-		},
-	}, nil
+	result, err := s.db.V1Addresses(ctx, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListAddresses")
+	}
+	return &indexerv1.ListAddressesResponse{Addresses: mapAddressStatsList(result.Rows), Page: v1Offset(binding, result.Next, result.Page, in.Limit, result.Total)}, nil
 }

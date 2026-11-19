@@ -45,34 +45,43 @@ message PageResponse {
 ```
 
 - `cursor` is **opaque**. Server encodes; clients pass back verbatim.
-- Current implementation encodes position as `(block_number, tx_index)` or similar and base64's it — but the encoding is internal. Clients must not parse or mutate cursors.
+- Every continuation binds the complete unique sort key, canonical filters/order, and selected dataset identity. Changing a filter or replaying a cursor after a dataset wipe returns `InvalidArgument`; restart without a cursor. Old unbound cursors also require a restart. Clients must not parse or mutate cursors.
 - `page_size` is clamped at server-configured caps (typical cap: 100).
 - Clients traversing backwards from `next_cursor` must re-issue the original request with the new cursor — there is no reverse mode.
 
-### Offset pagination
+### Numbered-page compatibility
 
-Use only for bounded browse endpoints where total is meaningful to show and users typically jump to a page:
-- `ListAddresses`, `ListTokens`, `ListTokenHolders`, `ListTransactionsPaginated`, `ListVerifiedContracts` (not in v1).
-
-`ListTransactionsPaginated` is the offset-paginated variant of the global
-transaction feed: same rows as `ListTransactions` (no filter), but with a true
-chain-wide `total_items` so browse-style UIs can render "page X of Y". Use the
-cursor-based `ListTransactions` for by-address / by-block feeds.
+The existing `OffsetPageRequest`/`OffsetPageResponse` names and original fields
+remain wire compatible for `ListAddresses`, `ListTokens`, `ListTokenHolders`,
+`ListTokenInventory`, `ListAllTokenTransfers` and `ListTransactionsPaginated`.
+All database traversal uses keysets, including old numbered-page calls.
 
 ```proto
 message OffsetPageRequest {
   int32 page_size = 1;
-  int32 page = 2;  // 1-based
+  int32 page = 2;  // 1-based; 0 means 1
+  string cursor = 3; // takes precedence over page
 }
 message OffsetPageResponse {
   int32 page = 1;
   int32 page_size = 2;
   int64 total_items = 3;
+  string next_cursor = 4;
 }
 ```
 
-- `total_items` is an exact count. On large tables the server may cap the scan and return `-1` for "too many to count" — consumers render "1000+" in that case.
-- `page_size` cap matches cursor pagination (100 by default).
+Continue with `next_cursor` for efficient sequential traversal. A page-only
+request walks keysets to the requested ordinal page, with a hard maximum of
+100 pages and 10,000 preceding rows. A deeper jump returns `ResourceExhausted`;
+it never substitutes page 1. Each SQL statement also has a five-second work
+limit. Page size uses the same configured cap as cursor lists; negative page
+or page size is invalid.
+
+`total_items` retains the endpoint's existing count meaning. In particular,
+the unfiltered transaction and transfer feeds retain cumulative chain totals
+when available, including pruned history; filtering by a token standard counts
+retained transfers. Current token, holder, inventory and address catalogs use
+their current counts. Totals are not a claim that older pruned rows are readable.
 
 ### Filter-wide counts on cursor list endpoints
 
@@ -83,9 +92,35 @@ consumers can render a true "showing N of M". It is the count for the active
 filter (e.g. all logs for `by_address`, all transfers of a `by_token`, every
 log of a `by_tx_hash`), independent of `page_size`.
 
-### Sort order
+### Sort order and filters
 
-Sort order is **fixed per RPC** and documented in the proto comments. Clients cannot change it. If a different ordering is needed, that's a new RPC or a new request field, not a freeform `order_by` option.
+Every list uses a unique seek key. The global transaction feed orders by
+`(block_number DESC, tx_index DESC, hash DESC)`; a block's transactions keep
+`(tx_index ASC, hash ASC)`. Historical log/transfer feeds order by descending
+block and log index, then hash and row id; a transaction's children keep ascending
+log index. Internal calls by transaction keep ascending trace address; their
+address feed keeps descending block/id, with hash/trace tie-breakers. Tokens sort
+by holder count descending then address ascending; addresses by transaction
+count descending then address ascending; holders by numeric balance descending
+then address ascending; NFT inventory by numeric token id ascending. Balances
+sort by token address; OP deposits by L1 block descending then L2 hash descending.
+
+Transaction category/status/time/block filters and address direction are
+applied together. Log and transfer filters also combine with AND on every
+branch. All V1 block/time ranges are half-open `[from,to)`. Unknown enum values
+are rejected. Native-balance address sorting and OP deposit `by_to` are explicitly
+unsupported and return `InvalidArgument`; the schema stores no OP destination.
+The optional archive-node transaction fallback supports block/status/time
+filters and pagination, but rejects category filtering because those categories
+are materialized by indexing and are unavailable in that fallback.
+
+All `List*` RPCs accept continuations, including by-transaction/by-block child
+lists and token balances. `Search` remains bounded autocomplete (at most 20
+suggestions of each kind), not a pageable enumeration API. Its deterministic
+suggestions do not promise exhaustive search results. Exact lookups, explicit
+batch requests and bounded chart windows are also not list-pagination APIs.
+The separately versioned V2 service defines exhaustive indexed search and new
+query shapes; those shapes do not change V1 requests.
 
 ## Scalar conventions
 
@@ -148,28 +183,30 @@ objects, at the cut and at every pass. Re-create them on `<table>` and the next 
 is gone; 0 = nothing pruned) and `pruned_through_timestamp` its timestamp (unset when nothing is pruned). With nothing
 pruned, every call behaves as before.
 
-**`OutOfRange`** answers explicit block targets at or below the watermark:
+**`OutOfRange / HISTORY_PRUNED`** answers explicit block targets at or below
+the watermark. `ErrorInfo` uses domain `indexer.ops` and metadata
+`history_from_block` containing the first retained block.
 
-- `GetBlock` by number.
-- `ListTransactions` and `ListInternalTransactions` `by_block` by number.
-- `BatchGetBlockTransactionCounts` when any requested block is at or below it.
-- `ListBlocks` when its upper bound (`before_number` or the cursor, exclusive) is at most watermark + 1.
-- `ListTransactions` and `ListTokenTransfers` `by_address` with `block_range.to_block` (exclusive) at most
-  watermark + 1 and no cursor.
-- `ListLogs` with `by_address` + `topic0` and `block_range.to_block` at or below the watermark: this path treats
-  `to_block` as **inclusive**. `ListLogs` honours `block_range` on that path only.
+Historical lists read the authoritative floor and their rows in one read-only
+repeatable-read transaction, and filter out older rows even before partition
+detach. A range crossing the floor returns retained rows, with an opaque
+terminal continuation. Consuming that continuation returns `HISTORY_PRUNED`
+and the freshly read floor. Pruning between pages also returns the explicit
+error when the saved position was removed. A numbered-page request reaching
+removed history returns the same error. A fully retained bounded range ends
+normally. Current token/holder/inventory/address/balance catalogs are unrelated
+to historical pruning and never get a synthetic pruned ending.
 
-**Hash lookups stay `NotFound`.** `GetBlock` by hash, `GetTransaction`, and `by_block` by hash cannot tell a pruned
-entity from one that never existed; while anything is pruned, the message ends with
-`(history at or below block W is pruned)`. `by_tx_hash` lists of a pruned transaction return empty.
+**Hash lookups stay `NotFound`.** `GetBlock` by hash and `GetTransaction` cannot
+tell a pruned entity from one that never existed; while anything is pruned,
+the message ends with `(history at or below block W is pruned)`. Historical
+`by_tx_hash` lists cannot claim a complete empty history below the floor.
 
-Lists that run into the watermark while paging (the feeds, `by_address` lists, deep offset pages) just end: no error.
-
-**With `PRUNED_LOOKUP=true`** a pruned target is served from the node instead: `GetBlock` by number or hash,
-`GetTransaction`, and `ListTransactions` `by_block` by number or hash, at or below the watermark, answer with the
-node's block or transaction, and the response carries the header `x-indexer-source: node`. When the node is busy or
-does not answer they return `Unavailable`. The other calls above still answer `OutOfRange`, `NotFound` or end as
-described.
+**With `PRUNED_LOOKUP=true`** explicit pruned targets may be served from the
+node: `GetBlock`, `GetTransaction`, and `ListTransactions` by block preserve the
+existing fallback, with `x-indexer-source: node`. A failed/busy node lookup
+returns `Unavailable`. A node-backed transaction continuation also binds that
+block's hash to the selected dataset.
 
 **Totals count pruned history**, from counters the writer keeps (never a `COUNT(*)` over retained rows):
 
@@ -250,7 +287,7 @@ Standard gRPC status codes:
 | `OK` | Success. |
 | `NotFound` | Entity does not exist in the index (e.g., `GetBlock` on an unseen number). |
 | `InvalidArgument` | Malformed address / hash / cursor, missing required filter, page size out of range. |
-| `OutOfRange` | An explicit block target is at or below the retention watermark: that history was pruned on purpose (see [History retention](#history-retention)). |
+| `OutOfRange` | `HISTORY_PRUNED`: explicit target or continuation reached removed history, with the first retained block in `ErrorInfo` (see [History retention](#history-retention)). |
 | `Unavailable` | Feature gated off for this indexer's chain (e.g., OP-Stack RPCs on a non-OP chain), or indexer is still syncing through startup. |
 | `FailedPrecondition` | Indexer is not yet ready to serve (e.g., migration not applied, DB unreachable). |
 | `ResourceExhausted` | Server-side cap hit (rare; typically a symptom of a client not using pagination). |

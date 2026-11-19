@@ -22,16 +22,16 @@ import (
 )
 
 type CallFrame struct {
-	Type    string       `json:"type"`
-	From    string       `json:"from"`
-	To      string       `json:"to,omitempty"`
-	Value   *hexutil.Big `json:"value,omitempty"`
+	Type    string         `json:"type"`
+	From    string         `json:"from"`
+	To      string         `json:"to,omitempty"`
+	Value   *hexutil.Big   `json:"value,omitempty"`
 	Gas     hexutil.Uint64 `json:"gas,omitempty"`
 	GasUsed hexutil.Uint64 `json:"gasUsed,omitempty"`
-	Input   string       `json:"input,omitempty"`
-	Output  string       `json:"output,omitempty"`
-	Error   string       `json:"error,omitempty"`
-	Calls   []CallFrame  `json:"calls,omitempty"`
+	Input   string         `json:"input,omitempty"`
+	Output  string         `json:"output,omitempty"`
+	Error   string         `json:"error,omitempty"`
+	Calls   []CallFrame    `json:"calls,omitempty"`
 }
 
 type TraceConfig struct {
@@ -228,11 +228,6 @@ func flattenCallFrameRecursive(frame *CallFrame, txHash string, blockNumber uint
 	}
 
 	callType := strings.ToLower(frame.Type)
-	switch callType {
-	case "call", "delegatecall", "staticcall", "create", "create2":
-	default:
-		callType = "call"
-	}
 
 	var to *string
 	if frame.To != "" {
@@ -286,9 +281,9 @@ func flattenCallFrameRecursive(frame *CallFrame, txHash string, blockNumber uint
 }
 
 type TraceResult struct {
-	TxHash       string
-	InternalTxs  []*explorerTypes.InternalTransaction
-	Err          error
+	TxHash      string
+	InternalTxs []*explorerTypes.InternalTransaction
+	Err         error
 }
 
 // traceMode is what a block's trace fetch does with a transaction it gets no trace for.

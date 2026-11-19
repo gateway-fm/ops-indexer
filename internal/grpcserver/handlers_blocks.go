@@ -57,51 +57,18 @@ func (s *Server) GetBlock(ctx context.Context, req *indexerv1.GetBlockRequest) (
 }
 
 func (s *Server) ListBlocks(ctx context.Context, req *indexerv1.ListBlocksRequest) (*indexerv1.ListBlocksResponse, error) {
-	limit := s.clampPageSize(req.GetPage().GetPageSize())
-
-	var beforeBlock *uint64
-	if c := req.GetPage().GetCursor(); c != "" {
-		var cur blockFeedCursor
-		if err := decodeCursor(c, &cur); err != nil {
-			return nil, err
-		}
-		beforeBlock = &cur.BlockNumber
-	} else if req.GetBeforeNumber() > 0 {
-		b := req.GetBeforeNumber()
-		beforeBlock = &b
+	if req.BeforeNumber > uint64(^uint64(0)>>1) {
+		return nil, invalidArgument("block bound exceeds supported integer range")
 	}
-	if beforeBlock != nil {
-		if err := s.checkRetained(ctx, lastBlockBelow(*beforeBlock)); err != nil {
-			return nil, err
-		}
-	}
-
-	// limit+1 trick to detect more pages.
-	rows, err := s.db.GetBlocks(ctx, int(limit)+1, beforeBlock)
+	in, binding, err := s.v1Input("blocks", req.BeforeNumber, req.Page, nil)
 	if err != nil {
-		slog.Error("ListBlocks", "error", err)
-		return nil, internalErr(err, "ListBlocks")
+		return nil, err
 	}
-	if beforeBlock != nil && len(rows) == 0 {
-		if err := s.recheckRetained(ctx, lastBlockBelow(*beforeBlock)); err != nil {
-			return nil, err
-		}
+	result, err := s.db.V1Blocks(ctx, req.BeforeNumber, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListBlocks")
 	}
-
-	nextCursor := ""
-	if int32(len(rows)) > limit {
-		last := rows[limit-1]
-		enc, err := encodeCursor(blockFeedCursor{BlockNumber: last.Number})
-		if err == nil {
-			nextCursor = enc
-		}
-		rows = rows[:limit]
-	}
-
-	return &indexerv1.ListBlocksResponse{
-		Blocks: mapBlocks(rows),
-		Page:   &indexerv1.PageResponse{NextCursor: nextCursor},
-	}, nil
+	return &indexerv1.ListBlocksResponse{Blocks: mapBlocks(result.Rows), Page: &indexerv1.PageResponse{NextCursor: v1Next(binding, result.Next)}}, nil
 }
 
 func (s *Server) GetLatestBlockNumber(ctx context.Context, _ *indexerv1.Empty) (*indexerv1.LatestBlockNumber, error) {

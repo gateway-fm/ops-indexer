@@ -1,0 +1,152 @@
+syntax = "proto3";
+package chain_indexer.v2;
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2";
+import "google/protobuf/timestamp.proto";
+import "chain_indexer/v2/common.proto";
+
+// Native retained indexed facts, without viewer or policy interpretation.
+message Block {
+  BlockKey key = 1;
+  bytes hash = 2;
+  bytes parent_hash = 3;
+  uint64 timestamp = 4;
+  uint64 gas_used = 5;
+  uint64 gas_limit = 6;
+  optional string base_fee_per_gas = 7;
+  uint64 transaction_count = 8;
+  optional uint64 size = 9;
+  optional string difficulty = 10;
+  optional string total_difficulty = 11;
+  optional bytes nonce = 12;
+  optional bytes miner = 13;
+  optional bytes extra_data = 14;
+  optional bytes state_root = 15;
+  optional bytes transactions_root = 16;
+  optional bytes receipts_root = 17;
+  google.protobuf.Timestamp created_at = 18;
+}
+// Includes parent and receipt metadata ONLY. Logs/transfers/traces are separate.
+message Transaction {
+  TransactionKey key = 1;
+  uint64 block_timestamp = 2;
+  bytes from = 3;
+  optional bytes to = 4;
+  optional bytes contract_address = 5;
+  string value = 6;
+  uint64 gas_used = 7;
+  string gas_price = 8;
+  optional uint64 gas_limit = 9;
+  optional string max_fee_per_gas = 10;
+  optional string max_priority_fee_per_gas = 11;
+  optional uint64 nonce = 12;
+  optional uint32 transaction_type = 13;
+  optional bytes input_data = 14;
+  uint32 status = 15;
+  optional string error = 16;
+  optional string revert_reason = 17;
+  google.protobuf.Timestamp created_at = 18;
+  repeated string categories = 19;
+  uint64 token_transfer_count = 20;
+  map<string, string> address_metadata = 21;
+}
+message Log {
+  LogKey key = 1;
+  int64 id = 2;
+  bytes transaction_hash = 3;
+  bytes address = 4;
+  optional bytes topic0 = 5;
+  optional bytes topic1 = 6;
+  optional bytes topic2 = 7;
+  optional bytes topic3 = 8;
+  bytes data = 9;
+  optional uint64 timestamp = 10;
+  bool removed = 11;
+  map<string, string> address_metadata = 12;
+}
+message TokenTransfer {
+  TransferKey key = 1;
+  int64 id = 2;
+  bytes transaction_hash = 3;
+  bytes token_address = 4;
+  bytes from = 5;
+  bytes to = 6;
+  string value = 7;
+  optional uint64 timestamp = 8;
+  string transfer_type = 9;
+  string token_type = 10;
+  optional string token_id = 11;
+  bool is_internal = 12;
+  map<string, string> address_metadata = 13;
+}
+// All retained indexed frames; block contiguity does NOT prove trace ingestion
+// completeness. Consumers requiring authoritative frames must verify via node.
+message InternalTransaction {
+  InternalKey key = 1;
+  int64 id = 2;
+  bytes from = 3;
+  optional bytes to = 4;
+  string value = 5;
+  optional uint64 gas = 6;
+  optional uint64 gas_used = 7;
+  optional bytes input = 8;
+  optional bytes output = 9;
+  string call_type = 10;
+  optional string error = 11;
+  optional uint64 timestamp = 12;
+  map<string, string> address_metadata = 13;
+}
+message Contract {
+  CreationKey key = 1;
+  bytes bytecode = 2;
+  optional bytes bytecode_hash = 3;
+  bytes creator = 4;
+  bytes creation_transaction = 5;
+  optional bool verified = 6;
+  optional string name = 7;
+  optional string compiler_version = 8;
+  optional bool optimization_used = 9;
+  optional string evm_version = 10;
+  optional string source_code = 11;
+  // Fixed fact field, NOT a query expression; preserves the native ABI JSON.
+  optional bytes abi_json = 12;
+  google.protobuf.Timestamp created_at = 13;
+  optional string license_type = 14;
+  optional bytes constructor_arguments = 15;
+  optional uint32 optimization_runs = 16;
+}
+message Token {
+  CreationKey key = 1;
+  string symbol = 2;
+  optional string name = 3;
+  uint32 decimals = 4;
+  string token_type = 5;
+  optional string total_supply = 6;
+  optional uint64 holder_count = 7;
+  optional uint64 transfer_count = 8;
+  optional string usd_price = 9;
+  optional string icon_url = 10;
+  optional bytes l1_address = 11;
+  optional bytes creation_transaction = 12;
+  google.protobuf.Timestamp off_chain_updated_at = 13;
+  google.protobuf.Timestamp created_at = 14;
+}
+message Address {
+  AddressKey key = 1;
+  string balance = 2;
+  optional uint64 transaction_count = 3;
+  optional uint64 internal_transaction_count = 4;
+  optional uint64 token_transfer_count = 5;
+  optional uint64 sent_count = 6;
+  optional uint64 first_seen = 7;
+  optional uint64 last_seen = 8;
+  optional bool is_contract = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+message Balance { BalanceKey key = 1; uint64 block_number = 2; string balance = 3; int64 reorg_epoch = 4; }
+message Holder { HolderKey key = 1; bytes token_address = 2; double percentage = 3; bool is_contract = 4; map<string,string> address_metadata = 5; }
+message Counterparty { AddressKey key = 1; uint64 first_block = 2; uint64 last_block = 3; }
+message FirstActivity { bytes target = 1; Transaction transaction = 2; }
+message SearchResult {
+  SearchKey key = 1;
+  oneof fact { Block block = 2; Transaction transaction = 3; Contract contract = 4; Token token = 5; Address address = 6; }
+}

@@ -61,6 +61,20 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 	}
 	defer tx.Rollback(ctx)
 
+	inserted, err := insertBlockRow(ctx, tx, b)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if inserted {
+		d.lateDays.noteBlock(b.Number, b.Timestamp)
+	}
+	return nil
+}
+
+func insertBlockRow(ctx context.Context, tx pgx.Tx, b *types.Block) (bool, error) {
 	ct, err := tx.Exec(ctx, `
 		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee_per_gas, transaction_count,
 			size, difficulty, total_difficulty, nonce, miner, extra_data, state_root, transactions_root, receipts_root)
@@ -69,11 +83,11 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 		b.Number, b.Hash, b.ParentHash, b.Timestamp, b.GasUsed, b.GasLimit, b.BaseFeePerGas, b.TransactionCount,
 		b.Size, b.Difficulty, b.TotalDifficulty, b.Nonce, b.Miner, b.ExtraData, b.StateRoot, b.TransactionsRoot, b.ReceiptsRoot)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if ct.RowsAffected() == 0 {
 		if err := storedBlockDiffers(ctx, tx, b); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if ct.RowsAffected() > 0 {
@@ -81,16 +95,10 @@ func (d *DB) InsertBlock(ctx context.Context, b *types.Block) error {
 			INSERT INTO chain_counters (name, count, updated_at) VALUES ('blocks_total', $1, NOW())
 			ON CONFLICT (name) DO UPDATE SET count = chain_counters.count + EXCLUDED.count, updated_at = NOW()`,
 			ct.RowsAffected()); err != nil {
-			return err
+			return false, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	if ct.RowsAffected() > 0 {
-		d.lateDays.noteBlock(b.Number, b.Timestamp)
-	}
-	return nil
+	return ct.RowsAffected() > 0, nil
 }
 
 // HighestBlockAtOrBelow is the highest stored block numbered at most number, with its number and hash only, or nil
@@ -494,28 +502,8 @@ func (d *DB) GetTransactions(ctx context.Context, limit int, beforeBlock *uint64
 }
 
 func (d *DB) GetTransactionsPaginated(ctx context.Context, page, pageSize int) ([]types.Transaction, int64, error) {
-	var total int64
-	err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE NOT (tx_type = ANY($1::int[]))`, d.HiddenTxTypes).Scan(&total)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	offset := (page - 1) * pageSize
-	rows, err := d.pool.Query(ctx, `
-		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
-			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
-			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at
-		FROM transactions t
-		WHERE NOT (t.tx_type = ANY($1::int[]))
-		ORDER BY t.block_number DESC, t.tx_index DESC
-		LIMIT $2 OFFSET $3`, d.HiddenTxTypes, pageSize, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	txs, err := scanTransactionsWithTimestamp(rows)
-	return txs, total, err
+	r, e := d.V1Transactions(ctx, V1TransactionFilter{RetainedTotal: true}, V1PageInput{Limit: pageSize, Page: page})
+	return r.Rows, r.Total, e
 }
 
 func (d *DB) GetTransactionsByBlock(ctx context.Context, blockNumber uint64) ([]types.Transaction, error) {
@@ -716,37 +704,8 @@ func (d *DB) GetTransactionsWithCategories(ctx context.Context, limit int, befor
 // GetTransactionsPaginatedWithCategories returns a feed page and its total. Without hidden tx types the total is
 // the transactions_total counter, which counts pruned history; with them it is a COUNT(*) of the retained rows.
 func (d *DB) GetTransactionsPaginatedWithCategories(ctx context.Context, page, pageSize int) ([]types.Transaction, int64, error) {
-	var total int64
-	var err error
-	if len(d.HiddenTxTypes) == 0 {
-		err = d.pool.QueryRow(ctx, `
-			SELECT COALESCE(
-				(SELECT count FROM chain_counters WHERE name = 'transactions_total'),
-				(SELECT COUNT(*) FROM transactions))`).Scan(&total)
-	} else {
-		err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE NOT (tx_type = ANY($1::int[]))`, d.HiddenTxTypes).Scan(&total)
-	}
-	if err != nil {
-		return nil, 0, err
-	}
-
-	offset := (page - 1) * pageSize
-	rows, err := d.pool.Query(ctx, `
-		SELECT t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
-			t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
-			t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at,
-			t.categories
-		FROM transactions t
-		WHERE NOT (t.tx_type = ANY($1::int[]))
-		ORDER BY t.block_number DESC, t.tx_index DESC
-		LIMIT $2 OFFSET $3`, d.HiddenTxTypes, pageSize, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	txs, err := scanTransactionsWithCategories(rows)
-	return txs, total, err
+	r, e := d.V1Transactions(ctx, V1TransactionFilter{GlobalTotal: true}, V1PageInput{Limit: pageSize, Page: page})
+	return r.Rows, r.Total, e
 }
 
 func (d *DB) GetTransactionWithCategories(ctx context.Context, hash string) (*types.Transaction, error) {
@@ -860,55 +819,8 @@ func (d *DB) GetToken(ctx context.Context, address string) (*types.Token, error)
 // case-insensitive substring match over name / symbol / address. The same
 // WHERE clause is reused for the COUNT and the page query so totals match.
 func (d *DB) GetTokens(ctx context.Context, limit int, offset int, tokenType, search string) ([]types.Token, int64, error) {
-	var (
-		conds []string
-		args  []any
-	)
-	if tokenType != "" {
-		args = append(args, tokenType)
-		conds = append(conds, fmt.Sprintf("token_type = $%d", len(args)))
-	}
-	if search = strings.TrimSpace(search); search != "" {
-		args = append(args, "%"+strings.ToLower(search)+"%")
-		conds = append(conds, fmt.Sprintf(
-			"(LOWER(name) LIKE $%d OR LOWER(symbol) LIKE $%d OR LOWER(address) LIKE $%d)",
-			len(args), len(args), len(args),
-		))
-	}
-	where := ""
-	if len(conds) > 0 {
-		where = " WHERE " + strings.Join(conds, " AND ")
-	}
-
-	var total int64
-	if err := d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM tokens"+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
-	args = append(args, limit, offset)
-	query := `
-		SELECT address, symbol, name, decimals, token_type, total_supply, holder_count, transfer_count,
-			usd_price, icon_url, l1_address, block_number, creation_tx, off_chain_updated_at, created_at
-		FROM tokens` + where + fmt.Sprintf(
-		" ORDER BY holder_count DESC, address LIMIT $%d OFFSET $%d", len(args)-1, len(args),
-	)
-
-	rows, err := d.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	var tokens []types.Token
-	for rows.Next() {
-		var t types.Token
-		if err := rows.Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, &t.TokenType, &t.TotalSupply, &t.HolderCount, &t.TransferCount,
-			&t.USDPrice, &t.IconURL, &t.L1Address, &t.BlockNumber, &t.CreationTx, &t.OffChainUpdatedAt, &t.CreatedAt); err != nil {
-			return nil, 0, err
-		}
-		tokens = append(tokens, t)
-	}
-	return tokens, total, rows.Err()
+	r, e := d.V1Tokens(ctx, tokenType, strings.ToLower(strings.TrimSpace(search)), V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 // RefreshTokenStats recomputes the stats on a token row that cannot be
@@ -1094,26 +1006,8 @@ func (d *DB) GetTransfersByTransaction(ctx context.Context, txHash string) ([]ty
 // GetTransfersByToken's total is tokens.transfer_count, which counts pruned history. A token without a tokens row
 // yet (metadata discovery pending) falls back to counting its retained transfers.
 func (d *DB) GetTransfersByToken(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenTransfer, int64, error) {
-	var total int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COALESCE(
-			(SELECT COALESCE(transfer_count, 0) FROM tokens WHERE address = LOWER($1)),
-			(SELECT COUNT(*) FROM token_transfers WHERE token_address = LOWER($1)))`, tokenAddress).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
-			timestamp, transfer_type, token_type, token_id, is_internal
-		FROM token_transfers WHERE token_address = LOWER($1)
-		ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, tokenAddress, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	transfers, err := scanTokenTransfers(rows)
-	return transfers, total, err
+	r, e := d.V1Transfers(ctx, V1TransferFilter{Token: strings.ToLower(tokenAddress), Cumulative: true}, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 // GetAllTokenTransfers returns the global, chain-wide transfer feed ordered by
@@ -1131,63 +1025,13 @@ func (d *DB) GetTransfersByToken(ctx context.Context, tokenAddress string, limit
 // reclassification that happens on reindex, so an always-correct count is the
 // safer trade there.
 func (d *DB) GetAllTokenTransfers(ctx context.Context, tokenType string, limit, offset int) ([]types.TokenTransfer, int64, error) {
-	const cols = `id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
-			timestamp, transfer_type, token_type, token_id, is_internal`
-
-	var total int64
-	var rows pgx.Rows
-	var err error
-	if tokenType != "" {
-		if cerr := d.pool.QueryRow(ctx,
-			"SELECT COUNT(*) FROM token_transfers WHERE token_type = $1", tokenType,
-		).Scan(&total); cerr != nil {
-			return nil, 0, cerr
-		}
-		rows, err = d.pool.Query(ctx, `
-			SELECT `+cols+`
-			FROM token_transfers WHERE token_type = $1
-			ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, tokenType, limit, offset)
-	} else {
-		// O(1): read the running total instead of COUNT(*). COALESCE to a live
-		// count only if the counter row is somehow absent (defensive; the
-		// migrate-time re-seed normally guarantees it exists).
-		if cerr := d.pool.QueryRow(ctx, `
-			SELECT COALESCE(
-				(SELECT count FROM chain_counters WHERE name = 'transfers_total'),
-				(SELECT COUNT(*) FROM token_transfers))`,
-		).Scan(&total); cerr != nil {
-			return nil, 0, cerr
-		}
-		rows, err = d.pool.Query(ctx, `
-			SELECT `+cols+`
-			FROM token_transfers
-			ORDER BY block_number DESC, log_index DESC LIMIT $1 OFFSET $2`, limit, offset)
-	}
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	transfers, err := scanTokenTransfers(rows)
-	return transfers, total, err
+	r, e := d.V1Transfers(ctx, V1TransferFilter{TokenType: tokenType, Cumulative: true}, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 func (d *DB) GetAllTransfers(ctx context.Context, limit int, offset int) ([]types.TokenTransfer, int64, error) {
-	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM token_transfers").Scan(&total)
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT id, tx_hash, log_index, token_address, from_address, to_address, value::text, block_number,
-			timestamp, transfer_type, token_type, token_id, is_internal
-		FROM token_transfers
-		ORDER BY block_number DESC, log_index DESC LIMIT $1 OFFSET $2`, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	transfers, err := scanTokenTransfers(rows)
-	return transfers, total, err
+	r, e := d.V1Transfers(ctx, V1TransferFilter{}, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 func scanTokenTransfers(rows pgx.Rows) ([]types.TokenTransfer, error) {
@@ -1208,39 +1052,8 @@ func scanTokenTransfers(rows pgx.Rows) ([]types.TokenTransfer, error) {
 // Token holder operations
 
 func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int, offset int) ([]types.TokenHolder, int64, error) {
-	// Current balances, not the balances history: retention drops history by range (migration 014), and the
-	// history read showed a holder's older positive balance after it went to zero.
-	var total int64
-	d.pool.QueryRow(ctx, `SELECT COALESCE(holder_count, 0) FROM tokens WHERE address = LOWER($1)`, tokenAddress).Scan(&total)
-
-	rows, err := d.pool.Query(ctx, `
-		WITH total_supply AS (
-			SELECT COALESCE(SUM(balance), 1) as supply FROM token_balances_current
-			WHERE token_address = LOWER($1) AND balance > 0
-		)
-		SELECT c.address, c.balance::text,
-			(c.balance::numeric / NULLIF(ts.supply::numeric, 0) * 100)::numeric(10,4) as percentage,
-			COALESCE((SELECT true FROM contracts WHERE address = LOWER(c.address)), false) as is_contract
-		FROM token_balances_current c, total_supply ts
-		WHERE c.token_address = LOWER($1) AND c.balance > 0
-		ORDER BY c.balance DESC
-		LIMIT $2 OFFSET $3`, tokenAddress, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	var holders []types.TokenHolder
-	for rows.Next() {
-		var h types.TokenHolder
-		var balanceStr string
-		if err := rows.Scan(&h.Address, &balanceStr, &h.Percentage, &h.IsContract); err != nil {
-			return nil, 0, err
-		}
-		h.Balance = types.JSONString(balanceStr)
-		holders = append(holders, h)
-	}
-	return holders, total, rows.Err()
+	r, e := d.V1Holders(ctx, strings.ToLower(tokenAddress), V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 // GetTokenInventory lists live (non-burned) NFT instances of a collection,
@@ -1248,36 +1061,8 @@ func (d *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit int
 // the indexer maintains per (token_address, token_id). A non-empty tokenID
 // filters to a single instance (used by the per-NFT detail lookup).
 func (d *DB) GetTokenInventory(ctx context.Context, tokenAddress string, tokenID string, limit int, offset int) ([]types.TokenInventoryItem, int64, error) {
-	var total int64
-	d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM nft_tokens
-		WHERE LOWER(token_address) = LOWER($1)
-		  AND owner <> '0x0000000000000000000000000000000000000000'
-		  AND ($2 = '' OR token_id = $2::numeric)`,
-		tokenAddress, tokenID).Scan(&total)
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT token_id::text, owner, token_uri
-		FROM nft_tokens
-		WHERE LOWER(token_address) = LOWER($1)
-		  AND owner <> '0x0000000000000000000000000000000000000000'
-		  AND ($2 = '' OR token_id = $2::numeric)
-		ORDER BY token_id
-		LIMIT $3 OFFSET $4`, tokenAddress, tokenID, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	var items []types.TokenInventoryItem
-	for rows.Next() {
-		var it types.TokenInventoryItem
-		if err := rows.Scan(&it.TokenID, &it.Owner, &it.TokenURI); err != nil {
-			return nil, 0, err
-		}
-		items = append(items, it)
-	}
-	return items, total, rows.Err()
+	r, e := d.V1Inventory(ctx, strings.ToLower(tokenAddress), tokenID, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 // Balance operations
@@ -1440,33 +1225,8 @@ func (d *DB) GetAddressStats(ctx context.Context, address string) (*types.Addres
 }
 
 func (d *DB) GetAccountsPaginated(ctx context.Context, page, pageSize int) ([]types.AddressStats, int64, error) {
-	var total int64
-	err := d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM address_stats`).Scan(&total)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	offset := (page - 1) * pageSize
-	rows, err := d.pool.Query(ctx, `
-		SELECT address, tx_count, internal_tx_count, token_transfer_count, sent_count, first_seen, last_seen, is_contract, updated_at
-		FROM address_stats
-		ORDER BY tx_count DESC, address ASC
-		LIMIT $1 OFFSET $2`, pageSize, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	var accounts []types.AddressStats
-	for rows.Next() {
-		var s types.AddressStats
-		if err := rows.Scan(&s.Address, &s.TxCount, &s.InternalTxCount, &s.TokenTransferCount, &s.SentCount, &s.FirstSeen, &s.LastSeen, &s.IsContract, &s.UpdatedAt); err != nil {
-			return nil, 0, err
-		}
-		accounts = append(accounts, s)
-	}
-
-	return accounts, total, rows.Err()
+	r, e := d.V1Addresses(ctx, V1PageInput{Limit: pageSize, Page: page})
+	return r.Rows, r.Total, e
 }
 
 // Contract operations
@@ -1550,29 +1310,8 @@ func (d *DB) SetContractABI(ctx context.Context, address string, abi json.RawMes
 }
 
 func (d *DB) GetVerifiedContracts(ctx context.Context, limit int, offset int) ([]types.Contract, int64, error) {
-	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM contracts WHERE is_verified = true").Scan(&total)
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT address, bytecode, bytecode_hash, creator, creation_tx, block_number, is_verified,
-			contract_name, compiler_version, optimization_used, evm_version, source_code, abi, created_at
-		FROM contracts WHERE is_verified = true
-		ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	var contracts []types.Contract
-	for rows.Next() {
-		var c types.Contract
-		if err := rows.Scan(&c.Address, &c.Bytecode, &c.BytecodeHash, &c.Creator, &c.CreationTx, &c.BlockNumber, &c.IsVerified,
-			&c.ContractName, &c.CompilerVersion, &c.OptimizationUsed, &c.EVMVersion, &c.SourceCode, &c.ABI, &c.CreatedAt); err != nil {
-			return nil, 0, err
-		}
-		contracts = append(contracts, c)
-	}
-	return contracts, total, rows.Err()
+	r, e := d.V1VerifiedContracts(ctx, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 // Log operations
@@ -1599,37 +1338,13 @@ func (d *DB) GetLogsByTransaction(ctx context.Context, txHash string) ([]types.L
 }
 
 func (d *DB) GetLogsByAddress(ctx context.Context, address string, limit int, offset int) ([]types.Log, int64, error) {
-	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM logs WHERE address = LOWER($1)", address).Scan(&total)
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT id, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed
-		FROM logs WHERE address = LOWER($1)
-		ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, address, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	logs, err := scanLogs(rows)
-	return logs, total, err
+	r, e := d.V1Logs(ctx, V1LogFilter{Address: strings.ToLower(address)}, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 func (d *DB) GetLogsByTopic(ctx context.Context, topic0 string, limit int, offset int) ([]types.Log, int64, error) {
-	var total int64
-	d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM logs WHERE topic0 = $1", topic0).Scan(&total)
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT id, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data, block_number, timestamp, removed
-		FROM logs WHERE topic0 = $1
-		ORDER BY block_number DESC, log_index DESC LIMIT $2 OFFSET $3`, topic0, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	logs, err := scanLogs(rows)
-	return logs, total, err
+	r, e := d.V1Logs(ctx, V1LogFilter{Topic: strings.ToLower(topic0)}, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 func (d *DB) GetLogs(ctx context.Context, address *string, topic0 *string, fromBlock *uint64, toBlock *uint64, limit int) ([]types.Log, error) {
@@ -1756,25 +1471,8 @@ func (d *DB) GetInternalTransactionsByBlock(ctx context.Context, blockNumber uin
 // GetInternalTransactionsByAddress's total is address_stats.internal_tx_count, which counts pruned history; a
 // self-call counts twice, once per side.
 func (d *DB) GetInternalTransactionsByAddress(ctx context.Context, address string, limit int, offset int) ([]types.InternalTransaction, int64, error) {
-	var total int64
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COALESCE((SELECT internal_tx_count FROM address_stats WHERE address = LOWER($1)), 0)`, address).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := d.pool.Query(ctx, `
-		SELECT id, tx_hash, block_number, trace_address, from_address, to_address, value::text,
-			gas, gas_used, input, output, call_type, error, timestamp
-		FROM internal_transactions
-		WHERE from_address = LOWER($1) OR to_address = LOWER($1)
-		ORDER BY block_number DESC, id DESC LIMIT $2 OFFSET $3`, address, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	its, err := scanInternalTransactions(rows)
-	return its, total, err
+	r, e := d.V1Internals(ctx, V1InternalFilter{Address: strings.ToLower(address)}, V1PageInput{Limit: limit, Skip: offset})
+	return r.Rows, r.Total, e
 }
 
 func scanInternalTransactions(rows pgx.Rows) ([]types.InternalTransaction, error) {
@@ -1885,12 +1583,17 @@ func (d *DB) GetTransactionHistory(ctx context.Context, intervalSeconds int, lim
 // Search suggestions
 
 func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]types.SearchSuggestion, error) {
+	tx, cleanup, err := d.BeginHistorySnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 	var suggestions []types.SearchSuggestion
 
 	if isNumeric(query) {
-		rows, err := d.pool.Query(ctx, `
+		rows, err := tx.Query(ctx, `
 			SELECT number FROM blocks
-			WHERE number::text LIKE $1 || '%'
+			WHERE number>=history_from() AND number::text LIKE $1 || '%'
 			ORDER BY number DESC LIMIT $2`, query, limit)
 		if err != nil {
 			return nil, err
@@ -1914,10 +1617,10 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	if len(query) >= 2 && query[:2] == "0x" {
-		rows, err := d.pool.Query(ctx, `
+		rows, err := tx.Query(ctx, `
 			SELECT hash FROM transactions
-			WHERE LOWER(hash) LIKE LOWER($1) || '%'
-			ORDER BY block_number DESC LIMIT $2`, query, limit)
+			WHERE block_number>=history_from() AND LOWER(hash) LIKE LOWER($1) || '%'
+			ORDER BY block_number DESC,tx_index DESC,hash DESC LIMIT $2`, query, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1940,10 +1643,10 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	if len(query) >= 2 && query[:2] == "0x" {
-		rows, err := d.pool.Query(ctx, `
+		rows, err := tx.Query(ctx, `
 			SELECT address, tx_count FROM address_stats
 			WHERE LOWER(address) LIKE LOWER($1) || '%'
-			ORDER BY tx_count DESC LIMIT $2`, query, limit)
+			ORDER BY tx_count DESC,address ASC LIMIT $2`, query, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1967,10 +1670,10 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	if len(query) >= 1 {
-		rows, err := d.pool.Query(ctx, `
+		rows, err := tx.Query(ctx, `
 			SELECT address, symbol, name FROM tokens
 			WHERE LOWER(symbol) LIKE LOWER($1) || '%' OR LOWER(name) LIKE '%' || LOWER($1) || '%'
-			ORDER BY holder_count DESC LIMIT $2`, query, limit)
+			ORDER BY holder_count DESC,address ASC LIMIT $2`, query, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1997,7 +1700,7 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 		}
 	}
 
-	return suggestions, nil
+	return suggestions, tx.Commit(ctx)
 }
 
 func isNumeric(s string) bool {
@@ -2288,8 +1991,17 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 		return err
 	}
 	defer release()
-	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
-		return fmt.Errorf("failed to mark the wipe as in progress: %w", err)
+	// Publish source invalidation and the crash-recovery mark atomically before
+	// any destructive step. A resumed wipe may rotate again; no continuation
+	// from either partially replaced dataset may survive it.
+	if err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+WipeMarkTable+` (started_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE indexer_dataset_metadata SET dataset_epoch=gen_random_uuid(),chain_id=NULL,genesis_hash=NULL WHERE id=1`)
+		return err
+	}); err != nil {
+		return fmt.Errorf("failed to invalidate and mark the indexed dataset: %w", err)
 	}
 	// A refill or repair staged from the old chain must not be applied to the new one. Dropped before chain_counters
 	// is truncated, so a wipe stopped in between never leaves a repair stage beside a reset revert count; and an
@@ -2400,8 +2112,8 @@ func (d *DB) WipeAllData(ctx context.Context) error {
 }
 
 // ResumeInterruptedWipe finishes a wipe that was stopped part way. Reconcile runs it first, so it finishes before
-// ingest, the ledger closer and retention start; the gRPC server already serves while it runs, and answers from the
-// half-wiped tables until it is done.
+// ingest, the ledger closer and retention start. Snapshot reads hold the shared
+// history gate and reject a surviving mark rather than serve half-wiped data.
 func (d *DB) ResumeInterruptedWipe(ctx context.Context) error {
 	var marked bool
 	if err := d.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, WipeMarkTable).Scan(&marked); err != nil {

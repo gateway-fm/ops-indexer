@@ -21,7 +21,9 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/gateway-fm/chain-indexer/internal/db"
+	"github.com/gateway-fm/chain-indexer/internal/indexerv2"
 	"github.com/gateway-fm/chain-indexer/internal/nodelookup"
+	"github.com/gateway-fm/chain-indexer/internal/v2transport"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 )
@@ -44,6 +46,11 @@ type Config struct {
 
 	// NodeLookup, when set, serves blocks and transactions below the prune watermark from the node.
 	NodeLookup *nodelookup.Lookup
+
+	// DatasetReady, when supplied by the indexing process, stays false until
+	// startup recovery and configured-node identity validation have completed.
+	// V2 reads must not expose a prior dataset while a startup wipe is pending.
+	DatasetReady func() bool
 
 	// DefaultPageSize is the page_size used when a request sends 0. 25.
 	DefaultPageSize int32
@@ -102,7 +109,8 @@ func (s *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("grpcserver: listen on %s: %w", s.cfg.ListenAddr, err)
 	}
 
-	grpcSrv := grpc.NewServer(
+	governor := v2transport.New()
+	options := append(governor.ServerOptions(),
 		grpc.MaxRecvMsgSize(s.cfg.MaxRecvMsgBytes),
 		grpc.MaxSendMsgSize(s.cfg.MaxSendMsgBytes),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -114,8 +122,10 @@ func (s *Server) Serve(ctx context.Context) error {
 			PermitWithoutStream: true,
 		}),
 	)
+	grpcSrv := grpc.NewServer(options...)
 
 	indexerv1.RegisterIndexerServiceServer(grpcSrv, s)
+	governor.Register(grpcSrv, indexerv2.New(s.db, s.cfg.NodeLookup, s.cfg.DatasetReady))
 
 	slog.Info("gRPC server listening", "addr", s.cfg.ListenAddr)
 

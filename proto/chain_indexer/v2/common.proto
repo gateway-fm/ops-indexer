@@ -1,0 +1,110 @@
+syntax = "proto3";
+package chain_indexer.v2;
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2";
+
+// Hashes are exactly 32 bytes; addresses are exactly 20 bytes. Empty optional
+// scalar values preserve database NULL. Decimal quantities are lossless strings.
+message ReadAt { uint64 block_number = 1; bytes block_hash = 2; }
+enum Order { ORDER_UNSPECIFIED = 0; ORDER_DESCENDING = 1; ORDER_ASCENDING = 2; }
+enum Consistency { CONSISTENCY_UNSPECIFIED = 0; CONSISTENCY_SNAPSHOT = 1; CONSISTENCY_CURRENT = 2; }
+enum Source { SOURCE_UNSPECIFIED = 0; SOURCE_INDEXER = 1; SOURCE_NODE = 2; }
+message AddressSet { repeated bytes addresses = 1; }
+message HashSet { repeated bytes hashes = 1; }
+message TransactionTypeSet { repeated uint32 types = 1; }
+message BlockRange { optional uint64 from_block = 1; optional uint64 to_block = 2; }
+// Inclusive Unix seconds, evaluated against the block timestamp.
+message TimeRange { optional uint64 from_timestamp = 1; optional uint64 to_timestamp = 2; }
+message ReadContext {
+  ReadAt read_at = 1;
+  string expect_dataset_epoch = 2;
+  // Required with start_after. Pins the first page's run even after backfill.
+  optional uint64 expected_run_floor = 3;
+}
+message BlockKey { uint64 number = 1; }
+message TransactionKey { uint64 block_number = 1; uint32 transaction_index = 2; bytes hash = 3; }
+message LogKey { uint64 block_number = 1; uint32 log_index = 2; }
+message TransferKey { uint64 block_number = 1; uint32 log_index = 2; }
+// trace_address is compared using PostgreSQL COLLATE "C".
+message InternalKey { uint64 block_number = 1; bytes transaction_hash = 2; string trace_address = 3; }
+message CreationKey { uint64 block_number = 1; bytes address = 2; }
+message AddressKey { bytes address = 1; }
+message BalanceKey { bytes token_address = 1; bytes address = 2; }
+message HolderKey { string balance = 1; bytes address = 2; }
+enum SearchKind { SEARCH_KIND_UNSPECIFIED = 0; SEARCH_KIND_BLOCK = 1; SEARCH_KIND_TRANSACTION = 2; SEARCH_KIND_CONTRACT = 3; SEARCH_KIND_TOKEN = 4; SEARCH_KIND_ADDRESS = 5; }
+message SearchKindSet { repeated SearchKind kinds = 1; }
+// Ordered by kind, block_number, identity. identity is hash or address; blocks
+// use their hash. Each kind has a unique natural key.
+message SearchKey { SearchKind kind = 1; uint64 block_number = 2; bytes identity = 3; }
+message Key {
+  oneof value {
+    BlockKey block = 1;
+    TransactionKey transaction = 2;
+    LogKey log = 3;
+    TransferKey transfer = 4;
+    InternalKey internal = 5;
+    CreationKey creation = 6;
+    AddressKey address = 7;
+    BalanceKey balance = 8;
+    HolderKey holder = 9;
+    SearchKey search = 10;
+  }
+}
+message PageRequest {
+  // Zero defaults to 25; negative is invalid; values above 100 clamp to 100.
+  int32 page_size = 1;
+  Key start_after = 2;
+  Order order = 3;
+}
+enum EndedAt { ENDED_AT_UNSPECIFIED = 0; ENDED_AT_END_OF_RANGE = 1; ENDED_AT_RETENTION_FLOOR = 2; ENDED_AT_INDEX_FLOOR = 3; }
+message PageInfo {
+  ReadAt read_at = 1;
+  string dataset_epoch = 2;
+  // Scan position, not necessarily the last visible row. Absent means terminal.
+  Key next_start_after = 3;
+  uint64 history_from_block = 4;
+  EndedAt ended_at = 5;
+  uint64 run_floor_block = 6;
+  Consistency consistency = 7;
+}
+// Half-open interval at transaction precision; no rounding to whole blocks.
+message TransactionPosition { uint64 block_number = 1; uint32 transaction_index = 2; }
+message DestinationInterval { bytes to_address = 1; TransactionPosition from = 2; TransactionPosition to = 3; }
+message ExactCreation { TransactionKey transaction = 1; }
+// Presence matters: present with no predicates matches nothing. Intervals and
+// creations are ORed together; this union is ANDed with all other filters.
+message DestinationPredicates { repeated DestinationInterval intervals = 1; repeated ExactCreation creations = 2; }
+message TransactionFilter {
+  AddressSet any_party = 1;
+  AddressSet from = 2;
+  AddressSet to = 3;
+  BlockRange block_range = 4;
+  TimeRange time_range = 5;
+  TransactionTypeSet transaction_types = 6;
+  optional bytes transaction_hash = 7;
+  DestinationPredicates destinations = 8;
+}
+message LogFilter {
+  AddressSet addresses = 1;
+  HashSet topic0 = 2;
+  HashSet topic1 = 3;
+  HashSet topic2 = 4;
+  HashSet topic3 = 5;
+  BlockRange block_range = 6;
+  optional bytes transaction_hash = 7;
+  optional uint64 block_number = 8;
+}
+message TransferFilter {
+  AddressSet any_party = 1;
+  AddressSet from = 2;
+  AddressSet to = 3;
+  AddressSet tokens = 4;
+  BlockRange block_range = 5;
+  optional bytes transaction_hash = 6;
+  optional uint64 block_number = 7;
+}
+message InternalFilter {
+  AddressSet any_party = 1;
+  BlockRange block_range = 2;
+  optional bytes transaction_hash = 3;
+  optional uint64 block_number = 4;
+}

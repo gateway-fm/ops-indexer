@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"log/slog"
+	"strings"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 )
@@ -47,59 +48,28 @@ func (s *Server) ListOPDeposits(ctx context.Context, req *indexerv1.ListOPDeposi
 	if !s.cfg.OPStackEnabled {
 		return nil, unavailable("OP-Stack endpoints are not enabled for this chain")
 	}
-	limit := int(s.clampPageSize(req.GetPage().GetPageSize()))
-
-	var fromAddr, toAddr *string
-	if req.GetByFrom() != "" {
-		v := req.GetByFrom()
-		fromAddr = &v
+	if req.ByTo != "" {
+		return nil, invalidArgument("by_to is not supported for OP deposits; use by_from")
 	}
-	if req.GetByTo() != "" {
-		v := req.GetByTo()
-		toAddr = &v
-	}
-	var l1From, l1To *uint64
-	if br := req.GetL1BlockRange(); br != nil {
-		if br.GetFromBlock() > 0 {
-			v := br.GetFromBlock()
-			l1From = &v
-		}
-		if br.GetToBlock() > 0 {
-			v := br.GetToBlock()
-			l1To = &v
-		}
-	}
-
-	var afterL1Block uint64
-	if c := req.GetPage().GetCursor(); c != "" {
-		var cur blockFeedCursor // reuse: block_number-keyed cursor
-		if err := decodeCursor(c, &cur); err != nil {
-			return nil, err
-		}
-		afterL1Block = cur.BlockNumber
-	}
-
-	rows, err := s.db.ListOPDeposits(ctx, fromAddr, toAddr, l1From, l1To, afterL1Block, limit+1)
+	lower, upper, err := v1BlockRange(req.L1BlockRange)
 	if err != nil {
-		slog.Error("ListOPDeposits", "error", err)
-		return nil, internalErr(err, "ListOPDeposits")
+		return nil, err
 	}
-
-	nextCursor := ""
-	if len(rows) > limit {
-		last := rows[limit-1]
-		if enc, e := encodeCursor(blockFeedCursor{BlockNumber: last.L1BlockNumber}); e == nil {
-			nextCursor = enc
-		}
-		rows = rows[:limit]
+	f := struct {
+		From         string
+		Lower, Upper uint64
+	}{strings.ToLower(req.ByFrom), lower, upper}
+	in, binding, err := s.v1Input("op-deposits", f, req.Page, nil)
+	if err != nil {
+		return nil, err
 	}
-
-	out := make([]*indexerv1.OPDeposit, 0, len(rows))
-	for i := range rows {
-		out = append(out, mapOPDeposit(&rows[i]))
+	result, err := s.db.V1Deposits(ctx, f.From, lower, upper, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListOPDeposits")
 	}
-	return &indexerv1.ListOPDepositsResponse{
-		Deposits: out,
-		Page:     &indexerv1.PageResponse{NextCursor: nextCursor},
-	}, nil
+	out := make([]*indexerv1.OPDeposit, 0, len(result.Rows))
+	for i := range result.Rows {
+		out = append(out, mapOPDeposit(&result.Rows[i]))
+	}
+	return &indexerv1.ListOPDepositsResponse{Deposits: out, Page: &indexerv1.PageResponse{NextCursor: v1Next(binding, result.Next)}}, nil
 }

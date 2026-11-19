@@ -100,6 +100,15 @@ func main() {
 	if err := database.MigrateSchema(); err != nil {
 		log.Fatal("failed to run migrations", "error", err)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "rotate-dataset-epoch" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := database.RotateDatasetEpoch(ctx); err != nil {
+			log.Fatal("failed to invalidate restored dataset continuations", "error", err)
+		}
+		log.Info("dataset epoch rotated; existing continuations are invalid")
+		return
+	}
 	if cfg.TxHashIndexes {
 		if err := database.EnsureTxHashIndexes(context.Background()); err != nil {
 			log.Fatal("failed to build the tx_hash lookup indexes", "error", err)
@@ -163,10 +172,12 @@ func main() {
 			Concurrency: cfg.PrunedLookupConcurrency,
 		})
 	}
+	var datasetReady atomic.Bool
 	grpcSrv, err := grpcserver.New(grpcserver.Config{
 		ListenAddr:     cfg.GRPCListenAddr,
 		OPStackEnabled: cfg.EnableOPDeposits,
 		NodeLookup:     nodeLookup,
+		DatasetReady:   datasetReady.Load,
 	}, database)
 	if err != nil {
 		log.Fatal("failed to create grpc server", "error", err)
@@ -185,7 +196,7 @@ func main() {
 
 	stop := &workerStop{cancel: cancel}
 	var wg sync.WaitGroup
-	wg.Add(6)
+	wg.Add(7)
 
 	// Built CONCURRENTLY beside ingest and gRPC; the ledger checks and the span rebase wait for them. A shutdown stops
 	// the build, so the pool can close, and the next start replaces the index it left invalid.
@@ -202,6 +213,26 @@ func main() {
 			return false
 		}
 	}
+
+	go func() {
+		defer wg.Done()
+		if !afterStartWipe() {
+			return
+		}
+		identityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := initializeDatasetIdentity(identityCtx, database, rpcClient); err != nil {
+			stop.fail("configured node does not establish the indexed dataset identity", err)
+			return
+		}
+		if cfg.StartBlock == 0 {
+			if err := initializeGenesis(identityCtx, database, rpcClient); err != nil {
+				stop.fail("configured node does not establish the genesis header", err)
+				return
+			}
+		}
+		datasetReady.Store(true)
+	}()
 
 	// The checks wait for the startup reconcile and the start's wipe like the ledger and retention: the address
 	// reconciliation creates and removes address_stats rows and moves addresses_total, which the reconcile's re-seed

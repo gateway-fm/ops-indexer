@@ -127,11 +127,50 @@ func (d *DB) DeleteMissingRange(ctx context.Context, id int) error {
 	return err
 }
 
+// DeleteMissingRangeByBlock completes one block, preserving every unfilled
+// sibling. The short table lock serializes splitting with all existing range
+// writers (including pruning); readers can still observe the prior snapshot.
 func (d *DB) DeleteMissingRangeByBlock(ctx context.Context, blockNumber uint64) error {
-	_, err := d.pool.Exec(ctx, `
-		DELETE FROM missing_block_ranges
-		WHERE from_number <= $1 AND to_number >= $1`, blockNumber)
-	return err
+	if blockNumber > 1<<63-1 {
+		return fmt.Errorf("block number exceeds the database range")
+	}
+	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `LOCK TABLE missing_block_ranges IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT id,from_number,to_number,created_at FROM missing_block_ranges WHERE from_number <= $1 AND to_number >= $1 ORDER BY id`, blockNumber)
+		if err != nil {
+			return err
+		}
+		ranges, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (BlockRange, error) {
+			var r BlockRange
+			err := row.Scan(&r.ID, &r.FromNumber, &r.ToNumber, &r.CreatedAt)
+			return r, err
+		})
+		if err != nil {
+			return err
+		}
+		for _, r := range ranges {
+			if _, err = tx.Exec(ctx, `DELETE FROM missing_block_ranges WHERE id=$1`, r.ID); err != nil {
+				return err
+			}
+			insert := func(from, to uint64) error {
+				_, err := tx.Exec(ctx, `INSERT INTO missing_block_ranges(from_number,to_number,created_at) VALUES($1,$2,$3) ON CONFLICT(from_number,to_number) DO NOTHING`, from, to, r.CreatedAt)
+				return err
+			}
+			if r.FromNumber < blockNumber {
+				if err = insert(r.FromNumber, blockNumber-1); err != nil {
+					return err
+				}
+			}
+			if blockNumber < r.ToNumber {
+				if err = insert(blockNumber+1, r.ToNumber); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }
 
 // AdvanceMissingRange records that the blocks of r below next are stored, in one transaction: the row starts at next,

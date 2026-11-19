@@ -2,87 +2,28 @@ package grpcserver
 
 import (
 	"context"
-	"log/slog"
-	"strings"
-
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
-	"github.com/gateway-fm/chain-indexer/internal/types"
+	"github.com/gateway-fm/chain-indexer/internal/db"
+	"strings"
 )
 
 func (s *Server) ListLogs(ctx context.Context, req *indexerv1.ListLogsRequest) (*indexerv1.ListLogsResponse, error) {
-	limit := int(s.clampPageSize(req.GetPage().GetPageSize()))
-
-	hasTxHash := req.GetByTxHash() != ""
-	hasAddress := req.GetByAddress() != ""
-	hasTopic := req.GetTopic0() != ""
-
-	if !hasTxHash && !hasAddress && !hasTopic {
-		return nil, invalidArgument("at least one of by_tx_hash, by_address, topic0 must be set")
+	f := db.V1LogFilter{TxHash: strings.ToLower(req.ByTxHash), Address: strings.ToLower(req.ByAddress), Topic: strings.ToLower(req.Topic0)}
+	if f.TxHash == "" && f.Address == "" && f.Topic == "" {
+		return nil, invalidArgument("at least one filter must be set")
 	}
-
-	var rows []types.Log
-	var total int64
 	var err error
-	// Dispatch to the narrowest existing db query. total is the filter-wide
-	// count (ignoring pagination) so consumers can show a true "of N".
-	switch {
-	case hasTxHash:
-		// A tx's logs are fully returned (no limit), so len is the true total.
-		rows, err = s.db.GetLogsByTransaction(ctx, req.GetByTxHash())
-		total = int64(len(rows))
-	case hasAddress && !hasTopic:
-		// db.GetLogsByAddress uses offset pagination; we adapt by ignoring offset
-		// for the first cursor-less page and returning no next cursor. A
-		// follow-up DB change introduces proper cursor semantics for this path.
-		rows, total, err = s.db.GetLogsByAddress(ctx, strings.ToLower(req.GetByAddress()), limit, 0)
-	case hasTopic && !hasAddress:
-		rows, total, err = s.db.GetLogsByTopic(ctx, req.GetTopic0(), limit, 0)
-	default:
-		// Multi-filter branch: use the flexible GetLogs + matching CountLogs.
-		var addr, topic *string
-		if hasAddress {
-			a := strings.ToLower(req.GetByAddress())
-			addr = &a
-		}
-		if hasTopic {
-			t := req.GetTopic0()
-			topic = &t
-		}
-		var from, to *uint64
-		if br := req.GetBlockRange(); br != nil {
-			if br.GetFromBlock() > 0 {
-				f := br.GetFromBlock()
-				from = &f
-			}
-			if br.GetToBlock() > 0 {
-				t := br.GetToBlock()
-				to = &t
-			}
-		}
-		// GetLogs treats to_block as inclusive.
-		if to != nil {
-			if cerr := s.checkRetained(ctx, *to); cerr != nil {
-				return nil, cerr
-			}
-		}
-		rows, err = s.db.GetLogs(ctx, addr, topic, from, to, limit)
-		if err == nil && to != nil && len(rows) == 0 {
-			if cerr := s.recheckRetained(ctx, *to); cerr != nil {
-				return nil, cerr
-			}
-		}
-		if err == nil {
-			total, err = s.db.CountLogs(ctx, addr, topic, from, to)
-		}
-	}
+	f.From, f.To, err = v1BlockRange(req.BlockRange)
 	if err != nil {
-		slog.Error("ListLogs", "error", err)
-		return nil, internalErr(err, "ListLogs")
+		return nil, err
 	}
-
-	return &indexerv1.ListLogsResponse{
-		Logs:       mapLogs(rows),
-		Page:       &indexerv1.PageResponse{}, // cursor pagination for logs pending DB support
-		TotalCount: total,
-	}, nil
+	in, binding, err := s.v1Input("logs", f, req.Page, nil)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.db.V1Logs(ctx, f, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListLogs")
+	}
+	return &indexerv1.ListLogsResponse{Logs: mapLogs(result.Rows), Page: &indexerv1.PageResponse{NextCursor: v1Next(binding, result.Next)}, TotalCount: result.Total}, nil
 }

@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"log/slog"
+	"math/big"
 	"strings"
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
@@ -25,197 +26,114 @@ func (s *Server) GetToken(ctx context.Context, req *indexerv1.GetTokenRequest) (
 	return mapToken(tok), nil
 }
 
+func v1TokenType(t indexerv1.TokenType) (string, error) {
+	switch t {
+	case indexerv1.TokenType_TOKEN_TYPE_UNSPECIFIED:
+		return "", nil
+	case indexerv1.TokenType_TOKEN_TYPE_ERC20:
+		return "ERC20", nil
+	case indexerv1.TokenType_TOKEN_TYPE_ERC721:
+		return "ERC721", nil
+	case indexerv1.TokenType_TOKEN_TYPE_ERC1155:
+		return "ERC1155", nil
+	}
+	return "", invalidArgument("unsupported token type")
+}
 func (s *Server) ListTokens(ctx context.Context, req *indexerv1.ListTokensRequest) (*indexerv1.ListTokensResponse, error) {
-	page := int(req.GetPage().GetPage())
-	if page < 1 {
-		page = 1
-	}
-	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
-	offset := (page - 1) * pageSize
-
-	tokenType := ""
-	switch req.GetTokenType() {
-	case indexerv1.TokenType_TOKEN_TYPE_ERC20:
-		tokenType = "ERC20"
-	case indexerv1.TokenType_TOKEN_TYPE_ERC721:
-		tokenType = "ERC721"
-	case indexerv1.TokenType_TOKEN_TYPE_ERC1155:
-		tokenType = "ERC1155"
-	}
-
-	rows, total, err := s.db.GetTokens(ctx, pageSize, offset, tokenType, req.GetSearch())
+	tokenType, err := v1TokenType(req.TokenType)
 	if err != nil {
-		slog.Error("ListTokens", "error", err)
-		return nil, internalErr(err, "ListTokens")
+		return nil, err
 	}
-	return &indexerv1.ListTokensResponse{
-		Tokens: mapTokens(rows),
-		Page: &indexerv1.OffsetPageResponse{
-			Page:       int32(page),
-			PageSize:   int32(pageSize),
-			TotalItems: total,
-		},
-	}, nil
+	search := strings.ToLower(strings.TrimSpace(req.Search))
+	f := struct{ Type, Search string }{tokenType, search}
+	in, binding, err := s.v1Input("tokens", f, nil, req.Page)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.db.V1Tokens(ctx, tokenType, search, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTokens")
+	}
+	return &indexerv1.ListTokensResponse{Tokens: mapTokens(result.Rows), Page: v1Offset(binding, result.Next, result.Page, in.Limit, result.Total)}, nil
 }
-
 func (s *Server) ListTokenTransfers(ctx context.Context, req *indexerv1.ListTokenTransfersRequest) (*indexerv1.ListTokenTransfersResponse, error) {
-	limit := int(s.clampPageSize(req.GetPage().GetPageSize()))
-
-	hasTx := req.GetByTxHash() != ""
-	hasAddr := req.GetByAddress() != ""
-	hasTok := req.GetByToken() != ""
-	if !hasTx && !hasAddr && !hasTok {
-		return nil, invalidArgument("at least one of by_tx_hash, by_address, by_token must be set")
+	f := db.V1TransferFilter{TxHash: strings.ToLower(req.ByTxHash), Address: strings.ToLower(req.ByAddress), Token: strings.ToLower(req.ByToken), Cumulative: true}
+	if f.TxHash == "" && f.Address == "" && f.Token == "" {
+		return nil, invalidArgument("at least one filter must be set")
 	}
-
-	var rows []types.TokenTransfer
-	var total int64
 	var err error
-	switch {
-	case hasTx:
-		// A tx's transfers are fully returned, so len is the true total.
-		rows, err = s.db.GetTransfersByTransaction(ctx, req.GetByTxHash())
-		total = int64(len(rows))
-	case hasAddr:
-		// Position priority mirrors ListTransactions by-address: opaque cursor
-		// (full (block, log_index) keyset — RD-1148), else block_range.to_block as an
-		// EXCLUSIVE whole-block upper bound (proto: half-open, 0 = unbounded).
-		var before *db.AddressFeedBound
-		var toBlock uint64
-		if c := req.GetPage().GetCursor(); c != "" {
-			var cur transferFeedCursor
-			if derr := decodeCursor(c, &cur); derr != nil {
-				return nil, derr
-			}
-			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.LogIndex}
-		} else if toBlock = req.GetBlockRange().GetToBlock(); toBlock > 0 {
-			before = &db.AddressFeedBound{Block: toBlock}
-			if cerr := s.checkRetained(ctx, lastBlockBelow(toBlock)); cerr != nil {
-				return nil, cerr
-			}
-		}
-		addr := strings.ToLower(req.GetByAddress())
-		rows, err = s.db.GetTransfersByAddress(ctx, addr, limit+1, before)
-		if err == nil && toBlock > 0 && len(rows) == 0 {
-			if cerr := s.recheckRetained(ctx, lastBlockBelow(toBlock)); cerr != nil {
-				return nil, cerr
-			}
-		}
-		if err == nil {
-			total, err = s.db.CountTransfersByAddress(ctx, addr)
-		}
-	case hasTok:
-		rows, total, err = s.db.GetTransfersByToken(ctx, strings.ToLower(req.GetByToken()), limit, 0)
-	}
+	f.From, f.To, err = v1BlockRange(req.BlockRange)
 	if err != nil {
-		slog.Error("ListTokenTransfers", "error", err)
-		return nil, internalErr(err, "ListTokenTransfers")
+		return nil, err
 	}
-
-	nextCursor := ""
-	if hasAddr && len(rows) > limit {
-		last := rows[limit-1]
-		if enc, e := encodeCursor(transferFeedCursor{BlockNumber: last.BlockNumber, LogIndex: uint32(last.LogIndex)}); e == nil {
-			nextCursor = enc
-		}
-		rows = rows[:limit]
+	in, binding, err := s.v1Input("token-transfers", f, req.Page, nil)
+	if err != nil {
+		return nil, err
 	}
-
-	return &indexerv1.ListTokenTransfersResponse{
-		Transfers:  mapTokenTransfers(rows),
-		Page:       &indexerv1.PageResponse{NextCursor: nextCursor},
-		TotalCount: total,
-	}, nil
+	result, err := s.db.V1Transfers(ctx, f, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTokenTransfers")
+	}
+	return &indexerv1.ListTokenTransfersResponse{Transfers: mapTokenTransfers(result.Rows), Page: &indexerv1.PageResponse{NextCursor: v1Next(binding, result.Next)}, TotalCount: result.Total}, nil
 }
-
 func (s *Server) ListAllTokenTransfers(ctx context.Context, req *indexerv1.ListAllTokenTransfersRequest) (*indexerv1.ListAllTokenTransfersResponse, error) {
-	page := int(req.GetPage().GetPage())
-	if page < 1 {
-		page = 1
-	}
-	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
-	offset := (page - 1) * pageSize
-
-	tokenType := ""
-	switch req.GetTokenType() {
-	case indexerv1.TokenType_TOKEN_TYPE_ERC20:
-		tokenType = "ERC20"
-	case indexerv1.TokenType_TOKEN_TYPE_ERC721:
-		tokenType = "ERC721"
-	case indexerv1.TokenType_TOKEN_TYPE_ERC1155:
-		tokenType = "ERC1155"
-	}
-
-	rows, total, err := s.db.GetAllTokenTransfers(ctx, tokenType, pageSize, offset)
+	tokenType, err := v1TokenType(req.TokenType)
 	if err != nil {
-		slog.Error("ListAllTokenTransfers", "error", err)
-		return nil, internalErr(err, "ListAllTokenTransfers")
+		return nil, err
 	}
-	return &indexerv1.ListAllTokenTransfersResponse{
-		Transfers: mapTokenTransfers(rows),
-		Page: &indexerv1.OffsetPageResponse{
-			Page:       int32(page),
-			PageSize:   int32(pageSize),
-			TotalItems: total,
-		},
-	}, nil
+	f := db.V1TransferFilter{TokenType: tokenType, Cumulative: true}
+	in, binding, err := s.v1Input("all-token-transfers", f, nil, req.Page)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.db.V1Transfers(ctx, f, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListAllTokenTransfers")
+	}
+	return &indexerv1.ListAllTokenTransfersResponse{Transfers: mapTokenTransfers(result.Rows), Page: v1Offset(binding, result.Next, result.Page, in.Limit, result.Total)}, nil
 }
-
 func (s *Server) ListTokenHolders(ctx context.Context, req *indexerv1.ListTokenHoldersRequest) (*indexerv1.ListTokenHoldersResponse, error) {
-	if req.GetTokenAddress() == "" {
+	token := strings.ToLower(req.TokenAddress)
+	if token == "" {
 		return nil, invalidArgument("token_address is required")
 	}
-	page := int(req.GetPage().GetPage())
-	if page < 1 {
-		page = 1
-	}
-	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
-	offset := (page - 1) * pageSize
-
-	rows, total, err := s.db.GetTokenHolders(ctx, strings.ToLower(req.GetTokenAddress()), pageSize, offset)
+	in, binding, err := s.v1Input("token-holders", token, nil, req.Page)
 	if err != nil {
-		slog.Error("ListTokenHolders", "error", err)
-		return nil, internalErr(err, "ListTokenHolders")
+		return nil, err
 	}
-	// Holders from the DB don't carry token_address; set it from the request context.
-	holders := mapHolders(rows)
+	result, err := s.db.V1Holders(ctx, token, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTokenHolders")
+	}
+	holders := mapHolders(result.Rows)
 	for _, h := range holders {
-		h.TokenAddress = strings.ToLower(req.GetTokenAddress())
+		h.TokenAddress = token
 	}
-	return &indexerv1.ListTokenHoldersResponse{
-		Holders: holders,
-		Page: &indexerv1.OffsetPageResponse{
-			Page:       int32(page),
-			PageSize:   int32(pageSize),
-			TotalItems: total,
-		},
-	}, nil
+	return &indexerv1.ListTokenHoldersResponse{Holders: holders, Page: v1Offset(binding, result.Next, result.Page, in.Limit, result.Total)}, nil
 }
-
 func (s *Server) ListTokenInventory(ctx context.Context, req *indexerv1.ListTokenInventoryRequest) (*indexerv1.ListTokenInventoryResponse, error) {
-	if req.GetTokenAddress() == "" {
+	token := strings.ToLower(req.TokenAddress)
+	if token == "" {
 		return nil, invalidArgument("token_address is required")
 	}
-	page := int(req.GetPage().GetPage())
-	if page < 1 {
-		page = 1
+	id := req.TokenId
+	if id != "" {
+		n, ok := new(big.Int).SetString(id, 10)
+		if !ok || n.Sign() < 0 {
+			return nil, invalidArgument("token_id must be an unsigned decimal integer")
+		}
+		id = n.String()
 	}
-	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
-	offset := (page - 1) * pageSize
-
-	rows, total, err := s.db.GetTokenInventory(ctx, strings.ToLower(req.GetTokenAddress()), req.GetTokenId(), pageSize, offset)
+	f := struct{ Token, ID string }{token, id}
+	in, binding, err := s.v1Input("token-inventory", f, nil, req.Page)
 	if err != nil {
-		slog.Error("ListTokenInventory", "error", err)
-		return nil, internalErr(err, "ListTokenInventory")
+		return nil, err
 	}
-	return &indexerv1.ListTokenInventoryResponse{
-		Items: mapInventoryItems(rows),
-		Page: &indexerv1.OffsetPageResponse{
-			Page:       int32(page),
-			PageSize:   int32(pageSize),
-			TotalItems: total,
-		},
-	}, nil
+	result, err := s.db.V1Inventory(ctx, token, id, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTokenInventory")
+	}
+	return &indexerv1.ListTokenInventoryResponse{Items: mapInventoryItems(result.Rows), Page: v1Offset(binding, result.Next, result.Page, in.Limit, result.Total)}, nil
 }
 
 func mapInventoryItems(rows []types.TokenInventoryItem) []*indexerv1.TokenInventoryItem {
@@ -235,33 +153,20 @@ func mapInventoryItems(rows []types.TokenInventoryItem) []*indexerv1.TokenInvent
 }
 
 func (s *Server) ListTokenBalances(ctx context.Context, req *indexerv1.ListTokenBalancesRequest) (*indexerv1.ListTokenBalancesResponse, error) {
-	if req.GetAddress() == "" {
+	address, token := strings.ToLower(req.Address), strings.ToLower(req.TokenAddress)
+	if address == "" {
 		return nil, invalidArgument("address is required")
 	}
-	addr := strings.ToLower(req.GetAddress())
-	if req.GetTokenAddress() != "" {
-		bal, err := s.db.GetLatestBalance(ctx, addr, strings.ToLower(req.GetTokenAddress()))
-		if err != nil {
-			slog.Error("ListTokenBalances(one)", "error", err)
-			return nil, internalErr(err, "ListTokenBalances")
-		}
-		if bal == nil {
-			return &indexerv1.ListTokenBalancesResponse{Page: &indexerv1.PageResponse{}}, nil
-		}
-		return &indexerv1.ListTokenBalancesResponse{
-			Balances: []*indexerv1.TokenBalance{mapBalance(bal)},
-			Page:     &indexerv1.PageResponse{},
-		}, nil
-	}
-	rows, err := s.db.GetTokenBalances(ctx, addr)
+	f := struct{ Address, Token string }{address, token}
+	in, binding, err := s.v1Input("token-balances", f, req.Page, nil)
 	if err != nil {
-		slog.Error("ListTokenBalances", "error", err)
-		return nil, internalErr(err, "ListTokenBalances")
+		return nil, err
 	}
-	return &indexerv1.ListTokenBalancesResponse{
-		Balances: mapBalances(rows),
-		Page:     &indexerv1.PageResponse{}, // balance list is bounded per-address; no cursor needed yet
-	}, nil
+	result, err := s.db.V1Balances(ctx, address, token, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTokenBalances")
+	}
+	return &indexerv1.ListTokenBalancesResponse{Balances: mapBalances(result.Rows), Page: &indexerv1.PageResponse{NextCursor: v1Next(binding, result.Next)}}, nil
 }
 
 func (s *Server) BatchGetTokenBalances(

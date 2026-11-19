@@ -30,18 +30,21 @@ message PageResponse {
   string next_cursor = 1;
 }
 
-// OffsetPageRequest is used only for bounded browse endpoints where offset
-// pagination is acceptable (see docs/API.md). Prefer cursor pagination.
+// OffsetPageRequest preserves legacy numbered pages. New clients should
+// continue with the opaque cursor; numbered pages use a bounded keyset walk.
 message OffsetPageRequest {
   int32 page_size = 1;
   // 1-based page number. page=0 is treated as page=1.
   int32 page = 2;
+  // Opaque continuation from next_cursor. Takes precedence over page.
+  string cursor = 3;
 }
 
 message OffsetPageResponse {
   int32 page = 1;
   int32 page_size = 2;
   int64 total_items = 3;
+  string next_cursor = 4;
 }
 
 // ----- Ranges -----

@@ -149,11 +149,11 @@ func TestFindMissingBlocksInRange(t *testing.T) {
 	defer cleanup()
 
 	tests := []struct {
-		name         string
-		blocks       [][2]uint64 // ranges of blocks to insert [from, to] inclusive
-		queryFrom    uint64
-		queryTo      uint64
-		wantRanges   [][2]uint64 // expected ranges in order (from_num DESC)
+		name       string
+		blocks     [][2]uint64 // ranges of blocks to insert [from, to] inclusive
+		queryFrom  uint64
+		queryTo    uint64
+		wantRanges [][2]uint64 // expected ranges in order (from_num DESC)
 	}{
 		{
 			name:       "gap_at_start",
@@ -393,16 +393,21 @@ func TestDeleteMissingRangeByBlock(t *testing.T) {
 				t.Fatalf("DeleteMissingRangeByBlock(%d): %v", tt.blockNumber, err)
 			}
 
-			count, err := d.GetMissingRangesCount(ctx)
+			ranges, err := d.GetMissingRangesBatch(ctx, 10)
 			if err != nil {
-				t.Fatalf("GetMissingRangesCount: %v", err)
+				t.Fatal(err)
 			}
-
-			if tt.wantDeleted && count != 0 {
-				t.Errorf("expected range to be deleted, but count=%d", count)
+			missing := map[uint64]bool{}
+			for _, r := range ranges {
+				for n := r.FromNumber; n <= r.ToNumber; n++ {
+					missing[n] = true
+				}
 			}
-			if !tt.wantDeleted && count != 1 {
-				t.Errorf("expected range to remain, but count=%d", count)
+			for n := uint64(1); n <= 9; n++ {
+				want := !tt.wantDeleted || n != tt.blockNumber
+				if missing[n] != want {
+					t.Errorf("block%d missing=%v want%v", n, missing[n], want)
+				}
 			}
 		})
 	}

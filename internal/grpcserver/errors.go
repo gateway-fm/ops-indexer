@@ -16,7 +16,7 @@ func notFound(kind, identifier string) error {
 
 // pruned returns OutOfRange for an explicit block target the retention window already removed.
 func pruned(block, watermark uint64) error {
-	return status.Errorf(codes.OutOfRange, "pruned: block %d is at or below the retention watermark %d", block, watermark)
+	return v1HistoryPruned(watermark + 1)
 }
 
 // invalidArgument returns InvalidArgument with a short, non-PII message.

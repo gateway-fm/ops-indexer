@@ -1,0 +1,86 @@
+syntax = "proto3";
+package chain_indexer.v2;
+option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2";
+import "chain_indexer/v2/common.proto";
+import "chain_indexer/v2/facts.proto";
+
+// Consumer agnostic, network isolated. No viewer credentials or policy inputs.
+service IndexerService {
+  rpc GetChainView(GetChainViewRequest) returns (GetChainViewResponse);
+  rpc GetBlock(GetBlockRequest) returns (GetBlockResponse);
+  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+  rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+  rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
+  rpc ListLogs(ListLogsRequest) returns (ListLogsResponse);
+  rpc ListTokenTransfers(ListTokenTransfersRequest) returns (ListTokenTransfersResponse);
+  rpc ListInternalTransactions(ListInternalTransactionsRequest) returns (ListInternalTransactionsResponse);
+  rpc BatchGetTransactions(BatchGetTransactionsRequest) returns (BatchGetTransactionsResponse);
+  rpc ListContracts(ListContractsRequest) returns (ListContractsResponse);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc ListAddresses(ListAddressesRequest) returns (ListAddressesResponse);
+  rpc ListBalances(ListBalancesRequest) returns (ListBalancesResponse);
+  rpc ListHolders(ListHoldersRequest) returns (ListHoldersResponse);
+  rpc ListCounterparties(ListCounterpartiesRequest) returns (ListCounterpartiesResponse);
+  rpc BatchFirstActivity(BatchFirstActivityRequest) returns (BatchFirstActivityResponse);
+  rpc CountTransactions(CountTransactionsRequest) returns (CountResponse);
+  rpc CountLogs(CountLogsRequest) returns (CountResponse);
+  rpc CountTokenTransfers(CountTokenTransfersRequest) returns (CountResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+message GetChainViewRequest { ReadContext read = 1; }
+message GetChainViewResponse {
+  PageInfo page = 1;
+  string chain_id = 2;
+  bytes genesis_hash = 3;
+  ReadAt safe_head = 4;
+  uint64 safe_head_timestamp = 5;
+  uint64 latest_indexed = 6;
+  optional uint64 last_finalized = 7;
+  optional uint64 last_verified = 8;
+  bool is_syncing = 9;
+  uint64 lowest_indexed = 10;
+  bool backfill_complete = 11;
+}
+message GetBlockRequest { ReadContext read = 1; oneof selector { uint64 number = 2; bytes hash = 3; } }
+message GetBlockResponse { PageInfo page = 1; Block block = 2; Source source = 3; }
+message GetTransactionRequest { ReadContext read = 1; bytes hash = 2; }
+message GetTransactionResponse { PageInfo page = 1; Transaction transaction = 2; Source source = 3; }
+message ListBlocksRequest { ReadContext read = 1; PageRequest page = 2; BlockRange block_range = 3; }
+message ListBlocksResponse { PageInfo page = 1; repeated Block blocks = 2; }
+message ListTransactionsRequest { ReadContext read = 1; PageRequest page = 2; TransactionFilter filter = 3; }
+message ListTransactionsResponse { PageInfo page = 1; repeated Transaction transactions = 2; }
+message ListLogsRequest { ReadContext read = 1; PageRequest page = 2; LogFilter filter = 3; }
+message ListLogsResponse { PageInfo page = 1; repeated Log logs = 2; }
+message ListTokenTransfersRequest { ReadContext read = 1; PageRequest page = 2; TransferFilter filter = 3; }
+message ListTokenTransfersResponse { PageInfo page = 1; repeated TokenTransfer transfers = 2; }
+message ListInternalTransactionsRequest { ReadContext read = 1; PageRequest page = 2; InternalFilter filter = 3; }
+message ListInternalTransactionsResponse { PageInfo page = 1; repeated InternalTransaction internal_transactions = 2; }
+message BatchGetTransactionsRequest { ReadContext read = 1; repeated bytes hashes = 2; }
+// One bundle per requested hash in exact request order. An absent parent is
+// NOT_FOUND for the whole request; no partial results or child truncation.
+message TransactionBundle { Transaction transaction = 1; repeated Log logs = 2; repeated TokenTransfer transfers = 3; repeated InternalTransaction internal_transactions = 4; }
+message BatchGetTransactionsResponse { PageInfo page = 1; repeated TransactionBundle transactions = 2; }
+message ListContractsRequest { ReadContext read = 1; PageRequest page = 2; AddressSet addresses = 3; BlockRange block_range = 4; optional bool verified = 5; }
+message ListContractsResponse { PageInfo page = 1; repeated Contract contracts = 2; }
+message ListTokensRequest { ReadContext read = 1; PageRequest page = 2; AddressSet addresses = 3; string token_type = 4; string search = 5; BlockRange block_range = 6; }
+message ListTokensResponse { PageInfo page = 1; repeated Token tokens = 2; }
+message ListAddressesRequest { ReadContext read = 1; PageRequest page = 2; AddressSet addresses = 3; optional bool contracts_only = 4; }
+message ListAddressesResponse { PageInfo page = 1; repeated Address addresses = 2; }
+message ListBalancesRequest { ReadContext read = 1; PageRequest page = 2; AddressSet addresses = 3; AddressSet tokens = 4; }
+message ListBalancesResponse { PageInfo page = 1; repeated Balance balances = 2; }
+message ListHoldersRequest { ReadContext read = 1; PageRequest page = 2; bytes token_address = 3; AddressSet addresses = 4; }
+message ListHoldersResponse { PageInfo page = 1; repeated Holder holders = 2; }
+message ListCounterpartiesRequest { ReadContext read = 1; AddressSet targets = 2; BlockRange block_range = 3; TimeRange time_range = 4; }
+// Atomic exact result, maximum 4096 destinations. Over cap is an error, never a
+// partial destination set. PageInfo has no continuation and is CURRENT.
+message ListCounterpartiesResponse { PageInfo page = 1; repeated Counterparty counterparties = 2; optional uint64 first_block = 3; optional uint64 last_block = 4; }
+message BatchFirstActivityRequest { ReadContext read = 1; AddressSet targets = 2; TransactionFilter filter = 3; }
+// One entry per input target in input order. A missing transaction means that
+// target has no match; SQL null and zero matches do not become invented facts.
+message BatchFirstActivityResponse { PageInfo page = 1; repeated FirstActivity activities = 2; }
+message CountTransactionsRequest { ReadContext read = 1; TransactionFilter filter = 2; }
+message CountLogsRequest { ReadContext read = 1; LogFilter filter = 2; }
+message CountTokenTransfersRequest { ReadContext read = 1; TransferFilter filter = 2; }
+message CountResponse { PageInfo page = 1; uint64 count = 2; }
+message SearchRequest { ReadContext read = 1; PageRequest page = 2; string query = 3; SearchKindSet kinds = 4; }
+message SearchResponse { PageInfo page = 1; repeated SearchResult results = 2; }

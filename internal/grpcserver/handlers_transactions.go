@@ -7,7 +7,7 @@ import (
 
 	indexerv1 "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v1"
 	"github.com/gateway-fm/chain-indexer/internal/db"
-	"github.com/gateway-fm/chain-indexer/internal/types"
+	"github.com/gateway-fm/chain-indexer/internal/nodelookup"
 )
 
 func (s *Server) GetTransaction(ctx context.Context, req *indexerv1.GetTransactionRequest) (*indexerv1.Transaction, error) {
@@ -39,164 +39,139 @@ func (s *Server) GetTransaction(ctx context.Context, req *indexerv1.GetTransacti
 }
 
 func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransactionsRequest) (*indexerv1.ListTransactionsResponse, error) {
-	limit := s.clampPageSize(req.GetPage().GetPageSize())
-
-	// Filter dispatch.
-	switch f := req.GetFilter().(type) {
+	f := db.V1TransactionFilter{}
+	var archive *nodelookup.Block
+	var err error
+	f.From, f.To, err = v1BlockRange(req.GetBlockRange())
+	if err != nil {
+		return nil, err
+	}
+	switch by := req.GetFilter().(type) {
 	case *indexerv1.ListTransactionsRequest_ByAddress:
-		if f.ByAddress.GetAddress() == "" {
+		if by.ByAddress.GetAddress() == "" {
 			return nil, invalidArgument("address is required")
 		}
-		addr := strings.ToLower(f.ByAddress.GetAddress())
-		// Position priority: opaque cursor (full (block, tx_index) keyset —
-		// RD-1148: resuming mid-block must not skip the block's remaining
-		// rows), else block_range.to_block as an EXCLUSIVE whole-block upper
-		// bound, per the proto contract (BlockRange is half-open; to_block
-		// exclusive, 0 = unbounded) — lets block-paging callers position
-		// without knowing the cursor encoding.
-		var before *db.AddressFeedBound
-		var toBlock uint64
-		if c := req.GetPage().GetCursor(); c != "" {
-			var cur txFeedCursor
-			if err := decodeCursor(c, &cur); err != nil {
-				return nil, err
-			}
-			before = &db.AddressFeedBound{Block: cur.BlockNumber, Index: &cur.TransactionIndex}
-		} else if toBlock = req.GetBlockRange().GetToBlock(); toBlock > 0 {
-			before = &db.AddressFeedBound{Block: toBlock}
-			if err := s.checkRetained(ctx, lastBlockBelow(toBlock)); err != nil {
-				return nil, err
-			}
+		f.Address = strings.ToLower(by.ByAddress.Address)
+		switch by.ByAddress.Direction {
+		case indexerv1.AddressDirection_ADDRESS_DIRECTION_UNSPECIFIED, indexerv1.AddressDirection_ADDRESS_DIRECTION_BOTH:
+			f.Direction = "both"
+		case indexerv1.AddressDirection_ADDRESS_DIRECTION_FROM:
+			f.Direction = "from"
+		case indexerv1.AddressDirection_ADDRESS_DIRECTION_TO:
+			f.Direction = "to"
+		default:
+			return nil, invalidArgument("unsupported address direction")
 		}
-		rows, err := s.db.GetTransactionsByAddress(ctx, addr, int(limit)+1, before)
-		if err != nil {
-			slog.Error("ListTransactions by address", "error", err)
-			return nil, internalErr(err, "ListTransactions")
-		}
-		if toBlock > 0 && len(rows) == 0 {
-			if err := s.recheckRetained(ctx, lastBlockBelow(toBlock)); err != nil {
-				return nil, err
-			}
-		}
-		return buildTxListResponse(rows, limit), nil
-
 	case *indexerv1.ListTransactionsRequest_ByBlock:
-		switch b := f.ByBlock.GetSelector().(type) {
+		switch b := by.ByBlock.GetSelector().(type) {
 		case *indexerv1.ListTransactionsRequest_BlockFilter_Number:
-			if nb, err := s.prunedBlockByNumber(ctx, b.Number); err != nil || nb != nil {
+			f.Block = &b.Number
+			if s.cfg.NodeLookup != nil {
+				if _, _, err = s.refreshPrunedThrough(ctx); err != nil {
+					return nil, err
+				}
+				archive, err = s.prunedBlockByNumber(ctx, b.Number)
 				if err != nil {
 					return nil, err
 				}
-				return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(nb.Txs), Page: &indexerv1.PageResponse{}}, nil
 			}
-			if err := s.checkRetained(ctx, b.Number); err != nil {
-				return nil, err
+		case *indexerv1.ListTransactionsRequest_BlockFilter_Hash:
+			f.Hash = strings.ToLower(b.Hash)
+			if f.Hash == "" {
+				return nil, invalidArgument("block hash is required")
 			}
-			rows, err := s.db.GetTransactionsByBlock(ctx, b.Number)
-			if err != nil {
-				slog.Error("ListTransactions by block", "error", err)
-				return nil, internalErr(err, "ListTransactions")
-			}
-			if len(rows) == 0 {
-				if err := s.recheckRetained(ctx, b.Number); err != nil {
+			if s.cfg.NodeLookup != nil {
+				if _, _, err = s.refreshPrunedThrough(ctx); err != nil {
+					return nil, err
+				}
+				archive, err = s.prunedBlockByHash(ctx, f.Hash)
+				if err != nil {
 					return nil, err
 				}
 			}
-			return &indexerv1.ListTransactionsResponse{
-				Transactions: mapTransactions(rows),
-				Page:         &indexerv1.PageResponse{},
-			}, nil
-		case *indexerv1.ListTransactionsRequest_BlockFilter_Hash:
-			// Lookup block by hash, then fetch its transactions by number.
-			blk, err := s.db.GetBlockByHash(ctx, b.Hash)
-			if err != nil {
-				slog.Error("ListTransactions by block hash", "error", err)
-				return nil, internalErr(err, "ListTransactions")
-			}
-			if blk == nil {
-				if nb, err := s.prunedBlockByHash(ctx, b.Hash); err != nil || nb != nil {
-					if err != nil {
-						return nil, err
-					}
-					return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(nb.Txs), Page: &indexerv1.PageResponse{}}, nil
-				}
-				return nil, s.notFoundByHash(ctx, "block", b.Hash)
-			}
-			rows, err := s.db.GetTransactionsByBlock(ctx, blk.Number)
-			if err != nil {
-				return nil, internalErr(err, "ListTransactions")
-			}
-			return &indexerv1.ListTransactionsResponse{
-				Transactions: mapTransactions(rows),
-				Page:         &indexerv1.PageResponse{},
-			}, nil
-		}
-		return nil, invalidArgument("block filter: selector is required")
 
-	case nil:
-		// No filter — main transaction feed.
-		var beforeBlock *uint64
-		if c := req.GetPage().GetCursor(); c != "" {
-			var cur txFeedCursor
-			if err := decodeCursor(c, &cur); err != nil {
-				return nil, err
-			}
-			beforeBlock = &cur.BlockNumber
+		default:
+			return nil, invalidArgument("block selector is required")
 		}
-		rows, err := s.db.GetTransactionsWithCategories(ctx, int(limit)+1, beforeBlock)
-		if err != nil {
-			slog.Error("ListTransactions feed", "error", err)
-			return nil, internalErr(err, "ListTransactions")
-		}
-		return buildTxListResponse(rows, limit), nil
 	}
-	return nil, invalidArgument("unsupported filter type")
-}
-
-// ListTransactionsPaginated serves the global tx feed with offset pagination
-// and a true chain-wide total, for browse-style UIs that show "page X of Y".
-func (s *Server) ListTransactionsPaginated(ctx context.Context, req *indexerv1.ListTransactionsPaginatedRequest) (*indexerv1.ListTransactionsPaginatedResponse, error) {
-	page := int(req.GetPage().GetPage())
-	if page < 1 {
-		page = 1
+	for _, cat := range req.CategoryIn {
+		switch cat {
+		case indexerv1.TransactionCategory_TRANSACTION_CATEGORY_COIN_TRANSFER:
+			f.CategoryMask |= 1
+		case indexerv1.TransactionCategory_TRANSACTION_CATEGORY_CONTRACT_CREATION:
+			f.CategoryMask |= 2
+		case indexerv1.TransactionCategory_TRANSACTION_CATEGORY_CONTRACT_CALL:
+			f.CategoryMask |= 4
+		case indexerv1.TransactionCategory_TRANSACTION_CATEGORY_TOKEN_TRANSFER:
+			f.CategoryMask |= 8
+		default:
+			return nil, invalidArgument("unsupported category")
+		}
 	}
-	pageSize := int(s.clampPageSize(req.GetPage().GetPageSize()))
-
-	rows, total, err := s.db.GetTransactionsPaginatedWithCategories(ctx, page, pageSize)
+	switch req.Status {
+	case indexerv1.TransactionStatus_TRANSACTION_STATUS_UNSPECIFIED:
+	case indexerv1.TransactionStatus_TRANSACTION_STATUS_SUCCESS:
+		v := 1
+		f.Status = &v
+	case indexerv1.TransactionStatus_TRANSACTION_STATUS_FAILED:
+		v := 0
+		f.Status = &v
+	default:
+		return nil, invalidArgument("unsupported status")
+	}
+	if tr := req.TimeRange; tr != nil {
+		if tr.Start != nil {
+			if e := tr.Start.CheckValid(); e != nil {
+				return nil, invalidArgument("invalid time_range.start")
+			}
+			v := tr.Start.Seconds
+			f.TimeFrom = &v
+			if tr.Start.Nanos != 0 {
+				v++
+				f.TimeFrom = &v
+			}
+		}
+		if tr.End != nil {
+			if e := tr.End.CheckValid(); e != nil {
+				return nil, invalidArgument("invalid time_range.end")
+			}
+			v := tr.End.Seconds
+			if tr.End.Nanos != 0 {
+				v++
+			}
+			f.TimeTo = &v
+		}
+		if tr.Start != nil && tr.End != nil && !tr.Start.AsTime().Before(tr.End.AsTime()) {
+			return nil, invalidArgument("time_range must be nonempty")
+		}
+	}
+	if f.Block != nil && *f.Block > uint64(^uint64(0)>>1) {
+		return nil, invalidArgument("block number exceeds supported integer range")
+	}
+	in, binding, err := s.v1Input("transactions", f, req.Page, nil)
 	if err != nil {
-		slog.Error("ListTransactionsPaginated", "error", err)
-		return nil, internalErr(err, "ListTransactionsPaginated")
+		return nil, err
 	}
-	return &indexerv1.ListTransactionsPaginatedResponse{
-		Transactions: mapTransactions(rows),
-		Page: &indexerv1.OffsetPageResponse{
-			Page:       int32(page),
-			PageSize:   int32(pageSize),
-			TotalItems: total,
-		},
-	}, nil
+	if archive != nil {
+		return s.v1NodeTransactions(ctx, archive, f, in, binding)
+	}
+	result, err := s.db.V1Transactions(ctx, f, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTransactions")
+	}
+	return &indexerv1.ListTransactionsResponse{Transactions: mapTransactions(result.Rows), Page: &indexerv1.PageResponse{NextCursor: v1Next(binding, result.Next)}}, nil
 }
-
-// buildTxListResponse applies the limit+1 cursor encoding pattern.
-// If len(rows) > limit, encode a cursor pointing at the last returned row
-// and trim rows to the requested page size.
-func buildTxListResponse(rows []types.Transaction, limit int32) *indexerv1.ListTransactionsResponse {
-	nextCursor := ""
-	if int32(len(rows)) > limit {
-		last := rows[limit-1]
-		enc, err := encodeCursor(txFeedCursor{
-			BlockNumber:      last.BlockNumber,
-			TransactionIndex: uint32(last.TxIndex),
-		})
-		if err == nil {
-			nextCursor = enc
-		}
-		rows = rows[:limit]
+func (s *Server) ListTransactionsPaginated(ctx context.Context, req *indexerv1.ListTransactionsPaginatedRequest) (*indexerv1.ListTransactionsPaginatedResponse, error) {
+	f := db.V1TransactionFilter{GlobalTotal: true}
+	in, binding, err := s.v1Input("transactions-paginated", f, nil, req.Page)
+	if err != nil {
+		return nil, err
 	}
-	return &indexerv1.ListTransactionsResponse{
-		Transactions: mapTransactions(rows),
-		Page:         &indexerv1.PageResponse{NextCursor: nextCursor},
+	result, err := s.db.V1Transactions(ctx, f, in)
+	if err != nil {
+		return nil, v1PagingError(err, "ListTransactionsPaginated")
 	}
+	return &indexerv1.ListTransactionsPaginatedResponse{Transactions: mapTransactions(result.Rows), Page: v1Offset(binding, result.Next, result.Page, in.Limit, result.Total)}, nil
 }
 
 func (s *Server) BatchGetAddressTransactionCounts(
