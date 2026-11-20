@@ -278,6 +278,58 @@ func (EndedAt) EnumDescriptor() ([]byte, []int) {
 	return file_chain_indexer_v2_common_proto_rawDescGZIP(), []int{4}
 }
 
+type TokenKind int32
+
+const (
+	TokenKind_TOKEN_KIND_UNSPECIFIED TokenKind = 0
+	TokenKind_TOKEN_KIND_ERC20       TokenKind = 1
+	TokenKind_TOKEN_KIND_ERC721      TokenKind = 2
+	TokenKind_TOKEN_KIND_ERC1155     TokenKind = 3
+)
+
+// Enum value maps for TokenKind.
+var (
+	TokenKind_name = map[int32]string{
+		0: "TOKEN_KIND_UNSPECIFIED",
+		1: "TOKEN_KIND_ERC20",
+		2: "TOKEN_KIND_ERC721",
+		3: "TOKEN_KIND_ERC1155",
+	}
+	TokenKind_value = map[string]int32{
+		"TOKEN_KIND_UNSPECIFIED": 0,
+		"TOKEN_KIND_ERC20":       1,
+		"TOKEN_KIND_ERC721":      2,
+		"TOKEN_KIND_ERC1155":     3,
+	}
+)
+
+func (x TokenKind) Enum() *TokenKind {
+	p := new(TokenKind)
+	*p = x
+	return p
+}
+
+func (x TokenKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TokenKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_chain_indexer_v2_common_proto_enumTypes[5].Descriptor()
+}
+
+func (TokenKind) Type() protoreflect.EnumType {
+	return &file_chain_indexer_v2_common_proto_enumTypes[5]
+}
+
+func (x TokenKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TokenKind.Descriptor instead.
+func (TokenKind) EnumDescriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_common_proto_rawDescGZIP(), []int{5}
+}
+
 // Hashes are exactly 32 bytes; addresses are exactly 20 bytes. Empty optional
 // scalar values preserve database NULL. Decimal quantities are lossless strings.
 type ReadAt struct {
@@ -1989,8 +2041,10 @@ type TransferFilter struct {
 	BlockRange      *BlockRange            `protobuf:"bytes,5,opt,name=block_range,json=blockRange,proto3" json:"block_range,omitempty"`
 	TransactionHash []byte                 `protobuf:"bytes,6,opt,name=transaction_hash,json=transactionHash,proto3,oneof" json:"transaction_hash,omitempty"`
 	BlockNumber     *uint64                `protobuf:"varint,7,opt,name=block_number,json=blockNumber,proto3,oneof" json:"block_number,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Absent matches all standards. Present UNSPECIFIED/unknown is invalid.
+	TokenKind     *TokenKind `protobuf:"varint,8,opt,name=token_kind,json=tokenKind,proto3,enum=chain_indexer.v2.TokenKind,oneof" json:"token_kind,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransferFilter) Reset() {
@@ -2070,6 +2124,13 @@ func (x *TransferFilter) GetBlockNumber() uint64 {
 		return *x.BlockNumber
 	}
 	return 0
+}
+
+func (x *TransferFilter) GetTokenKind() TokenKind {
+	if x != nil && x.TokenKind != nil {
+		return *x.TokenKind
+	}
+	return TokenKind_TOKEN_KIND_UNSPECIFIED
 }
 
 type InternalFilter struct {
@@ -2270,7 +2331,7 @@ const file_chain_indexer_v2_common_proto_rawDesc = "" +
 	"\x10transaction_hash\x18\a \x01(\fH\x00R\x0ftransactionHash\x88\x01\x01\x12&\n" +
 	"\fblock_number\x18\b \x01(\x04H\x01R\vblockNumber\x88\x01\x01B\x13\n" +
 	"\x11_transaction_hashB\x0f\n" +
-	"\r_block_number\"\x9e\x03\n" +
+	"\r_block_number\"\xee\x03\n" +
 	"\x0eTransferFilter\x129\n" +
 	"\tany_party\x18\x01 \x01(\v2\x1c.chain_indexer.v2.AddressSetR\banyParty\x120\n" +
 	"\x04from\x18\x02 \x01(\v2\x1c.chain_indexer.v2.AddressSetR\x04from\x12,\n" +
@@ -2279,9 +2340,12 @@ const file_chain_indexer_v2_common_proto_rawDesc = "" +
 	"\vblock_range\x18\x05 \x01(\v2\x1c.chain_indexer.v2.BlockRangeR\n" +
 	"blockRange\x12.\n" +
 	"\x10transaction_hash\x18\x06 \x01(\fH\x00R\x0ftransactionHash\x88\x01\x01\x12&\n" +
-	"\fblock_number\x18\a \x01(\x04H\x01R\vblockNumber\x88\x01\x01B\x13\n" +
+	"\fblock_number\x18\a \x01(\x04H\x01R\vblockNumber\x88\x01\x01\x12?\n" +
+	"\n" +
+	"token_kind\x18\b \x01(\x0e2\x1b.chain_indexer.v2.TokenKindH\x02R\ttokenKind\x88\x01\x01B\x13\n" +
 	"\x11_transaction_hashB\x0f\n" +
-	"\r_block_number\"\x88\x02\n" +
+	"\r_block_numberB\r\n" +
+	"\v_token_kind\"\x88\x02\n" +
 	"\x0eInternalFilter\x129\n" +
 	"\tany_party\x18\x01 \x01(\v2\x1c.chain_indexer.v2.AddressSetR\banyParty\x12=\n" +
 	"\vblock_range\x18\x02 \x01(\v2\x1c.chain_indexer.v2.BlockRangeR\n" +
@@ -2314,7 +2378,12 @@ const file_chain_indexer_v2_common_proto_rawDesc = "" +
 	"\x14ENDED_AT_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15ENDED_AT_END_OF_RANGE\x10\x01\x12\x1c\n" +
 	"\x18ENDED_AT_RETENTION_FLOOR\x10\x02\x12\x18\n" +
-	"\x14ENDED_AT_INDEX_FLOOR\x10\x03BGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2b\x06proto3"
+	"\x14ENDED_AT_INDEX_FLOOR\x10\x03*l\n" +
+	"\tTokenKind\x12\x1a\n" +
+	"\x16TOKEN_KIND_UNSPECIFIED\x10\x00\x12\x14\n" +
+	"\x10TOKEN_KIND_ERC20\x10\x01\x12\x15\n" +
+	"\x11TOKEN_KIND_ERC721\x10\x02\x12\x16\n" +
+	"\x12TOKEN_KIND_ERC1155\x10\x03BGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2b\x06proto3"
 
 var (
 	file_chain_indexer_v2_common_proto_rawDescOnce sync.Once
@@ -2328,7 +2397,7 @@ func file_chain_indexer_v2_common_proto_rawDescGZIP() []byte {
 	return file_chain_indexer_v2_common_proto_rawDescData
 }
 
-var file_chain_indexer_v2_common_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_chain_indexer_v2_common_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
 var file_chain_indexer_v2_common_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
 var file_chain_indexer_v2_common_proto_goTypes = []any{
 	(Order)(0),                    // 0: chain_indexer.v2.Order
@@ -2336,86 +2405,88 @@ var file_chain_indexer_v2_common_proto_goTypes = []any{
 	(Source)(0),                   // 2: chain_indexer.v2.Source
 	(SearchKind)(0),               // 3: chain_indexer.v2.SearchKind
 	(EndedAt)(0),                  // 4: chain_indexer.v2.EndedAt
-	(*ReadAt)(nil),                // 5: chain_indexer.v2.ReadAt
-	(*AddressSet)(nil),            // 6: chain_indexer.v2.AddressSet
-	(*HashSet)(nil),               // 7: chain_indexer.v2.HashSet
-	(*TransactionTypeSet)(nil),    // 8: chain_indexer.v2.TransactionTypeSet
-	(*BlockRange)(nil),            // 9: chain_indexer.v2.BlockRange
-	(*TimeRange)(nil),             // 10: chain_indexer.v2.TimeRange
-	(*ReadContext)(nil),           // 11: chain_indexer.v2.ReadContext
-	(*BlockKey)(nil),              // 12: chain_indexer.v2.BlockKey
-	(*TransactionKey)(nil),        // 13: chain_indexer.v2.TransactionKey
-	(*LogKey)(nil),                // 14: chain_indexer.v2.LogKey
-	(*TransferKey)(nil),           // 15: chain_indexer.v2.TransferKey
-	(*InternalKey)(nil),           // 16: chain_indexer.v2.InternalKey
-	(*CreationKey)(nil),           // 17: chain_indexer.v2.CreationKey
-	(*AddressKey)(nil),            // 18: chain_indexer.v2.AddressKey
-	(*BalanceKey)(nil),            // 19: chain_indexer.v2.BalanceKey
-	(*HolderKey)(nil),             // 20: chain_indexer.v2.HolderKey
-	(*SearchKindSet)(nil),         // 21: chain_indexer.v2.SearchKindSet
-	(*SearchKey)(nil),             // 22: chain_indexer.v2.SearchKey
-	(*Key)(nil),                   // 23: chain_indexer.v2.Key
-	(*PageRequest)(nil),           // 24: chain_indexer.v2.PageRequest
-	(*PageInfo)(nil),              // 25: chain_indexer.v2.PageInfo
-	(*TransactionPosition)(nil),   // 26: chain_indexer.v2.TransactionPosition
-	(*DestinationInterval)(nil),   // 27: chain_indexer.v2.DestinationInterval
-	(*ExactCreation)(nil),         // 28: chain_indexer.v2.ExactCreation
-	(*DestinationPredicates)(nil), // 29: chain_indexer.v2.DestinationPredicates
-	(*TransactionFilter)(nil),     // 30: chain_indexer.v2.TransactionFilter
-	(*LogFilter)(nil),             // 31: chain_indexer.v2.LogFilter
-	(*TransferFilter)(nil),        // 32: chain_indexer.v2.TransferFilter
-	(*InternalFilter)(nil),        // 33: chain_indexer.v2.InternalFilter
+	(TokenKind)(0),                // 5: chain_indexer.v2.TokenKind
+	(*ReadAt)(nil),                // 6: chain_indexer.v2.ReadAt
+	(*AddressSet)(nil),            // 7: chain_indexer.v2.AddressSet
+	(*HashSet)(nil),               // 8: chain_indexer.v2.HashSet
+	(*TransactionTypeSet)(nil),    // 9: chain_indexer.v2.TransactionTypeSet
+	(*BlockRange)(nil),            // 10: chain_indexer.v2.BlockRange
+	(*TimeRange)(nil),             // 11: chain_indexer.v2.TimeRange
+	(*ReadContext)(nil),           // 12: chain_indexer.v2.ReadContext
+	(*BlockKey)(nil),              // 13: chain_indexer.v2.BlockKey
+	(*TransactionKey)(nil),        // 14: chain_indexer.v2.TransactionKey
+	(*LogKey)(nil),                // 15: chain_indexer.v2.LogKey
+	(*TransferKey)(nil),           // 16: chain_indexer.v2.TransferKey
+	(*InternalKey)(nil),           // 17: chain_indexer.v2.InternalKey
+	(*CreationKey)(nil),           // 18: chain_indexer.v2.CreationKey
+	(*AddressKey)(nil),            // 19: chain_indexer.v2.AddressKey
+	(*BalanceKey)(nil),            // 20: chain_indexer.v2.BalanceKey
+	(*HolderKey)(nil),             // 21: chain_indexer.v2.HolderKey
+	(*SearchKindSet)(nil),         // 22: chain_indexer.v2.SearchKindSet
+	(*SearchKey)(nil),             // 23: chain_indexer.v2.SearchKey
+	(*Key)(nil),                   // 24: chain_indexer.v2.Key
+	(*PageRequest)(nil),           // 25: chain_indexer.v2.PageRequest
+	(*PageInfo)(nil),              // 26: chain_indexer.v2.PageInfo
+	(*TransactionPosition)(nil),   // 27: chain_indexer.v2.TransactionPosition
+	(*DestinationInterval)(nil),   // 28: chain_indexer.v2.DestinationInterval
+	(*ExactCreation)(nil),         // 29: chain_indexer.v2.ExactCreation
+	(*DestinationPredicates)(nil), // 30: chain_indexer.v2.DestinationPredicates
+	(*TransactionFilter)(nil),     // 31: chain_indexer.v2.TransactionFilter
+	(*LogFilter)(nil),             // 32: chain_indexer.v2.LogFilter
+	(*TransferFilter)(nil),        // 33: chain_indexer.v2.TransferFilter
+	(*InternalFilter)(nil),        // 34: chain_indexer.v2.InternalFilter
 }
 var file_chain_indexer_v2_common_proto_depIdxs = []int32{
-	5,  // 0: chain_indexer.v2.ReadContext.read_at:type_name -> chain_indexer.v2.ReadAt
+	6,  // 0: chain_indexer.v2.ReadContext.read_at:type_name -> chain_indexer.v2.ReadAt
 	3,  // 1: chain_indexer.v2.SearchKindSet.kinds:type_name -> chain_indexer.v2.SearchKind
 	3,  // 2: chain_indexer.v2.SearchKey.kind:type_name -> chain_indexer.v2.SearchKind
-	12, // 3: chain_indexer.v2.Key.block:type_name -> chain_indexer.v2.BlockKey
-	13, // 4: chain_indexer.v2.Key.transaction:type_name -> chain_indexer.v2.TransactionKey
-	14, // 5: chain_indexer.v2.Key.log:type_name -> chain_indexer.v2.LogKey
-	15, // 6: chain_indexer.v2.Key.transfer:type_name -> chain_indexer.v2.TransferKey
-	16, // 7: chain_indexer.v2.Key.internal:type_name -> chain_indexer.v2.InternalKey
-	17, // 8: chain_indexer.v2.Key.creation:type_name -> chain_indexer.v2.CreationKey
-	18, // 9: chain_indexer.v2.Key.address:type_name -> chain_indexer.v2.AddressKey
-	19, // 10: chain_indexer.v2.Key.balance:type_name -> chain_indexer.v2.BalanceKey
-	20, // 11: chain_indexer.v2.Key.holder:type_name -> chain_indexer.v2.HolderKey
-	22, // 12: chain_indexer.v2.Key.search:type_name -> chain_indexer.v2.SearchKey
-	23, // 13: chain_indexer.v2.PageRequest.start_after:type_name -> chain_indexer.v2.Key
+	13, // 3: chain_indexer.v2.Key.block:type_name -> chain_indexer.v2.BlockKey
+	14, // 4: chain_indexer.v2.Key.transaction:type_name -> chain_indexer.v2.TransactionKey
+	15, // 5: chain_indexer.v2.Key.log:type_name -> chain_indexer.v2.LogKey
+	16, // 6: chain_indexer.v2.Key.transfer:type_name -> chain_indexer.v2.TransferKey
+	17, // 7: chain_indexer.v2.Key.internal:type_name -> chain_indexer.v2.InternalKey
+	18, // 8: chain_indexer.v2.Key.creation:type_name -> chain_indexer.v2.CreationKey
+	19, // 9: chain_indexer.v2.Key.address:type_name -> chain_indexer.v2.AddressKey
+	20, // 10: chain_indexer.v2.Key.balance:type_name -> chain_indexer.v2.BalanceKey
+	21, // 11: chain_indexer.v2.Key.holder:type_name -> chain_indexer.v2.HolderKey
+	23, // 12: chain_indexer.v2.Key.search:type_name -> chain_indexer.v2.SearchKey
+	24, // 13: chain_indexer.v2.PageRequest.start_after:type_name -> chain_indexer.v2.Key
 	0,  // 14: chain_indexer.v2.PageRequest.order:type_name -> chain_indexer.v2.Order
-	5,  // 15: chain_indexer.v2.PageInfo.read_at:type_name -> chain_indexer.v2.ReadAt
-	23, // 16: chain_indexer.v2.PageInfo.next_start_after:type_name -> chain_indexer.v2.Key
+	6,  // 15: chain_indexer.v2.PageInfo.read_at:type_name -> chain_indexer.v2.ReadAt
+	24, // 16: chain_indexer.v2.PageInfo.next_start_after:type_name -> chain_indexer.v2.Key
 	4,  // 17: chain_indexer.v2.PageInfo.ended_at:type_name -> chain_indexer.v2.EndedAt
 	1,  // 18: chain_indexer.v2.PageInfo.consistency:type_name -> chain_indexer.v2.Consistency
-	26, // 19: chain_indexer.v2.DestinationInterval.from:type_name -> chain_indexer.v2.TransactionPosition
-	26, // 20: chain_indexer.v2.DestinationInterval.to:type_name -> chain_indexer.v2.TransactionPosition
-	13, // 21: chain_indexer.v2.ExactCreation.transaction:type_name -> chain_indexer.v2.TransactionKey
-	27, // 22: chain_indexer.v2.DestinationPredicates.intervals:type_name -> chain_indexer.v2.DestinationInterval
-	28, // 23: chain_indexer.v2.DestinationPredicates.creations:type_name -> chain_indexer.v2.ExactCreation
-	6,  // 24: chain_indexer.v2.TransactionFilter.any_party:type_name -> chain_indexer.v2.AddressSet
-	6,  // 25: chain_indexer.v2.TransactionFilter.from:type_name -> chain_indexer.v2.AddressSet
-	6,  // 26: chain_indexer.v2.TransactionFilter.to:type_name -> chain_indexer.v2.AddressSet
-	9,  // 27: chain_indexer.v2.TransactionFilter.block_range:type_name -> chain_indexer.v2.BlockRange
-	10, // 28: chain_indexer.v2.TransactionFilter.time_range:type_name -> chain_indexer.v2.TimeRange
-	8,  // 29: chain_indexer.v2.TransactionFilter.transaction_types:type_name -> chain_indexer.v2.TransactionTypeSet
-	29, // 30: chain_indexer.v2.TransactionFilter.destinations:type_name -> chain_indexer.v2.DestinationPredicates
-	6,  // 31: chain_indexer.v2.LogFilter.addresses:type_name -> chain_indexer.v2.AddressSet
-	7,  // 32: chain_indexer.v2.LogFilter.topic0:type_name -> chain_indexer.v2.HashSet
-	7,  // 33: chain_indexer.v2.LogFilter.topic1:type_name -> chain_indexer.v2.HashSet
-	7,  // 34: chain_indexer.v2.LogFilter.topic2:type_name -> chain_indexer.v2.HashSet
-	7,  // 35: chain_indexer.v2.LogFilter.topic3:type_name -> chain_indexer.v2.HashSet
-	9,  // 36: chain_indexer.v2.LogFilter.block_range:type_name -> chain_indexer.v2.BlockRange
-	6,  // 37: chain_indexer.v2.TransferFilter.any_party:type_name -> chain_indexer.v2.AddressSet
-	6,  // 38: chain_indexer.v2.TransferFilter.from:type_name -> chain_indexer.v2.AddressSet
-	6,  // 39: chain_indexer.v2.TransferFilter.to:type_name -> chain_indexer.v2.AddressSet
-	6,  // 40: chain_indexer.v2.TransferFilter.tokens:type_name -> chain_indexer.v2.AddressSet
-	9,  // 41: chain_indexer.v2.TransferFilter.block_range:type_name -> chain_indexer.v2.BlockRange
-	6,  // 42: chain_indexer.v2.InternalFilter.any_party:type_name -> chain_indexer.v2.AddressSet
-	9,  // 43: chain_indexer.v2.InternalFilter.block_range:type_name -> chain_indexer.v2.BlockRange
-	44, // [44:44] is the sub-list for method output_type
-	44, // [44:44] is the sub-list for method input_type
-	44, // [44:44] is the sub-list for extension type_name
-	44, // [44:44] is the sub-list for extension extendee
-	0,  // [0:44] is the sub-list for field type_name
+	27, // 19: chain_indexer.v2.DestinationInterval.from:type_name -> chain_indexer.v2.TransactionPosition
+	27, // 20: chain_indexer.v2.DestinationInterval.to:type_name -> chain_indexer.v2.TransactionPosition
+	14, // 21: chain_indexer.v2.ExactCreation.transaction:type_name -> chain_indexer.v2.TransactionKey
+	28, // 22: chain_indexer.v2.DestinationPredicates.intervals:type_name -> chain_indexer.v2.DestinationInterval
+	29, // 23: chain_indexer.v2.DestinationPredicates.creations:type_name -> chain_indexer.v2.ExactCreation
+	7,  // 24: chain_indexer.v2.TransactionFilter.any_party:type_name -> chain_indexer.v2.AddressSet
+	7,  // 25: chain_indexer.v2.TransactionFilter.from:type_name -> chain_indexer.v2.AddressSet
+	7,  // 26: chain_indexer.v2.TransactionFilter.to:type_name -> chain_indexer.v2.AddressSet
+	10, // 27: chain_indexer.v2.TransactionFilter.block_range:type_name -> chain_indexer.v2.BlockRange
+	11, // 28: chain_indexer.v2.TransactionFilter.time_range:type_name -> chain_indexer.v2.TimeRange
+	9,  // 29: chain_indexer.v2.TransactionFilter.transaction_types:type_name -> chain_indexer.v2.TransactionTypeSet
+	30, // 30: chain_indexer.v2.TransactionFilter.destinations:type_name -> chain_indexer.v2.DestinationPredicates
+	7,  // 31: chain_indexer.v2.LogFilter.addresses:type_name -> chain_indexer.v2.AddressSet
+	8,  // 32: chain_indexer.v2.LogFilter.topic0:type_name -> chain_indexer.v2.HashSet
+	8,  // 33: chain_indexer.v2.LogFilter.topic1:type_name -> chain_indexer.v2.HashSet
+	8,  // 34: chain_indexer.v2.LogFilter.topic2:type_name -> chain_indexer.v2.HashSet
+	8,  // 35: chain_indexer.v2.LogFilter.topic3:type_name -> chain_indexer.v2.HashSet
+	10, // 36: chain_indexer.v2.LogFilter.block_range:type_name -> chain_indexer.v2.BlockRange
+	7,  // 37: chain_indexer.v2.TransferFilter.any_party:type_name -> chain_indexer.v2.AddressSet
+	7,  // 38: chain_indexer.v2.TransferFilter.from:type_name -> chain_indexer.v2.AddressSet
+	7,  // 39: chain_indexer.v2.TransferFilter.to:type_name -> chain_indexer.v2.AddressSet
+	7,  // 40: chain_indexer.v2.TransferFilter.tokens:type_name -> chain_indexer.v2.AddressSet
+	10, // 41: chain_indexer.v2.TransferFilter.block_range:type_name -> chain_indexer.v2.BlockRange
+	5,  // 42: chain_indexer.v2.TransferFilter.token_kind:type_name -> chain_indexer.v2.TokenKind
+	7,  // 43: chain_indexer.v2.InternalFilter.any_party:type_name -> chain_indexer.v2.AddressSet
+	10, // 44: chain_indexer.v2.InternalFilter.block_range:type_name -> chain_indexer.v2.BlockRange
+	45, // [45:45] is the sub-list for method output_type
+	45, // [45:45] is the sub-list for method input_type
+	45, // [45:45] is the sub-list for extension type_name
+	45, // [45:45] is the sub-list for extension extendee
+	0,  // [0:45] is the sub-list for field type_name
 }
 
 func init() { file_chain_indexer_v2_common_proto_init() }
@@ -2447,7 +2518,7 @@ func file_chain_indexer_v2_common_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_chain_indexer_v2_common_proto_rawDesc), len(file_chain_indexer_v2_common_proto_rawDesc)),
-			NumEnums:      5,
+			NumEnums:      6,
 			NumMessages:   29,
 			NumExtensions: 0,
 			NumServices:   0,

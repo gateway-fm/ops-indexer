@@ -61,9 +61,6 @@ func (s *Service) CountTokenTransfers(ctx context.Context, r *pb.CountTokenTrans
 		return nil, e
 	}
 	q := query{family: "transfers", blocks: r.GetFilter().GetBlockRange(), match: func(m proto.Message) bool { return matchesTransfer(r.Filter, m.(*pb.TokenTransfer)) }}
-	if h := r.GetFilter().GetTransactionHash(); h != nil {
-		q.where = "r.tx_hash=@1@"
-		q.args = []any{hexString(h)}
-	}
+	q.where, q.args = transferSourceWhere(r.Filter)
 	return s.count(ctx, r, r.Read, q)
 }

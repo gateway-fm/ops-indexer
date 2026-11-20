@@ -118,10 +118,7 @@ func (s *Service) ListTokenTransfers(ctx context.Context, r *pb.ListTokenTransfe
 	defer v.close()
 	q := query{family: "transfers", page: r.Page, blocks: r.GetFilter().GetBlockRange(), times: nil, consistency: pb.Consistency_CONSISTENCY_SNAPSHOT}
 	q.match = func(m proto.Message) bool { return matchesTransfer(r.Filter, m.(*pb.TokenTransfer)) }
-	if h := r.GetFilter().GetTransactionHash(); h != nil {
-		q.where = "r.tx_hash=@1@"
-		q.args = []any{hexString(h)}
-	}
+	q.where, q.args = transferSourceWhere(r.Filter)
 	rows, p, e := v.scan(q, false)
 	if e != nil {
 		return nil, e

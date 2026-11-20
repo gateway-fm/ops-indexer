@@ -2,6 +2,7 @@ package indexerv2
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"strings"
 
@@ -189,13 +190,43 @@ func validateTransfer(f *pb.TransferFilter) error {
 	if f.TransactionHash != nil && len(f.TransactionHash) != 32 || f.BlockNumber != nil && *f.BlockNumber > math.MaxInt64 {
 		return invalid("INVALID_FILTER")
 	}
+	if f.TokenKind != nil && transferTokenKind(*f.TokenKind) == "" {
+		return invalid("INVALID_FILTER")
+	}
 	return validateRange(f.BlockRange, nil)
+}
+func transferTokenKind(kind pb.TokenKind) string {
+	switch kind {
+	case pb.TokenKind_TOKEN_KIND_ERC20:
+		return "ERC20"
+	case pb.TokenKind_TOKEN_KIND_ERC721:
+		return "ERC721"
+	case pb.TokenKind_TOKEN_KIND_ERC1155:
+		return "ERC1155"
+	default:
+		return ""
+	}
+}
+
+// List and Count narrow the same source population before seek/scan budgets.
+// The matching guard also checks the typed field on every returned fact.
+func transferSourceWhere(f *pb.TransferFilter) (string, []any) {
+	conditions, args := []string{}, []any{}
+	if f.GetTransactionHash() != nil {
+		args = append(args, hexString(f.GetTransactionHash()))
+		conditions = append(conditions, fmt.Sprintf("r.tx_hash=@%d@", len(args)))
+	}
+	if f != nil && f.TokenKind != nil {
+		args = append(args, transferTokenKind(*f.TokenKind))
+		conditions = append(conditions, fmt.Sprintf("r.token_type=@%d@", len(args)))
+	}
+	return strings.Join(conditions, " AND "), args
 }
 func matchesTransfer(f *pb.TransferFilter, r *pb.TokenTransfer) bool {
 	if f == nil {
 		return true
 	}
-	return addressMatch(f.AnyParty, r.From, r.To) && addressMatch(f.From, r.From) && addressMatch(f.To, r.To) && addressMatch(f.Tokens, r.TokenAddress) && (f.TransactionHash == nil || bytes.Equal(f.TransactionHash, r.TransactionHash)) && (f.BlockNumber == nil || *f.BlockNumber == r.Key.BlockNumber)
+	return addressMatch(f.AnyParty, r.From, r.To) && addressMatch(f.From, r.From) && addressMatch(f.To, r.To) && addressMatch(f.Tokens, r.TokenAddress) && (f.TransactionHash == nil || bytes.Equal(f.TransactionHash, r.TransactionHash)) && (f.BlockNumber == nil || *f.BlockNumber == r.Key.BlockNumber) && (f.TokenKind == nil || transferTokenKind(*f.TokenKind) == r.TokenType)
 }
 func validateInternal(f *pb.InternalFilter) error {
 	if f == nil {

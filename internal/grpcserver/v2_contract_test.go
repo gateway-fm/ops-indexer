@@ -416,6 +416,65 @@ INSERT INTO token_balances_current(token_address,address,block_number,balance) V
 			t.Fatalf("typed log/filter/null: %v", p)
 		}
 	})
+	t.Run("transfer_token_kind_source_pages_and_count", func(t *testing.T) {
+		ctx := reset(t)
+		_, e := h.pool.Exec(ctx, `INSERT INTO token_transfers(tx_hash,log_index,token_address,from_address,to_address,value,block_number,token_type,token_id)
+ SELECT '0x'||lpad('1005',64,'0'),n,'0xddd0000000000000000000000000000000000004','0xaaa0000000000000000000000000000000000001','0xbbb0000000000000000000000000000000000002',1,5,CASE WHEN n%3=0 THEN 'ERC20' WHEN n%3=1 THEN 'ERC721' ELSE 'ERC1155' END,CASE WHEN n%3=0 THEN NULL ELSE n END FROM generate_series(0,11)n`)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, kind := range []indexerv2.TokenKind{indexerv2.TokenKind_TOKEN_KIND_ERC20, indexerv2.TokenKind_TOKEN_KIND_ERC721, indexerv2.TokenKind_TOKEN_KIND_ERC1155} {
+			filter := &indexerv2.TransferFilter{TokenKind: kind.Enum(), TransactionHash: v2Hash(0x1005)}
+			want := map[indexerv2.TokenKind]string{indexerv2.TokenKind_TOKEN_KIND_ERC20: "ERC20", indexerv2.TokenKind_TOKEN_KIND_ERC721: "ERC721", indexerv2.TokenKind_TOKEN_KIND_ERC1155: "ERC1155"}[kind]
+			for _, size := range []int32{1, 3, 100} {
+				req := &indexerv2.ListTokenTransfersRequest{Filter: filter, Page: &indexerv2.PageRequest{PageSize: size}}
+				seen := map[uint32]bool{}
+				for n := 0; n < 10; n++ {
+					p, err := client.ListTokenTransfers(ctx, req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, row := range p.Transfers {
+						if row.TokenType != want || seen[row.Key.LogIndex] {
+							t.Fatalf("wrong type/repeated row: %v", row)
+						}
+						seen[row.Key.LogIndex] = true
+					}
+					if p.Page.NextStartAfter == nil {
+						break
+					}
+					req.Read = v2Resume(p.Page)
+					req.Page.StartAfter = p.Page.NextStartAfter
+				}
+				if len(seen) != 4 {
+					t.Fatalf("%s page%d missing matches beyond first page: %v", want, size, seen)
+				}
+			}
+			count, err := client.CountTokenTransfers(ctx, &indexerv2.CountTokenTransfersRequest{Filter: filter})
+			if err != nil || count.Count != 4 {
+				t.Fatalf("typed count: %v %v", count, err)
+			}
+			filter.TransactionHash = v2Hash(0x1004)
+			count, err = client.CountTokenTransfers(ctx, &indexerv2.CountTokenTransfersRequest{Filter: filter})
+			if err != nil || count.Count != 0 {
+				t.Fatalf("kind must AND transaction hash: %v %v", count, err)
+			}
+		}
+		all, e := client.CountTokenTransfers(ctx, &indexerv2.CountTokenTransfersRequest{})
+		if e != nil || all.Count != 12 {
+			t.Fatalf("unfiltered compatibility: %v %v", all, e)
+		}
+		for _, kind := range []indexerv2.TokenKind{indexerv2.TokenKind_TOKEN_KIND_UNSPECIFIED, 99, -1} {
+			_, e = client.ListTokenTransfers(ctx, &indexerv2.ListTokenTransfersRequest{Filter: &indexerv2.TransferFilter{TokenKind: kind.Enum()}})
+			if status.Code(e) != codes.InvalidArgument {
+				t.Fatalf("invalid present kind accepted by list: %v", e)
+			}
+			_, e = client.CountTokenTransfers(ctx, &indexerv2.CountTokenTransfersRequest{Filter: &indexerv2.TransferFilter{TokenKind: kind.Enum()}})
+			if status.Code(e) != codes.InvalidArgument {
+				t.Fatalf("invalid present kind accepted by count: %v", e)
+			}
+		}
+	})
 	t.Run("transfers_typed_filters_lossless_value", func(t *testing.T) {
 		ctx := reset(t)
 		seedFacts(t, ctx)

@@ -101,10 +101,19 @@ message TransferFilter {
   BlockRange block_range = 5;
   optional bytes transaction_hash = 6;
   optional uint64 block_number = 7;
+  // Absent matches all standards. Present UNSPECIFIED/unknown is invalid.
+  optional TokenKind token_kind = 8;
 }
 message InternalFilter {
   AddressSet any_party = 1;
   BlockRange block_range = 2;
   optional bytes transaction_hash = 3;
   optional uint64 block_number = 4;
+}
+
+enum TokenKind {
+  TOKEN_KIND_UNSPECIFIED = 0;
+  TOKEN_KIND_ERC20 = 1;
+  TOKEN_KIND_ERC721 = 2;
+  TOKEN_KIND_ERC1155 = 3;
 }
