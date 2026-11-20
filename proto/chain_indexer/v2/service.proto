@@ -3,6 +3,7 @@ package chain_indexer.v2;
 option go_package = "github.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2";
 import "chain_indexer/v2/common.proto";
 import "chain_indexer/v2/facts.proto";
+import "google/protobuf/timestamp.proto";
 
 // Consumer agnostic, network isolated. No viewer credentials or policy inputs.
 service IndexerService {
@@ -25,8 +26,20 @@ service IndexerService {
   rpc CountTransactions(CountTransactionsRequest) returns (CountResponse);
   rpc CountLogs(CountLogsRequest) returns (CountResponse);
   rpc CountTokenTransfers(CountTokenTransfersRequest) returns (CountResponse);
+  rpc BatchCountCurrent(BatchCountCurrentRequest) returns (BatchCountCurrentResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
 }
+// A finite source observation, never a consumer authorization decision. Every
+// selector requires a present, sorted, unique address set (empty matches none).
+message CurrentAddresses { AddressSet addresses = 1; }
+message CurrentTokens { AddressSet addresses = 1; string token_type = 2; string search = 3; BlockRange block_range = 4; }
+message CurrentHolders { bytes token_address = 1; AddressSet addresses = 2; }
+message CurrentCountSelector {
+  oneof value { CurrentAddresses addresses = 1; CurrentTokens tokens = 2; CurrentHolders holders = 3; }
+}
+message BatchCountCurrentRequest { ReadContext read = 1; repeated CurrentCountSelector selectors = 2; }
+message CurrentCountResult { bytes selector_digest = 1; uint64 count = 2; }
+message BatchCountCurrentResponse { PageInfo page = 1; repeated CurrentCountResult counts = 2; google.protobuf.Timestamp observed_at = 3; }
 message GetChainViewRequest { ReadContext read = 1; }
 message GetChainViewResponse {
   PageInfo page = 1;

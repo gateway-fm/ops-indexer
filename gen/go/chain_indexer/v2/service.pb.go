@@ -9,6 +9,7 @@ package indexerv2
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -21,6 +22,434 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// A finite source observation, never a consumer authorization decision. Every
+// selector requires a present, sorted, unique address set (empty matches none).
+type CurrentAddresses struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Addresses     *AddressSet            `protobuf:"bytes,1,opt,name=addresses,proto3" json:"addresses,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CurrentAddresses) Reset() {
+	*x = CurrentAddresses{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CurrentAddresses) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CurrentAddresses) ProtoMessage() {}
+
+func (x *CurrentAddresses) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CurrentAddresses.ProtoReflect.Descriptor instead.
+func (*CurrentAddresses) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *CurrentAddresses) GetAddresses() *AddressSet {
+	if x != nil {
+		return x.Addresses
+	}
+	return nil
+}
+
+type CurrentTokens struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Addresses     *AddressSet            `protobuf:"bytes,1,opt,name=addresses,proto3" json:"addresses,omitempty"`
+	TokenType     string                 `protobuf:"bytes,2,opt,name=token_type,json=tokenType,proto3" json:"token_type,omitempty"`
+	Search        string                 `protobuf:"bytes,3,opt,name=search,proto3" json:"search,omitempty"`
+	BlockRange    *BlockRange            `protobuf:"bytes,4,opt,name=block_range,json=blockRange,proto3" json:"block_range,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CurrentTokens) Reset() {
+	*x = CurrentTokens{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CurrentTokens) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CurrentTokens) ProtoMessage() {}
+
+func (x *CurrentTokens) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CurrentTokens.ProtoReflect.Descriptor instead.
+func (*CurrentTokens) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *CurrentTokens) GetAddresses() *AddressSet {
+	if x != nil {
+		return x.Addresses
+	}
+	return nil
+}
+
+func (x *CurrentTokens) GetTokenType() string {
+	if x != nil {
+		return x.TokenType
+	}
+	return ""
+}
+
+func (x *CurrentTokens) GetSearch() string {
+	if x != nil {
+		return x.Search
+	}
+	return ""
+}
+
+func (x *CurrentTokens) GetBlockRange() *BlockRange {
+	if x != nil {
+		return x.BlockRange
+	}
+	return nil
+}
+
+type CurrentHolders struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TokenAddress  []byte                 `protobuf:"bytes,1,opt,name=token_address,json=tokenAddress,proto3" json:"token_address,omitempty"`
+	Addresses     *AddressSet            `protobuf:"bytes,2,opt,name=addresses,proto3" json:"addresses,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CurrentHolders) Reset() {
+	*x = CurrentHolders{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CurrentHolders) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CurrentHolders) ProtoMessage() {}
+
+func (x *CurrentHolders) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CurrentHolders.ProtoReflect.Descriptor instead.
+func (*CurrentHolders) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *CurrentHolders) GetTokenAddress() []byte {
+	if x != nil {
+		return x.TokenAddress
+	}
+	return nil
+}
+
+func (x *CurrentHolders) GetAddresses() *AddressSet {
+	if x != nil {
+		return x.Addresses
+	}
+	return nil
+}
+
+type CurrentCountSelector struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Value:
+	//
+	//	*CurrentCountSelector_Addresses
+	//	*CurrentCountSelector_Tokens
+	//	*CurrentCountSelector_Holders
+	Value         isCurrentCountSelector_Value `protobuf_oneof:"value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CurrentCountSelector) Reset() {
+	*x = CurrentCountSelector{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CurrentCountSelector) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CurrentCountSelector) ProtoMessage() {}
+
+func (x *CurrentCountSelector) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CurrentCountSelector.ProtoReflect.Descriptor instead.
+func (*CurrentCountSelector) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *CurrentCountSelector) GetValue() isCurrentCountSelector_Value {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *CurrentCountSelector) GetAddresses() *CurrentAddresses {
+	if x != nil {
+		if x, ok := x.Value.(*CurrentCountSelector_Addresses); ok {
+			return x.Addresses
+		}
+	}
+	return nil
+}
+
+func (x *CurrentCountSelector) GetTokens() *CurrentTokens {
+	if x != nil {
+		if x, ok := x.Value.(*CurrentCountSelector_Tokens); ok {
+			return x.Tokens
+		}
+	}
+	return nil
+}
+
+func (x *CurrentCountSelector) GetHolders() *CurrentHolders {
+	if x != nil {
+		if x, ok := x.Value.(*CurrentCountSelector_Holders); ok {
+			return x.Holders
+		}
+	}
+	return nil
+}
+
+type isCurrentCountSelector_Value interface {
+	isCurrentCountSelector_Value()
+}
+
+type CurrentCountSelector_Addresses struct {
+	Addresses *CurrentAddresses `protobuf:"bytes,1,opt,name=addresses,proto3,oneof"`
+}
+
+type CurrentCountSelector_Tokens struct {
+	Tokens *CurrentTokens `protobuf:"bytes,2,opt,name=tokens,proto3,oneof"`
+}
+
+type CurrentCountSelector_Holders struct {
+	Holders *CurrentHolders `protobuf:"bytes,3,opt,name=holders,proto3,oneof"`
+}
+
+func (*CurrentCountSelector_Addresses) isCurrentCountSelector_Value() {}
+
+func (*CurrentCountSelector_Tokens) isCurrentCountSelector_Value() {}
+
+func (*CurrentCountSelector_Holders) isCurrentCountSelector_Value() {}
+
+type BatchCountCurrentRequest struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Read          *ReadContext            `protobuf:"bytes,1,opt,name=read,proto3" json:"read,omitempty"`
+	Selectors     []*CurrentCountSelector `protobuf:"bytes,2,rep,name=selectors,proto3" json:"selectors,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchCountCurrentRequest) Reset() {
+	*x = BatchCountCurrentRequest{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchCountCurrentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchCountCurrentRequest) ProtoMessage() {}
+
+func (x *BatchCountCurrentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchCountCurrentRequest.ProtoReflect.Descriptor instead.
+func (*BatchCountCurrentRequest) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *BatchCountCurrentRequest) GetRead() *ReadContext {
+	if x != nil {
+		return x.Read
+	}
+	return nil
+}
+
+func (x *BatchCountCurrentRequest) GetSelectors() []*CurrentCountSelector {
+	if x != nil {
+		return x.Selectors
+	}
+	return nil
+}
+
+type CurrentCountResult struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	SelectorDigest []byte                 `protobuf:"bytes,1,opt,name=selector_digest,json=selectorDigest,proto3" json:"selector_digest,omitempty"`
+	Count          uint64                 `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *CurrentCountResult) Reset() {
+	*x = CurrentCountResult{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CurrentCountResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CurrentCountResult) ProtoMessage() {}
+
+func (x *CurrentCountResult) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CurrentCountResult.ProtoReflect.Descriptor instead.
+func (*CurrentCountResult) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *CurrentCountResult) GetSelectorDigest() []byte {
+	if x != nil {
+		return x.SelectorDigest
+	}
+	return nil
+}
+
+func (x *CurrentCountResult) GetCount() uint64 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+type BatchCountCurrentResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Page          *PageInfo              `protobuf:"bytes,1,opt,name=page,proto3" json:"page,omitempty"`
+	Counts        []*CurrentCountResult  `protobuf:"bytes,2,rep,name=counts,proto3" json:"counts,omitempty"`
+	ObservedAt    *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchCountCurrentResponse) Reset() {
+	*x = BatchCountCurrentResponse{}
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchCountCurrentResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchCountCurrentResponse) ProtoMessage() {}
+
+func (x *BatchCountCurrentResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchCountCurrentResponse.ProtoReflect.Descriptor instead.
+func (*BatchCountCurrentResponse) Descriptor() ([]byte, []int) {
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *BatchCountCurrentResponse) GetPage() *PageInfo {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
+func (x *BatchCountCurrentResponse) GetCounts() []*CurrentCountResult {
+	if x != nil {
+		return x.Counts
+	}
+	return nil
+}
+
+func (x *BatchCountCurrentResponse) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
 type GetChainViewRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Read          *ReadContext           `protobuf:"bytes,1,opt,name=read,proto3" json:"read,omitempty"`
@@ -30,7 +459,7 @@ type GetChainViewRequest struct {
 
 func (x *GetChainViewRequest) Reset() {
 	*x = GetChainViewRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[0]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -42,7 +471,7 @@ func (x *GetChainViewRequest) String() string {
 func (*GetChainViewRequest) ProtoMessage() {}
 
 func (x *GetChainViewRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[0]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -55,7 +484,7 @@ func (x *GetChainViewRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetChainViewRequest.ProtoReflect.Descriptor instead.
 func (*GetChainViewRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{0}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetChainViewRequest) GetRead() *ReadContext {
@@ -84,7 +513,7 @@ type GetChainViewResponse struct {
 
 func (x *GetChainViewResponse) Reset() {
 	*x = GetChainViewResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[1]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -96,7 +525,7 @@ func (x *GetChainViewResponse) String() string {
 func (*GetChainViewResponse) ProtoMessage() {}
 
 func (x *GetChainViewResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[1]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -109,7 +538,7 @@ func (x *GetChainViewResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetChainViewResponse.ProtoReflect.Descriptor instead.
 func (*GetChainViewResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{1}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetChainViewResponse) GetPage() *PageInfo {
@@ -203,7 +632,7 @@ type GetBlockRequest struct {
 
 func (x *GetBlockRequest) Reset() {
 	*x = GetBlockRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[2]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -215,7 +644,7 @@ func (x *GetBlockRequest) String() string {
 func (*GetBlockRequest) ProtoMessage() {}
 
 func (x *GetBlockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[2]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -228,7 +657,7 @@ func (x *GetBlockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetBlockRequest.ProtoReflect.Descriptor instead.
 func (*GetBlockRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{2}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GetBlockRequest) GetRead() *ReadContext {
@@ -290,7 +719,7 @@ type GetBlockResponse struct {
 
 func (x *GetBlockResponse) Reset() {
 	*x = GetBlockResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[3]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -302,7 +731,7 @@ func (x *GetBlockResponse) String() string {
 func (*GetBlockResponse) ProtoMessage() {}
 
 func (x *GetBlockResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[3]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -315,7 +744,7 @@ func (x *GetBlockResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetBlockResponse.ProtoReflect.Descriptor instead.
 func (*GetBlockResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{3}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetBlockResponse) GetPage() *PageInfo {
@@ -349,7 +778,7 @@ type GetTransactionRequest struct {
 
 func (x *GetTransactionRequest) Reset() {
 	*x = GetTransactionRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[4]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -361,7 +790,7 @@ func (x *GetTransactionRequest) String() string {
 func (*GetTransactionRequest) ProtoMessage() {}
 
 func (x *GetTransactionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[4]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -374,7 +803,7 @@ func (x *GetTransactionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTransactionRequest.ProtoReflect.Descriptor instead.
 func (*GetTransactionRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{4}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetTransactionRequest) GetRead() *ReadContext {
@@ -402,7 +831,7 @@ type GetTransactionResponse struct {
 
 func (x *GetTransactionResponse) Reset() {
 	*x = GetTransactionResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[5]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -414,7 +843,7 @@ func (x *GetTransactionResponse) String() string {
 func (*GetTransactionResponse) ProtoMessage() {}
 
 func (x *GetTransactionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[5]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -427,7 +856,7 @@ func (x *GetTransactionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTransactionResponse.ProtoReflect.Descriptor instead.
 func (*GetTransactionResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{5}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GetTransactionResponse) GetPage() *PageInfo {
@@ -462,7 +891,7 @@ type ListBlocksRequest struct {
 
 func (x *ListBlocksRequest) Reset() {
 	*x = ListBlocksRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[6]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -474,7 +903,7 @@ func (x *ListBlocksRequest) String() string {
 func (*ListBlocksRequest) ProtoMessage() {}
 
 func (x *ListBlocksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[6]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -487,7 +916,7 @@ func (x *ListBlocksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBlocksRequest.ProtoReflect.Descriptor instead.
 func (*ListBlocksRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{6}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ListBlocksRequest) GetRead() *ReadContext {
@@ -521,7 +950,7 @@ type ListBlocksResponse struct {
 
 func (x *ListBlocksResponse) Reset() {
 	*x = ListBlocksResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[7]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -533,7 +962,7 @@ func (x *ListBlocksResponse) String() string {
 func (*ListBlocksResponse) ProtoMessage() {}
 
 func (x *ListBlocksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[7]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -546,7 +975,7 @@ func (x *ListBlocksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBlocksResponse.ProtoReflect.Descriptor instead.
 func (*ListBlocksResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{7}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ListBlocksResponse) GetPage() *PageInfo {
@@ -574,7 +1003,7 @@ type ListTransactionsRequest struct {
 
 func (x *ListTransactionsRequest) Reset() {
 	*x = ListTransactionsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[8]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -586,7 +1015,7 @@ func (x *ListTransactionsRequest) String() string {
 func (*ListTransactionsRequest) ProtoMessage() {}
 
 func (x *ListTransactionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[8]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -599,7 +1028,7 @@ func (x *ListTransactionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionsRequest.ProtoReflect.Descriptor instead.
 func (*ListTransactionsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{8}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ListTransactionsRequest) GetRead() *ReadContext {
@@ -633,7 +1062,7 @@ type ListTransactionsResponse struct {
 
 func (x *ListTransactionsResponse) Reset() {
 	*x = ListTransactionsResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[9]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -645,7 +1074,7 @@ func (x *ListTransactionsResponse) String() string {
 func (*ListTransactionsResponse) ProtoMessage() {}
 
 func (x *ListTransactionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[9]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -658,7 +1087,7 @@ func (x *ListTransactionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionsResponse.ProtoReflect.Descriptor instead.
 func (*ListTransactionsResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{9}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ListTransactionsResponse) GetPage() *PageInfo {
@@ -686,7 +1115,7 @@ type ListLogsRequest struct {
 
 func (x *ListLogsRequest) Reset() {
 	*x = ListLogsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[10]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -698,7 +1127,7 @@ func (x *ListLogsRequest) String() string {
 func (*ListLogsRequest) ProtoMessage() {}
 
 func (x *ListLogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[10]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -711,7 +1140,7 @@ func (x *ListLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListLogsRequest.ProtoReflect.Descriptor instead.
 func (*ListLogsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{10}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ListLogsRequest) GetRead() *ReadContext {
@@ -745,7 +1174,7 @@ type ListLogsResponse struct {
 
 func (x *ListLogsResponse) Reset() {
 	*x = ListLogsResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[11]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -757,7 +1186,7 @@ func (x *ListLogsResponse) String() string {
 func (*ListLogsResponse) ProtoMessage() {}
 
 func (x *ListLogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[11]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -770,7 +1199,7 @@ func (x *ListLogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListLogsResponse.ProtoReflect.Descriptor instead.
 func (*ListLogsResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{11}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ListLogsResponse) GetPage() *PageInfo {
@@ -798,7 +1227,7 @@ type ListTokenTransfersRequest struct {
 
 func (x *ListTokenTransfersRequest) Reset() {
 	*x = ListTokenTransfersRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[12]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -810,7 +1239,7 @@ func (x *ListTokenTransfersRequest) String() string {
 func (*ListTokenTransfersRequest) ProtoMessage() {}
 
 func (x *ListTokenTransfersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[12]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -823,7 +1252,7 @@ func (x *ListTokenTransfersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTokenTransfersRequest.ProtoReflect.Descriptor instead.
 func (*ListTokenTransfersRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{12}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ListTokenTransfersRequest) GetRead() *ReadContext {
@@ -857,7 +1286,7 @@ type ListTokenTransfersResponse struct {
 
 func (x *ListTokenTransfersResponse) Reset() {
 	*x = ListTokenTransfersResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[13]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -869,7 +1298,7 @@ func (x *ListTokenTransfersResponse) String() string {
 func (*ListTokenTransfersResponse) ProtoMessage() {}
 
 func (x *ListTokenTransfersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[13]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -882,7 +1311,7 @@ func (x *ListTokenTransfersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTokenTransfersResponse.ProtoReflect.Descriptor instead.
 func (*ListTokenTransfersResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{13}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ListTokenTransfersResponse) GetPage() *PageInfo {
@@ -910,7 +1339,7 @@ type ListInternalTransactionsRequest struct {
 
 func (x *ListInternalTransactionsRequest) Reset() {
 	*x = ListInternalTransactionsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[14]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -922,7 +1351,7 @@ func (x *ListInternalTransactionsRequest) String() string {
 func (*ListInternalTransactionsRequest) ProtoMessage() {}
 
 func (x *ListInternalTransactionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[14]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -935,7 +1364,7 @@ func (x *ListInternalTransactionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListInternalTransactionsRequest.ProtoReflect.Descriptor instead.
 func (*ListInternalTransactionsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{14}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ListInternalTransactionsRequest) GetRead() *ReadContext {
@@ -969,7 +1398,7 @@ type ListInternalTransactionsResponse struct {
 
 func (x *ListInternalTransactionsResponse) Reset() {
 	*x = ListInternalTransactionsResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[15]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -981,7 +1410,7 @@ func (x *ListInternalTransactionsResponse) String() string {
 func (*ListInternalTransactionsResponse) ProtoMessage() {}
 
 func (x *ListInternalTransactionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[15]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -994,7 +1423,7 @@ func (x *ListInternalTransactionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListInternalTransactionsResponse.ProtoReflect.Descriptor instead.
 func (*ListInternalTransactionsResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{15}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ListInternalTransactionsResponse) GetPage() *PageInfo {
@@ -1021,7 +1450,7 @@ type BatchGetTransactionsRequest struct {
 
 func (x *BatchGetTransactionsRequest) Reset() {
 	*x = BatchGetTransactionsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[16]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1033,7 +1462,7 @@ func (x *BatchGetTransactionsRequest) String() string {
 func (*BatchGetTransactionsRequest) ProtoMessage() {}
 
 func (x *BatchGetTransactionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[16]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1046,7 +1475,7 @@ func (x *BatchGetTransactionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchGetTransactionsRequest.ProtoReflect.Descriptor instead.
 func (*BatchGetTransactionsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{16}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *BatchGetTransactionsRequest) GetRead() *ReadContext {
@@ -1077,7 +1506,7 @@ type TransactionBundle struct {
 
 func (x *TransactionBundle) Reset() {
 	*x = TransactionBundle{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[17]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1089,7 +1518,7 @@ func (x *TransactionBundle) String() string {
 func (*TransactionBundle) ProtoMessage() {}
 
 func (x *TransactionBundle) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[17]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1102,7 +1531,7 @@ func (x *TransactionBundle) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionBundle.ProtoReflect.Descriptor instead.
 func (*TransactionBundle) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{17}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *TransactionBundle) GetTransaction() *Transaction {
@@ -1143,7 +1572,7 @@ type BatchGetTransactionsResponse struct {
 
 func (x *BatchGetTransactionsResponse) Reset() {
 	*x = BatchGetTransactionsResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[18]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1155,7 +1584,7 @@ func (x *BatchGetTransactionsResponse) String() string {
 func (*BatchGetTransactionsResponse) ProtoMessage() {}
 
 func (x *BatchGetTransactionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[18]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1168,7 +1597,7 @@ func (x *BatchGetTransactionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchGetTransactionsResponse.ProtoReflect.Descriptor instead.
 func (*BatchGetTransactionsResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{18}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *BatchGetTransactionsResponse) GetPage() *PageInfo {
@@ -1198,7 +1627,7 @@ type ListContractsRequest struct {
 
 func (x *ListContractsRequest) Reset() {
 	*x = ListContractsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[19]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1210,7 +1639,7 @@ func (x *ListContractsRequest) String() string {
 func (*ListContractsRequest) ProtoMessage() {}
 
 func (x *ListContractsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[19]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1223,7 +1652,7 @@ func (x *ListContractsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListContractsRequest.ProtoReflect.Descriptor instead.
 func (*ListContractsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{19}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ListContractsRequest) GetRead() *ReadContext {
@@ -1271,7 +1700,7 @@ type ListContractsResponse struct {
 
 func (x *ListContractsResponse) Reset() {
 	*x = ListContractsResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[20]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1283,7 +1712,7 @@ func (x *ListContractsResponse) String() string {
 func (*ListContractsResponse) ProtoMessage() {}
 
 func (x *ListContractsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[20]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1296,7 +1725,7 @@ func (x *ListContractsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListContractsResponse.ProtoReflect.Descriptor instead.
 func (*ListContractsResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{20}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ListContractsResponse) GetPage() *PageInfo {
@@ -1327,7 +1756,7 @@ type ListTokensRequest struct {
 
 func (x *ListTokensRequest) Reset() {
 	*x = ListTokensRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[21]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1339,7 +1768,7 @@ func (x *ListTokensRequest) String() string {
 func (*ListTokensRequest) ProtoMessage() {}
 
 func (x *ListTokensRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[21]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1352,7 +1781,7 @@ func (x *ListTokensRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTokensRequest.ProtoReflect.Descriptor instead.
 func (*ListTokensRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{21}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ListTokensRequest) GetRead() *ReadContext {
@@ -1407,7 +1836,7 @@ type ListTokensResponse struct {
 
 func (x *ListTokensResponse) Reset() {
 	*x = ListTokensResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[22]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1419,7 +1848,7 @@ func (x *ListTokensResponse) String() string {
 func (*ListTokensResponse) ProtoMessage() {}
 
 func (x *ListTokensResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[22]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1432,7 +1861,7 @@ func (x *ListTokensResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTokensResponse.ProtoReflect.Descriptor instead.
 func (*ListTokensResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{22}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ListTokensResponse) GetPage() *PageInfo {
@@ -1461,7 +1890,7 @@ type ListAddressesRequest struct {
 
 func (x *ListAddressesRequest) Reset() {
 	*x = ListAddressesRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[23]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1473,7 +1902,7 @@ func (x *ListAddressesRequest) String() string {
 func (*ListAddressesRequest) ProtoMessage() {}
 
 func (x *ListAddressesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[23]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1486,7 +1915,7 @@ func (x *ListAddressesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAddressesRequest.ProtoReflect.Descriptor instead.
 func (*ListAddressesRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{23}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ListAddressesRequest) GetRead() *ReadContext {
@@ -1527,7 +1956,7 @@ type ListAddressesResponse struct {
 
 func (x *ListAddressesResponse) Reset() {
 	*x = ListAddressesResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[24]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1539,7 +1968,7 @@ func (x *ListAddressesResponse) String() string {
 func (*ListAddressesResponse) ProtoMessage() {}
 
 func (x *ListAddressesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[24]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1552,7 +1981,7 @@ func (x *ListAddressesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAddressesResponse.ProtoReflect.Descriptor instead.
 func (*ListAddressesResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{24}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ListAddressesResponse) GetPage() *PageInfo {
@@ -1581,7 +2010,7 @@ type ListBalancesRequest struct {
 
 func (x *ListBalancesRequest) Reset() {
 	*x = ListBalancesRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[25]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1593,7 +2022,7 @@ func (x *ListBalancesRequest) String() string {
 func (*ListBalancesRequest) ProtoMessage() {}
 
 func (x *ListBalancesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[25]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1606,7 +2035,7 @@ func (x *ListBalancesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBalancesRequest.ProtoReflect.Descriptor instead.
 func (*ListBalancesRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{25}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ListBalancesRequest) GetRead() *ReadContext {
@@ -1647,7 +2076,7 @@ type ListBalancesResponse struct {
 
 func (x *ListBalancesResponse) Reset() {
 	*x = ListBalancesResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[26]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1659,7 +2088,7 @@ func (x *ListBalancesResponse) String() string {
 func (*ListBalancesResponse) ProtoMessage() {}
 
 func (x *ListBalancesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[26]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1672,7 +2101,7 @@ func (x *ListBalancesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBalancesResponse.ProtoReflect.Descriptor instead.
 func (*ListBalancesResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{26}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ListBalancesResponse) GetPage() *PageInfo {
@@ -1701,7 +2130,7 @@ type ListHoldersRequest struct {
 
 func (x *ListHoldersRequest) Reset() {
 	*x = ListHoldersRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[27]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1713,7 +2142,7 @@ func (x *ListHoldersRequest) String() string {
 func (*ListHoldersRequest) ProtoMessage() {}
 
 func (x *ListHoldersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[27]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1726,7 +2155,7 @@ func (x *ListHoldersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHoldersRequest.ProtoReflect.Descriptor instead.
 func (*ListHoldersRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{27}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ListHoldersRequest) GetRead() *ReadContext {
@@ -1767,7 +2196,7 @@ type ListHoldersResponse struct {
 
 func (x *ListHoldersResponse) Reset() {
 	*x = ListHoldersResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[28]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1779,7 +2208,7 @@ func (x *ListHoldersResponse) String() string {
 func (*ListHoldersResponse) ProtoMessage() {}
 
 func (x *ListHoldersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[28]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1792,7 +2221,7 @@ func (x *ListHoldersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHoldersResponse.ProtoReflect.Descriptor instead.
 func (*ListHoldersResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{28}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ListHoldersResponse) GetPage() *PageInfo {
@@ -1821,7 +2250,7 @@ type ListCounterpartiesRequest struct {
 
 func (x *ListCounterpartiesRequest) Reset() {
 	*x = ListCounterpartiesRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[29]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1833,7 +2262,7 @@ func (x *ListCounterpartiesRequest) String() string {
 func (*ListCounterpartiesRequest) ProtoMessage() {}
 
 func (x *ListCounterpartiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[29]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1846,7 +2275,7 @@ func (x *ListCounterpartiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCounterpartiesRequest.ProtoReflect.Descriptor instead.
 func (*ListCounterpartiesRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{29}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ListCounterpartiesRequest) GetRead() *ReadContext {
@@ -1891,7 +2320,7 @@ type ListCounterpartiesResponse struct {
 
 func (x *ListCounterpartiesResponse) Reset() {
 	*x = ListCounterpartiesResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[30]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1903,7 +2332,7 @@ func (x *ListCounterpartiesResponse) String() string {
 func (*ListCounterpartiesResponse) ProtoMessage() {}
 
 func (x *ListCounterpartiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[30]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1916,7 +2345,7 @@ func (x *ListCounterpartiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCounterpartiesResponse.ProtoReflect.Descriptor instead.
 func (*ListCounterpartiesResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{30}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ListCounterpartiesResponse) GetPage() *PageInfo {
@@ -1958,7 +2387,7 @@ type BatchFirstActivityRequest struct {
 
 func (x *BatchFirstActivityRequest) Reset() {
 	*x = BatchFirstActivityRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[31]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1970,7 +2399,7 @@ func (x *BatchFirstActivityRequest) String() string {
 func (*BatchFirstActivityRequest) ProtoMessage() {}
 
 func (x *BatchFirstActivityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[31]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1983,7 +2412,7 @@ func (x *BatchFirstActivityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchFirstActivityRequest.ProtoReflect.Descriptor instead.
 func (*BatchFirstActivityRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{31}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *BatchFirstActivityRequest) GetRead() *ReadContext {
@@ -2019,7 +2448,7 @@ type BatchFirstActivityResponse struct {
 
 func (x *BatchFirstActivityResponse) Reset() {
 	*x = BatchFirstActivityResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[32]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2031,7 +2460,7 @@ func (x *BatchFirstActivityResponse) String() string {
 func (*BatchFirstActivityResponse) ProtoMessage() {}
 
 func (x *BatchFirstActivityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[32]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2044,7 +2473,7 @@ func (x *BatchFirstActivityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchFirstActivityResponse.ProtoReflect.Descriptor instead.
 func (*BatchFirstActivityResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{32}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *BatchFirstActivityResponse) GetPage() *PageInfo {
@@ -2071,7 +2500,7 @@ type CountTransactionsRequest struct {
 
 func (x *CountTransactionsRequest) Reset() {
 	*x = CountTransactionsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[33]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2083,7 +2512,7 @@ func (x *CountTransactionsRequest) String() string {
 func (*CountTransactionsRequest) ProtoMessage() {}
 
 func (x *CountTransactionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[33]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2096,7 +2525,7 @@ func (x *CountTransactionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CountTransactionsRequest.ProtoReflect.Descriptor instead.
 func (*CountTransactionsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{33}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *CountTransactionsRequest) GetRead() *ReadContext {
@@ -2123,7 +2552,7 @@ type CountLogsRequest struct {
 
 func (x *CountLogsRequest) Reset() {
 	*x = CountLogsRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[34]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2135,7 +2564,7 @@ func (x *CountLogsRequest) String() string {
 func (*CountLogsRequest) ProtoMessage() {}
 
 func (x *CountLogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[34]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2148,7 +2577,7 @@ func (x *CountLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CountLogsRequest.ProtoReflect.Descriptor instead.
 func (*CountLogsRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{34}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *CountLogsRequest) GetRead() *ReadContext {
@@ -2175,7 +2604,7 @@ type CountTokenTransfersRequest struct {
 
 func (x *CountTokenTransfersRequest) Reset() {
 	*x = CountTokenTransfersRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[35]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2187,7 +2616,7 @@ func (x *CountTokenTransfersRequest) String() string {
 func (*CountTokenTransfersRequest) ProtoMessage() {}
 
 func (x *CountTokenTransfersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[35]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2200,7 +2629,7 @@ func (x *CountTokenTransfersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CountTokenTransfersRequest.ProtoReflect.Descriptor instead.
 func (*CountTokenTransfersRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{35}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *CountTokenTransfersRequest) GetRead() *ReadContext {
@@ -2227,7 +2656,7 @@ type CountResponse struct {
 
 func (x *CountResponse) Reset() {
 	*x = CountResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[36]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2239,7 +2668,7 @@ func (x *CountResponse) String() string {
 func (*CountResponse) ProtoMessage() {}
 
 func (x *CountResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[36]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2252,7 +2681,7 @@ func (x *CountResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CountResponse.ProtoReflect.Descriptor instead.
 func (*CountResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{36}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *CountResponse) GetPage() *PageInfo {
@@ -2281,7 +2710,7 @@ type SearchRequest struct {
 
 func (x *SearchRequest) Reset() {
 	*x = SearchRequest{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[37]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2293,7 +2722,7 @@ func (x *SearchRequest) String() string {
 func (*SearchRequest) ProtoMessage() {}
 
 func (x *SearchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[37]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2306,7 +2735,7 @@ func (x *SearchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchRequest.ProtoReflect.Descriptor instead.
 func (*SearchRequest) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{37}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *SearchRequest) GetRead() *ReadContext {
@@ -2347,7 +2776,7 @@ type SearchResponse struct {
 
 func (x *SearchResponse) Reset() {
 	*x = SearchResponse{}
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[38]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2359,7 +2788,7 @@ func (x *SearchResponse) String() string {
 func (*SearchResponse) ProtoMessage() {}
 
 func (x *SearchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chain_indexer_v2_service_proto_msgTypes[38]
+	mi := &file_chain_indexer_v2_service_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2372,7 +2801,7 @@ func (x *SearchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchResponse.ProtoReflect.Descriptor instead.
 func (*SearchResponse) Descriptor() ([]byte, []int) {
-	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{38}
+	return file_chain_indexer_v2_service_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *SearchResponse) GetPage() *PageInfo {
@@ -2393,7 +2822,35 @@ var File_chain_indexer_v2_service_proto protoreflect.FileDescriptor
 
 const file_chain_indexer_v2_service_proto_rawDesc = "" +
 	"\n" +
-	"\x1echain_indexer/v2/service.proto\x12\x10chain_indexer.v2\x1a\x1dchain_indexer/v2/common.proto\x1a\x1cchain_indexer/v2/facts.proto\"H\n" +
+	"\x1echain_indexer/v2/service.proto\x12\x10chain_indexer.v2\x1a\x1dchain_indexer/v2/common.proto\x1a\x1cchain_indexer/v2/facts.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"N\n" +
+	"\x10CurrentAddresses\x12:\n" +
+	"\taddresses\x18\x01 \x01(\v2\x1c.chain_indexer.v2.AddressSetR\taddresses\"\xc1\x01\n" +
+	"\rCurrentTokens\x12:\n" +
+	"\taddresses\x18\x01 \x01(\v2\x1c.chain_indexer.v2.AddressSetR\taddresses\x12\x1d\n" +
+	"\n" +
+	"token_type\x18\x02 \x01(\tR\ttokenType\x12\x16\n" +
+	"\x06search\x18\x03 \x01(\tR\x06search\x12=\n" +
+	"\vblock_range\x18\x04 \x01(\v2\x1c.chain_indexer.v2.BlockRangeR\n" +
+	"blockRange\"q\n" +
+	"\x0eCurrentHolders\x12#\n" +
+	"\rtoken_address\x18\x01 \x01(\fR\ftokenAddress\x12:\n" +
+	"\taddresses\x18\x02 \x01(\v2\x1c.chain_indexer.v2.AddressSetR\taddresses\"\xdc\x01\n" +
+	"\x14CurrentCountSelector\x12B\n" +
+	"\taddresses\x18\x01 \x01(\v2\".chain_indexer.v2.CurrentAddressesH\x00R\taddresses\x129\n" +
+	"\x06tokens\x18\x02 \x01(\v2\x1f.chain_indexer.v2.CurrentTokensH\x00R\x06tokens\x12<\n" +
+	"\aholders\x18\x03 \x01(\v2 .chain_indexer.v2.CurrentHoldersH\x00R\aholdersB\a\n" +
+	"\x05value\"\x93\x01\n" +
+	"\x18BatchCountCurrentRequest\x121\n" +
+	"\x04read\x18\x01 \x01(\v2\x1d.chain_indexer.v2.ReadContextR\x04read\x12D\n" +
+	"\tselectors\x18\x02 \x03(\v2&.chain_indexer.v2.CurrentCountSelectorR\tselectors\"S\n" +
+	"\x12CurrentCountResult\x12'\n" +
+	"\x0fselector_digest\x18\x01 \x01(\fR\x0eselectorDigest\x12\x14\n" +
+	"\x05count\x18\x02 \x01(\x04R\x05count\"\xc6\x01\n" +
+	"\x19BatchCountCurrentResponse\x12.\n" +
+	"\x04page\x18\x01 \x01(\v2\x1a.chain_indexer.v2.PageInfoR\x04page\x12<\n" +
+	"\x06counts\x18\x02 \x03(\v2$.chain_indexer.v2.CurrentCountResultR\x06counts\x12;\n" +
+	"\vobserved_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAt\"H\n" +
 	"\x13GetChainViewRequest\x121\n" +
 	"\x04read\x18\x01 \x01(\v2\x1d.chain_indexer.v2.ReadContextR\x04read\"\x80\x04\n" +
 	"\x14GetChainViewResponse\x12.\n" +
@@ -2568,7 +3025,7 @@ const file_chain_indexer_v2_service_proto_rawDesc = "" +
 	"\x05kinds\x18\x04 \x01(\v2\x1f.chain_indexer.v2.SearchKindSetR\x05kinds\"z\n" +
 	"\x0eSearchResponse\x12.\n" +
 	"\x04page\x18\x01 \x01(\v2\x1a.chain_indexer.v2.PageInfoR\x04page\x128\n" +
-	"\aresults\x18\x02 \x03(\v2\x1e.chain_indexer.v2.SearchResultR\aresults2\xcb\x0f\n" +
+	"\aresults\x18\x02 \x03(\v2\x1e.chain_indexer.v2.SearchResultR\aresults2\xb9\x10\n" +
 	"\x0eIndexerService\x12]\n" +
 	"\fGetChainView\x12%.chain_indexer.v2.GetChainViewRequest\x1a&.chain_indexer.v2.GetChainViewResponse\x12Q\n" +
 	"\bGetBlock\x12!.chain_indexer.v2.GetBlockRequest\x1a\".chain_indexer.v2.GetBlockResponse\x12c\n" +
@@ -2590,7 +3047,8 @@ const file_chain_indexer_v2_service_proto_rawDesc = "" +
 	"\x12BatchFirstActivity\x12+.chain_indexer.v2.BatchFirstActivityRequest\x1a,.chain_indexer.v2.BatchFirstActivityResponse\x12`\n" +
 	"\x11CountTransactions\x12*.chain_indexer.v2.CountTransactionsRequest\x1a\x1f.chain_indexer.v2.CountResponse\x12P\n" +
 	"\tCountLogs\x12\".chain_indexer.v2.CountLogsRequest\x1a\x1f.chain_indexer.v2.CountResponse\x12d\n" +
-	"\x13CountTokenTransfers\x12,.chain_indexer.v2.CountTokenTransfersRequest\x1a\x1f.chain_indexer.v2.CountResponse\x12K\n" +
+	"\x13CountTokenTransfers\x12,.chain_indexer.v2.CountTokenTransfersRequest\x1a\x1f.chain_indexer.v2.CountResponse\x12l\n" +
+	"\x11BatchCountCurrent\x12*.chain_indexer.v2.BatchCountCurrentRequest\x1a+.chain_indexer.v2.BatchCountCurrentResponse\x12K\n" +
 	"\x06Search\x12\x1f.chain_indexer.v2.SearchRequest\x1a .chain_indexer.v2.SearchResponseBGZEgithub.com/gateway-fm/chain-indexer/gen/go/chain_indexer/v2;indexerv2b\x06proto3"
 
 var (
@@ -2605,214 +3063,236 @@ func file_chain_indexer_v2_service_proto_rawDescGZIP() []byte {
 	return file_chain_indexer_v2_service_proto_rawDescData
 }
 
-var file_chain_indexer_v2_service_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_chain_indexer_v2_service_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_chain_indexer_v2_service_proto_goTypes = []any{
-	(*GetChainViewRequest)(nil),              // 0: chain_indexer.v2.GetChainViewRequest
-	(*GetChainViewResponse)(nil),             // 1: chain_indexer.v2.GetChainViewResponse
-	(*GetBlockRequest)(nil),                  // 2: chain_indexer.v2.GetBlockRequest
-	(*GetBlockResponse)(nil),                 // 3: chain_indexer.v2.GetBlockResponse
-	(*GetTransactionRequest)(nil),            // 4: chain_indexer.v2.GetTransactionRequest
-	(*GetTransactionResponse)(nil),           // 5: chain_indexer.v2.GetTransactionResponse
-	(*ListBlocksRequest)(nil),                // 6: chain_indexer.v2.ListBlocksRequest
-	(*ListBlocksResponse)(nil),               // 7: chain_indexer.v2.ListBlocksResponse
-	(*ListTransactionsRequest)(nil),          // 8: chain_indexer.v2.ListTransactionsRequest
-	(*ListTransactionsResponse)(nil),         // 9: chain_indexer.v2.ListTransactionsResponse
-	(*ListLogsRequest)(nil),                  // 10: chain_indexer.v2.ListLogsRequest
-	(*ListLogsResponse)(nil),                 // 11: chain_indexer.v2.ListLogsResponse
-	(*ListTokenTransfersRequest)(nil),        // 12: chain_indexer.v2.ListTokenTransfersRequest
-	(*ListTokenTransfersResponse)(nil),       // 13: chain_indexer.v2.ListTokenTransfersResponse
-	(*ListInternalTransactionsRequest)(nil),  // 14: chain_indexer.v2.ListInternalTransactionsRequest
-	(*ListInternalTransactionsResponse)(nil), // 15: chain_indexer.v2.ListInternalTransactionsResponse
-	(*BatchGetTransactionsRequest)(nil),      // 16: chain_indexer.v2.BatchGetTransactionsRequest
-	(*TransactionBundle)(nil),                // 17: chain_indexer.v2.TransactionBundle
-	(*BatchGetTransactionsResponse)(nil),     // 18: chain_indexer.v2.BatchGetTransactionsResponse
-	(*ListContractsRequest)(nil),             // 19: chain_indexer.v2.ListContractsRequest
-	(*ListContractsResponse)(nil),            // 20: chain_indexer.v2.ListContractsResponse
-	(*ListTokensRequest)(nil),                // 21: chain_indexer.v2.ListTokensRequest
-	(*ListTokensResponse)(nil),               // 22: chain_indexer.v2.ListTokensResponse
-	(*ListAddressesRequest)(nil),             // 23: chain_indexer.v2.ListAddressesRequest
-	(*ListAddressesResponse)(nil),            // 24: chain_indexer.v2.ListAddressesResponse
-	(*ListBalancesRequest)(nil),              // 25: chain_indexer.v2.ListBalancesRequest
-	(*ListBalancesResponse)(nil),             // 26: chain_indexer.v2.ListBalancesResponse
-	(*ListHoldersRequest)(nil),               // 27: chain_indexer.v2.ListHoldersRequest
-	(*ListHoldersResponse)(nil),              // 28: chain_indexer.v2.ListHoldersResponse
-	(*ListCounterpartiesRequest)(nil),        // 29: chain_indexer.v2.ListCounterpartiesRequest
-	(*ListCounterpartiesResponse)(nil),       // 30: chain_indexer.v2.ListCounterpartiesResponse
-	(*BatchFirstActivityRequest)(nil),        // 31: chain_indexer.v2.BatchFirstActivityRequest
-	(*BatchFirstActivityResponse)(nil),       // 32: chain_indexer.v2.BatchFirstActivityResponse
-	(*CountTransactionsRequest)(nil),         // 33: chain_indexer.v2.CountTransactionsRequest
-	(*CountLogsRequest)(nil),                 // 34: chain_indexer.v2.CountLogsRequest
-	(*CountTokenTransfersRequest)(nil),       // 35: chain_indexer.v2.CountTokenTransfersRequest
-	(*CountResponse)(nil),                    // 36: chain_indexer.v2.CountResponse
-	(*SearchRequest)(nil),                    // 37: chain_indexer.v2.SearchRequest
-	(*SearchResponse)(nil),                   // 38: chain_indexer.v2.SearchResponse
-	(*ReadContext)(nil),                      // 39: chain_indexer.v2.ReadContext
-	(*PageInfo)(nil),                         // 40: chain_indexer.v2.PageInfo
-	(*ReadAt)(nil),                           // 41: chain_indexer.v2.ReadAt
-	(*Block)(nil),                            // 42: chain_indexer.v2.Block
-	(Source)(0),                              // 43: chain_indexer.v2.Source
-	(*Transaction)(nil),                      // 44: chain_indexer.v2.Transaction
-	(*PageRequest)(nil),                      // 45: chain_indexer.v2.PageRequest
-	(*BlockRange)(nil),                       // 46: chain_indexer.v2.BlockRange
-	(*TransactionFilter)(nil),                // 47: chain_indexer.v2.TransactionFilter
-	(*LogFilter)(nil),                        // 48: chain_indexer.v2.LogFilter
-	(*Log)(nil),                              // 49: chain_indexer.v2.Log
-	(*TransferFilter)(nil),                   // 50: chain_indexer.v2.TransferFilter
-	(*TokenTransfer)(nil),                    // 51: chain_indexer.v2.TokenTransfer
-	(*InternalFilter)(nil),                   // 52: chain_indexer.v2.InternalFilter
-	(*InternalTransaction)(nil),              // 53: chain_indexer.v2.InternalTransaction
-	(*AddressSet)(nil),                       // 54: chain_indexer.v2.AddressSet
-	(*Contract)(nil),                         // 55: chain_indexer.v2.Contract
-	(*Token)(nil),                            // 56: chain_indexer.v2.Token
-	(*Address)(nil),                          // 57: chain_indexer.v2.Address
-	(*Balance)(nil),                          // 58: chain_indexer.v2.Balance
-	(*Holder)(nil),                           // 59: chain_indexer.v2.Holder
-	(*TimeRange)(nil),                        // 60: chain_indexer.v2.TimeRange
-	(*Counterparty)(nil),                     // 61: chain_indexer.v2.Counterparty
-	(*FirstActivity)(nil),                    // 62: chain_indexer.v2.FirstActivity
-	(*SearchKindSet)(nil),                    // 63: chain_indexer.v2.SearchKindSet
-	(*SearchResult)(nil),                     // 64: chain_indexer.v2.SearchResult
+	(*CurrentAddresses)(nil),                 // 0: chain_indexer.v2.CurrentAddresses
+	(*CurrentTokens)(nil),                    // 1: chain_indexer.v2.CurrentTokens
+	(*CurrentHolders)(nil),                   // 2: chain_indexer.v2.CurrentHolders
+	(*CurrentCountSelector)(nil),             // 3: chain_indexer.v2.CurrentCountSelector
+	(*BatchCountCurrentRequest)(nil),         // 4: chain_indexer.v2.BatchCountCurrentRequest
+	(*CurrentCountResult)(nil),               // 5: chain_indexer.v2.CurrentCountResult
+	(*BatchCountCurrentResponse)(nil),        // 6: chain_indexer.v2.BatchCountCurrentResponse
+	(*GetChainViewRequest)(nil),              // 7: chain_indexer.v2.GetChainViewRequest
+	(*GetChainViewResponse)(nil),             // 8: chain_indexer.v2.GetChainViewResponse
+	(*GetBlockRequest)(nil),                  // 9: chain_indexer.v2.GetBlockRequest
+	(*GetBlockResponse)(nil),                 // 10: chain_indexer.v2.GetBlockResponse
+	(*GetTransactionRequest)(nil),            // 11: chain_indexer.v2.GetTransactionRequest
+	(*GetTransactionResponse)(nil),           // 12: chain_indexer.v2.GetTransactionResponse
+	(*ListBlocksRequest)(nil),                // 13: chain_indexer.v2.ListBlocksRequest
+	(*ListBlocksResponse)(nil),               // 14: chain_indexer.v2.ListBlocksResponse
+	(*ListTransactionsRequest)(nil),          // 15: chain_indexer.v2.ListTransactionsRequest
+	(*ListTransactionsResponse)(nil),         // 16: chain_indexer.v2.ListTransactionsResponse
+	(*ListLogsRequest)(nil),                  // 17: chain_indexer.v2.ListLogsRequest
+	(*ListLogsResponse)(nil),                 // 18: chain_indexer.v2.ListLogsResponse
+	(*ListTokenTransfersRequest)(nil),        // 19: chain_indexer.v2.ListTokenTransfersRequest
+	(*ListTokenTransfersResponse)(nil),       // 20: chain_indexer.v2.ListTokenTransfersResponse
+	(*ListInternalTransactionsRequest)(nil),  // 21: chain_indexer.v2.ListInternalTransactionsRequest
+	(*ListInternalTransactionsResponse)(nil), // 22: chain_indexer.v2.ListInternalTransactionsResponse
+	(*BatchGetTransactionsRequest)(nil),      // 23: chain_indexer.v2.BatchGetTransactionsRequest
+	(*TransactionBundle)(nil),                // 24: chain_indexer.v2.TransactionBundle
+	(*BatchGetTransactionsResponse)(nil),     // 25: chain_indexer.v2.BatchGetTransactionsResponse
+	(*ListContractsRequest)(nil),             // 26: chain_indexer.v2.ListContractsRequest
+	(*ListContractsResponse)(nil),            // 27: chain_indexer.v2.ListContractsResponse
+	(*ListTokensRequest)(nil),                // 28: chain_indexer.v2.ListTokensRequest
+	(*ListTokensResponse)(nil),               // 29: chain_indexer.v2.ListTokensResponse
+	(*ListAddressesRequest)(nil),             // 30: chain_indexer.v2.ListAddressesRequest
+	(*ListAddressesResponse)(nil),            // 31: chain_indexer.v2.ListAddressesResponse
+	(*ListBalancesRequest)(nil),              // 32: chain_indexer.v2.ListBalancesRequest
+	(*ListBalancesResponse)(nil),             // 33: chain_indexer.v2.ListBalancesResponse
+	(*ListHoldersRequest)(nil),               // 34: chain_indexer.v2.ListHoldersRequest
+	(*ListHoldersResponse)(nil),              // 35: chain_indexer.v2.ListHoldersResponse
+	(*ListCounterpartiesRequest)(nil),        // 36: chain_indexer.v2.ListCounterpartiesRequest
+	(*ListCounterpartiesResponse)(nil),       // 37: chain_indexer.v2.ListCounterpartiesResponse
+	(*BatchFirstActivityRequest)(nil),        // 38: chain_indexer.v2.BatchFirstActivityRequest
+	(*BatchFirstActivityResponse)(nil),       // 39: chain_indexer.v2.BatchFirstActivityResponse
+	(*CountTransactionsRequest)(nil),         // 40: chain_indexer.v2.CountTransactionsRequest
+	(*CountLogsRequest)(nil),                 // 41: chain_indexer.v2.CountLogsRequest
+	(*CountTokenTransfersRequest)(nil),       // 42: chain_indexer.v2.CountTokenTransfersRequest
+	(*CountResponse)(nil),                    // 43: chain_indexer.v2.CountResponse
+	(*SearchRequest)(nil),                    // 44: chain_indexer.v2.SearchRequest
+	(*SearchResponse)(nil),                   // 45: chain_indexer.v2.SearchResponse
+	(*AddressSet)(nil),                       // 46: chain_indexer.v2.AddressSet
+	(*BlockRange)(nil),                       // 47: chain_indexer.v2.BlockRange
+	(*ReadContext)(nil),                      // 48: chain_indexer.v2.ReadContext
+	(*PageInfo)(nil),                         // 49: chain_indexer.v2.PageInfo
+	(*timestamppb.Timestamp)(nil),            // 50: google.protobuf.Timestamp
+	(*ReadAt)(nil),                           // 51: chain_indexer.v2.ReadAt
+	(*Block)(nil),                            // 52: chain_indexer.v2.Block
+	(Source)(0),                              // 53: chain_indexer.v2.Source
+	(*Transaction)(nil),                      // 54: chain_indexer.v2.Transaction
+	(*PageRequest)(nil),                      // 55: chain_indexer.v2.PageRequest
+	(*TransactionFilter)(nil),                // 56: chain_indexer.v2.TransactionFilter
+	(*LogFilter)(nil),                        // 57: chain_indexer.v2.LogFilter
+	(*Log)(nil),                              // 58: chain_indexer.v2.Log
+	(*TransferFilter)(nil),                   // 59: chain_indexer.v2.TransferFilter
+	(*TokenTransfer)(nil),                    // 60: chain_indexer.v2.TokenTransfer
+	(*InternalFilter)(nil),                   // 61: chain_indexer.v2.InternalFilter
+	(*InternalTransaction)(nil),              // 62: chain_indexer.v2.InternalTransaction
+	(*Contract)(nil),                         // 63: chain_indexer.v2.Contract
+	(*Token)(nil),                            // 64: chain_indexer.v2.Token
+	(*Address)(nil),                          // 65: chain_indexer.v2.Address
+	(*Balance)(nil),                          // 66: chain_indexer.v2.Balance
+	(*Holder)(nil),                           // 67: chain_indexer.v2.Holder
+	(*TimeRange)(nil),                        // 68: chain_indexer.v2.TimeRange
+	(*Counterparty)(nil),                     // 69: chain_indexer.v2.Counterparty
+	(*FirstActivity)(nil),                    // 70: chain_indexer.v2.FirstActivity
+	(*SearchKindSet)(nil),                    // 71: chain_indexer.v2.SearchKindSet
+	(*SearchResult)(nil),                     // 72: chain_indexer.v2.SearchResult
 }
 var file_chain_indexer_v2_service_proto_depIdxs = []int32{
-	39,  // 0: chain_indexer.v2.GetChainViewRequest.read:type_name -> chain_indexer.v2.ReadContext
-	40,  // 1: chain_indexer.v2.GetChainViewResponse.page:type_name -> chain_indexer.v2.PageInfo
-	41,  // 2: chain_indexer.v2.GetChainViewResponse.safe_head:type_name -> chain_indexer.v2.ReadAt
-	39,  // 3: chain_indexer.v2.GetBlockRequest.read:type_name -> chain_indexer.v2.ReadContext
-	40,  // 4: chain_indexer.v2.GetBlockResponse.page:type_name -> chain_indexer.v2.PageInfo
-	42,  // 5: chain_indexer.v2.GetBlockResponse.block:type_name -> chain_indexer.v2.Block
-	43,  // 6: chain_indexer.v2.GetBlockResponse.source:type_name -> chain_indexer.v2.Source
-	39,  // 7: chain_indexer.v2.GetTransactionRequest.read:type_name -> chain_indexer.v2.ReadContext
-	40,  // 8: chain_indexer.v2.GetTransactionResponse.page:type_name -> chain_indexer.v2.PageInfo
-	44,  // 9: chain_indexer.v2.GetTransactionResponse.transaction:type_name -> chain_indexer.v2.Transaction
-	43,  // 10: chain_indexer.v2.GetTransactionResponse.source:type_name -> chain_indexer.v2.Source
-	39,  // 11: chain_indexer.v2.ListBlocksRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 12: chain_indexer.v2.ListBlocksRequest.page:type_name -> chain_indexer.v2.PageRequest
-	46,  // 13: chain_indexer.v2.ListBlocksRequest.block_range:type_name -> chain_indexer.v2.BlockRange
-	40,  // 14: chain_indexer.v2.ListBlocksResponse.page:type_name -> chain_indexer.v2.PageInfo
-	42,  // 15: chain_indexer.v2.ListBlocksResponse.blocks:type_name -> chain_indexer.v2.Block
-	39,  // 16: chain_indexer.v2.ListTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 17: chain_indexer.v2.ListTransactionsRequest.page:type_name -> chain_indexer.v2.PageRequest
-	47,  // 18: chain_indexer.v2.ListTransactionsRequest.filter:type_name -> chain_indexer.v2.TransactionFilter
-	40,  // 19: chain_indexer.v2.ListTransactionsResponse.page:type_name -> chain_indexer.v2.PageInfo
-	44,  // 20: chain_indexer.v2.ListTransactionsResponse.transactions:type_name -> chain_indexer.v2.Transaction
-	39,  // 21: chain_indexer.v2.ListLogsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 22: chain_indexer.v2.ListLogsRequest.page:type_name -> chain_indexer.v2.PageRequest
-	48,  // 23: chain_indexer.v2.ListLogsRequest.filter:type_name -> chain_indexer.v2.LogFilter
-	40,  // 24: chain_indexer.v2.ListLogsResponse.page:type_name -> chain_indexer.v2.PageInfo
-	49,  // 25: chain_indexer.v2.ListLogsResponse.logs:type_name -> chain_indexer.v2.Log
-	39,  // 26: chain_indexer.v2.ListTokenTransfersRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 27: chain_indexer.v2.ListTokenTransfersRequest.page:type_name -> chain_indexer.v2.PageRequest
-	50,  // 28: chain_indexer.v2.ListTokenTransfersRequest.filter:type_name -> chain_indexer.v2.TransferFilter
-	40,  // 29: chain_indexer.v2.ListTokenTransfersResponse.page:type_name -> chain_indexer.v2.PageInfo
-	51,  // 30: chain_indexer.v2.ListTokenTransfersResponse.transfers:type_name -> chain_indexer.v2.TokenTransfer
-	39,  // 31: chain_indexer.v2.ListInternalTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 32: chain_indexer.v2.ListInternalTransactionsRequest.page:type_name -> chain_indexer.v2.PageRequest
-	52,  // 33: chain_indexer.v2.ListInternalTransactionsRequest.filter:type_name -> chain_indexer.v2.InternalFilter
-	40,  // 34: chain_indexer.v2.ListInternalTransactionsResponse.page:type_name -> chain_indexer.v2.PageInfo
-	53,  // 35: chain_indexer.v2.ListInternalTransactionsResponse.internal_transactions:type_name -> chain_indexer.v2.InternalTransaction
-	39,  // 36: chain_indexer.v2.BatchGetTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	44,  // 37: chain_indexer.v2.TransactionBundle.transaction:type_name -> chain_indexer.v2.Transaction
-	49,  // 38: chain_indexer.v2.TransactionBundle.logs:type_name -> chain_indexer.v2.Log
-	51,  // 39: chain_indexer.v2.TransactionBundle.transfers:type_name -> chain_indexer.v2.TokenTransfer
-	53,  // 40: chain_indexer.v2.TransactionBundle.internal_transactions:type_name -> chain_indexer.v2.InternalTransaction
-	40,  // 41: chain_indexer.v2.BatchGetTransactionsResponse.page:type_name -> chain_indexer.v2.PageInfo
-	17,  // 42: chain_indexer.v2.BatchGetTransactionsResponse.transactions:type_name -> chain_indexer.v2.TransactionBundle
-	39,  // 43: chain_indexer.v2.ListContractsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 44: chain_indexer.v2.ListContractsRequest.page:type_name -> chain_indexer.v2.PageRequest
-	54,  // 45: chain_indexer.v2.ListContractsRequest.addresses:type_name -> chain_indexer.v2.AddressSet
-	46,  // 46: chain_indexer.v2.ListContractsRequest.block_range:type_name -> chain_indexer.v2.BlockRange
-	40,  // 47: chain_indexer.v2.ListContractsResponse.page:type_name -> chain_indexer.v2.PageInfo
-	55,  // 48: chain_indexer.v2.ListContractsResponse.contracts:type_name -> chain_indexer.v2.Contract
-	39,  // 49: chain_indexer.v2.ListTokensRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 50: chain_indexer.v2.ListTokensRequest.page:type_name -> chain_indexer.v2.PageRequest
-	54,  // 51: chain_indexer.v2.ListTokensRequest.addresses:type_name -> chain_indexer.v2.AddressSet
-	46,  // 52: chain_indexer.v2.ListTokensRequest.block_range:type_name -> chain_indexer.v2.BlockRange
-	40,  // 53: chain_indexer.v2.ListTokensResponse.page:type_name -> chain_indexer.v2.PageInfo
-	56,  // 54: chain_indexer.v2.ListTokensResponse.tokens:type_name -> chain_indexer.v2.Token
-	39,  // 55: chain_indexer.v2.ListAddressesRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 56: chain_indexer.v2.ListAddressesRequest.page:type_name -> chain_indexer.v2.PageRequest
-	54,  // 57: chain_indexer.v2.ListAddressesRequest.addresses:type_name -> chain_indexer.v2.AddressSet
-	40,  // 58: chain_indexer.v2.ListAddressesResponse.page:type_name -> chain_indexer.v2.PageInfo
-	57,  // 59: chain_indexer.v2.ListAddressesResponse.addresses:type_name -> chain_indexer.v2.Address
-	39,  // 60: chain_indexer.v2.ListBalancesRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 61: chain_indexer.v2.ListBalancesRequest.page:type_name -> chain_indexer.v2.PageRequest
-	54,  // 62: chain_indexer.v2.ListBalancesRequest.addresses:type_name -> chain_indexer.v2.AddressSet
-	54,  // 63: chain_indexer.v2.ListBalancesRequest.tokens:type_name -> chain_indexer.v2.AddressSet
-	40,  // 64: chain_indexer.v2.ListBalancesResponse.page:type_name -> chain_indexer.v2.PageInfo
-	58,  // 65: chain_indexer.v2.ListBalancesResponse.balances:type_name -> chain_indexer.v2.Balance
-	39,  // 66: chain_indexer.v2.ListHoldersRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 67: chain_indexer.v2.ListHoldersRequest.page:type_name -> chain_indexer.v2.PageRequest
-	54,  // 68: chain_indexer.v2.ListHoldersRequest.addresses:type_name -> chain_indexer.v2.AddressSet
-	40,  // 69: chain_indexer.v2.ListHoldersResponse.page:type_name -> chain_indexer.v2.PageInfo
-	59,  // 70: chain_indexer.v2.ListHoldersResponse.holders:type_name -> chain_indexer.v2.Holder
-	39,  // 71: chain_indexer.v2.ListCounterpartiesRequest.read:type_name -> chain_indexer.v2.ReadContext
-	54,  // 72: chain_indexer.v2.ListCounterpartiesRequest.targets:type_name -> chain_indexer.v2.AddressSet
-	46,  // 73: chain_indexer.v2.ListCounterpartiesRequest.block_range:type_name -> chain_indexer.v2.BlockRange
-	60,  // 74: chain_indexer.v2.ListCounterpartiesRequest.time_range:type_name -> chain_indexer.v2.TimeRange
-	40,  // 75: chain_indexer.v2.ListCounterpartiesResponse.page:type_name -> chain_indexer.v2.PageInfo
-	61,  // 76: chain_indexer.v2.ListCounterpartiesResponse.counterparties:type_name -> chain_indexer.v2.Counterparty
-	39,  // 77: chain_indexer.v2.BatchFirstActivityRequest.read:type_name -> chain_indexer.v2.ReadContext
-	54,  // 78: chain_indexer.v2.BatchFirstActivityRequest.targets:type_name -> chain_indexer.v2.AddressSet
-	47,  // 79: chain_indexer.v2.BatchFirstActivityRequest.filter:type_name -> chain_indexer.v2.TransactionFilter
-	40,  // 80: chain_indexer.v2.BatchFirstActivityResponse.page:type_name -> chain_indexer.v2.PageInfo
-	62,  // 81: chain_indexer.v2.BatchFirstActivityResponse.activities:type_name -> chain_indexer.v2.FirstActivity
-	39,  // 82: chain_indexer.v2.CountTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	47,  // 83: chain_indexer.v2.CountTransactionsRequest.filter:type_name -> chain_indexer.v2.TransactionFilter
-	39,  // 84: chain_indexer.v2.CountLogsRequest.read:type_name -> chain_indexer.v2.ReadContext
-	48,  // 85: chain_indexer.v2.CountLogsRequest.filter:type_name -> chain_indexer.v2.LogFilter
-	39,  // 86: chain_indexer.v2.CountTokenTransfersRequest.read:type_name -> chain_indexer.v2.ReadContext
-	50,  // 87: chain_indexer.v2.CountTokenTransfersRequest.filter:type_name -> chain_indexer.v2.TransferFilter
-	40,  // 88: chain_indexer.v2.CountResponse.page:type_name -> chain_indexer.v2.PageInfo
-	39,  // 89: chain_indexer.v2.SearchRequest.read:type_name -> chain_indexer.v2.ReadContext
-	45,  // 90: chain_indexer.v2.SearchRequest.page:type_name -> chain_indexer.v2.PageRequest
-	63,  // 91: chain_indexer.v2.SearchRequest.kinds:type_name -> chain_indexer.v2.SearchKindSet
-	40,  // 92: chain_indexer.v2.SearchResponse.page:type_name -> chain_indexer.v2.PageInfo
-	64,  // 93: chain_indexer.v2.SearchResponse.results:type_name -> chain_indexer.v2.SearchResult
-	0,   // 94: chain_indexer.v2.IndexerService.GetChainView:input_type -> chain_indexer.v2.GetChainViewRequest
-	2,   // 95: chain_indexer.v2.IndexerService.GetBlock:input_type -> chain_indexer.v2.GetBlockRequest
-	4,   // 96: chain_indexer.v2.IndexerService.GetTransaction:input_type -> chain_indexer.v2.GetTransactionRequest
-	6,   // 97: chain_indexer.v2.IndexerService.ListBlocks:input_type -> chain_indexer.v2.ListBlocksRequest
-	8,   // 98: chain_indexer.v2.IndexerService.ListTransactions:input_type -> chain_indexer.v2.ListTransactionsRequest
-	10,  // 99: chain_indexer.v2.IndexerService.ListLogs:input_type -> chain_indexer.v2.ListLogsRequest
-	12,  // 100: chain_indexer.v2.IndexerService.ListTokenTransfers:input_type -> chain_indexer.v2.ListTokenTransfersRequest
-	14,  // 101: chain_indexer.v2.IndexerService.ListInternalTransactions:input_type -> chain_indexer.v2.ListInternalTransactionsRequest
-	16,  // 102: chain_indexer.v2.IndexerService.BatchGetTransactions:input_type -> chain_indexer.v2.BatchGetTransactionsRequest
-	19,  // 103: chain_indexer.v2.IndexerService.ListContracts:input_type -> chain_indexer.v2.ListContractsRequest
-	21,  // 104: chain_indexer.v2.IndexerService.ListTokens:input_type -> chain_indexer.v2.ListTokensRequest
-	23,  // 105: chain_indexer.v2.IndexerService.ListAddresses:input_type -> chain_indexer.v2.ListAddressesRequest
-	25,  // 106: chain_indexer.v2.IndexerService.ListBalances:input_type -> chain_indexer.v2.ListBalancesRequest
-	27,  // 107: chain_indexer.v2.IndexerService.ListHolders:input_type -> chain_indexer.v2.ListHoldersRequest
-	29,  // 108: chain_indexer.v2.IndexerService.ListCounterparties:input_type -> chain_indexer.v2.ListCounterpartiesRequest
-	31,  // 109: chain_indexer.v2.IndexerService.BatchFirstActivity:input_type -> chain_indexer.v2.BatchFirstActivityRequest
-	33,  // 110: chain_indexer.v2.IndexerService.CountTransactions:input_type -> chain_indexer.v2.CountTransactionsRequest
-	34,  // 111: chain_indexer.v2.IndexerService.CountLogs:input_type -> chain_indexer.v2.CountLogsRequest
-	35,  // 112: chain_indexer.v2.IndexerService.CountTokenTransfers:input_type -> chain_indexer.v2.CountTokenTransfersRequest
-	37,  // 113: chain_indexer.v2.IndexerService.Search:input_type -> chain_indexer.v2.SearchRequest
-	1,   // 114: chain_indexer.v2.IndexerService.GetChainView:output_type -> chain_indexer.v2.GetChainViewResponse
-	3,   // 115: chain_indexer.v2.IndexerService.GetBlock:output_type -> chain_indexer.v2.GetBlockResponse
-	5,   // 116: chain_indexer.v2.IndexerService.GetTransaction:output_type -> chain_indexer.v2.GetTransactionResponse
-	7,   // 117: chain_indexer.v2.IndexerService.ListBlocks:output_type -> chain_indexer.v2.ListBlocksResponse
-	9,   // 118: chain_indexer.v2.IndexerService.ListTransactions:output_type -> chain_indexer.v2.ListTransactionsResponse
-	11,  // 119: chain_indexer.v2.IndexerService.ListLogs:output_type -> chain_indexer.v2.ListLogsResponse
-	13,  // 120: chain_indexer.v2.IndexerService.ListTokenTransfers:output_type -> chain_indexer.v2.ListTokenTransfersResponse
-	15,  // 121: chain_indexer.v2.IndexerService.ListInternalTransactions:output_type -> chain_indexer.v2.ListInternalTransactionsResponse
-	18,  // 122: chain_indexer.v2.IndexerService.BatchGetTransactions:output_type -> chain_indexer.v2.BatchGetTransactionsResponse
-	20,  // 123: chain_indexer.v2.IndexerService.ListContracts:output_type -> chain_indexer.v2.ListContractsResponse
-	22,  // 124: chain_indexer.v2.IndexerService.ListTokens:output_type -> chain_indexer.v2.ListTokensResponse
-	24,  // 125: chain_indexer.v2.IndexerService.ListAddresses:output_type -> chain_indexer.v2.ListAddressesResponse
-	26,  // 126: chain_indexer.v2.IndexerService.ListBalances:output_type -> chain_indexer.v2.ListBalancesResponse
-	28,  // 127: chain_indexer.v2.IndexerService.ListHolders:output_type -> chain_indexer.v2.ListHoldersResponse
-	30,  // 128: chain_indexer.v2.IndexerService.ListCounterparties:output_type -> chain_indexer.v2.ListCounterpartiesResponse
-	32,  // 129: chain_indexer.v2.IndexerService.BatchFirstActivity:output_type -> chain_indexer.v2.BatchFirstActivityResponse
-	36,  // 130: chain_indexer.v2.IndexerService.CountTransactions:output_type -> chain_indexer.v2.CountResponse
-	36,  // 131: chain_indexer.v2.IndexerService.CountLogs:output_type -> chain_indexer.v2.CountResponse
-	36,  // 132: chain_indexer.v2.IndexerService.CountTokenTransfers:output_type -> chain_indexer.v2.CountResponse
-	38,  // 133: chain_indexer.v2.IndexerService.Search:output_type -> chain_indexer.v2.SearchResponse
-	114, // [114:134] is the sub-list for method output_type
-	94,  // [94:114] is the sub-list for method input_type
-	94,  // [94:94] is the sub-list for extension type_name
-	94,  // [94:94] is the sub-list for extension extendee
-	0,   // [0:94] is the sub-list for field type_name
+	46,  // 0: chain_indexer.v2.CurrentAddresses.addresses:type_name -> chain_indexer.v2.AddressSet
+	46,  // 1: chain_indexer.v2.CurrentTokens.addresses:type_name -> chain_indexer.v2.AddressSet
+	47,  // 2: chain_indexer.v2.CurrentTokens.block_range:type_name -> chain_indexer.v2.BlockRange
+	46,  // 3: chain_indexer.v2.CurrentHolders.addresses:type_name -> chain_indexer.v2.AddressSet
+	0,   // 4: chain_indexer.v2.CurrentCountSelector.addresses:type_name -> chain_indexer.v2.CurrentAddresses
+	1,   // 5: chain_indexer.v2.CurrentCountSelector.tokens:type_name -> chain_indexer.v2.CurrentTokens
+	2,   // 6: chain_indexer.v2.CurrentCountSelector.holders:type_name -> chain_indexer.v2.CurrentHolders
+	48,  // 7: chain_indexer.v2.BatchCountCurrentRequest.read:type_name -> chain_indexer.v2.ReadContext
+	3,   // 8: chain_indexer.v2.BatchCountCurrentRequest.selectors:type_name -> chain_indexer.v2.CurrentCountSelector
+	49,  // 9: chain_indexer.v2.BatchCountCurrentResponse.page:type_name -> chain_indexer.v2.PageInfo
+	5,   // 10: chain_indexer.v2.BatchCountCurrentResponse.counts:type_name -> chain_indexer.v2.CurrentCountResult
+	50,  // 11: chain_indexer.v2.BatchCountCurrentResponse.observed_at:type_name -> google.protobuf.Timestamp
+	48,  // 12: chain_indexer.v2.GetChainViewRequest.read:type_name -> chain_indexer.v2.ReadContext
+	49,  // 13: chain_indexer.v2.GetChainViewResponse.page:type_name -> chain_indexer.v2.PageInfo
+	51,  // 14: chain_indexer.v2.GetChainViewResponse.safe_head:type_name -> chain_indexer.v2.ReadAt
+	48,  // 15: chain_indexer.v2.GetBlockRequest.read:type_name -> chain_indexer.v2.ReadContext
+	49,  // 16: chain_indexer.v2.GetBlockResponse.page:type_name -> chain_indexer.v2.PageInfo
+	52,  // 17: chain_indexer.v2.GetBlockResponse.block:type_name -> chain_indexer.v2.Block
+	53,  // 18: chain_indexer.v2.GetBlockResponse.source:type_name -> chain_indexer.v2.Source
+	48,  // 19: chain_indexer.v2.GetTransactionRequest.read:type_name -> chain_indexer.v2.ReadContext
+	49,  // 20: chain_indexer.v2.GetTransactionResponse.page:type_name -> chain_indexer.v2.PageInfo
+	54,  // 21: chain_indexer.v2.GetTransactionResponse.transaction:type_name -> chain_indexer.v2.Transaction
+	53,  // 22: chain_indexer.v2.GetTransactionResponse.source:type_name -> chain_indexer.v2.Source
+	48,  // 23: chain_indexer.v2.ListBlocksRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 24: chain_indexer.v2.ListBlocksRequest.page:type_name -> chain_indexer.v2.PageRequest
+	47,  // 25: chain_indexer.v2.ListBlocksRequest.block_range:type_name -> chain_indexer.v2.BlockRange
+	49,  // 26: chain_indexer.v2.ListBlocksResponse.page:type_name -> chain_indexer.v2.PageInfo
+	52,  // 27: chain_indexer.v2.ListBlocksResponse.blocks:type_name -> chain_indexer.v2.Block
+	48,  // 28: chain_indexer.v2.ListTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 29: chain_indexer.v2.ListTransactionsRequest.page:type_name -> chain_indexer.v2.PageRequest
+	56,  // 30: chain_indexer.v2.ListTransactionsRequest.filter:type_name -> chain_indexer.v2.TransactionFilter
+	49,  // 31: chain_indexer.v2.ListTransactionsResponse.page:type_name -> chain_indexer.v2.PageInfo
+	54,  // 32: chain_indexer.v2.ListTransactionsResponse.transactions:type_name -> chain_indexer.v2.Transaction
+	48,  // 33: chain_indexer.v2.ListLogsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 34: chain_indexer.v2.ListLogsRequest.page:type_name -> chain_indexer.v2.PageRequest
+	57,  // 35: chain_indexer.v2.ListLogsRequest.filter:type_name -> chain_indexer.v2.LogFilter
+	49,  // 36: chain_indexer.v2.ListLogsResponse.page:type_name -> chain_indexer.v2.PageInfo
+	58,  // 37: chain_indexer.v2.ListLogsResponse.logs:type_name -> chain_indexer.v2.Log
+	48,  // 38: chain_indexer.v2.ListTokenTransfersRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 39: chain_indexer.v2.ListTokenTransfersRequest.page:type_name -> chain_indexer.v2.PageRequest
+	59,  // 40: chain_indexer.v2.ListTokenTransfersRequest.filter:type_name -> chain_indexer.v2.TransferFilter
+	49,  // 41: chain_indexer.v2.ListTokenTransfersResponse.page:type_name -> chain_indexer.v2.PageInfo
+	60,  // 42: chain_indexer.v2.ListTokenTransfersResponse.transfers:type_name -> chain_indexer.v2.TokenTransfer
+	48,  // 43: chain_indexer.v2.ListInternalTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 44: chain_indexer.v2.ListInternalTransactionsRequest.page:type_name -> chain_indexer.v2.PageRequest
+	61,  // 45: chain_indexer.v2.ListInternalTransactionsRequest.filter:type_name -> chain_indexer.v2.InternalFilter
+	49,  // 46: chain_indexer.v2.ListInternalTransactionsResponse.page:type_name -> chain_indexer.v2.PageInfo
+	62,  // 47: chain_indexer.v2.ListInternalTransactionsResponse.internal_transactions:type_name -> chain_indexer.v2.InternalTransaction
+	48,  // 48: chain_indexer.v2.BatchGetTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	54,  // 49: chain_indexer.v2.TransactionBundle.transaction:type_name -> chain_indexer.v2.Transaction
+	58,  // 50: chain_indexer.v2.TransactionBundle.logs:type_name -> chain_indexer.v2.Log
+	60,  // 51: chain_indexer.v2.TransactionBundle.transfers:type_name -> chain_indexer.v2.TokenTransfer
+	62,  // 52: chain_indexer.v2.TransactionBundle.internal_transactions:type_name -> chain_indexer.v2.InternalTransaction
+	49,  // 53: chain_indexer.v2.BatchGetTransactionsResponse.page:type_name -> chain_indexer.v2.PageInfo
+	24,  // 54: chain_indexer.v2.BatchGetTransactionsResponse.transactions:type_name -> chain_indexer.v2.TransactionBundle
+	48,  // 55: chain_indexer.v2.ListContractsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 56: chain_indexer.v2.ListContractsRequest.page:type_name -> chain_indexer.v2.PageRequest
+	46,  // 57: chain_indexer.v2.ListContractsRequest.addresses:type_name -> chain_indexer.v2.AddressSet
+	47,  // 58: chain_indexer.v2.ListContractsRequest.block_range:type_name -> chain_indexer.v2.BlockRange
+	49,  // 59: chain_indexer.v2.ListContractsResponse.page:type_name -> chain_indexer.v2.PageInfo
+	63,  // 60: chain_indexer.v2.ListContractsResponse.contracts:type_name -> chain_indexer.v2.Contract
+	48,  // 61: chain_indexer.v2.ListTokensRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 62: chain_indexer.v2.ListTokensRequest.page:type_name -> chain_indexer.v2.PageRequest
+	46,  // 63: chain_indexer.v2.ListTokensRequest.addresses:type_name -> chain_indexer.v2.AddressSet
+	47,  // 64: chain_indexer.v2.ListTokensRequest.block_range:type_name -> chain_indexer.v2.BlockRange
+	49,  // 65: chain_indexer.v2.ListTokensResponse.page:type_name -> chain_indexer.v2.PageInfo
+	64,  // 66: chain_indexer.v2.ListTokensResponse.tokens:type_name -> chain_indexer.v2.Token
+	48,  // 67: chain_indexer.v2.ListAddressesRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 68: chain_indexer.v2.ListAddressesRequest.page:type_name -> chain_indexer.v2.PageRequest
+	46,  // 69: chain_indexer.v2.ListAddressesRequest.addresses:type_name -> chain_indexer.v2.AddressSet
+	49,  // 70: chain_indexer.v2.ListAddressesResponse.page:type_name -> chain_indexer.v2.PageInfo
+	65,  // 71: chain_indexer.v2.ListAddressesResponse.addresses:type_name -> chain_indexer.v2.Address
+	48,  // 72: chain_indexer.v2.ListBalancesRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 73: chain_indexer.v2.ListBalancesRequest.page:type_name -> chain_indexer.v2.PageRequest
+	46,  // 74: chain_indexer.v2.ListBalancesRequest.addresses:type_name -> chain_indexer.v2.AddressSet
+	46,  // 75: chain_indexer.v2.ListBalancesRequest.tokens:type_name -> chain_indexer.v2.AddressSet
+	49,  // 76: chain_indexer.v2.ListBalancesResponse.page:type_name -> chain_indexer.v2.PageInfo
+	66,  // 77: chain_indexer.v2.ListBalancesResponse.balances:type_name -> chain_indexer.v2.Balance
+	48,  // 78: chain_indexer.v2.ListHoldersRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 79: chain_indexer.v2.ListHoldersRequest.page:type_name -> chain_indexer.v2.PageRequest
+	46,  // 80: chain_indexer.v2.ListHoldersRequest.addresses:type_name -> chain_indexer.v2.AddressSet
+	49,  // 81: chain_indexer.v2.ListHoldersResponse.page:type_name -> chain_indexer.v2.PageInfo
+	67,  // 82: chain_indexer.v2.ListHoldersResponse.holders:type_name -> chain_indexer.v2.Holder
+	48,  // 83: chain_indexer.v2.ListCounterpartiesRequest.read:type_name -> chain_indexer.v2.ReadContext
+	46,  // 84: chain_indexer.v2.ListCounterpartiesRequest.targets:type_name -> chain_indexer.v2.AddressSet
+	47,  // 85: chain_indexer.v2.ListCounterpartiesRequest.block_range:type_name -> chain_indexer.v2.BlockRange
+	68,  // 86: chain_indexer.v2.ListCounterpartiesRequest.time_range:type_name -> chain_indexer.v2.TimeRange
+	49,  // 87: chain_indexer.v2.ListCounterpartiesResponse.page:type_name -> chain_indexer.v2.PageInfo
+	69,  // 88: chain_indexer.v2.ListCounterpartiesResponse.counterparties:type_name -> chain_indexer.v2.Counterparty
+	48,  // 89: chain_indexer.v2.BatchFirstActivityRequest.read:type_name -> chain_indexer.v2.ReadContext
+	46,  // 90: chain_indexer.v2.BatchFirstActivityRequest.targets:type_name -> chain_indexer.v2.AddressSet
+	56,  // 91: chain_indexer.v2.BatchFirstActivityRequest.filter:type_name -> chain_indexer.v2.TransactionFilter
+	49,  // 92: chain_indexer.v2.BatchFirstActivityResponse.page:type_name -> chain_indexer.v2.PageInfo
+	70,  // 93: chain_indexer.v2.BatchFirstActivityResponse.activities:type_name -> chain_indexer.v2.FirstActivity
+	48,  // 94: chain_indexer.v2.CountTransactionsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	56,  // 95: chain_indexer.v2.CountTransactionsRequest.filter:type_name -> chain_indexer.v2.TransactionFilter
+	48,  // 96: chain_indexer.v2.CountLogsRequest.read:type_name -> chain_indexer.v2.ReadContext
+	57,  // 97: chain_indexer.v2.CountLogsRequest.filter:type_name -> chain_indexer.v2.LogFilter
+	48,  // 98: chain_indexer.v2.CountTokenTransfersRequest.read:type_name -> chain_indexer.v2.ReadContext
+	59,  // 99: chain_indexer.v2.CountTokenTransfersRequest.filter:type_name -> chain_indexer.v2.TransferFilter
+	49,  // 100: chain_indexer.v2.CountResponse.page:type_name -> chain_indexer.v2.PageInfo
+	48,  // 101: chain_indexer.v2.SearchRequest.read:type_name -> chain_indexer.v2.ReadContext
+	55,  // 102: chain_indexer.v2.SearchRequest.page:type_name -> chain_indexer.v2.PageRequest
+	71,  // 103: chain_indexer.v2.SearchRequest.kinds:type_name -> chain_indexer.v2.SearchKindSet
+	49,  // 104: chain_indexer.v2.SearchResponse.page:type_name -> chain_indexer.v2.PageInfo
+	72,  // 105: chain_indexer.v2.SearchResponse.results:type_name -> chain_indexer.v2.SearchResult
+	7,   // 106: chain_indexer.v2.IndexerService.GetChainView:input_type -> chain_indexer.v2.GetChainViewRequest
+	9,   // 107: chain_indexer.v2.IndexerService.GetBlock:input_type -> chain_indexer.v2.GetBlockRequest
+	11,  // 108: chain_indexer.v2.IndexerService.GetTransaction:input_type -> chain_indexer.v2.GetTransactionRequest
+	13,  // 109: chain_indexer.v2.IndexerService.ListBlocks:input_type -> chain_indexer.v2.ListBlocksRequest
+	15,  // 110: chain_indexer.v2.IndexerService.ListTransactions:input_type -> chain_indexer.v2.ListTransactionsRequest
+	17,  // 111: chain_indexer.v2.IndexerService.ListLogs:input_type -> chain_indexer.v2.ListLogsRequest
+	19,  // 112: chain_indexer.v2.IndexerService.ListTokenTransfers:input_type -> chain_indexer.v2.ListTokenTransfersRequest
+	21,  // 113: chain_indexer.v2.IndexerService.ListInternalTransactions:input_type -> chain_indexer.v2.ListInternalTransactionsRequest
+	23,  // 114: chain_indexer.v2.IndexerService.BatchGetTransactions:input_type -> chain_indexer.v2.BatchGetTransactionsRequest
+	26,  // 115: chain_indexer.v2.IndexerService.ListContracts:input_type -> chain_indexer.v2.ListContractsRequest
+	28,  // 116: chain_indexer.v2.IndexerService.ListTokens:input_type -> chain_indexer.v2.ListTokensRequest
+	30,  // 117: chain_indexer.v2.IndexerService.ListAddresses:input_type -> chain_indexer.v2.ListAddressesRequest
+	32,  // 118: chain_indexer.v2.IndexerService.ListBalances:input_type -> chain_indexer.v2.ListBalancesRequest
+	34,  // 119: chain_indexer.v2.IndexerService.ListHolders:input_type -> chain_indexer.v2.ListHoldersRequest
+	36,  // 120: chain_indexer.v2.IndexerService.ListCounterparties:input_type -> chain_indexer.v2.ListCounterpartiesRequest
+	38,  // 121: chain_indexer.v2.IndexerService.BatchFirstActivity:input_type -> chain_indexer.v2.BatchFirstActivityRequest
+	40,  // 122: chain_indexer.v2.IndexerService.CountTransactions:input_type -> chain_indexer.v2.CountTransactionsRequest
+	41,  // 123: chain_indexer.v2.IndexerService.CountLogs:input_type -> chain_indexer.v2.CountLogsRequest
+	42,  // 124: chain_indexer.v2.IndexerService.CountTokenTransfers:input_type -> chain_indexer.v2.CountTokenTransfersRequest
+	4,   // 125: chain_indexer.v2.IndexerService.BatchCountCurrent:input_type -> chain_indexer.v2.BatchCountCurrentRequest
+	44,  // 126: chain_indexer.v2.IndexerService.Search:input_type -> chain_indexer.v2.SearchRequest
+	8,   // 127: chain_indexer.v2.IndexerService.GetChainView:output_type -> chain_indexer.v2.GetChainViewResponse
+	10,  // 128: chain_indexer.v2.IndexerService.GetBlock:output_type -> chain_indexer.v2.GetBlockResponse
+	12,  // 129: chain_indexer.v2.IndexerService.GetTransaction:output_type -> chain_indexer.v2.GetTransactionResponse
+	14,  // 130: chain_indexer.v2.IndexerService.ListBlocks:output_type -> chain_indexer.v2.ListBlocksResponse
+	16,  // 131: chain_indexer.v2.IndexerService.ListTransactions:output_type -> chain_indexer.v2.ListTransactionsResponse
+	18,  // 132: chain_indexer.v2.IndexerService.ListLogs:output_type -> chain_indexer.v2.ListLogsResponse
+	20,  // 133: chain_indexer.v2.IndexerService.ListTokenTransfers:output_type -> chain_indexer.v2.ListTokenTransfersResponse
+	22,  // 134: chain_indexer.v2.IndexerService.ListInternalTransactions:output_type -> chain_indexer.v2.ListInternalTransactionsResponse
+	25,  // 135: chain_indexer.v2.IndexerService.BatchGetTransactions:output_type -> chain_indexer.v2.BatchGetTransactionsResponse
+	27,  // 136: chain_indexer.v2.IndexerService.ListContracts:output_type -> chain_indexer.v2.ListContractsResponse
+	29,  // 137: chain_indexer.v2.IndexerService.ListTokens:output_type -> chain_indexer.v2.ListTokensResponse
+	31,  // 138: chain_indexer.v2.IndexerService.ListAddresses:output_type -> chain_indexer.v2.ListAddressesResponse
+	33,  // 139: chain_indexer.v2.IndexerService.ListBalances:output_type -> chain_indexer.v2.ListBalancesResponse
+	35,  // 140: chain_indexer.v2.IndexerService.ListHolders:output_type -> chain_indexer.v2.ListHoldersResponse
+	37,  // 141: chain_indexer.v2.IndexerService.ListCounterparties:output_type -> chain_indexer.v2.ListCounterpartiesResponse
+	39,  // 142: chain_indexer.v2.IndexerService.BatchFirstActivity:output_type -> chain_indexer.v2.BatchFirstActivityResponse
+	43,  // 143: chain_indexer.v2.IndexerService.CountTransactions:output_type -> chain_indexer.v2.CountResponse
+	43,  // 144: chain_indexer.v2.IndexerService.CountLogs:output_type -> chain_indexer.v2.CountResponse
+	43,  // 145: chain_indexer.v2.IndexerService.CountTokenTransfers:output_type -> chain_indexer.v2.CountResponse
+	6,   // 146: chain_indexer.v2.IndexerService.BatchCountCurrent:output_type -> chain_indexer.v2.BatchCountCurrentResponse
+	45,  // 147: chain_indexer.v2.IndexerService.Search:output_type -> chain_indexer.v2.SearchResponse
+	127, // [127:148] is the sub-list for method output_type
+	106, // [106:127] is the sub-list for method input_type
+	106, // [106:106] is the sub-list for extension type_name
+	106, // [106:106] is the sub-list for extension extendee
+	0,   // [0:106] is the sub-list for field type_name
 }
 
 func init() { file_chain_indexer_v2_service_proto_init() }
@@ -2822,21 +3302,26 @@ func file_chain_indexer_v2_service_proto_init() {
 	}
 	file_chain_indexer_v2_common_proto_init()
 	file_chain_indexer_v2_facts_proto_init()
-	file_chain_indexer_v2_service_proto_msgTypes[1].OneofWrappers = []any{}
-	file_chain_indexer_v2_service_proto_msgTypes[2].OneofWrappers = []any{
+	file_chain_indexer_v2_service_proto_msgTypes[3].OneofWrappers = []any{
+		(*CurrentCountSelector_Addresses)(nil),
+		(*CurrentCountSelector_Tokens)(nil),
+		(*CurrentCountSelector_Holders)(nil),
+	}
+	file_chain_indexer_v2_service_proto_msgTypes[8].OneofWrappers = []any{}
+	file_chain_indexer_v2_service_proto_msgTypes[9].OneofWrappers = []any{
 		(*GetBlockRequest_Number)(nil),
 		(*GetBlockRequest_Hash)(nil),
 	}
-	file_chain_indexer_v2_service_proto_msgTypes[19].OneofWrappers = []any{}
-	file_chain_indexer_v2_service_proto_msgTypes[23].OneofWrappers = []any{}
+	file_chain_indexer_v2_service_proto_msgTypes[26].OneofWrappers = []any{}
 	file_chain_indexer_v2_service_proto_msgTypes[30].OneofWrappers = []any{}
+	file_chain_indexer_v2_service_proto_msgTypes[37].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_chain_indexer_v2_service_proto_rawDesc), len(file_chain_indexer_v2_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   39,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

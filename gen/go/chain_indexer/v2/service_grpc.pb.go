@@ -38,6 +38,7 @@ const (
 	IndexerService_CountTransactions_FullMethodName        = "/chain_indexer.v2.IndexerService/CountTransactions"
 	IndexerService_CountLogs_FullMethodName                = "/chain_indexer.v2.IndexerService/CountLogs"
 	IndexerService_CountTokenTransfers_FullMethodName      = "/chain_indexer.v2.IndexerService/CountTokenTransfers"
+	IndexerService_BatchCountCurrent_FullMethodName        = "/chain_indexer.v2.IndexerService/BatchCountCurrent"
 	IndexerService_Search_FullMethodName                   = "/chain_indexer.v2.IndexerService/Search"
 )
 
@@ -66,6 +67,7 @@ type IndexerServiceClient interface {
 	CountTransactions(ctx context.Context, in *CountTransactionsRequest, opts ...grpc.CallOption) (*CountResponse, error)
 	CountLogs(ctx context.Context, in *CountLogsRequest, opts ...grpc.CallOption) (*CountResponse, error)
 	CountTokenTransfers(ctx context.Context, in *CountTokenTransfersRequest, opts ...grpc.CallOption) (*CountResponse, error)
+	BatchCountCurrent(ctx context.Context, in *BatchCountCurrentRequest, opts ...grpc.CallOption) (*BatchCountCurrentResponse, error)
 	Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
 }
 
@@ -267,6 +269,16 @@ func (c *indexerServiceClient) CountTokenTransfers(ctx context.Context, in *Coun
 	return out, nil
 }
 
+func (c *indexerServiceClient) BatchCountCurrent(ctx context.Context, in *BatchCountCurrentRequest, opts ...grpc.CallOption) (*BatchCountCurrentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchCountCurrentResponse)
+	err := c.cc.Invoke(ctx, IndexerService_BatchCountCurrent_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *indexerServiceClient) Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SearchResponse)
@@ -302,6 +314,7 @@ type IndexerServiceServer interface {
 	CountTransactions(context.Context, *CountTransactionsRequest) (*CountResponse, error)
 	CountLogs(context.Context, *CountLogsRequest) (*CountResponse, error)
 	CountTokenTransfers(context.Context, *CountTokenTransfersRequest) (*CountResponse, error)
+	BatchCountCurrent(context.Context, *BatchCountCurrentRequest) (*BatchCountCurrentResponse, error)
 	Search(context.Context, *SearchRequest) (*SearchResponse, error)
 	mustEmbedUnimplementedIndexerServiceServer()
 }
@@ -369,6 +382,9 @@ func (UnimplementedIndexerServiceServer) CountLogs(context.Context, *CountLogsRe
 }
 func (UnimplementedIndexerServiceServer) CountTokenTransfers(context.Context, *CountTokenTransfersRequest) (*CountResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CountTokenTransfers not implemented")
+}
+func (UnimplementedIndexerServiceServer) BatchCountCurrent(context.Context, *BatchCountCurrentRequest) (*BatchCountCurrentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchCountCurrent not implemented")
 }
 func (UnimplementedIndexerServiceServer) Search(context.Context, *SearchRequest) (*SearchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Search not implemented")
@@ -736,6 +752,24 @@ func _IndexerService_CountTokenTransfers_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _IndexerService_BatchCountCurrent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchCountCurrentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(IndexerServiceServer).BatchCountCurrent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: IndexerService_BatchCountCurrent_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(IndexerServiceServer).BatchCountCurrent(ctx, req.(*BatchCountCurrentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _IndexerService_Search_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SearchRequest)
 	if err := dec(in); err != nil {
@@ -836,6 +870,10 @@ var IndexerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CountTokenTransfers",
 			Handler:    _IndexerService_CountTokenTransfers_Handler,
+		},
+		{
+			MethodName: "BatchCountCurrent",
+			Handler:    _IndexerService_BatchCountCurrent_Handler,
 		},
 		{
 			MethodName: "Search",

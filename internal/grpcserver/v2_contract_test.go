@@ -382,6 +382,91 @@ INSERT INTO token_balances_current(token_address,address,block_number,balance) V
 			t.Fatal(e)
 		}
 	}
+
+	t.Run("current_count_batch_exact_typed_and_finite", func(t *testing.T) {
+		ctx := reset(t)
+		seedFacts(t, ctx)
+		a := v2Address("aaa0000000000000000000000000000000000001")
+		token := v2Address("ddd0000000000000000000000000000000000004")
+		set := &indexerv2.AddressSet{Addresses: [][]byte{a, token}}
+		request := &indexerv2.BatchCountCurrentRequest{Selectors: []*indexerv2.CurrentCountSelector{
+			{Value: &indexerv2.CurrentCountSelector_Addresses{Addresses: &indexerv2.CurrentAddresses{Addresses: set}}},
+			{Value: &indexerv2.CurrentCountSelector_Tokens{Tokens: &indexerv2.CurrentTokens{Addresses: set, TokenType: "ERC20"}}},
+			{Value: &indexerv2.CurrentCountSelector_Holders{Holders: &indexerv2.CurrentHolders{TokenAddress: token, Addresses: set}}},
+			{Value: &indexerv2.CurrentCountSelector_Addresses{Addresses: &indexerv2.CurrentAddresses{Addresses: &indexerv2.AddressSet{}}}},
+		}}
+		out, e := client.BatchCountCurrent(ctx, request)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if len(out.Counts) != 4 || out.Counts[0].Count != 1 || out.Counts[1].Count != 1 || out.Counts[2].Count != 1 || out.Counts[3].Count != 0 || out.ObservedAt == nil || out.ObservedAt.CheckValid() != nil {
+			t.Fatalf("current counts %v", out)
+		}
+		checkPage(t, out.Page, indexerv2.Consistency_CONSISTENCY_CURRENT)
+		for _, c := range out.Counts {
+			if len(c.SelectorDigest) != 32 {
+				t.Fatal("missing selector digest")
+			}
+		}
+
+		for _, search := range []string{"İ", "i", "Σ", "σ", "ς", "STRAẞE", "straße", "😀"} {
+			if _, e = h.pool.Exec(ctx, `UPDATE tokens SET symbol='İΣSTRAẞE😀',name='straßeς' WHERE address='0xddd0000000000000000000000000000000000004'`); e != nil {
+				t.Fatal(e)
+			}
+			listed, e := client.ListTokens(ctx, &indexerv2.ListTokensRequest{Addresses: set, Search: search})
+			if e != nil {
+				t.Fatal(e)
+			}
+			counted, e := client.BatchCountCurrent(ctx, &indexerv2.BatchCountCurrentRequest{Selectors: []*indexerv2.CurrentCountSelector{{Value: &indexerv2.CurrentCountSelector_Tokens{Tokens: &indexerv2.CurrentTokens{Addresses: set, Search: search}}}}})
+			if e != nil || counted.Counts[0].Count != uint64(len(listed.Tokens)) {
+				t.Fatalf("Unicode list/count population diverged for %q: %v %v %v", search, listed, counted, e)
+			}
+		}
+		request.Read = v2Resume(out.Page)
+		again, e := client.BatchCountCurrent(ctx, request)
+		if e != nil || again.Counts[1].Count != 1 {
+			t.Fatal("pinned CURRENT observation", again, e)
+		}
+
+		if _, e = h.pool.Exec(ctx, `INSERT INTO address_stats(address) SELECT '0x'||lpad(to_hex(100000+n),40,'0') FROM generate_series(1,20000)n;ANALYZE address_stats`); e != nil {
+			t.Fatal(e)
+		}
+		plan, e := h.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT count(*) FROM unnest($1::text[]) selected(address) JOIN address_stats r ON r.address=selected.address`, []string{"0xaaa0000000000000000000000000000000000001", "0xddd0000000000000000000000000000000000004"})
+		if e != nil {
+			t.Fatal(e)
+		}
+		var lines []string
+		for plan.Next() {
+			var line string
+			if e = plan.Scan(&line); e != nil {
+				t.Fatal(e)
+			}
+			lines = append(lines, line)
+		}
+		plan.Close()
+		if !strings.Contains(strings.Join(lines, "\n"), "Index") {
+			t.Fatal("bounded selected-address plan lost its PK lookup", lines)
+		}
+		large := &indexerv2.AddressSet{}
+		for n := 1; n <= 4096; n++ {
+			large.Addresses = append(large.Addresses, v2Address(fmt.Sprintf("%040x", n)))
+		}
+		oversized := &indexerv2.BatchCountCurrentRequest{}
+		for i := 0; i < 5; i++ {
+			oversized.Selectors = append(oversized.Selectors, &indexerv2.CurrentCountSelector{Value: &indexerv2.CurrentCountSelector_Addresses{Addresses: &indexerv2.CurrentAddresses{Addresses: large}}})
+		}
+		_, e = client.BatchCountCurrent(ctx, oversized)
+		v2RequireReason(t, e, codes.ResourceExhausted, "READ_BUDGET_EXCEEDED")
+		request.Selectors[0].GetAddresses().Addresses = nil
+		_, e = client.BatchCountCurrent(ctx, request)
+		v2RequireReason(t, e, codes.InvalidArgument, "INVALID_FILTER")
+		request.Selectors[0].GetAddresses().Addresses = &indexerv2.AddressSet{Addresses: [][]byte{a, a}}
+		_, e = client.BatchCountCurrent(ctx, request)
+		v2RequireReason(t, e, codes.InvalidArgument, "INVALID_FILTER")
+		request.Selectors = make([]*indexerv2.CurrentCountSelector, 26)
+		_, e = client.BatchCountCurrent(ctx, request)
+		v2RequireReason(t, e, codes.InvalidArgument, "INVALID_FILTER")
+	})
 	t.Run("get_block_point_source", func(t *testing.T) {
 		ctx := reset(t)
 		p, e := client.GetBlock(ctx, &indexerv2.GetBlockRequest{Selector: &indexerv2.GetBlockRequest_Number{Number: 5}})
