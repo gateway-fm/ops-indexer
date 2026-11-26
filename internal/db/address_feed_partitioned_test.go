@@ -32,10 +32,46 @@ func partitionHistory(t *testing.T, d *DB, partitionBlocks, upto uint64) {
 }
 
 type planNode struct {
+	NodeType string     `json:"Node Type"`
 	Relation string     `json:"Relation Name"`
+	Index    string     `json:"Index Name"`
 	Rows     float64    `json:"Actual Rows"`
 	Loops    float64    `json:"Actual Loops"`
 	Plans    []planNode `json:"Plans"`
+}
+
+func (n planNode) usesIndexSuffix(suffix string) bool {
+	if strings.HasSuffix(n.Index, suffix) {
+		return true
+	}
+	for _, c := range n.Plans {
+		if c.usesIndexSuffix(suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+type partitionProbe struct{ executions, partitionScans float64 }
+
+func (n planNode) transactionHashProbes() []partitionProbe {
+	var probes []partitionProbe
+	if n.NodeType == "Append" && len(n.Plans) > 0 {
+		probe := partitionProbe{executions: n.Loops}
+		onTransactions, byHash := true, false
+		for _, c := range n.Plans {
+			onTransactions = onTransactions && strings.HasPrefix(c.Relation, "transactions")
+			byHash = byHash || c.usesIndexSuffix("_pkey")
+			probe.partitionScans += c.Loops
+		}
+		if onTransactions && byHash {
+			return append(probes, probe)
+		}
+	}
+	for _, c := range n.Plans {
+		probes = append(probes, c.transactionHashProbes()...)
+	}
+	return probes
 }
 
 func (n planNode) rowsFrom(prefix string) float64 {
@@ -148,6 +184,7 @@ func TestGetTransactionsByAddressOnPartitionedHistoryReadsOnlyTheAddressRows(t *
 		return hashes
 	}
 
+	var probedByHash bool
 	for _, addr := range []string{withTransfers, withoutTransfers} {
 		want := reference(addr)
 		require.NotEmpty(t, want)
@@ -186,6 +223,14 @@ func TestGetTransactionsByAddressOnPartitionedHistoryReadsOnlyTheAddressRows(t *
 			require.NoError(t, json.Unmarshal(plan, &root))
 			read := root[0].Plan.rowsFrom("transactions")
 			require.LessOrEqual(t, read, float64(60), "%s before %v reads %v transactions rows", addr, bound, read)
+			for _, probe := range root[0].Plan.transactionHashProbes() {
+				require.LessOrEqual(t, probe.partitionScans, probe.executions,
+					"%s before %v: a lookup by hash scans more than its own partition", addr, bound)
+				if addr == withTransfers && probe.executions > 0 {
+					probedByHash = true
+				}
+			}
 		}
 	}
+	require.True(t, probedByHash, "the transfer candidates must be looked up by hash")
 }
