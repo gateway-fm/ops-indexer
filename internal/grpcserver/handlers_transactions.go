@@ -136,19 +136,28 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 	case nil:
 		// No filter — main transaction feed.
 		var beforeBlock *uint64
+		var toBlock uint64
 		if c := req.GetPage().GetCursor(); c != "" {
 			var cur txFeedCursor
 			if err := decodeCursor(c, &cur); err != nil {
 				return nil, err
 			}
 			beforeBlock = &cur.BlockNumber
-		} else if toBlock := req.GetBlockRange().GetToBlock(); toBlock > 0 {
+		} else if toBlock = req.GetBlockRange().GetToBlock(); toBlock > 0 {
 			beforeBlock = &toBlock
+			if err := s.checkRetained(ctx, lastBlockBelow(toBlock)); err != nil {
+				return nil, err
+			}
 		}
 		rows, err := s.db.GetTransactionsWithCategories(ctx, int(limit)+1, beforeBlock)
 		if err != nil {
 			slog.Error("ListTransactions feed", "error", err)
 			return nil, internalErr(err, "ListTransactions")
+		}
+		if toBlock > 0 && len(rows) == 0 {
+			if err := s.recheckRetained(ctx, lastBlockBelow(toBlock)); err != nil {
+				return nil, err
+			}
 		}
 		return buildTxListResponse(rows, limit), nil
 	}
