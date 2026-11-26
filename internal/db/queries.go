@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1880,14 +1881,69 @@ func (d *DB) GetTransactionHistory(ctx context.Context, intervalSeconds int, lim
 
 // Search suggestions
 
+// minHexPrefix is the shortest hex prefix (after "0x") that triggers a hash or
+// address lookup. Shorter prefixes match too large a share of the table to be
+// useful as suggestions.
+const minHexPrefix = 3
+
+// hexPrefixRange turns a "0x…" query into a lowercase prefix and an exclusive
+// upper bound, so the lookup is a btree range scan on the primary key instead
+// of a sequential scan. ok is false when the query is not 0x followed by
+// minHexPrefix..maxHex hex digits. Hashes and addresses are stored lowercase.
+func hexPrefixRange(query string, maxHex int) (lo, hi string, ok bool) {
+	if len(query) < 2 || (query[:2] != "0x" && query[:2] != "0X") {
+		return "", "", false
+	}
+	digits := strings.ToLower(query[2:])
+	if len(digits) < minHexPrefix || len(digits) > maxHex {
+		return "", "", false
+	}
+	for _, c := range digits {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", "", false
+		}
+	}
+	lo = "0x" + digits
+	// 'g' sorts after every hex digit, so [lo, lo+"g") holds exactly the
+	// strings that start with lo.
+	return lo, lo + "g", true
+}
+
+// blockPrefixRanges returns the half-open block-number ranges whose decimal
+// form starts with prefix: for "18" that is [18,19), [180,190), [1800,1900), …
+// Each range is an index range scan on blocks.number.
+func blockPrefixRanges(prefix string) (los, his []int64) {
+	if prefix == "" || (len(prefix) > 1 && prefix[0] == '0') || len(prefix) > 18 {
+		return nil, nil
+	}
+	p, err := strconv.ParseInt(prefix, 10, 64)
+	if err != nil {
+		return nil, nil
+	}
+	if p == 0 {
+		return []int64{0}, []int64{1}
+	}
+	const maxBlock = int64(1) << 53
+	for lo, hi := p, p+1; lo <= maxBlock; lo, hi = lo*10, hi*10 {
+		los = append(los, lo)
+		his = append(his, hi)
+	}
+	return los, his
+}
+
 func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]types.SearchSuggestion, error) {
 	var suggestions []types.SearchSuggestion
 
-	if isNumeric(query) {
+	if los, his := blockPrefixRanges(query); len(los) > 0 {
 		rows, err := d.pool.Query(ctx, `
-			SELECT number FROM blocks
-			WHERE number::text LIKE $1 || '%'
-			ORDER BY number DESC LIMIT $2`, query, limit)
+			SELECT b.number
+			FROM unnest($1::bigint[], $2::bigint[]) AS r(lo, hi)
+			CROSS JOIN LATERAL (
+				SELECT number FROM blocks
+				WHERE number >= r.lo AND number < r.hi
+				ORDER BY number DESC LIMIT $3
+			) b
+			ORDER BY b.number DESC LIMIT $3`, los, his, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1909,11 +1965,11 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 		}
 	}
 
-	if len(query) >= 2 && query[:2] == "0x" {
+	if lo, hi, ok := hexPrefixRange(query, 64); ok {
 		rows, err := d.pool.Query(ctx, `
 			SELECT hash FROM transactions
-			WHERE LOWER(hash) LIKE LOWER($1) || '%'
-			ORDER BY block_number DESC LIMIT $2`, query, limit)
+			WHERE hash >= $1 AND hash < $2
+			ORDER BY block_number DESC LIMIT $3`, lo, hi, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1935,11 +1991,11 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 		}
 	}
 
-	if len(query) >= 2 && query[:2] == "0x" {
+	if lo, hi, ok := hexPrefixRange(query, 40); ok {
 		rows, err := d.pool.Query(ctx, `
 			SELECT address, tx_count FROM address_stats
-			WHERE LOWER(address) LIKE LOWER($1) || '%'
-			ORDER BY tx_count DESC LIMIT $2`, query, limit)
+			WHERE address >= $1 AND address < $2
+			ORDER BY tx_count DESC LIMIT $3`, lo, hi, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1994,15 +2050,6 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	return suggestions, nil
-}
-
-func isNumeric(s string) bool {
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
 }
 
 func truncateHash(hash string) string {
