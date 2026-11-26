@@ -187,6 +187,16 @@ func TestRetention_ExplicitBlockTargets(t *testing.T) {
 	})
 	requireCode(t, err, codes.OutOfRange)
 
+	_, err = h.client.ListTransactions(ctx, &indexerv1.ListTransactionsRequest{BlockRange: &indexerv1.BlockRange{ToBlock: 3}})
+	requireCode(t, err, codes.OutOfRange)
+	below4, err := h.client.ListTransactions(ctx, &indexerv1.ListTransactionsRequest{BlockRange: &indexerv1.BlockRange{ToBlock: 4}})
+	if err != nil {
+		t.Fatalf("ListTransactions feed before 4: %v", err)
+	}
+	if len(below4.GetTransactions()) != 1 || below4.GetTransactions()[0].GetBlockNumber() != 3 {
+		t.Errorf("feed before 4 = %v, want [3]", below4.GetTransactions())
+	}
+
 	// A feed that reaches the watermark just ends.
 	feed, err := h.client.ListTransactions(ctx, &indexerv1.ListTransactionsRequest{Page: &indexerv1.PageRequest{PageSize: 10}})
 	if err != nil {

@@ -154,8 +154,8 @@ pruned, every call behaves as before.
 - `ListTransactions` and `ListInternalTransactions` `by_block` by number.
 - `BatchGetBlockTransactionCounts` when any requested block is at or below it.
 - `ListBlocks` when its upper bound (`before_number` or the cursor, exclusive) is at most watermark + 1.
-- `ListTransactions` and `ListTokenTransfers` `by_address` with `block_range.to_block` (exclusive) at most
-  watermark + 1 and no cursor.
+- `ListTransactions` (unfiltered or `by_address`) and `ListTokenTransfers` `by_address` with
+  `block_range.to_block` (exclusive) at most watermark + 1 and no cursor.
 - `ListLogs` with `by_address` + `topic0` and `block_range.to_block` at or below the watermark: this path treats
   `to_block` as **inclusive**. `ListLogs` honours `block_range` on that path only.
 
