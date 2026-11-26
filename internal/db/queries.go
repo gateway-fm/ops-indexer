@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
 	"strings"
@@ -565,9 +566,6 @@ func (b *AddressFeedBound) rowBound() (uint64, uint32) {
 }
 
 func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit int, before *AddressFeedBound) ([]types.Transaction, error) {
-	var rows pgx.Rows
-	var err error
-
 	// Addresses are canonicalised to lowercase at insert time, so an exact
 	// lowercase match hits the (from_address|to_address, block_number DESC)
 	// composite indexes.
@@ -588,85 +586,83 @@ func (d *DB) GetTransactionsByAddress(ctx context.Context, address string, limit
 	// outer sort sees at most 3*limit rows regardless of table size
 	// (~0.2ms on the same data).
 	//
-	// The transfer branch limits by DISTINCT tx_hash (GROUP BY tx_hash), not by
-	// transfer-log row: a single recent tx can emit many Transfer logs to the
-	// address (airdrops, batch transfers, swaps, NFT mints), and a plain row
-	// LIMIT would let those collapse the candidate set to a handful of hashes,
-	// silently dropping older transfer-only txs that belong on the page. The
-	// candidate hashes are ordered and bounded by the SAME (block_number,
-	// tx_index) keyset as the outer query (joining transactions for tx_index),
-	// so the top-`limit` distinct candidates line up exactly with the page.
-	// Ordering candidates by MAX(block_number) alone left intra-block ties
-	// unstable: a block holding more than `limit` transfer-only txs could then
-	// drop rows the outer keyset never revisits (Copilot review on #27).
-	addr := strings.ToLower(address)
-
-	const cols = `t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
-		t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
-		t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at`
-
+	// The transfer branch limits by DISTINCT tx_hash, not by transfer-log row:
+	// a single recent tx can emit many Transfer logs to the address (airdrops,
+	// batch transfers, swaps, NFT mints), and a plain row LIMIT would let those
+	// collapse the candidate set to a handful of hashes, silently dropping older
+	// transfer-only txs that belong on the page. It walks down the address's
+	// transfer blocks below the bound, at most `limit` of them since each holds
+	// at least one tx, and keeps every transfer-touching tx of each block that
+	// still has fewer than `limit` such txs in newer blocks below the bound,
+	// whole blocks included, so the branch's own (block_number, tx_index)
+	// keyset order and LIMIT see every row the page needs. Ordering candidates
+	// by MAX(block_number) alone left intra-block ties unstable: a block
+	// holding more than `limit` transfer-only txs could then drop rows the
+	// outer keyset never revisits (Copilot review on #27).
+	bBlock, bIdx := uint64(math.MaxInt64), uint32(0)
 	if before != nil {
-		// Keyset seek (RD-1148): the exclusive row-value comparison
-		// (block_number, tx_index) < ($2, $3) resumes exactly after the cursor
-		// row, so a page boundary inside a block cannot skip the block's
-		// remaining transactions (bare `block_number < $2` did). The
-		// transfer-candidate subquery applies the same (block, tx_index) keyset
-		// bound and ordering (via a join to transactions) so its top-`limit`
-		// distinct hashes are exactly the ones the outer query needs.
-		// $1 = addr, $2 = bound block, $3 = bound idx, $4 = limit
-		bBlock, bIdx := before.rowBound()
-		query := `
-			SELECT * FROM (
-				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.from_address = $1 AND (t.block_number, t.tx_index) < ($2, $3)
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
-				UNION
-				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.to_address = $1 AND (t.block_number, t.tx_index) < ($2, $3)
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
-				UNION
-				(SELECT ` + cols + ` FROM transactions t
-				 WHERE (t.block_number, t.tx_index) < ($2, $3) AND t.hash IN (
-					SELECT tt.tx_hash FROM token_transfers tt
-					JOIN transactions ct ON ct.hash = tt.tx_hash
-					WHERE (tt.from_address = $1 OR tt.to_address = $1)
-					  AND (ct.block_number, ct.tx_index) < ($2, $3)
-					GROUP BY tt.tx_hash, ct.block_number, ct.tx_index
-					ORDER BY ct.block_number DESC, ct.tx_index DESC LIMIT $4)
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
-			) t
-			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4`
-		rows, err = d.pool.Query(ctx, query, addr, bBlock, bIdx, limit)
-	} else {
-		// $1 = addr, $2 = limit
-		query := `
-			SELECT * FROM (
-				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.from_address = $1
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2)
-				UNION
-				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.to_address = $1
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2)
-				UNION
-				(SELECT ` + cols + ` FROM transactions t
-				 WHERE t.hash IN (
-					SELECT tt.tx_hash FROM token_transfers tt
-					JOIN transactions ct ON ct.hash = tt.tx_hash
-					WHERE tt.from_address = $1 OR tt.to_address = $1
-					GROUP BY tt.tx_hash, ct.block_number, ct.tx_index
-					ORDER BY ct.block_number DESC, ct.tx_index DESC LIMIT $2)
-				 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2)
-			) t
-			ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $2`
-		rows, err = d.pool.Query(ctx, query, addr, limit)
+		bBlock, bIdx = before.rowBound()
 	}
+	rows, err := d.pool.Query(ctx, addressTransactionsQuery, strings.ToLower(address), bBlock, bIdx, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanTransactionsWithTimestamp(rows)
 }
+
+const addressTransactionCols = `t.hash, t.block_number, t.block_timestamp, t.tx_index, t.from_address, t.to_address, t.value::text,
+	t.gas_used, t.gas_price, t.gas_limit, t.max_fee_per_gas, t.max_priority_fee_per_gas, t.nonce,
+	t.tx_type, t.input_data, t.status, t.error, t.revert_reason, t.created_at`
+
+const addressTransactionsQuery = `
+	WITH RECURSIVE transfer_blocks(block_number, depth) AS (
+		SELECT $2::bigint, 0::bigint
+		UNION ALL
+		SELECT below.block_number, walked.depth + 1
+		FROM transfer_blocks walked
+		CROSS JOIN LATERAL (
+			(SELECT tt.block_number FROM token_transfers tt WHERE tt.from_address = $1 AND tt.block_number < walked.block_number
+			 ORDER BY tt.block_number DESC LIMIT 1)
+			UNION ALL
+			(SELECT tt.block_number FROM token_transfers tt WHERE tt.to_address = $1 AND tt.block_number < walked.block_number
+			 ORDER BY tt.block_number DESC LIMIT 1)
+			ORDER BY block_number DESC LIMIT 1
+		) below
+		WHERE walked.depth < $4
+	),
+	transfer_txs AS (
+		SELECT DISTINCT tt.tx_hash, tt.block_number FROM token_transfers tt
+		WHERE (tt.from_address = $1 OR tt.to_address = $1)
+		  AND tt.block_number BETWEEN (SELECT min(block_number) FROM transfer_blocks) AND $2
+	),
+	page_transfer_txs AS (
+		SELECT tx_hash, block_number FROM (
+			SELECT tx_hash, block_number,
+				count(*) FILTER (WHERE block_number < $2)
+					OVER (ORDER BY block_number DESC RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS txs_in_newer_blocks
+			FROM transfer_txs
+		) ranked
+		WHERE txs_in_newer_blocks < $4
+	)
+	SELECT * FROM (
+		(SELECT ` + addressTransactionCols + ` FROM transactions t
+		 WHERE t.from_address = $1 AND (t.block_number, t.tx_index) < ($2, $3)
+		 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
+		UNION
+		(SELECT ` + addressTransactionCols + ` FROM transactions t
+		 WHERE t.to_address = $1 AND (t.block_number, t.tx_index) < ($2, $3)
+		 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
+		UNION
+		(SELECT t.* FROM page_transfer_txs c
+		 CROSS JOIN LATERAL (
+			SELECT ` + addressTransactionCols + ` FROM transactions t
+			WHERE t.hash = c.tx_hash AND t.block_number = c.block_number LIMIT 1
+		 ) t
+		 WHERE (t.block_number, t.tx_index) < ($2, $3)
+		 ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4)
+	) t
+	ORDER BY t.block_number DESC, t.tx_index DESC LIMIT $4`
 
 func scanTransactionsWithTimestamp(rows pgx.Rows) ([]types.Transaction, error) {
 	var txs []types.Transaction
