@@ -142,6 +142,8 @@ func (s *Server) ListTransactions(ctx context.Context, req *indexerv1.ListTransa
 				return nil, err
 			}
 			beforeBlock = &cur.BlockNumber
+		} else if toBlock := req.GetBlockRange().GetToBlock(); toBlock > 0 {
+			beforeBlock = &toBlock
 		}
 		rows, err := s.db.GetTransactionsWithCategories(ctx, int(limit)+1, beforeBlock)
 		if err != nil {
