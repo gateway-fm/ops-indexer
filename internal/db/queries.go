@@ -1909,12 +1909,97 @@ func hexPrefixRange(query string, maxHex int) (lo, hi string, ok bool) {
 	return lo, lo + "g", true
 }
 
+// hexRangeCond is the prefix predicate on a hex column for the [$1, $2) bounds
+// from hexPrefixRange. With a bytewise collation it is a primary-key range
+// scan. Otherwise the range is taken in the "C" collation: still correct, but
+// no index serves it, so it scans (as the LIKE before PRST-6066 did).
+func hexRangeCond(col string, bytewise bool) string {
+	if bytewise {
+		return col + ` >= $1 AND ` + col + ` < $2`
+	}
+	return col + ` COLLATE "C" >= $1 AND ` + col + ` COLLATE "C" < $2`
+}
+
+// txPrefixQuery returns transactions whose hash starts with the prefix, newest
+// first. The hash matches are MATERIALIZED before the ordering: otherwise the
+// planner may satisfy ORDER BY block_number DESC LIMIT n by walking
+// idx_tx_block and filtering on hash, which reads most of the table when the
+// matches sit in old blocks.
+func txPrefixQuery(bytewise bool) string {
+	return `
+		WITH m AS MATERIALIZED (
+			SELECT hash, block_number FROM transactions
+			WHERE ` + hexRangeCond("hash", bytewise) + `
+		)
+		SELECT hash FROM m ORDER BY block_number DESC LIMIT $3`
+}
+
+// hexOrderIsBytewise reports whether transactions.hash and
+// address_stats.address order hex strings bytewise under their collation, which
+// the hexPrefixRange bounds rely on. Some collations do not (ICU "da" sorts
+// "aa" after "f"), and there the range would silently miss matches. Checked
+// once; on error it assumes not, which is slower but correct.
+func (d *DB) hexOrderIsBytewise() bool {
+	d.hexOrderOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ok, err := d.probeHexOrder(ctx)
+		if err != nil {
+			log.Warn("search suggestions: could not check the hash/address collation; prefix lookups will scan", "err", err)
+		} else if !ok {
+			log.Warn("search suggestions: the hash/address collation does not order hex bytewise; prefix lookups will scan. Use the C collation for fast lookups")
+		}
+		d.hexOrderBytewise = err == nil && ok
+	})
+	return d.hexOrderBytewise
+}
+
+// probeHexOrder sorts every string of up to three characters from the hex
+// alphabet, 'g' and 'x' under each column's collation and compares the order
+// with "C".
+func (d *DB) probeHexOrder(ctx context.Context) (bool, error) {
+	for _, c := range [][2]string{{"transactions", "hash"}, {"address_stats", "address"}} {
+		var coll string
+		if err := d.pool.QueryRow(ctx, `
+			SELECT co.collname FROM pg_attribute a JOIN pg_collation co ON co.oid = a.attcollation
+			WHERE a.attrelid = $1::regclass AND a.attname = $2`, c[0], c[1]).Scan(&coll); err != nil {
+			return false, fmt.Errorf("collation of %s.%s: %w", c[0], c[1], err)
+		}
+		var mismatched int
+		if err := d.pool.QueryRow(ctx, `
+			WITH a(ch) AS (SELECT unnest(string_to_array('0123456789abcdefgx', NULL))),
+			v(s) AS (
+				SELECT ch FROM a
+				UNION ALL SELECT a1.ch || a2.ch FROM a a1, a a2
+				UNION ALL SELECT a1.ch || a2.ch || a3.ch FROM a a1, a a2, a a3
+			),
+			o AS (
+				SELECT row_number() OVER (ORDER BY s COLLATE `+pgx.Identifier{coll}.Sanitize()+`) AS r1,
+				       row_number() OVER (ORDER BY s COLLATE "C") AS r2
+				FROM v
+			)
+			SELECT count(*) FROM o WHERE r1 <> r2`).Scan(&mismatched); err != nil {
+			return false, fmt.Errorf("hex order under %q: %w", coll, err)
+		}
+		if mismatched > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // blockPrefixRanges returns the half-open block-number ranges whose decimal
 // form starts with prefix: for "18" that is [18,19), [180,190), [1800,1900), …
 // Each range is an index range scan on blocks.number.
 func blockPrefixRanges(prefix string) (los, his []int64) {
 	if prefix == "" || (len(prefix) > 1 && prefix[0] == '0') || len(prefix) > 18 {
 		return nil, nil
+	}
+	// ParseInt alone would accept a sign ("+15" is 15).
+	for _, c := range prefix {
+		if c < '0' || c > '9' {
+			return nil, nil
+		}
 	}
 	p, err := strconv.ParseInt(prefix, 10, 64)
 	if err != nil {
@@ -1966,10 +2051,7 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	if lo, hi, ok := hexPrefixRange(query, 64); ok {
-		rows, err := d.pool.Query(ctx, `
-			SELECT hash FROM transactions
-			WHERE hash >= $1 AND hash < $2
-			ORDER BY block_number DESC LIMIT $3`, lo, hi, limit)
+		rows, err := d.pool.Query(ctx, txPrefixQuery(d.hexOrderIsBytewise()), lo, hi, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1994,7 +2076,7 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	if lo, hi, ok := hexPrefixRange(query, 40); ok {
 		rows, err := d.pool.Query(ctx, `
 			SELECT address, tx_count FROM address_stats
-			WHERE address >= $1 AND address < $2
+			WHERE `+hexRangeCond("address", d.hexOrderIsBytewise())+`
 			ORDER BY tx_count DESC LIMIT $3`, lo, hi, limit)
 		if err != nil {
 			return nil, err
