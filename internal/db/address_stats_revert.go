@@ -32,7 +32,7 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 			SELECT address, count(DISTINCT tx) AS txs, sum(sent) AS sent, sum(internal) AS internal, sum(transfers) AS transfers
 			FROM ledger_address_contributions($1::BIGINT, $2::BIGINT) GROUP BY address
 		) c
-		ORDER BY c.address COLLATE "C"`, int64(number), int64(number)+1)
+		ORDER BY c.address COLLATE pg_catalog."C"`, int64(number), int64(number)+1)
 	if err != nil {
 		return 0, err
 	}
@@ -125,7 +125,7 @@ func revertAddressStats(ctx context.Context, tx pgx.Tx, number uint64) (int64, e
 		addresses[i] = c.address
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO ledger_reverted_address (address) SELECT a FROM unnest($1::TEXT[]) a ORDER BY a COLLATE "C"
+		INSERT INTO ledger_reverted_address (address) SELECT a FROM unnest($1::TEXT[]) a ORDER BY a COLLATE pg_catalog."C"
 		ON CONFLICT (address) DO UPDATE SET address = EXCLUDED.address`, addresses)
 	return forgotten, err
 }

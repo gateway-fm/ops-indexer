@@ -20,7 +20,7 @@ import (
 func revertNFTTokens(ctx context.Context, tx pgx.Tx, number uint64) error {
 	rows, err := tx.Query(ctx, `
 		SELECT token_address, token_id::TEXT FROM nft_tokens WHERE block_number >= $1
-		ORDER BY token_address COLLATE "C", token_id::TEXT COLLATE "C" FOR UPDATE`, int64(number))
+		ORDER BY token_address COLLATE pg_catalog."C", token_id::TEXT COLLATE pg_catalog."C" FOR UPDATE`, int64(number))
 	if err != nil {
 		return err
 	}
