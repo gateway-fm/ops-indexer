@@ -1888,8 +1888,7 @@ func (d *DB) GetTransactionHistory(ctx context.Context, intervalSeconds int, lim
 const minHexPrefix = 3
 
 // hexPrefixRange turns a "0x…" query into a lowercase prefix and an exclusive
-// upper bound, so the lookup is a btree range scan on the primary key instead
-// of a sequential scan. ok is false when the query is not 0x followed by
+// upper bound for hexRangeCond. ok is false when the query is not 0x followed by
 // minHexPrefix..maxHex hex digits. Hashes and addresses are stored lowercase.
 func hexPrefixRange(query string, maxHex int) (lo, hi string, ok bool) {
 	if len(query) < 2 || (query[:2] != "0x" && query[:2] != "0X") {
@@ -1905,34 +1904,53 @@ func hexPrefixRange(query string, maxHex int) (lo, hi string, ok bool) {
 		}
 	}
 	lo = "0x" + digits
-	// 'g' sorts after every hex digit, so [lo, lo+"g") holds exactly the
-	// strings that start with lo.
+	// 'g' sorts after every hex digit, so under a bytewise comparison [lo, lo+"g")
+	// holds exactly the strings that start with lo.
 	return lo, lo + "g", true
 }
 
 // hexRangeCond is the prefix predicate on a hex column for the [$1, $2) bounds
-// from hexPrefixRange. With a bytewise collation it is a primary-key range
-// scan. Otherwise the range is taken in the "C" collation: still correct, but
-// no index serves it, so it scans (as the LIKE before PRST-6066 did).
+// from hexPrefixRange. With a bytewise column collation it compares in that
+// collation, so the primary key serves it as a range scan. Otherwise it
+// compares in pg_catalog."C" (qualified, so no "C" earlier on search_path can
+// stand in for it): still exact, but no index serves the range, so it is a
+// filter.
 func hexRangeCond(col string, bytewise bool) string {
 	if bytewise {
 		return col + ` >= $1 AND ` + col + ` < $2`
 	}
-	return col + ` COLLATE "C" >= $1 AND ` + col + ` COLLATE "C" < $2`
+	return col + ` COLLATE pg_catalog."C" >= $1 AND ` + col + ` COLLATE pg_catalog."C" < $2`
 }
 
-// txPrefixQuery returns transactions whose hash starts with the prefix, newest
-// first. The hash matches are MATERIALIZED before the ordering: otherwise the
-// planner may satisfy ORDER BY block_number DESC LIMIT n by walking
-// idx_tx_block and filtering on hash, which reads most of the table when the
-// matches sit in old blocks.
-func txPrefixQuery(bytewise bool) string {
-	return `
+// minFencedHexPrefix is the shortest hash prefix whose matches txPrefixQuery
+// collects before ordering. For 4+ digits the matches are few (N/65536) and
+// cheap to read through the primary key, while walking idx_tx_block needs about
+// 65536 x limit rows to find limit uniformly spread matches, and reads most of
+// the table when they sit in old blocks. With 3 digits the walk can win on a
+// large enough table (about 4096 x limit rows against N/4096 matches), so the
+// planner keeps the choice.
+const minFencedHexPrefix = 4
+
+// txPrefixQuery returns transactions whose hash starts with the prefix of the
+// given number of digits, newest first. On the bytewise path a prefix of
+// minFencedHexPrefix+ digits has its matches MATERIALIZED before the ordering:
+// otherwise the planner may satisfy ORDER BY block_number DESC LIMIT n by
+// walking idx_tx_block and filtering on hash. Without a bytewise collation no
+// index serves the hash range, so there the walk, newest first and stopping at
+// the limit, is the best plan, and fencing would force a full scan.
+func txPrefixQuery(bytewise bool, digits int) string {
+	if bytewise && digits >= minFencedHexPrefix {
+		return `
 		WITH m AS MATERIALIZED (
 			SELECT hash, block_number FROM transactions
 			WHERE ` + hexRangeCond("hash", bytewise) + `
 		)
 		SELECT hash FROM m ORDER BY block_number DESC LIMIT $3`
+	}
+	return `
+		SELECT hash FROM transactions
+		WHERE ` + hexRangeCond("hash", bytewise) + `
+		ORDER BY block_number DESC LIMIT $3`
 }
 
 // hexOrder caches one column's collation check. Only a successful check is
@@ -1941,6 +1959,10 @@ type hexOrder struct {
 	mu       sync.Mutex
 	checked  bool
 	bytewise bool
+	// lastWarn is when a failed check was last logged (at most once a minute).
+	lastWarn time.Time
+	// probe replaces the catalog lookup in tests.
+	probe func(context.Context) (hexCollation, error)
 }
 
 func (d *DB) txHashOrderIsBytewise(ctx context.Context) bool {
@@ -1955,27 +1977,44 @@ func (d *DB) addressOrderIsBytewise(ctx context.Context) bool {
 // collation, which the hexPrefixRange bounds rely on. Other collations may not
 // order hex that way (ICU "da" sorts "aa" after "f"), and there the range would
 // silently miss matches. Until the catalog confirms it, it answers no, which is
-// slower but correct.
+// slower but correct. The lock covers only the cached fields: concurrent
+// lookups before the first success each run the check, which is harmless.
 func (d *DB) hexOrderIsBytewise(ctx context.Context, o *hexOrder, table, col string) bool {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.checked {
-		return o.bytewise
+	checked, bytewise, probe := o.checked, o.bytewise, o.probe
+	o.mu.Unlock()
+	if checked {
+		return bytewise
+	}
+	if probe == nil {
+		probe = func(ctx context.Context) (hexCollation, error) { return d.hexCollation(ctx, table, col) }
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	c, err := d.hexCollation(ctx, table, col)
+	c, err := probe(ctx)
+
+	o.mu.Lock()
 	if err != nil {
-		log.Warn("search suggestions: could not check the collation; prefix lookups will scan until a check succeeds",
-			"column", table+"."+col, "err", err)
+		warn := time.Since(o.lastWarn) >= time.Minute
+		if warn {
+			o.lastWarn = time.Now()
+		}
+		o.mu.Unlock()
+		if warn {
+			log.Warn("search suggestions: could not check the collation; prefix lookups will scan until a check succeeds",
+				"column", table+"."+col, "error", err)
+		}
 		return false
 	}
+	first := !o.checked
 	o.checked, o.bytewise = true, c.bytewise()
-	if !o.bytewise {
+	bytewise = o.bytewise
+	o.mu.Unlock()
+	if first && !bytewise {
 		log.Warn("search suggestions: the collation is not bytewise; prefix lookups will scan. Use the C collation for fast lookups",
 			"column", table+"."+col)
 	}
-	return o.bytewise
+	return bytewise
 }
 
 // hexCollation is a column's collation as the catalog records it, with the
@@ -2024,9 +2063,9 @@ func (d *DB) hexCollation(ctx context.Context, table, col string) (hexCollation,
 		       COALESCE(to_jsonb(co)->>'colllocale', ''),
 		       COALESCE(to_jsonb(db)->>'datlocprovider', 'c'), db.datcollate::text,
 		       COALESCE(to_jsonb(db)->>'datlocale', '')
-		FROM pg_attribute a
-		LEFT JOIN pg_collation co ON co.oid = a.attcollation
-		JOIN pg_database db ON db.datname = current_database()
+		FROM pg_catalog.pg_attribute a
+		LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+		JOIN pg_catalog.pg_database db ON db.datname = current_database()
 		WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND NOT a.attisdropped`, table, col).
 		Scan(&c.isDefault, &c.provider, &c.collate, &c.locale, &c.dbProvider, &c.dbCollate, &c.dbLocale)
 	if err != nil {
@@ -2098,7 +2137,7 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	if lo, hi, ok := hexPrefixRange(query, 64); ok {
-		rows, err := d.pool.Query(ctx, txPrefixQuery(d.txHashOrderIsBytewise(ctx)), lo, hi, limit)
+		rows, err := d.pool.Query(ctx, txPrefixQuery(d.txHashOrderIsBytewise(ctx), len(lo)-2), lo, hi, limit)
 		if err != nil {
 			return nil, err
 		}

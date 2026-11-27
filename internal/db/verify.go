@@ -270,7 +270,7 @@ func truthMoved(ctx context.Context, tx pgx.Tx, lo int64, drifts []Drift) error 
 		return nil
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO ledger_reverted_address (address) SELECT a FROM unnest($1::TEXT[]) a ORDER BY a COLLATE "C"
+		INSERT INTO ledger_reverted_address (address) SELECT a FROM unnest($1::TEXT[]) a ORDER BY a COLLATE pg_catalog."C"
 		ON CONFLICT (address) DO UPDATE SET address = EXCLUDED.address`, addresses)
 	return err
 }

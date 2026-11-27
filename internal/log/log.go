@@ -3,7 +3,7 @@
 // Usage:
 //
 //	log.Info("server started", "port", 8080)
-//	log.Error("failed to connect", "err", err)
+//	log.Error("failed to connect", "error", err)
 //	log.With("component", "indexer").Info("processing block", "number", 123)
 //
 // The package uses slog under the hood with a custom terminal handler that

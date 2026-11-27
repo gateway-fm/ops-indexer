@@ -1,10 +1,18 @@
 package db
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/gateway-fm/chain-indexer/internal/log"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -149,8 +157,22 @@ func TestSearchSuggestionsNonBytewiseCollation(t *testing.T) {
 	require.Equal(t, []string{target}, addrs)
 }
 
+// suggestionsByType runs SearchSuggestions and groups the values by type.
+func suggestionsByType(t *testing.T, d *DB, q string) map[string][]string {
+	t.Helper()
+	got, err := d.SearchSuggestions(context.Background(), q, 10)
+	require.NoError(t, err, q)
+	m := map[string][]string{}
+	for _, s := range got {
+		m[s.Type] = append(m[s.Type], s.Value)
+	}
+	return m
+}
+
 // An ICU collation in another schema that is merely named "C" must not pass for
-// pg_catalog."C": the lookup has to find the Danish-ordered row.
+// pg_catalog."C", neither in the catalog check nor in the fallback's COLLATE
+// when that schema comes before pg_catalog on search_path: the lookup has to
+// find the rows that the Danish ordering puts outside the range.
 func TestSearchSuggestionsCollationNamedC(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -162,18 +184,70 @@ func TestSearchSuggestionsCollationNamedC(t *testing.T) {
 		ALTER TABLE address_stats ALTER COLUMN address TYPE text COLLATE spoof."C"`)
 	require.NoError(t, err)
 	target := "0x12aa" + strings.Repeat("0", 36)
+	txHash := "0x12aa" + strings.Repeat("0", 60)
+	insertBlock(t, d, 1)
 	_, err = d.pool.Exec(ctx, `INSERT INTO address_stats (address, tx_count) VALUES ($1, 1)`, target)
 	require.NoError(t, err)
-
-	got, err := d.SearchSuggestions(ctx, "0x12a", 10)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
+		VALUES ($1, 1, 0, $2, $2, '0', 0, 0, '0x', 1, 0)`, txHash, target)
 	require.NoError(t, err)
-	var addrs []string
-	for _, s := range got {
-		if s.Type == "address" {
-			addrs = append(addrs, s.Value)
-		}
+
+	got := suggestionsByType(t, d, "0x12a")
+	require.Equal(t, []string{target}, got["address"])
+	require.Equal(t, []string{txHash}, got["transaction"])
+
+	cfg := d.pool.Config()
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
-	require.Equal(t, []string{target}, addrs)
+	cfg.ConnConfig.RuntimeParams["search_path"] = "spoof, pg_catalog, public"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer pool.Close()
+	got = suggestionsByType(t, &DB{pool: pool}, "0x12a")
+	require.Equal(t, []string{target}, got["address"], "spoof.\"C\" ahead of pg_catalog on search_path")
+	require.Equal(t, []string{txHash}, got["transaction"], "spoof.\"C\" ahead of pg_catalog on search_path")
+}
+
+// The bytewise fast path, which C-collated deployments take: both columns
+// classify as bytewise and the range finds the rows, including one just inside
+// the prefix boundary, for a short (unfenced) and a long (fenced) prefix.
+func TestSearchSuggestionsBytewise(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_, err := d.pool.Exec(ctx, `
+		ALTER TABLE transactions ALTER COLUMN hash TYPE text COLLATE "C";
+		ALTER TABLE address_stats ALTER COLUMN address TYPE text COLLATE "C"`)
+	require.NoError(t, err)
+	require.True(t, d.txHashOrderIsBytewise(ctx))
+	require.True(t, d.addressOrderIsBytewise(ctx))
+
+	for b := uint64(1); b <= 3; b++ {
+		insertBlock(t, d, b)
+	}
+	from := "0x" + strings.Repeat("1", 40)
+	tx := func(prefix string) string { return prefix + strings.Repeat("0", 66-len(prefix)) }
+	addr := func(prefix string) string { return prefix + strings.Repeat("0", 42-len(prefix)) }
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
+		VALUES ($1, 1, 0, $5, $5, '0', 0, 0, '0x', 1, 0), ($2, 2, 0, $5, $5, '0', 0, 0, '0x', 1, 0),
+		       ($3, 3, 0, $5, $5, '0', 0, 0, '0x', 1, 0), ($4, 3, 1, $5, $5, '0', 0, 0, '0x', 1, 0)`,
+		tx("0x12aa"), tx("0x12af"), tx("0x12b"), tx("0x129f"), from)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `INSERT INTO address_stats (address, tx_count) VALUES ($1, 5), ($2, 7), ($3, 9), ($4, 11)`,
+		addr("0x12aa"), addr("0x12af"), addr("0x12b"), addr("0x129f"))
+	require.NoError(t, err)
+
+	got := suggestionsByType(t, d, "0x12A")
+	require.Equal(t, []string{tx("0x12af"), tx("0x12aa")}, got["transaction"], "newest first")
+	require.Equal(t, []string{addr("0x12af"), addr("0x12aa")}, got["address"], "by tx_count")
+
+	got = suggestionsByType(t, d, "0x12aa000")
+	require.Equal(t, []string{tx("0x12aa")}, got["transaction"])
+	require.Equal(t, []string{addr("0x12aa")}, got["address"])
 }
 
 func TestBytewiseCollation(t *testing.T) {
@@ -303,7 +377,66 @@ func TestHexOrderRetriesAfterError(t *testing.T) {
 	require.True(t, d.addressOrderIsBytewise(ctx))
 }
 
-// The transaction prefix lookup must read the hash matches, not walk the
+// seedPrefixTxs inserts 20,000 blocks of 10 transactions. The blocks matching
+// the SQL condition on b hold hashes starting with prefix; the rest start 0x0.
+func seedPrefixTxs(t *testing.T, d *DB, matching, prefix string) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
+		SELECT g, '0xblock' || g, '0xblock' || (g - 1), 1700000000 + g, 0, 30000000, 10 FROM generate_series(1, 20000) g`)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `
+		INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
+		SELECT CASE WHEN `+matching+` THEN $1 || substr(md5(b || ':' || i) || md5(i || ':' || b), 1, 64 - length($1) + 2)
+		            ELSE '0x0' || substr(md5(b || ':' || i) || md5(i || ':' || b), 1, 63) END,
+		       b, i, '0x' || repeat('1', 40), '0x' || repeat('2', 40), '0', 0, 0, '0x', 1, 0
+		FROM generate_series(1, 20000) b, generate_series(0, 9) i`, prefix)
+	require.NoError(t, err)
+	_, err = d.pool.Exec(ctx, `ANALYZE transactions`)
+	require.NoError(t, err)
+}
+
+// prefixPlan runs q for prefix under EXPLAIN ANALYZE and returns the rows its
+// filters discarded and the plan.
+func prefixPlan(t *testing.T, d *DB, q, prefix string) (removed int, plan string) {
+	t.Helper()
+	require.NoError(t, d.pool.QueryRow(context.Background(), `EXPLAIN (ANALYZE, FORMAT JSON) `+q, prefix, prefix+"g", 10).Scan(&plan))
+	for _, part := range strings.Split(plan, `"Rows Removed by Filter": `)[1:] {
+		n := 0
+		fmt.Sscanf(part, "%d", &n)
+		removed += n
+	}
+	return removed, plan
+}
+
+// prefixBlocks runs q for prefix and returns the block of each hash it
+// returns, checking that every hash has the prefix.
+func prefixBlocks(t *testing.T, d *DB, q, prefix string) []int64 {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := d.pool.Query(ctx, q, prefix, prefix+"g", 10)
+	require.NoError(t, err)
+	hashes, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	blocks := make([]int64, len(hashes))
+	for i, h := range hashes {
+		require.True(t, strings.HasPrefix(h, prefix), h)
+		require.NoError(t, d.pool.QueryRow(ctx, `SELECT block_number FROM transactions WHERE hash = $1`, h).Scan(&blocks[i]))
+	}
+	return blocks
+}
+
+func TestTxPrefixQueryShape(t *testing.T) {
+	require.Contains(t, txPrefixQuery(true, minFencedHexPrefix), "MATERIALIZED")
+	require.Contains(t, txPrefixQuery(true, 64), "MATERIALIZED")
+	require.NotContains(t, txPrefixQuery(true, minFencedHexPrefix-1), "MATERIALIZED")
+	require.NotContains(t, txPrefixQuery(false, minFencedHexPrefix), "MATERIALIZED")
+	require.NotContains(t, txPrefixQuery(false, 64), "MATERIALIZED")
+	require.Contains(t, txPrefixQuery(false, 3), `COLLATE pg_catalog."C"`)
+}
+
+// A long prefix on the bytewise path must read the hash matches, not walk the
 // block-number index filtering on hash: with the matches in old blocks that
 // walk reads almost every row.
 func TestTxPrefixQueryReadsOnlyMatches(t *testing.T) {
@@ -311,45 +444,82 @@ func TestTxPrefixQueryReadsOnlyMatches(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	_, err := d.pool.Exec(ctx, `
-		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, transaction_count)
-		SELECT g, '0xblock' || g, '0xblock' || (g - 1), 1700000000 + g, 0, 30000000, 10 FROM generate_series(1, 20000) g`)
-	require.NoError(t, err)
-	// 200k transactions. Blocks 1-2000 (10%, the oldest) hold hashes starting
-	// 0xabc; the rest start 0x0. A large, old match set is what makes the planner
-	// prefer walking the block index for ORDER BY block_number DESC LIMIT n.
-	_, err = d.pool.Exec(ctx, `
-		INSERT INTO transactions (hash, block_number, tx_index, from_address, to_address, value, gas_used, gas_price, input_data, status, tx_type)
-		SELECT CASE WHEN b <= 2000 THEN '0xabc' || substr(md5(b || ':' || i) || md5(i || ':' || b), 1, 61)
-		            ELSE '0x0' || substr(md5(b || ':' || i) || md5(i || ':' || b), 1, 63) END,
-		       b, i, '0x' || repeat('1', 40), '0x' || repeat('2', 40), '0', 0, 0, '0x', 1, 0
-		FROM generate_series(1, 20000) b, generate_series(0, 9) i`)
+	// Blocks 1-2000 (10%, the oldest) hold hashes starting 0xabcde. A large, old
+	// match set is what makes the planner prefer walking the block index for
+	// ORDER BY block_number DESC LIMIT n.
+	seedPrefixTxs(t, d, "b <= 2000", "0xabcde")
+	_, err := d.pool.Exec(ctx, `ALTER TABLE transactions ALTER COLUMN hash TYPE text COLLATE "C"`)
 	require.NoError(t, err)
 	_, err = d.pool.Exec(ctx, `ANALYZE transactions`)
 	require.NoError(t, err)
 
-	removed := func(q string) int {
-		t.Helper()
-		var plan string
-		require.NoError(t, d.pool.QueryRow(ctx, `EXPLAIN (ANALYZE, FORMAT JSON) `+q, "0xabc", "0xabcg", 10).Scan(&plan))
-		total := 0
-		for _, part := range strings.Split(plan, `"Rows Removed by Filter": `)[1:] {
-			n := 0
-			fmt.Sscanf(part, "%d", &n)
-			total += n
-		}
-		return total
-	}
-	require.Less(t, removed(txPrefixQuery(true)), 1000)
+	q := txPrefixQuery(true, 5)
+	removed, _ := prefixPlan(t, d, q, "0xabcde")
+	require.Less(t, removed, 1000)
+	require.Equal(t, []int64{2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000}, prefixBlocks(t, d, q, "0xabcde"),
+		"the newest ten matches")
 
-	got, err := d.SearchSuggestions(ctx, "0xabc", 10)
-	require.NoError(t, err)
-	n := 0
-	for _, s := range got {
-		if s.Type == "transaction" {
-			require.True(t, strings.HasPrefix(s.Value, "0xabc"), s.Value)
-			n++
-		}
+	got := suggestionsByType(t, d, "0xabcde")
+	require.Len(t, got["transaction"], 10)
+	for _, h := range got["transaction"] {
+		require.True(t, strings.HasPrefix(h, "0xabcde"), h)
 	}
-	require.Equal(t, 10, n)
+}
+
+// The non-bytewise fallback has no index on the hash range, so it must walk the
+// block-number index newest first and stop at the limit, not collect every
+// match (a full scan) before ordering.
+func TestTxPrefixFallbackStopsEarly(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// The newest 2000 blocks hold hashes starting 0xabc.
+	seedPrefixTxs(t, d, "b > 18000", "0xabc")
+
+	q := txPrefixQuery(false, 3)
+	removed, plan := prefixPlan(t, d, q, "0xabc")
+	require.NotContains(t, plan, `"Seq Scan"`)
+	require.Less(t, removed, 1000)
+	require.Equal(t, []int64{20000, 20000, 20000, 20000, 20000, 20000, 20000, 20000, 20000, 20000}, prefixBlocks(t, d, q, "0xabc"))
+}
+
+// While the collation check keeps failing, concurrent lookups each probe at
+// once rather than queueing on one another, and the failure is logged once,
+// not per lookup.
+func TestHexOrderProbesDoNotSerialize(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Default()
+	log.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer log.SetDefault(prev)
+
+	const n = 8
+	var d DB
+	var entered atomic.Int32
+	all := make(chan struct{})
+	d.addressOrder.probe = func(ctx context.Context) (hexCollation, error) {
+		if entered.Add(1) == n {
+			close(all)
+		}
+		select {
+		case <-all:
+		case <-time.After(5 * time.Second):
+		}
+		return hexCollation{}, errors.New("injected")
+	}
+	start := time.Now()
+	var wg sync.WaitGroup
+	results := make([]bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = d.addressOrderIsBytewise(context.Background())
+		}()
+	}
+	wg.Wait()
+	require.Less(t, time.Since(start), 4*time.Second, "the probes ran one at a time")
+	require.EqualValues(t, n, entered.Load())
+	require.Equal(t, make([]bool, n), results)
+	require.Equal(t, 1, strings.Count(buf.String(), "could not check the collation"), buf.String())
+	require.Contains(t, buf.String(), "error=injected")
 }
