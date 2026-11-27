@@ -41,9 +41,10 @@ type DB struct {
 	// while it validated (only the retention goroutine reads or writes it).
 	cutMargin uint64
 	ensureMu  sync.Mutex
-	// hexOrderOnce guards hexOrderBytewise (see hexOrderIsBytewise).
-	hexOrderOnce     sync.Once
-	hexOrderBytewise bool
+	// txHashOrder and addressOrder cache the collation checks of
+	// transactions.hash and address_stats.address (see hexOrderIsBytewise).
+	txHashOrder  hexOrder
+	addressOrder hexOrder
 }
 
 func New(databaseURL string) (*DB, error) {

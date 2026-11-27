@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -132,9 +134,9 @@ func TestSearchSuggestionsNonBytewiseCollation(t *testing.T) {
 	require.NoError(t, d.pool.QueryRow(ctx, `SELECT count(*) FROM address_stats WHERE address >= '0x12a' AND address < '0x12ag'`).Scan(&inRange))
 	require.Zero(t, inRange, "fixture no longer reproduces the collation gap")
 
-	ok, err := d.probeHexOrder(ctx)
+	c, err := d.hexCollation(ctx, "address_stats", "address")
 	require.NoError(t, err)
-	require.False(t, ok)
+	require.False(t, c.bytewise())
 
 	got, err := d.SearchSuggestions(ctx, "0x12a", 10)
 	require.NoError(t, err)
@@ -147,12 +149,158 @@ func TestSearchSuggestionsNonBytewiseCollation(t *testing.T) {
 	require.Equal(t, []string{target}, addrs)
 }
 
-func TestProbeHexOrderDefaultSchema(t *testing.T) {
+// An ICU collation in another schema that is merely named "C" must not pass for
+// pg_catalog."C": the lookup has to find the Danish-ordered row.
+func TestSearchSuggestionsCollationNamedC(t *testing.T) {
 	d, cleanup := setupTestDB(t)
 	defer cleanup()
-	ok, err := d.probeHexOrder(context.Background())
+	ctx := context.Background()
+
+	_, err := d.pool.Exec(ctx, `
+		CREATE SCHEMA spoof;
+		CREATE COLLATION spoof."C" (provider = icu, locale = 'da');
+		ALTER TABLE address_stats ALTER COLUMN address TYPE text COLLATE spoof."C"`)
 	require.NoError(t, err)
-	require.True(t, ok, "the test database's default collation should order hex bytewise")
+	target := "0x12aa" + strings.Repeat("0", 36)
+	_, err = d.pool.Exec(ctx, `INSERT INTO address_stats (address, tx_count) VALUES ($1, 1)`, target)
+	require.NoError(t, err)
+
+	got, err := d.SearchSuggestions(ctx, "0x12a", 10)
+	require.NoError(t, err)
+	var addrs []string
+	for _, s := range got {
+		if s.Type == "address" {
+			addrs = append(addrs, s.Value)
+		}
+	}
+	require.Equal(t, []string{target}, addrs)
+}
+
+func TestBytewiseCollation(t *testing.T) {
+	cases := []struct {
+		name string
+		c    hexCollation
+		want bool
+	}{
+		{"libc C", hexCollation{provider: "c", collate: "C"}, true},
+		{"libc POSIX", hexCollation{provider: "c", collate: "POSIX"}, true},
+		{"libc en_US", hexCollation{provider: "c", collate: "en_US.utf8"}, false},
+		{"libc C.UTF-8", hexCollation{provider: "c", collate: "C.UTF-8"}, false},
+		{"ICU", hexCollation{provider: "i", locale: "da"}, false},
+		{"ICU named C", hexCollation{provider: "i", locale: "C"}, false},
+		{"builtin C", hexCollation{provider: "b", locale: "C"}, true},
+		{"builtin C.UTF-8", hexCollation{provider: "b", locale: "C.UTF-8"}, false},
+		{"default, C database", hexCollation{isDefault: true, provider: "d", dbProvider: "c", dbCollate: "C"}, true},
+		{"default, POSIX database", hexCollation{isDefault: true, provider: "d", dbProvider: "c", dbCollate: "POSIX"}, true},
+		{"default, en_US database", hexCollation{isDefault: true, provider: "d", dbProvider: "c", dbCollate: "en_US.utf8"}, false},
+		{"default, ICU database with lc_collate C", hexCollation{isDefault: true, provider: "d", dbProvider: "i", dbCollate: "C", dbLocale: "und"}, false},
+		{"default, builtin C database", hexCollation{isDefault: true, provider: "d", dbProvider: "b", dbCollate: "C", dbLocale: "C"}, true},
+		{"default, builtin C.UTF-8 database", hexCollation{isDefault: true, provider: "d", dbProvider: "b", dbCollate: "C", dbLocale: "C.UTF-8"}, false},
+		{"no collation", hexCollation{provider: "c"}, false},
+	}
+	for _, c := range cases {
+		require.Equal(t, c.want, c.c.bytewise(), c.name)
+	}
+}
+
+// The catalog lookup classifies each kind of column collation, including the
+// database default under a C, a non-C and an ICU database.
+func TestHexCollationFromCatalog(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_, err := d.pool.Exec(ctx, `
+		CREATE SCHEMA spoof;
+		CREATE COLLATION spoof."C" (provider = icu, locale = 'da');
+		CREATE TABLE colls (c text COLLATE "C", posix text COLLATE "POSIX", icu text COLLATE "und-x-icu",
+			spoofed text COLLATE spoof."C", dflt text)`)
+	require.NoError(t, err)
+	bytewise := func(d *DB, table, col string) bool {
+		t.Helper()
+		c, err := d.hexCollation(ctx, table, col)
+		require.NoError(t, err, col)
+		return c.bytewise()
+	}
+	require.True(t, bytewise(d, "colls", "c"))
+	require.True(t, bytewise(d, "colls", "posix"))
+	require.False(t, bytewise(d, "colls", "icu"))
+	require.False(t, bytewise(d, "colls", "spoofed"))
+	// The test server's default locale is en_US.utf8.
+	require.False(t, bytewise(d, "colls", "dflt"))
+	require.False(t, bytewise(d, "transactions", "hash"))
+
+	_, err = d.hexCollation(ctx, "no_such_table", "x")
+	require.Error(t, err)
+
+	for _, c := range []struct {
+		opts string
+		want bool
+	}{
+		{"LC_COLLATE 'C' LC_CTYPE 'C'", true},
+		{"LC_COLLATE 'POSIX' LC_CTYPE 'POSIX'", true},
+		{"LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'", false},
+		{"LOCALE_PROVIDER icu ICU_LOCALE 'und' LC_COLLATE 'C' LC_CTYPE 'C'", false},
+	} {
+		ld, drop := localeDB(t, c.opts)
+		_, err := ld.pool.Exec(ctx, `CREATE TABLE address_stats (address text PRIMARY KEY)`)
+		require.NoError(t, err)
+		require.Equal(t, c.want, bytewise(ld, "address_stats", "address"), c.opts)
+		drop()
+	}
+}
+
+// localeDB creates an empty database from template0 with the given locale
+// options. setupTestDB must have started the shared server.
+func localeDB(t *testing.T, opts string) (*DB, func()) {
+	t.Helper()
+	ctx := context.Background()
+	name := fmt.Sprintf("locale_%d", testDBSeq.Add(1))
+	admin := *sharedPGURL
+	admin.Path = "/postgres"
+	conn, err := pgx.Connect(ctx, admin.String())
+	require.NoError(t, err)
+	defer conn.Close(ctx)
+	_, err = conn.Exec(ctx, "CREATE DATABASE "+name+" TEMPLATE template0 "+opts)
+	require.NoError(t, err)
+	own := *sharedPGURL
+	own.Path = "/" + name
+	pool, err := pgxpool.New(ctx, own.String())
+	require.NoError(t, err)
+	return &DB{pool: pool}, func() {
+		pool.Close()
+		conn, err := pgx.Connect(ctx, admin.String())
+		require.NoError(t, err)
+		defer conn.Close(ctx)
+		_, err = conn.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
+		require.NoError(t, err)
+	}
+}
+
+// A failed check is not cached: the next call checks again. Each column is
+// classified on its own, so one failing leaves the other's fast path.
+func TestHexOrderRetriesAfterError(t *testing.T) {
+	d, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_, err := d.pool.Exec(ctx, `
+		ALTER TABLE transactions ALTER COLUMN hash TYPE text COLLATE "C";
+		ALTER TABLE address_stats ALTER COLUMN address TYPE text COLLATE "C";
+		ALTER TABLE address_stats RENAME TO address_stats_away`)
+	require.NoError(t, err)
+
+	require.False(t, d.addressOrderIsBytewise(ctx), "the check fails while the table is missing")
+	require.True(t, d.txHashOrderIsBytewise(ctx), "the hash column is classified on its own")
+
+	_, err = d.pool.Exec(ctx, `ALTER TABLE address_stats_away RENAME TO address_stats`)
+	require.NoError(t, err)
+	require.True(t, d.addressOrderIsBytewise(ctx), "the failed check is retried")
+
+	// A successful classification is cached.
+	_, err = d.pool.Exec(ctx, `ALTER TABLE address_stats ALTER COLUMN address TYPE text COLLATE "und-x-icu"`)
+	require.NoError(t, err)
+	require.True(t, d.addressOrderIsBytewise(ctx))
 }
 
 // The transaction prefix lookup must read the hash matches, not walk the

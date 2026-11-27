@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gateway-fm/chain-indexer/internal/log"
@@ -1934,58 +1935,104 @@ func txPrefixQuery(bytewise bool) string {
 		SELECT hash FROM m ORDER BY block_number DESC LIMIT $3`
 }
 
-// hexOrderIsBytewise reports whether transactions.hash and
-// address_stats.address order hex strings bytewise under their collation, which
-// the hexPrefixRange bounds rely on. Some collations do not (ICU "da" sorts
-// "aa" after "f"), and there the range would silently miss matches. Checked
-// once; on error it assumes not, which is slower but correct.
-func (d *DB) hexOrderIsBytewise() bool {
-	d.hexOrderOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		ok, err := d.probeHexOrder(ctx)
-		if err != nil {
-			log.Warn("search suggestions: could not check the hash/address collation; prefix lookups will scan", "err", err)
-		} else if !ok {
-			log.Warn("search suggestions: the hash/address collation does not order hex bytewise; prefix lookups will scan. Use the C collation for fast lookups")
-		}
-		d.hexOrderBytewise = err == nil && ok
-	})
-	return d.hexOrderBytewise
+// hexOrder caches one column's collation check. Only a successful check is
+// cached: after an error the next lookup checks again.
+type hexOrder struct {
+	mu       sync.Mutex
+	checked  bool
+	bytewise bool
 }
 
-// probeHexOrder sorts every string of up to three characters from the hex
-// alphabet, 'g' and 'x' under each column's collation and compares the order
-// with "C".
-func (d *DB) probeHexOrder(ctx context.Context) (bool, error) {
-	for _, c := range [][2]string{{"transactions", "hash"}, {"address_stats", "address"}} {
-		var coll string
-		if err := d.pool.QueryRow(ctx, `
-			SELECT co.collname FROM pg_attribute a JOIN pg_collation co ON co.oid = a.attcollation
-			WHERE a.attrelid = $1::regclass AND a.attname = $2`, c[0], c[1]).Scan(&coll); err != nil {
-			return false, fmt.Errorf("collation of %s.%s: %w", c[0], c[1], err)
-		}
-		var mismatched int
-		if err := d.pool.QueryRow(ctx, `
-			WITH a(ch) AS (SELECT unnest(string_to_array('0123456789abcdefgx', NULL))),
-			v(s) AS (
-				SELECT ch FROM a
-				UNION ALL SELECT a1.ch || a2.ch FROM a a1, a a2
-				UNION ALL SELECT a1.ch || a2.ch || a3.ch FROM a a1, a a2, a a3
-			),
-			o AS (
-				SELECT row_number() OVER (ORDER BY s COLLATE `+pgx.Identifier{coll}.Sanitize()+`) AS r1,
-				       row_number() OVER (ORDER BY s COLLATE "C") AS r2
-				FROM v
-			)
-			SELECT count(*) FROM o WHERE r1 <> r2`).Scan(&mismatched); err != nil {
-			return false, fmt.Errorf("hex order under %q: %w", coll, err)
-		}
-		if mismatched > 0 {
-			return false, nil
-		}
+func (d *DB) txHashOrderIsBytewise(ctx context.Context) bool {
+	return d.hexOrderIsBytewise(ctx, &d.txHashOrder, "transactions", "hash")
+}
+
+func (d *DB) addressOrderIsBytewise(ctx context.Context) bool {
+	return d.hexOrderIsBytewise(ctx, &d.addressOrder, "address_stats", "address")
+}
+
+// hexOrderIsBytewise reports whether table.col compares bytewise under its
+// collation, which the hexPrefixRange bounds rely on. Other collations may not
+// order hex that way (ICU "da" sorts "aa" after "f"), and there the range would
+// silently miss matches. Until the catalog confirms it, it answers no, which is
+// slower but correct.
+func (d *DB) hexOrderIsBytewise(ctx context.Context, o *hexOrder, table, col string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.checked {
+		return o.bytewise
 	}
-	return true, nil
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	c, err := d.hexCollation(ctx, table, col)
+	if err != nil {
+		log.Warn("search suggestions: could not check the collation; prefix lookups will scan until a check succeeds",
+			"column", table+"."+col, "err", err)
+		return false
+	}
+	o.checked, o.bytewise = true, c.bytewise()
+	if !o.bytewise {
+		log.Warn("search suggestions: the collation is not bytewise; prefix lookups will scan. Use the C collation for fast lookups",
+			"column", table+"."+col)
+	}
+	return o.bytewise
+}
+
+// hexCollation is a column's collation as the catalog records it, with the
+// database default it stands for when it is "default". provider is
+// pg_collation.collprovider ('c' libc, 'i' ICU, 'b' builtin, 'd' default);
+// collate is the libc LC_COLLATE and locale the ICU or builtin locale. The db
+// fields are the same for pg_database.
+type hexCollation struct {
+	isDefault                       bool
+	provider, collate, locale       string
+	dbProvider, dbCollate, dbLocale string
+}
+
+func (c hexCollation) bytewise() bool {
+	if c.isDefault {
+		return bytewiseLocale(c.dbProvider, c.dbCollate, c.dbLocale)
+	}
+	return bytewiseLocale(c.provider, c.collate, c.locale)
+}
+
+// bytewiseLocale accepts only locales that compare bytes: libc "C" and "POSIX"
+// and the builtin provider's "C" (PostgreSQL 17). Anything else, ICU and
+// C.UTF-8 included, counts as not bytewise even where it may order hex the
+// same way.
+func bytewiseLocale(provider, collate, locale string) bool {
+	switch provider {
+	case "c":
+		return collate == "C" || collate == "POSIX"
+	case "b":
+		return locale == "C"
+	}
+	return false
+}
+
+// hexCollation reads the collation of table.col from the catalog. The table is
+// resolved through search_path, as the lookups resolve it, and the collation by
+// OID, so a collation in another schema that is only named "C" is not mistaken
+// for pg_catalog."C". Columns that older servers lack (collprovider before 10,
+// datlocprovider before 15, colllocale and datlocale before 17) read as libc
+// with no locale through to_jsonb.
+func (d *DB) hexCollation(ctx context.Context, table, col string) (hexCollation, error) {
+	var c hexCollation
+	err := d.pool.QueryRow(ctx, `
+		SELECT a.attcollation = 100,
+		       COALESCE(to_jsonb(co)->>'collprovider', 'c'), COALESCE(co.collcollate::text, ''),
+		       COALESCE(to_jsonb(co)->>'colllocale', ''),
+		       COALESCE(to_jsonb(db)->>'datlocprovider', 'c'), db.datcollate::text,
+		       COALESCE(to_jsonb(db)->>'datlocale', '')
+		FROM pg_attribute a
+		LEFT JOIN pg_collation co ON co.oid = a.attcollation
+		JOIN pg_database db ON db.datname = current_database()
+		WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND NOT a.attisdropped`, table, col).
+		Scan(&c.isDefault, &c.provider, &c.collate, &c.locale, &c.dbProvider, &c.dbCollate, &c.dbLocale)
+	if err != nil {
+		return hexCollation{}, fmt.Errorf("collation of %s.%s: %w", table, col, err)
+	}
+	return c, nil
 }
 
 // blockPrefixRanges returns the half-open block-number ranges whose decimal
@@ -2051,7 +2098,7 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	}
 
 	if lo, hi, ok := hexPrefixRange(query, 64); ok {
-		rows, err := d.pool.Query(ctx, txPrefixQuery(d.hexOrderIsBytewise()), lo, hi, limit)
+		rows, err := d.pool.Query(ctx, txPrefixQuery(d.txHashOrderIsBytewise(ctx)), lo, hi, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -2076,7 +2123,7 @@ func (d *DB) SearchSuggestions(ctx context.Context, query string, limit int) ([]
 	if lo, hi, ok := hexPrefixRange(query, 40); ok {
 		rows, err := d.pool.Query(ctx, `
 			SELECT address, tx_count FROM address_stats
-			WHERE `+hexRangeCond("address", d.hexOrderIsBytewise())+`
+			WHERE `+hexRangeCond("address", d.addressOrderIsBytewise(ctx))+`
 			ORDER BY tx_count DESC LIMIT $3`, lo, hi, limit)
 		if err != nil {
 			return nil, err
